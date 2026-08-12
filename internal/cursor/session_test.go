@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestExtractToolResultsTrailingOnly(t *testing.T) {
@@ -295,6 +297,61 @@ func TestSubmitToolResultsRebuildsWhenResponseEnded(t *testing.T) {
 	if !s.closed {
 		t.Fatal("expected session closed after rebuild signal")
 	}
+}
+
+func TestReadLoopKeepsReadingTrailingUsageWhileWaitingForTools(t *testing.T) {
+	requestReader, requestWriter := io.Pipe()
+	go func() {
+		_, _ = io.Copy(io.Discard, requestReader)
+	}()
+	responseReader, responseWriter := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Session{
+		stream:       &BidiStream{writer: requestWriter, body: responseReader},
+		events:       make(chan StreamEvent, 4),
+		errCh:        make(chan error, 1),
+		waitingTools: true,
+		pauseCh:      make(chan struct{}),
+		done:         ctx.Done(),
+		cancel:       cancel,
+		lastActivity: time.Now(),
+	}
+	go s.readLoop(ctx)
+
+	inputTokens := int64(120)
+	cacheWriteTokens := int64(80)
+	serverMessage := &agentv1.AgentServerMessage{
+		Message: &agentv1.AgentServerMessage_InteractionUpdate{
+			InteractionUpdate: &agentv1.InteractionUpdate{
+				Message: &agentv1.InteractionUpdate_TurnEnded{
+					TurnEnded: &agentv1.TurnEndedUpdate{
+						InputTokens:      &inputTokens,
+						CacheWriteTokens: &cacheWriteTokens,
+					},
+				},
+			},
+		},
+	}
+	payload, err := proto.Marshal(serverMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = responseWriter.Write(EncodeEnvelope(payload, false)); err != nil {
+		t.Fatal(err)
+	}
+
+	usage, ok := s.TakeUsage(time.Second)
+	if !ok {
+		t.Fatal("trailing TurnEnded was not read while waiting for tools")
+	}
+	if usage.InputTokens != inputTokens || usage.CacheWriteTokens != cacheWriteTokens {
+		t.Fatalf("usage=%+v", usage)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = responseWriter.Close()
+	_ = requestReader.Close()
 }
 
 func TestReleasePendingExecClearsAllAliases(t *testing.T) {

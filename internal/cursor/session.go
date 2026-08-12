@@ -303,6 +303,7 @@ func (s *Session) readLoop(ctx context.Context) {
 	for {
 		s.mu.Lock()
 		waiting := s.waitingTools
+		responseEnded := s.responseEnded
 		closed := s.closed
 		stream := s.stream
 		pauseCh := s.pauseCh
@@ -322,7 +323,11 @@ func (s *Session) readLoop(ctx context.Context) {
 			return
 		default:
 		}
-		if waiting {
+		// Keep reading while a live run is waiting for client tools. Cursor may
+		// send a trailing TurnEnded after the formal tool boundary; pausing here
+		// discarded those authoritative cache counters. Once the response has
+		// actually ended, wait for SubmitToolResults to rebuild or resume.
+		if waiting && responseEnded {
 			select {
 			case <-ctx.Done():
 				return
@@ -795,6 +800,7 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	s.turnEndedSeen = false
 	s.terminalUsageReady = false
 	s.terminalUsage = StreamEvent{}
+	s.usageSeen = nil
 	s.thinkingFlushed = false
 	s.textStreamLive = false
 	if s.holdTimer != nil {
