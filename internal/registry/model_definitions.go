@@ -90,8 +90,9 @@ func GetCursorModels() []*ModelInfo {
 // WithCursorBuiltins injects hard-coded Cursor Agent models that should not
 // disappear when upstream models.json has an empty cursor section.
 func WithCursorBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models,
+	return appendMissingModelInfos(models,
 		cursorBuiltinModel("default", "Cursor Default", "Cursor Agent default model selector."),
+		cursorBuiltinModel("claude-fable-5", "Claude Fable 5", "Cursor Agent Claude Fable 5."),
 		cursorBuiltinModel("claude-4.6-sonnet", "Claude 4.6 Sonnet", "Cursor Agent Claude 4.6 Sonnet."),
 		cursorBuiltinModel("gpt-5.4", "GPT-5.4", "Cursor Agent GPT-5.4."),
 	)
@@ -283,6 +284,34 @@ func upsertModelInfos(models []*ModelInfo, extras ...*ModelInfo) []*ModelInfo {
 
 	filtered = append(filtered, extraList...)
 	return filtered
+}
+
+func appendMissingModelInfos(models []*ModelInfo, extras ...*ModelInfo) []*ModelInfo {
+	result := cloneModelInfos(models)
+	seen := make(map[string]struct{}, len(result)+len(extras))
+	for _, model := range result {
+		if model == nil {
+			continue
+		}
+		if id := strings.ToLower(strings.TrimSpace(model.ID)); id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+	for _, extra := range extras {
+		if extra == nil {
+			continue
+		}
+		id := strings.ToLower(strings.TrimSpace(extra.ID))
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, cloneModelInfo(extra))
+	}
+	return result
 }
 
 // cloneModelInfos returns a shallow copy of the slice with each element deep-cloned.

@@ -119,6 +119,36 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	}
 }
 
+func TestGetRequestDetails_RoutesCursorFableBuiltin(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	const clientID = "test-request-details-cursor-fable"
+	modelRegistry.RegisterClient(clientID, "cursor", registry.GetCursorModels())
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(clientID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	providers, model, errMsg := handler.getRequestDetails("claude-fable-5")
+	if errMsg != nil {
+		t.Fatalf("getRequestDetails() error = %v", errMsg)
+	}
+	if !containsProvider(providers, "cursor") {
+		t.Fatalf("getRequestDetails() providers = %v, want cursor", providers)
+	}
+	if model != "claude-fable-5" {
+		t.Fatalf("getRequestDetails() model = %q, want claude-fable-5", model)
+	}
+}
+
+func containsProvider(providers []string, want string) bool {
+	for _, provider := range providers {
+		if provider == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
 
