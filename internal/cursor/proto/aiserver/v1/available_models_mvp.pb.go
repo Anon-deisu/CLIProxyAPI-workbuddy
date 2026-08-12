@@ -455,19 +455,21 @@ func (x *ModelParameterDefinition_EnumParameterDefinition_EnumParameterValue) Ge
 }
 
 type AvailableModelsResponse_AvailableModel struct {
-	state                protoimpl.MessageState                        `protogen:"open.v1"`
-	Name                 string                                        `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	SupportsThinking     *bool                                         `protobuf:"varint,9,opt,name=supports_thinking,json=supportsThinking,proto3,oneof" json:"supports_thinking,omitempty"`
-	SupportsImages       *bool                                         `protobuf:"varint,10,opt,name=supports_images,json=supportsImages,proto3,oneof" json:"supports_images,omitempty"`
-	ClientDisplayName    *string                                       `protobuf:"bytes,17,opt,name=client_display_name,json=clientDisplayName,proto3,oneof" json:"client_display_name,omitempty"`
-	ServerModelName      *string                                       `protobuf:"bytes,18,opt,name=server_model_name,json=serverModelName,proto3,oneof" json:"server_model_name,omitempty"`
-	SupportsNonMaxMode   *bool                                         `protobuf:"varint,19,opt,name=supports_non_max_mode,json=supportsNonMaxMode,proto3,oneof" json:"supports_non_max_mode,omitempty"`
-	ParameterDefinitions []*ModelParameterDefinition                   `protobuf:"bytes,29,rep,name=parameter_definitions,json=parameterDefinitions,proto3" json:"parameter_definitions,omitempty"`
-	Variants             []*AvailableModelsResponse_ModelVariantConfig `protobuf:"bytes,30,rep,name=variants,proto3" json:"variants,omitempty"`
-	IdAliases            []string                                      `protobuf:"bytes,37,rep,name=id_aliases,json=idAliases,proto3" json:"id_aliases,omitempty"`
-	ContextTokenLimit    *int32                                        `protobuf:"varint,15,opt,name=context_token_limit,json=contextTokenLimit,proto3,oneof" json:"context_token_limit,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	state                       protoimpl.MessageState                        `protogen:"open.v1"`
+	Name                        string                                        `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	SupportsThinking            *bool                                         `protobuf:"varint,9,opt,name=supports_thinking,json=supportsThinking,proto3,oneof" json:"supports_thinking,omitempty"`
+	SupportsImages              *bool                                         `protobuf:"varint,10,opt,name=supports_images,json=supportsImages,proto3,oneof" json:"supports_images,omitempty"`
+	SupportsMaxMode             *bool                                         `protobuf:"varint,14,opt,name=supports_max_mode,json=supportsMaxMode,proto3,oneof" json:"supports_max_mode,omitempty"`
+	ContextTokenLimit           *int32                                        `protobuf:"varint,15,opt,name=context_token_limit,json=contextTokenLimit,proto3,oneof" json:"context_token_limit,omitempty"`
+	ContextTokenLimitForMaxMode *int32                                        `protobuf:"varint,16,opt,name=context_token_limit_for_max_mode,json=contextTokenLimitForMaxMode,proto3,oneof" json:"context_token_limit_for_max_mode,omitempty"`
+	ClientDisplayName           *string                                       `protobuf:"bytes,17,opt,name=client_display_name,json=clientDisplayName,proto3,oneof" json:"client_display_name,omitempty"`
+	ServerModelName             *string                                       `protobuf:"bytes,18,opt,name=server_model_name,json=serverModelName,proto3,oneof" json:"server_model_name,omitempty"`
+	SupportsNonMaxMode          *bool                                         `protobuf:"varint,19,opt,name=supports_non_max_mode,json=supportsNonMaxMode,proto3,oneof" json:"supports_non_max_mode,omitempty"`
+	ParameterDefinitions        []*ModelParameterDefinition                   `protobuf:"bytes,29,rep,name=parameter_definitions,json=parameterDefinitions,proto3" json:"parameter_definitions,omitempty"`
+	Variants                    []*AvailableModelsResponse_ModelVariantConfig `protobuf:"bytes,30,rep,name=variants,proto3" json:"variants,omitempty"`
+	IdAliases                   []string                                      `protobuf:"bytes,37,rep,name=id_aliases,json=idAliases,proto3" json:"id_aliases,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
 }
 
 func (x *AvailableModelsResponse_AvailableModel) Reset() {
@@ -521,6 +523,27 @@ func (x *AvailableModelsResponse_AvailableModel) GetSupportsImages() bool {
 	return false
 }
 
+func (x *AvailableModelsResponse_AvailableModel) GetSupportsMaxMode() bool {
+	if x != nil && x.SupportsMaxMode != nil {
+		return *x.SupportsMaxMode
+	}
+	return false
+}
+
+func (x *AvailableModelsResponse_AvailableModel) GetContextTokenLimit() int32 {
+	if x != nil && x.ContextTokenLimit != nil {
+		return *x.ContextTokenLimit
+	}
+	return 0
+}
+
+func (x *AvailableModelsResponse_AvailableModel) GetContextTokenLimitForMaxMode() int32 {
+	if x != nil && x.ContextTokenLimitForMaxMode != nil {
+		return *x.ContextTokenLimitForMaxMode
+	}
+	return 0
+}
+
 func (x *AvailableModelsResponse_AvailableModel) GetClientDisplayName() string {
 	if x != nil && x.ClientDisplayName != nil {
 		return *x.ClientDisplayName
@@ -563,18 +586,12 @@ func (x *AvailableModelsResponse_AvailableModel) GetIdAliases() []string {
 	return nil
 }
 
-func (x *AvailableModelsResponse_AvailableModel) GetContextTokenLimit() int32 {
-	if x != nil && x.ContextTokenLimit != nil {
-		return *x.ContextTokenLimit
-	}
-	return 0
-}
-
 type AvailableModelsResponse_ModelVariantConfig struct {
 	state                       protoimpl.MessageState                   `protogen:"open.v1"`
 	ParameterValues             []*v1.RequestedModel_ModelParameterValue `protobuf:"bytes,1,rep,name=parameter_values,json=parameterValues,proto3" json:"parameter_values,omitempty"`
 	DisplayName                 string                                   `protobuf:"bytes,2,opt,name=display_name,json=displayName,proto3" json:"display_name,omitempty"`
 	IsMaxMode                   bool                                     `protobuf:"varint,3,opt,name=is_max_mode,json=isMaxMode,proto3" json:"is_max_mode,omitempty"`
+	IsDefaultMaxConfig          *bool                                    `protobuf:"varint,4,opt,name=is_default_max_config,json=isDefaultMaxConfig,proto3,oneof" json:"is_default_max_config,omitempty"`
 	IsDefaultNonMaxConfig       *bool                                    `protobuf:"varint,5,opt,name=is_default_non_max_config,json=isDefaultNonMaxConfig,proto3,oneof" json:"is_default_non_max_config,omitempty"`
 	VariantStringRepresentation *string                                  `protobuf:"bytes,9,opt,name=variant_string_representation,json=variantStringRepresentation,proto3,oneof" json:"variant_string_representation,omitempty"`
 	LegacySlug                  *string                                  `protobuf:"bytes,11,opt,name=legacy_slug,json=legacySlug,proto3,oneof" json:"legacy_slug,omitempty"`
@@ -633,6 +650,13 @@ func (x *AvailableModelsResponse_ModelVariantConfig) GetIsMaxMode() bool {
 	return false
 }
 
+func (x *AvailableModelsResponse_ModelVariantConfig) GetIsDefaultMaxConfig() bool {
+	if x != nil && x.IsDefaultMaxConfig != nil {
+		return *x.IsDefaultMaxConfig
+	}
+	return false
+}
+
 func (x *AvailableModelsResponse_ModelVariantConfig) GetIsDefaultNonMaxConfig() bool {
 	if x != nil && x.IsDefaultNonMaxConfig != nil {
 		return *x.IsDefaultNonMaxConfig
@@ -685,40 +709,45 @@ const file_aiserver_v1_available_models_mvp_proto_rawDesc = "" +
 	"\x17EnumParameterDefinition\x12h\n" +
 	"\x06values\x18\x01 \x03(\v2P.aiserver.v1.ModelParameterDefinition.EnumParameterDefinition.EnumParameterValueR\x06values\x1a*\n" +
 	"\x12EnumParameterValue\x12\x14\n" +
-	"\x05value\x18\x01 \x01(\tR\x05value\"\x9e\n" +
-	"\n" +
+	"\x05value\x18\x01 \x01(\tR\x05value\"\xa8\f\n" +
 	"\x17AvailableModelsResponse\x12\x1f\n" +
 	"\vmodel_names\x18\x01 \x03(\tR\n" +
 	"modelNames\x12K\n" +
 	"\x06models\x18\x02 \x03(\v23.aiserver.v1.AvailableModelsResponse.AvailableModelR\x06models\x120\n" +
-	"\x14use_model_parameters\x18\v \x01(\bR\x12useModelParameters\x1a\xb1\x05\n" +
+	"\x14use_model_parameters\x18\v \x01(\bR\x12useModelParameters\x1a\xe9\x06\n" +
 	"\x0eAvailableModel\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x120\n" +
 	"\x11supports_thinking\x18\t \x01(\bH\x00R\x10supportsThinking\x88\x01\x01\x12,\n" +
 	"\x0fsupports_images\x18\n" +
-	" \x01(\bH\x01R\x0esupportsImages\x88\x01\x01\x123\n" +
-	"\x13client_display_name\x18\x11 \x01(\tH\x02R\x11clientDisplayName\x88\x01\x01\x12/\n" +
-	"\x11server_model_name\x18\x12 \x01(\tH\x03R\x0fserverModelName\x88\x01\x01\x126\n" +
-	"\x15supports_non_max_mode\x18\x13 \x01(\bH\x04R\x12supportsNonMaxMode\x88\x01\x01\x12Z\n" +
+	" \x01(\bH\x01R\x0esupportsImages\x88\x01\x01\x12/\n" +
+	"\x11supports_max_mode\x18\x0e \x01(\bH\x02R\x0fsupportsMaxMode\x88\x01\x01\x123\n" +
+	"\x13context_token_limit\x18\x0f \x01(\x05H\x03R\x11contextTokenLimit\x88\x01\x01\x12J\n" +
+	" context_token_limit_for_max_mode\x18\x10 \x01(\x05H\x04R\x1bcontextTokenLimitForMaxMode\x88\x01\x01\x123\n" +
+	"\x13client_display_name\x18\x11 \x01(\tH\x05R\x11clientDisplayName\x88\x01\x01\x12/\n" +
+	"\x11server_model_name\x18\x12 \x01(\tH\x06R\x0fserverModelName\x88\x01\x01\x126\n" +
+	"\x15supports_non_max_mode\x18\x13 \x01(\bH\aR\x12supportsNonMaxMode\x88\x01\x01\x12Z\n" +
 	"\x15parameter_definitions\x18\x1d \x03(\v2%.aiserver.v1.ModelParameterDefinitionR\x14parameterDefinitions\x12S\n" +
 	"\bvariants\x18\x1e \x03(\v27.aiserver.v1.AvailableModelsResponse.ModelVariantConfigR\bvariants\x12\x1d\n" +
 	"\n" +
-	"id_aliases\x18% \x03(\tR\tidAliases\x123\n" +
-	"\x13context_token_limit\x18\x0f \x01(\x05H\x05R\x11contextTokenLimit\x88\x01\x01B\x14\n" +
+	"id_aliases\x18% \x03(\tR\tidAliasesB\x14\n" +
 	"\x12_supports_thinkingB\x12\n" +
-	"\x10_supports_imagesB\x16\n" +
+	"\x10_supports_imagesB\x14\n" +
+	"\x12_supports_max_modeB\x16\n" +
+	"\x14_context_token_limitB#\n" +
+	"!_context_token_limit_for_max_modeB\x16\n" +
 	"\x14_client_display_nameB\x14\n" +
 	"\x12_server_model_nameB\x18\n" +
-	"\x16_supports_non_max_modeB\x16\n" +
-	"\x14_context_token_limit\x1a\xae\x03\n" +
+	"\x16_supports_non_max_mode\x1a\x80\x04\n" +
 	"\x12ModelVariantConfig\x12W\n" +
 	"\x10parameter_values\x18\x01 \x03(\v2,.agent.v1.RequestedModel.ModelParameterValueR\x0fparameterValues\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x12\x1e\n" +
-	"\vis_max_mode\x18\x03 \x01(\bR\tisMaxMode\x12=\n" +
-	"\x19is_default_non_max_config\x18\x05 \x01(\bH\x00R\x15isDefaultNonMaxConfig\x88\x01\x01\x12G\n" +
-	"\x1dvariant_string_representation\x18\t \x01(\tH\x01R\x1bvariantStringRepresentation\x88\x01\x01\x12$\n" +
-	"\vlegacy_slug\x18\v \x01(\tH\x02R\n" +
-	"legacySlug\x88\x01\x01B\x1c\n" +
+	"\vis_max_mode\x18\x03 \x01(\bR\tisMaxMode\x126\n" +
+	"\x15is_default_max_config\x18\x04 \x01(\bH\x00R\x12isDefaultMaxConfig\x88\x01\x01\x12=\n" +
+	"\x19is_default_non_max_config\x18\x05 \x01(\bH\x01R\x15isDefaultNonMaxConfig\x88\x01\x01\x12G\n" +
+	"\x1dvariant_string_representation\x18\t \x01(\tH\x02R\x1bvariantStringRepresentation\x88\x01\x01\x12$\n" +
+	"\vlegacy_slug\x18\v \x01(\tH\x03R\n" +
+	"legacySlug\x88\x01\x01B\x18\n" +
+	"\x16_is_default_max_configB\x1c\n" +
 	"\x1a_is_default_non_max_configB \n" +
 	"\x1e_variant_string_representationB\x0e\n" +
 	"\f_legacy_slugBVZTgithub.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1;aiserverv1b\x06proto3"

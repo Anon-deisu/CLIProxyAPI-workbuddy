@@ -3,7 +3,18 @@ package cursor
 import (
 	"strings"
 	"testing"
+	"time"
+
+	aiserverv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1"
 )
+
+func resetCatalogForTest() {
+	globalCatalogCache.mu.Lock()
+	defer globalCatalogCache.mu.Unlock()
+	globalCatalogCache.byModel = map[string]CatalogModel{}
+	globalCatalogCache.usable = nil
+	globalCatalogCache.fetched = time.Time{}
+}
 
 func TestResolveRequestedModelUsesCatalogParams(t *testing.T) {
 	RememberCatalog([]CatalogModel{{
@@ -33,9 +44,147 @@ func TestResolveRequestedModelUsesMatchingWireID(t *testing.T) {
 }
 
 func TestResolveRequestedModelDefaultSelector(t *testing.T) {
+	resetCatalogForTest()
+	t.Cleanup(resetCatalogForTest)
 	sel := ResolveRequestedModel("default")
-	if sel.ModelID != "default" || len(sel.Parameters) != 0 {
+	if sel.ModelID != "default" || len(sel.Parameters) != 0 || !sel.MaxMode {
 		t.Fatalf("default selector should have no parameters, got %#v", sel)
+	}
+}
+
+func TestNormalizeAvailableModelsDefaultsToMaximumContext(t *testing.T) {
+	resetCatalogForTest()
+	t.Cleanup(resetCatalogForTest)
+	supportsMax := true
+	supportsNonMax := true
+	contextLimit := int32(272000)
+	maxContextLimit := int32(1000000)
+	defaultNonMax := true
+	defaultMax := true
+	resp := &aiserverv1.AvailableModelsResponse{
+		UseModelParameters: true,
+		Models: []*aiserverv1.AvailableModelsResponse_AvailableModel{{
+			Name:                        "claude-context-test",
+			SupportsMaxMode:             &supportsMax,
+			SupportsNonMaxMode:          &supportsNonMax,
+			ContextTokenLimit:           &contextLimit,
+			ContextTokenLimitForMaxMode: &maxContextLimit,
+			Variants: []*aiserverv1.AvailableModelsResponse_ModelVariantConfig{
+				{
+					DisplayName:           "272K",
+					IsMaxMode:             false,
+					IsDefaultNonMaxConfig: &defaultNonMax,
+				},
+				{
+					DisplayName:        "1M",
+					IsMaxMode:          true,
+					IsDefaultMaxConfig: &defaultMax,
+				},
+			},
+		}},
+	}
+
+	models := normalizeAvailableModels(resp)
+	if len(models) != 1 {
+		t.Fatalf("expected one base model, got %#v", models)
+	}
+	model := models[0]
+	if model.ID != "claude-context-test" || !model.MaxMode || !model.SupportsMax {
+		t.Fatalf("expected native max mode on the base model, got %#v", model)
+	}
+	if model.ContextLimit != 1000000 {
+		t.Fatalf("expected 1M context limit, got %d", model.ContextLimit)
+	}
+
+	RememberCatalog(models)
+	rememberUsableModels(nil)
+	sel := ResolveRequestedModel("claude-context-test")
+	if !sel.MaxMode || sel.ModelID != "claude-context-test" {
+		t.Fatalf("expected base id with max mode, got %#v", sel)
+	}
+	requested := toRequestedModelProto(sel)
+	if !requested.GetMaxMode() {
+		t.Fatalf("requested model max_mode was not set: %#v", requested)
+	}
+}
+
+func TestExplicitNonMaxVariantIsNotPromotedByAgentBuilder(t *testing.T) {
+	resetCatalogForTest()
+	t.Cleanup(resetCatalogForTest)
+	RememberCatalog([]CatalogModel{{
+		ID:          "explicit-context-test",
+		MaxMode:     true,
+		SupportsMax: true,
+		Variants: []CatalogVariant{
+			{
+				LegacySlug: "explicit-context-test-thinking",
+				MaxMode:    false,
+				Parameters: []ModelParameter{{ID: "thinking", Value: "true"}},
+			},
+			{
+				LegacySlug: "explicit-context-test-thinking-max",
+				MaxMode:    true,
+				Parameters: []ModelParameter{{ID: "thinking", Value: "true"}},
+			},
+		},
+	}})
+	rememberUsableModels(nil)
+
+	msg, _, _, err := buildRunRequest("explicit-context-test-thinking", []ChatMessage{{Role: "user", Content: "hi"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := msg.GetRunRequest()
+	if run.GetRequestedModel().GetMaxMode() {
+		t.Fatalf("explicit non-max variant was promoted: %#v", run.GetRequestedModel())
+	}
+	if run.GetModelDetails().MaxMode != nil {
+		t.Fatalf("model details should omit false max_mode: %#v", run.GetModelDetails())
+	}
+}
+
+func TestDefaultFastKeepsMaximumContextVariant(t *testing.T) {
+	resetCatalogForTest()
+	t.Cleanup(resetCatalogForTest)
+	RememberCatalog([]CatalogModel{{
+		ID:          "fast-context-test",
+		MaxMode:     true,
+		SupportsMax: true,
+		Parameters:  []ModelParameter{{ID: "thinking", Value: "true"}},
+		Variants: []CatalogVariant{
+			{MaxMode: false, Parameters: []ModelParameter{{ID: "thinking", Value: "true"}, {ID: "fast", Value: "true"}}},
+			{MaxMode: true, IsDefaultMax: true, Parameters: []ModelParameter{{ID: "thinking", Value: "true"}, {ID: "fast", Value: "true"}}},
+		},
+	}})
+	rememberUsableModels(nil)
+
+	sel := ResolveRequestedModel("fast-context-test")
+	if !sel.MaxMode || paramValue(sel.Parameters, "fast") != "true" {
+		t.Fatalf("default fast selection mixed context variants: %#v", sel)
+	}
+}
+
+func TestDefaultFastDoesNotMixNonMaxVariantParameters(t *testing.T) {
+	resetCatalogForTest()
+	t.Cleanup(resetCatalogForTest)
+	RememberCatalog([]CatalogModel{{
+		ID:          "max-without-fast-variant",
+		MaxMode:     true,
+		SupportsMax: true,
+		Parameters:  []ModelParameter{{ID: "thinking", Value: "true"}},
+		Variants: []CatalogVariant{
+			{MaxMode: false, Parameters: []ModelParameter{{ID: "thinking", Value: "true"}, {ID: "fast", Value: "true"}}},
+			{MaxMode: true, IsDefaultMax: true, Parameters: []ModelParameter{{ID: "thinking", Value: "true"}}},
+		},
+	}})
+	rememberUsableModels(nil)
+
+	sel := ResolveRequestedModel("max-without-fast-variant")
+	if !sel.MaxMode {
+		t.Fatalf("maximum context was lost: %#v", sel)
+	}
+	if paramValue(sel.Parameters, "fast") != "" {
+		t.Fatalf("non-max fast parameters leaked into max selection: %#v", sel)
 	}
 }
 

@@ -68,6 +68,11 @@ func ResolveRequestedModel(requested string) ModelSelection {
 
 	entry, ok := catalogEntry(base)
 	if !ok {
+		// Cursor's built-in Auto/default selector explicitly supports Max Mode.
+		// Keep maximum context enabled even before an account catalog is warm.
+		if strings.EqualFold(base, "default") && len(tokens) == 0 {
+			sel.MaxMode = true
+		}
 		// Invented params as last-resort when catalog is cold.
 		if len(tokens) > 0 {
 			sel.Parameters = parametersFromTokens(tokens)
@@ -129,9 +134,12 @@ func applyDefaultFast(sel ModelSelection, entry CatalogModel) ModelSelection {
 		return sel
 	}
 	desire := true
-	if v := preferCatalogVariant(entry.Variants, true, &desire); v != nil && paramValue(v.Parameters, "fast") == "true" {
+	if v := preferCatalogVariantForMode(entry.Variants, true, &desire, &sel.MaxMode); v != nil && paramValue(v.Parameters, "fast") == "true" {
 		sel.Parameters = append([]ModelParameter(nil), v.Parameters...)
 		sel.MaxMode = v.MaxMode
+		return sel
+	}
+	if len(entry.Variants) > 0 {
 		return sel
 	}
 	sel.Parameters = upsertModelParameter(sel.Parameters, "fast", "true")
@@ -140,9 +148,12 @@ func applyDefaultFast(sel ModelSelection, entry CatalogModel) ModelSelection {
 
 func applyExplicitStandard(sel ModelSelection, entry CatalogModel) ModelSelection {
 	desire := false
-	if v := preferCatalogVariant(entry.Variants, true, &desire); v != nil {
+	if v := preferCatalogVariantForMode(entry.Variants, true, &desire, &sel.MaxMode); v != nil && paramValue(v.Parameters, "fast") == "false" {
 		sel.Parameters = append([]ModelParameter(nil), v.Parameters...)
 		sel.MaxMode = v.MaxMode
+		return sel
+	}
+	if len(entry.Variants) > 0 {
 		return sel
 	}
 	sel.Parameters = upsertModelParameter(sel.Parameters, "fast", "false")
