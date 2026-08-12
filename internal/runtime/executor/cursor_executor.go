@@ -261,14 +261,38 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				errIter = rebuildErr
 			}
 		}
-		if errIter != nil && isCursorProviderError(errIter) && !contentEmitted {
+		// These providers fail while the stream is being read, not while it is
+		// opened, so opening again always succeeds and the open-time retry
+		// ladder never engages. Re-run the whole attempt instead, pacing it so
+		// a brief upstream outage has time to clear.
+		for attempt := 0; errIter != nil && isCursorProviderError(errIter) && !contentEmitted; attempt++ {
 			_ = session.Close()
+			if attempt >= len(cursorTransientBackoff) || !isCursorTransientProviderError(errIter) {
+				break
+			}
+			select {
+			case <-time.After(cursorTransientBackoff[attempt]):
+			case <-ctx.Done():
+				errIter = ctx.Err()
+			}
+			if ctx.Err() != nil {
+				break
+			}
 			retrySession, retryErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools)
-			if retryErr == nil {
-				session = retrySession
-				errIter = iterate(session)
-			} else {
+			if retryErr != nil {
 				errIter = retryErr
+				break
+			}
+			session = retrySession
+			errIter = iterate(session)
+		}
+		// A hard 400 mid-stream is usually a tool-name collision with a Cursor
+		// built-in, so give the aliased tool set one shot.
+		if errIter != nil && isCursorHardProviderError(errIter) && !contentEmitted {
+			aliased, aliasErr := openCursorSession(ctx, creds, upstreamModel, messages, tools, cursorlib.WithForceToolAlias())
+			if aliasErr == nil {
+				session = aliased
+				errIter = iterate(session)
 			}
 		}
 		if errIter != nil {
@@ -289,7 +313,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// checkpoint/text frames. readLoop EndStream/EOF owns teardown;
 		// the session manager reaper cleans any stranded runs.
 
-		endPayload := map[string]any{
+		endChunk, _ := json.Marshal(map[string]any{
 			"id":      completionID,
 			"object":  "chat.completion.chunk",
 			"created": created,
@@ -297,17 +321,28 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			"choices": []map[string]any{
 				{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason},
 			},
-		}
-		// Without a usage block the Claude translator emits message_delta with
-		// zeros, so clients show no tokens and no prompt cache at all. Only
-		// attach it when Cursor actually reported counters, otherwise an
-		// all-zero usage would overwrite what the client already tracked.
-		if usageFinal.InputTokens > 0 || usageFinal.OutputTokens > 0 || usageFinal.CacheReadTokens > 0 || usageFinal.CacheWriteTokens > 0 {
-			endPayload["usage"] = cursorUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens, usageFinal.ReasoningTokens)
-		}
-		endChunk, _ := json.Marshal(endPayload)
+		})
 		if !emitLine([]byte("data: " + string(endChunk))) {
 			return
+		}
+
+		// Usage rides in its own trailing chunk with an empty choices array,
+		// which is where the OpenAI streaming spec puts it; attaching it to the
+		// finish_reason chunk made strict clients report zero tokens. Emit it
+		// only when Cursor actually reported counters so an all-zero block
+		// cannot overwrite what the client already tracked.
+		if usageFinal.InputTokens > 0 || usageFinal.OutputTokens > 0 || usageFinal.CacheReadTokens > 0 || usageFinal.CacheWriteTokens > 0 {
+			usageChunk, _ := json.Marshal(map[string]any{
+				"id":      completionID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   req.Model,
+				"choices": []map[string]any{},
+				"usage":   cursorUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens, usageFinal.ReasoningTokens),
+			})
+			if !emitLine([]byte("data: " + string(usageChunk))) {
+				return
+			}
 		}
 		// Claude translator requires the SSE "data:" prefix; bare "[DONE]"
 		// is dropped and leaves Anthropic clients without message_stop
@@ -348,6 +383,11 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 		// Keep the tool set exactly as the client sent it. Re-capping here
 		// changed the prompt prefix on every rebuild, which cost a full
 		// uncached re-read of the whole conversation.
+		//
+		// The conversation this tool call belongs to still holds a run that
+		// died waiting for the result; replaying onto that id makes Cursor
+		// answer "unavailable" no matter how often we retry.
+		opts = append(opts, cursorlib.WithFreshConversation())
 	}
 	return cursorlib.StartSession(ctx, creds, model, messages, tools, opts...)
 }
@@ -638,7 +678,7 @@ func extractTopLevelSystem(body []byte) string {
 }
 
 func isCursorProviderError(err error) bool {
-	if isCursorPolicyBlock(err) {
+	if isCursorPolicyBlock(err) || isCursorRateLimited(err) {
 		// A usage-policy refusal is permanent: retrying, shrinking tools or
 		// switching wires cannot help, and every attempt is billed.
 		return false
@@ -660,20 +700,40 @@ func isCursorPolicyBlock(err error) bool {
 		strings.Contains(msg, "Usage Policy")
 }
 
+// isCursorRateLimited detects Cursor throttling the account itself. Retrying,
+// shrinking tools or switching wires only deepens the throttle, so this class
+// must bypass the degrade ladder entirely.
+func isCursorRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "RATE_LIMIT_EXCEEDED") ||
+		strings.Contains(msg, "Rate limit exceeded") ||
+		strings.Contains(msg, "ERROR_RESOURCE_EXHAUSTED")
+}
+
 // humanizeCursorError replaces the raw Connect trailer with something a client
 // (and the agent reading it) can act on.
 func humanizeCursorError(err error) error {
-	if !isCursorPolicyBlock(err) {
-		return err
+	switch {
+	case isCursorPolicyBlock(err):
+		return fmt.Errorf("cursor: upstream refused this request under Anthropic's usage policy (cyber content review). " +
+			"Rephrase or remove the flagged content; retrying the same prompt will not help")
+	case isCursorRateLimited(err):
+		// Surfacing a real 429 lets the conductor rotate to another account
+		// instead of burning the degrade ladder on a throttled one. No
+		// retry-after hint: Cursor does not advertise the window length.
+		return statusErr{code: http.StatusTooManyRequests, msg: "cursor: account rate limit exceeded " +
+			"(ERROR_PRO_USER_RATE_LIMIT_EXCEEDED). Wait for the window to reset or add another Cursor account"}
 	}
-	return fmt.Errorf("cursor: upstream refused this request under Anthropic's usage policy (cyber content review). " +
-		"Rephrase or remove the flagged content; retrying the same prompt will not help")
+	return err
 }
 
 // isCursorTransientProviderError is Cursor→model-provider connectivity failure.
 // Same request shape can succeed after a short backoff.
 func isCursorTransientProviderError(err error) bool {
-	if err == nil || isCursorPolicyBlock(err) {
+	if err == nil || isCursorPolicyBlock(err) || isCursorRateLimited(err) {
 		return false
 	}
 	msg := err.Error()
@@ -688,7 +748,7 @@ func isCursorTransientProviderError(err error) bool {
 
 // isCursorHardProviderError is a request-shape / provider 400 class failure.
 func isCursorHardProviderError(err error) bool {
-	if err == nil || isCursorPolicyBlock(err) {
+	if err == nil || isCursorPolicyBlock(err) || isCursorRateLimited(err) {
 		return false
 	}
 	msg := err.Error()
@@ -697,7 +757,10 @@ func isCursorHardProviderError(err error) bool {
 		(strings.Contains(msg, "Provider Error") && strings.Contains(msg, "400"))
 }
 
-var cursorTransientBackoff = []time.Duration{300 * time.Millisecond, 900 * time.Millisecond}
+// cursorTransientBackoff paces retries for "unable to reach the model provider".
+// Sub-second gaps were useless: the upstream typically needs a couple of
+// seconds, so every tier fired into the same outage and the turn failed.
+var cursorTransientBackoff = []time.Duration{1 * time.Second, 3 * time.Second, 6 * time.Second}
 
 // cursorRetryBudget caps how long the whole degrade ladder may run. Each tier
 // is a fresh upstream turn, so an unbounded ladder used to leave Claude Code
@@ -903,7 +966,25 @@ func compactMessagesForRetry(messages []cursorlib.ChatMessage) []cursorlib.ChatM
 	out := make([]cursorlib.ChatMessage, 0, len(system)+len(rest))
 	out = append(out, system...)
 	out = append(out, rest...)
+	// Trimming can leave only assistant/tool rows, and a run without a user
+	// turn is rejected outright ("request has no user message"), which killed
+	// the remaining degrade tiers instead of recovering.
+	if !hasUserTurn(out) {
+		out = append(out, cursorlib.ChatMessage{
+			Role:    "user",
+			Content: "Continue the task based on the conversation above.",
+		})
+	}
 	return out
+}
+
+func hasUserTurn(messages []cursorlib.ChatMessage) bool {
+	for _, msg := range messages {
+		if msg.Role == "user" && strings.TrimSpace(msg.Content) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // stripTrailingToolRound drops a dangling assistant tool_calls + tool results

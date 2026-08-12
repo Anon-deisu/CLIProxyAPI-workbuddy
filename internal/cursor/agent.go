@@ -114,7 +114,11 @@ func storeBlob(store map[string][]byte, data []byte) []byte {
 	return id
 }
 
-func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
+func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, cfgs ...startConfig) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
+	var cfg startConfig
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+	}
 	selection := ResolveRequestedModel(model)
 	model = selection.ModelID
 	blobStore := map[string][]byte{}
@@ -144,6 +148,11 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 	if activeUser == nil {
 		return nil, nil, "", fmt.Errorf("cursor: request has no user message")
 	}
+	// The live turn bypasses trimConversationHistory, so clamp it too: a huge
+	// paste in the current message overflows the model on its own.
+	current := *activeUser
+	current.Content = clampMessageContent(current.Content)
+	activeUser = &current
 
 	history := trimConversationHistory(conversation[:historyEnd])
 
@@ -245,7 +254,11 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		log.Debugf("cursor: attached %d inline image(s) to the user turn", len(images))
 	}
 
-	conversationID := reuseConversationID(conversationKeyFor(model, systemPrompt, conversation))
+	conversationKey := conversationKeyFor(model, systemPrompt, conversation)
+	conversationID := reuseConversationID(conversationKey)
+	if cfg.freshConversation {
+		conversationID = rotateConversationID(conversationKey)
+	}
 	// Desktop / cursor2api do not set exclude_workspace_context by default;
 	// forcing it true is rejected for many accounts ("Workspace context
 	// exclusion is not allowed…").
@@ -307,7 +320,31 @@ const (
 	maxHistoryMessages   = 48
 	maxHistoryChars      = 120_000
 	maxSystemPromptRunes = 40_000
+	// maxMessageChars bounds a single turn. Dropping whole messages cannot
+	// save a history whose *last* message is a 500 KB tool result, and the
+	// provider answers the oversized prompt with a 400 that no retry tier can
+	// undo.
+	maxMessageChars = 60_000
 )
+
+// clampMessageContent keeps the head and tail of an oversized turn: the request
+// is stated at the top and the newest output sits at the bottom, so cutting the
+// middle preserves what the model actually needs.
+func clampMessageContent(content string) string {
+	if len(content) <= maxMessageChars {
+		return content
+	}
+	runes := []rune(content)
+	if len(runes) <= maxMessageChars {
+		return content
+	}
+	head := maxMessageChars * 2 / 3
+	tail := maxMessageChars - head
+	omitted := len(runes) - head - tail
+	return string(runes[:head]) +
+		fmt.Sprintf("\n\n…[CLIProxyAPI truncated %d characters]…\n\n", omitted) +
+		string(runes[len(runes)-tail:])
+}
 
 func splitSystemMessages(messages []ChatMessage) (systemPrompt string, conversation []ChatMessage) {
 	parts := make([]string, 0)
@@ -338,7 +375,11 @@ func trimConversationHistory(history []ChatMessage) []ChatMessage {
 			start++
 		}
 	}
-	out := history[start:]
+	out := make([]ChatMessage, 0, len(history)-start)
+	for _, msg := range history[start:] {
+		msg.Content = clampMessageContent(msg.Content)
+		out = append(out, msg)
+	}
 	total := 0
 	for _, msg := range out {
 		total += len(msg.Content)

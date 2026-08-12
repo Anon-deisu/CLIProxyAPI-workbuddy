@@ -102,6 +102,8 @@ type Session struct {
 	segmentEnded        bool
 	textFlushed         bool
 	thinkingFlushed     bool
+	textStreamLive      bool
+	holdTimer           *time.Timer
 	resumed             bool
 	// lastFrame is the last time anything arrived from Cursor. Thinking and
 	// text deltas are buffered rather than emitted, so consumer-side idle
@@ -128,7 +130,8 @@ type ChatResult struct {
 type StartOption func(*startConfig)
 
 type startConfig struct {
-	forceToolAlias bool
+	forceToolAlias    bool
+	freshConversation bool
 }
 
 // WithForceToolAlias prefixes every client tool name before sending it to
@@ -136,6 +139,13 @@ type startConfig struct {
 // tool name collision.
 func WithForceToolAlias() StartOption {
 	return func(c *startConfig) { c.forceToolAlias = true }
+}
+
+// WithFreshConversation mints a new Cursor conversation id instead of reusing
+// the cached one. Needed when the previous run on that conversation died mid
+// tool call: Cursor rejects the follow-up run until the id is rotated.
+func WithFreshConversation() StartOption {
+	return func(c *startConfig) { c.freshConversation = true }
 }
 
 // StartSession opens a new Agent run for the given messages/tools.
@@ -156,7 +166,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		log.Debugf("cursor: renamed %d tool(s) that collide with Cursor built-ins", len(toolAlias.toClient))
 	}
 	selection := ResolveRequestedModel(model)
-	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools)
+	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -750,6 +760,11 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	s.textFlushed = false
 	s.turnEndedSeen = false
 	s.thinkingFlushed = false
+	s.textStreamLive = false
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+		s.holdTimer = nil
+	}
 	s.resumed = true
 	s.visibleText.Reset()
 	s.emittedText.Reset()
@@ -1036,15 +1051,81 @@ func (s *Session) handleThinkingDelta(text string) {
 	s.emit(StreamEvent{Type: "thinking_delta", Text: text})
 }
 
+// textHoldWindow is how long the opening of an answer is withheld so the
+// conversation checkpoint can repair Cursor's dropped leading token. Everything
+// after the release streams live, so the cost is a short initial delay instead
+// of the whole answer landing in one burst.
+const textHoldWindow = 1200 * time.Millisecond
+
 func (s *Session) handleTextDelta(text string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.textFlushed {
+	if text == "" {
 		return
 	}
-	// Always buffer. Emitting live races the checkpoint and shows truncated
-	// leading tokens (MARKER→ARKER).
+	s.mu.Lock()
+	if s.textFlushed {
+		s.mu.Unlock()
+		return
+	}
 	s.visibleText.WriteString(text)
+	live := s.textStreamLive
+	if live {
+		s.emittedText.WriteString(text)
+	} else if s.holdTimer == nil {
+		s.holdTimer = time.AfterFunc(textHoldWindow, s.releaseTextStream)
+	}
+	s.mu.Unlock()
+	if live {
+		s.emit(StreamEvent{Type: "text_delta", Text: text})
+	}
+}
+
+// releaseTextStream emits the withheld opening — reconciled against the
+// checkpoint when one has already arrived — and switches to live streaming.
+func (s *Session) releaseTextStream() {
+	s.mu.Lock()
+	if s.textStreamLive || s.textFlushed {
+		s.mu.Unlock()
+		return
+	}
+	emitted := s.emittedText.String()
+	visible := s.visibleText.String()
+	if s.seenAssistantMsgIDs == nil {
+		s.seenAssistantMsgIDs = map[string]struct{}{}
+	}
+	s.mu.Unlock()
+
+	final := visible
+	var newIDs []string
+	for _, msg := range s.checkpointAssistantMessages() {
+		s.mu.Lock()
+		_, seen := s.seenAssistantMsgIDs[msg.identity]
+		s.mu.Unlock()
+		if seen {
+			continue
+		}
+		newIDs = append(newIDs, msg.identity)
+		final = reconcileAssistantText(final, msg.text)
+	}
+
+	out := final
+	if emitted != "" && strings.HasPrefix(final, emitted) {
+		out = final[len(emitted):]
+	}
+
+	s.mu.Lock()
+	for _, id := range newIDs {
+		s.seenAssistantMsgIDs[id] = struct{}{}
+	}
+	s.textStreamLive = true
+	s.emittedText.Reset()
+	s.emittedText.WriteString(final)
+	s.visibleText.Reset()
+	s.visibleText.WriteString(final)
+	s.mu.Unlock()
+
+	for _, part := range splitTextForSSE(out, sseChunkBytes) {
+		s.emit(StreamEvent{Type: "text_delta", Text: part})
+	}
 }
 
 // flushAssistantText reconciles buffered deltas with the conversation
@@ -1084,6 +1165,15 @@ func (s *Session) flushAssistantText(force bool) {
 			finalThink = reconcileAssistantText(finalThink, msg.thinking)
 		}
 	}
+	if haveCheckpoint {
+		// The authoritative copy is here: stop withholding the opening.
+		s.mu.Lock()
+		s.textStreamLive = true
+		if s.holdTimer != nil {
+			s.holdTimer.Stop()
+		}
+		s.mu.Unlock()
+	}
 	if !haveCheckpoint && !force {
 		return
 	}
@@ -1113,12 +1203,13 @@ func (s *Session) flushAssistantText(force bool) {
 		out = final
 	case strings.HasPrefix(final, emitted):
 		out = final[len(emitted):]
-	case strings.HasSuffix(final, emitted):
-		// Live/partial emit lost a prefix; replace with the full checkpoint
-		// text so buffering clients (Claude Code) still see a correct answer.
-		out = final
 	default:
-		out = final
+		// Once the opening has been released the client already holds that
+		// text, so the checkpoint may only append; re-sending the reconciled
+		// copy would duplicate the answer.
+		log.Debugf("cursor: checkpoint text diverges from streamed text (streamed=%d checkpoint=%d); keeping streamed copy",
+			len(emitted), len(final))
+		out = ""
 	}
 
 	s.mu.Lock()
@@ -1306,6 +1397,11 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
 		s.manager.BindPending(clientID, s)
 		if nativeID != clientID {
 			s.manager.BindPending(nativeID, s)
+		}
+		if clientID != nativeID {
+			// Cursor's OpenAI-family ids embed a newline; clients only ever see
+			// the sanitized form, so both must stay indexed.
+			log.Debugf("cursor: tool_call_id sanitized %q -> %q", nativeID, clientID)
 		}
 	}
 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})

@@ -82,7 +82,7 @@ func AliasToolsForCursor(tools []ToolDefinition, forceAll bool) ([]ToolDefinitio
 			// of the original name, and a model told to "use Read" picks that
 			// one, which cannot execute here ("No exec result"). Steering the
 			// choice from the description is what actually works.
-			copied.Description = steerToAlias(client, tool.Description)
+			copied.Description = steerToAlias(upstream, client, tool.Description)
 		}
 		copied.Name = upstream
 		out = append(out, copied)
@@ -90,11 +90,11 @@ func AliasToolsForCursor(tools []ToolDefinition, forceAll bool) ([]ToolDefinitio
 	return out, alias
 }
 
-func steerToAlias(clientName, description string) string {
+func steerToAlias(aliasName, clientName, description string) string {
 	lead := fmt.Sprintf(
-		"Use this tool whenever the task calls for %q. It is the only working %s implementation in this session; "+
-			"never use a built-in tool named %q, which cannot execute here.",
-		clientName, clientName, clientName)
+		"IMPORTANT: %s is the %s tool. Any built-in tool named %q is unavailable in this environment and "+
+			"returns no result, so every %s operation must call %s instead.",
+		aliasName, clientName, clientName, clientName, aliasName)
 	if strings.TrimSpace(description) == "" {
 		return lead
 	}

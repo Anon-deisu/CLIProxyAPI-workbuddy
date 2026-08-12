@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
@@ -121,6 +123,9 @@ func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, 
 		}
 		session := m.lookupPendingLocked(result.ToolCallID)
 		if session == nil {
+			// Clients that retry a long-dead turn land here forever, so keep
+			// this quiet; the caller already logs the rebuild it falls back to.
+			log.Debugf("cursor: no live session for tool_call_id %q (%d bound)", result.ToolCallID, len(m.pending))
 			return nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
 		}
 		if owner == nil {

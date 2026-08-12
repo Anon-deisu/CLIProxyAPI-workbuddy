@@ -90,6 +90,33 @@ func TestCursorErrorClassification(t *testing.T) {
 	}
 }
 
+func TestCompactMessagesAlwaysKeepsAUserTurn(t *testing.T) {
+	// A long tool-only tail: trimming used to leave no user message at all.
+	msgs := []cursorlib.ChatMessage{{Role: "system", Content: "rules"}}
+	for i := 0; i < 12; i++ {
+		msgs = append(msgs,
+			cursorlib.ChatMessage{Role: "assistant", ToolCalls: []cursorlib.ToolCall{{ID: fmt.Sprintf("c%d", i), Name: "Bash"}}},
+			cursorlib.ChatMessage{Role: "tool", ToolCallID: fmt.Sprintf("c%d", i), Content: "output"},
+		)
+	}
+	out := compactMessagesForRetry(msgs)
+	if !hasUserTurn(out) {
+		t.Fatalf("compacted request must keep a user turn: %#v", out)
+	}
+}
+
+func TestCompactMessagesKeepsExistingUserTurn(t *testing.T) {
+	msgs := []cursorlib.ChatMessage{
+		{Role: "system", Content: "rules"},
+		{Role: "user", Content: "the real question"},
+	}
+	out := compactMessagesForRetry(msgs)
+	last := out[len(out)-1]
+	if last.Role != "user" || last.Content != "the real question" {
+		t.Fatalf("existing user turn must be preserved, got %#v", out)
+	}
+}
+
 func TestStripTrailingToolRound(t *testing.T) {
 	in := []cursorlib.ChatMessage{
 		{Role: "user", Content: "hi"},

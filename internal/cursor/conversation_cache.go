@@ -84,3 +84,16 @@ func reuseConversationID(key string) string {
 	conversationIDs.byKey[key] = conversationEntry{id: id, lastSeen: now}
 	return id
 }
+
+// rotateConversationID abandons the id currently mapped to key and remembers a
+// fresh one, so later turns of the same chat stay cacheable under the new id.
+//
+// A conversation whose last run died mid tool call keeps server-side state that
+// makes Cursor reject the next run on that id, so a retry must not reuse it.
+func rotateConversationID(key string) string {
+	id := uuid.NewString()
+	conversationIDs.Lock()
+	defer conversationIDs.Unlock()
+	conversationIDs.byKey[key] = conversationEntry{id: id, lastSeen: time.Now()}
+	return id
+}
