@@ -1179,22 +1179,15 @@ func applyCursorReasoningEffort(model string, body []byte) string {
 
 // cursorUsagePayload renders Cursor's TurnEnded counters as OpenAI usage.
 //
-// Cursor's input_tokens counts the whole prompt it processed, which already
-// covers both the cache-read prefix and the freshly written cache segment.
-// Anthropic clients expect those three buckets to be disjoint
-// (input + cache_read + cache_creation = prompt), so the uncached remainder is
-// what belongs in input_tokens. The Anthropic translator subtracts
-// cached_tokens from prompt_tokens, so prompt_tokens carries uncached + read.
+// Cursor's input_tokens is the complete processed input. OpenAI and Responses
+// define cache details as subsets of that total, so keep the authoritative
+// number intact here. The Anthropic translator separates cache read/write from
+// uncached input when it maps this OpenAI-shaped usage block.
 func cursorUsagePayload(input, output, cacheRead, cacheWrite, reasoning int64) map[string]any {
-	uncached := input - cacheRead - cacheWrite
-	if uncached < 0 {
-		uncached = 0
-	}
-	promptTokens := uncached + cacheRead
 	usagePayload := map[string]any{
-		"prompt_tokens":     promptTokens,
+		"prompt_tokens":     input,
 		"completion_tokens": output,
-		"total_tokens":      promptTokens + cacheWrite + output,
+		"total_tokens":      input + output,
 	}
 	details := map[string]any{}
 	if cacheRead > 0 {
