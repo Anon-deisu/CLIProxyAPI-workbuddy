@@ -88,6 +88,11 @@ type Session struct {
 	cancel        context.CancelFunc
 	lastActivity  time.Time
 	manager       *SessionManager
+	// usageSeen carries TurnEnded counters that land after the caller already
+	// stopped reading the segment, which is the normal ordering when a turn
+	// pauses for client tools.
+	usageSeen   *StreamEvent
+	usageSignal chan struct{}
 
 	// Checkpoint / text recovery (cursor2api): Cursor wire text_deltas often
 	// miss a leading token; the authoritative assistant text lands in a later
@@ -452,6 +457,58 @@ func (s *Session) beginWaitingTools() {
 	}
 	s.waitingTools = true
 	s.pauseCh = make(chan struct{})
+}
+
+func (s *Session) recordUsage(ev StreamEvent) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	copied := ev
+	s.usageSeen = &copied
+	signal := s.usageSignal
+	s.usageSignal = nil
+	s.mu.Unlock()
+	if signal != nil {
+		close(signal)
+	}
+}
+
+// TakeUsage returns the counters for the turn, waiting up to d for them.
+//
+// Cursor reports TurnEnded after it has already asked the client to run a tool,
+// so a caller that stops at the tool call sees nothing unless it waits a moment
+// for the trailing frame.
+func (s *Session) TakeUsage(d time.Duration) (StreamEvent, bool) {
+	if s == nil {
+		return StreamEvent{}, false
+	}
+	s.mu.Lock()
+	if s.usageSeen != nil {
+		ev := *s.usageSeen
+		s.mu.Unlock()
+		return ev, true
+	}
+	if d <= 0 {
+		s.mu.Unlock()
+		return StreamEvent{}, false
+	}
+	if s.usageSignal == nil {
+		s.usageSignal = make(chan struct{})
+	}
+	signal := s.usageSignal
+	s.mu.Unlock()
+
+	select {
+	case <-signal:
+	case <-time.After(d):
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.usageSeen == nil {
+		return StreamEvent{}, false
+	}
+	return *s.usageSeen, true
 }
 
 // awaitingClientTools reports whether the Agent turn is paused for mcp_result.
@@ -867,6 +924,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			// while client tools are still pending, but still report usage —
 			// dropping it left every tool-calling turn with zero tokens and no
 			// cache numbers on the client.
+			s.recordUsage(ev)
 			s.mu.Lock()
 			pendingCount := len(s.pending)
 			waiting := s.waitingTools

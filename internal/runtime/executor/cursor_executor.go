@@ -309,6 +309,25 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if finishReason == "tool_calls" && toolIndex == 0 {
 			finishReason = "stop"
 		}
+		// TurnEnded can land after the segment loop has already stopped
+		// reading, which leaves the counters sitting unread. Collect them if
+		// they are there, but never wait: when a turn pauses for a client tool
+		// Cursor sends no TurnEnded at all, and blocking for it would tax every
+		// step of an agent loop for nothing.
+		if usageFinal.InputTokens == 0 && usageFinal.OutputTokens == 0 &&
+			usageFinal.CacheReadTokens == 0 && usageFinal.CacheWriteTokens == 0 {
+			if late, ok := session.TakeUsage(0); ok {
+				usageFinal = late
+				reporter.Publish(ctx, usage.Detail{
+					InputTokens:     late.InputTokens,
+					OutputTokens:    late.OutputTokens,
+					CachedTokens:    late.CacheReadTokens,
+					CacheReadTokens: late.CacheReadTokens,
+					ReasoningTokens: late.ReasoningTokens,
+					TotalTokens:     late.InputTokens + late.OutputTokens,
+				})
+			}
+		}
 		// Do not Close() on stop here: TurnEnded can precede trailing
 		// checkpoint/text frames. readLoop EndStream/EOF owns teardown;
 		// the session manager reaper cleans any stranded runs.
@@ -363,6 +382,7 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 	results := trailingToolResults(messages)
 	if len(results) > 0 {
 		session, err := cursorlib.DefaultSessionManager().ResolveForToolResults(results)
+		hadLiveRun := err == nil
 		if err == nil {
 			if err = session.SubmitToolResults(results); err == nil {
 				return session, nil
@@ -384,10 +404,13 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 		// changed the prompt prefix on every rebuild, which cost a full
 		// uncached re-read of the whole conversation.
 		//
-		// The conversation this tool call belongs to still holds a run that
-		// died waiting for the result; replaying onto that id makes Cursor
-		// answer "unavailable" no matter how often we retry.
-		opts = append(opts, cursorlib.WithFreshConversation())
+		// Rotate the conversation id only when a live run actually died
+		// holding this tool call. Rotating whenever the session is simply gone
+		// (a restart, an expired index) changes the prompt prefix and turns
+		// every step of an agent loop into a full cache write.
+		if hadLiveRun {
+			opts = append(opts, cursorlib.WithFreshConversation())
+		}
 	}
 	return cursorlib.StartSession(ctx, creds, model, messages, tools, opts...)
 }
