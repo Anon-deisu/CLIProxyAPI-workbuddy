@@ -103,19 +103,23 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 		}
 	}
 
-	if !bytes.HasPrefix(rawJSON, dataTag) {
-		return [][]byte{}
-	}
-	rawJSON = bytes.TrimSpace(rawJSON[5:])
-
 	if (*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap == nil {
 		(*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap = util.ToolNameMapFromClaudeRequest(originalRequestRawJSON)
 	}
 
-	// Check if this is the [DONE] marker
-	if bytes.Equal(bytes.TrimSpace(rawJSON), []byte("[DONE]")) {
+	// Accept both "data: [DONE]" and bare "[DONE]" (some executors emit either).
+	trimmedDone := bytes.TrimSpace(rawJSON)
+	if bytes.HasPrefix(trimmedDone, dataTag) {
+		trimmedDone = bytes.TrimSpace(trimmedDone[len(dataTag):])
+	}
+	if bytes.Equal(trimmedDone, []byte("[DONE]")) {
 		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
+
+	if !bytes.HasPrefix(rawJSON, dataTag) {
+		return [][]byte{}
+	}
+	rawJSON = bytes.TrimSpace(rawJSON[5:])
 
 	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
 	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
@@ -349,6 +353,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			if cachedTokens > 0 {
 				messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.cache_read_input_tokens", cachedTokens)
 			}
+			messageDeltaJSON = applyOpenAICacheCreation(messageDeltaJSON, usage)
 			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
 			param.MessageDeltaSent = true
 
@@ -482,6 +487,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		if cachedTokens > 0 {
 			out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
 		}
+		out = applyOpenAICacheCreation(out, usage)
 	}
 
 	return [][]byte{out}
@@ -755,6 +761,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 		if cachedTokens > 0 {
 			out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
 		}
+		out = applyOpenAICacheCreation(out, respUsage)
 	}
 
 	if !stopReasonSet {
@@ -770,6 +777,23 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 func ClaudeTokenCount(ctx context.Context, count int64) []byte {
 	return translatorcommon.ClaudeInputTokensJSON(count)
+}
+
+// applyOpenAICacheCreation surfaces provider-reported cache writes, which some
+// upstreams (Cursor Agent) report alongside cached_tokens.
+func applyOpenAICacheCreation(payload []byte, usage gjson.Result) []byte {
+	created := usage.Get("prompt_tokens_details.cache_creation_tokens").Int()
+	if created <= 0 {
+		created = usage.Get("input_tokens_details.cache_write_tokens").Int()
+	}
+	if created <= 0 {
+		return payload
+	}
+	out, err := sjson.SetBytes(payload, "usage.cache_creation_input_tokens", created)
+	if err != nil {
+		return payload
+	}
+	return out
 }
 
 func extractOpenAIUsage(usage gjson.Result) (int64, int64, int64) {

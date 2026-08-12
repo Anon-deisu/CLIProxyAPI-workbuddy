@@ -19,6 +19,15 @@ const (
 	usableModelsAgentServicePath = "/agent.v1.AgentService/GetUsableModels"
 )
 
+// CatalogVariant is one AvailableModels variant (thinking/effort/fast combo).
+type CatalogVariant struct {
+	Parameters        []ModelParameter
+	MaxMode           bool
+	IsDefaultNonMax   bool
+	LegacySlug        string
+	VariantStringRepr string
+}
+
 // CatalogModel is one account-visible Cursor model from AvailableModels.
 type CatalogModel struct {
 	ID           string
@@ -30,8 +39,9 @@ type CatalogModel struct {
 	MaxMode      bool
 	ContextLimit int
 	Parameters   []ModelParameter
-	// WireID is the Agent-accepted model id from GetUsableModels (often a
-	// variant string like cursor-grok-4.5-high-fast). Empty means public ID.
+	Variants     []CatalogVariant
+	// WireID is optional GetUsableModels id (legacy). cursor2api sends the
+	// public base id + parameters instead; WireID is kept for diagnostics.
 	WireID string
 }
 
@@ -218,12 +228,14 @@ func matchUsableWireID(model CatalogModel, usable []usableModel) string {
 		idFold := strings.ToLower(id)
 		score := 0
 		switch {
-		case idFold == publicFold:
-			score = 100
 		case strings.HasPrefix(idFold, "cursor-"+publicFold+"-"):
-			score = 80
+			// Prefer Agent-accepted variant strings over the public catalog name
+			// (bare public ids often yield ERROR_BAD_MODEL_NAME).
+			score = 100
 		case strings.HasPrefix(idFold, publicFold+"-"):
-			score = 70
+			score = 90
+		case idFold == publicFold:
+			score = 40
 		default:
 			for _, alias := range item.Aliases {
 				if strings.EqualFold(strings.TrimSpace(alias), publicID) {
@@ -242,10 +254,14 @@ func matchUsableWireID(model CatalogModel, usable []usableModel) string {
 			continue
 		}
 		hasFast := strings.Contains(idFold, "-fast")
-		if wantFast == hasFast {
-			score += 10
+		if wantFast && hasFast {
+			score += 30
 		} else if wantFast && !hasFast {
-			score -= 5
+			score -= 25
+		} else if !wantFast && hasFast {
+			score -= 10
+		} else if !wantFast && !hasFast {
+			score += 5
 		}
 		if wantEffort != "" {
 			if strings.Contains(idFold, "-"+wantEffort) || strings.HasSuffix(idFold, wantEffort) {
@@ -291,10 +307,19 @@ func normalizeAvailableModels(resp *aiserverv1.AvailableModelsResponse) []Catalo
 		if v := strings.TrimSpace(model.GetServerModelName()); v != "" {
 			displayModel = v
 		}
-		variant := defaultVariant(model)
-		params := validVariantParameters(model, variant)
+		variants := collectCatalogVariants(model)
+		variant := preferCatalogVariant(variants, false, nil)
+		params := []ModelParameter(nil)
+		if variant != nil {
+			params = append([]ModelParameter(nil), variant.Parameters...)
+		} else if raw := defaultVariant(model); raw != nil {
+			params = validVariantParameters(model, raw)
+		}
 		nonMaxDisabled := model.SupportsNonMaxMode != nil && !model.GetSupportsNonMaxMode()
-		maxMode := nonMaxDisabled || (variant != nil && variant.GetIsMaxMode())
+		maxMode := nonMaxDisabled
+		if variant != nil {
+			maxMode = maxMode || variant.MaxMode
+		}
 		entry := CatalogModel{
 			ID:           id,
 			DisplayName:  display,
@@ -304,6 +329,7 @@ func normalizeAvailableModels(resp *aiserverv1.AvailableModelsResponse) []Catalo
 			SupportsImg:  model.GetSupportsImages(),
 			MaxMode:      maxMode,
 			ContextLimit: int(model.GetContextTokenLimit()),
+			Variants:     variants,
 		}
 		if resp.GetUseModelParameters() && params != nil {
 			entry.Parameters = params
@@ -322,6 +348,130 @@ func normalizeAvailableModels(resp *aiserverv1.AvailableModelsResponse) []Catalo
 		out = append(out, byID[id])
 	}
 	return out
+}
+
+func collectCatalogVariants(model *aiserverv1.AvailableModelsResponse_AvailableModel) []CatalogVariant {
+	raw := model.GetVariants()
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]CatalogVariant, 0, len(raw))
+	for _, variant := range raw {
+		if variant == nil {
+			continue
+		}
+		params := variantParametersLoose(variant)
+		if params == nil {
+			// Fall back to strict validation used for wire safety.
+			params = validVariantParameters(model, variant)
+		}
+		if params == nil {
+			continue
+		}
+		out = append(out, CatalogVariant{
+			Parameters:        params,
+			MaxMode:           variant.GetIsMaxMode(),
+			IsDefaultNonMax:   variant.IsDefaultNonMaxConfig != nil && variant.GetIsDefaultNonMaxConfig(),
+			LegacySlug:        strings.TrimSpace(variant.GetLegacySlug()),
+			VariantStringRepr: strings.TrimSpace(variant.GetVariantStringRepresentation()),
+		})
+	}
+	return out
+}
+
+// variantParametersLoose keeps server-advertised parameter_values even when
+// they don't cover every parameter_definition (needed for fast/thinking picks).
+func variantParametersLoose(variant *aiserverv1.AvailableModelsResponse_ModelVariantConfig) []ModelParameter {
+	if variant == nil {
+		return nil
+	}
+	values := variant.GetParameterValues()
+	if len(values) == 0 {
+		return []ModelParameter{}
+	}
+	out := make([]ModelParameter, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, item := range values {
+		id := strings.TrimSpace(item.GetId())
+		value := strings.TrimSpace(item.GetValue())
+		if id == "" || value == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, ModelParameter{ID: id, Value: value})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// preferCatalogVariant mirrors cursor2api apply_request_model_variant ranking:
+// non-max → thinking-on → fast=true → default_non_max / baseline overlap.
+func preferCatalogVariant(variants []CatalogVariant, explicitFast bool, desireFast *bool) *CatalogVariant {
+	if len(variants) == 0 {
+		return nil
+	}
+	bestIdx := -1
+	bestScore := [4]int{-1, -1, -1, -1}
+	for i := range variants {
+		v := variants[i]
+		if explicitFast && desireFast != nil {
+			fastVal := paramValue(v.Parameters, "fast") == "true"
+			if fastVal != *desireFast {
+				continue
+			}
+			if paramValue(v.Parameters, "fast") == "" {
+				continue
+			}
+		}
+		valuesFast := paramValue(v.Parameters, "fast") == "true"
+		thinkingOn := paramValue(v.Parameters, "thinking") == "true" ||
+			(paramValue(v.Parameters, "thinking") == "" &&
+				(paramValue(v.Parameters, "effort") != "" || paramValue(v.Parameters, "reasoning") != ""))
+		score := [4]int{
+			boolToInt(!v.MaxMode),
+			boolToInt(thinkingOn),
+			boolToInt(!explicitFast && valuesFast),
+			boolToInt(v.IsDefaultNonMax),
+		}
+		if bestIdx < 0 || compareScore(score, bestScore) > 0 {
+			bestIdx = i
+			bestScore = score
+		}
+	}
+	if bestIdx < 0 {
+		return &variants[0]
+	}
+	return &variants[bestIdx]
+}
+
+func paramValue(params []ModelParameter, id string) string {
+	for _, p := range params {
+		if strings.EqualFold(p.ID, id) {
+			return strings.ToLower(strings.TrimSpace(p.Value))
+		}
+	}
+	return ""
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func compareScore(a, b [4]int) int {
+	for i := 0; i < 4; i++ {
+		if a[i] != b[i] {
+			return a[i] - b[i]
+		}
+	}
+	return 0
 }
 
 func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *aiserverv1.AvailableModelsResponse_ModelVariantConfig {
@@ -362,6 +512,12 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
 				thinkingVariants = append(thinkingVariants, variant)
 			}
 		}
+		// Prefer advertised fast=true (cursor2api desktop default).
+		for _, variant := range thinkingVariants {
+			if parameterValue(variant, "fast") == "true" {
+				return variant
+			}
+		}
 		for _, variant := range thinkingVariants {
 			if variant.IsDefaultNonMaxConfig != nil && variant.GetIsDefaultNonMaxConfig() {
 				return variant
@@ -369,6 +525,11 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
 		}
 		if len(thinkingVariants) > 0 {
 			return thinkingVariants[0]
+		}
+	}
+	for _, variant := range nonMax {
+		if parameterValue(variant, "fast") == "true" {
+			return variant
 		}
 	}
 	for _, variant := range variants {

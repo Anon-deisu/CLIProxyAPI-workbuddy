@@ -1135,7 +1135,15 @@ func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 }
 
 func (m *Manager) selectionModelKeyForAuth(auth *Auth, routeModel string) string {
-	return canonicalModelKey(m.selectionModelForAuth(auth, routeModel))
+	key := canonicalModelKey(m.selectionModelForAuth(auth, routeModel))
+	// Cursor public catalog ids are base names; "-fast"/"-thinking-high" are
+	// variant selectors (cursor2api). Map them back so auth shards match.
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "cursor") {
+		if base := util.RegistryModelID(key); base != "" {
+			return base
+		}
+	}
+	return key
 }
 
 func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {

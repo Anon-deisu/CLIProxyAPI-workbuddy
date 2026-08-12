@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
@@ -637,8 +638,18 @@ func (m *scheduledAuthMeta) supportsModel(modelKey string) bool {
 	if len(m.supportedModelSet) == 0 {
 		return false
 	}
-	_, ok := m.supportedModelSet[modelKey]
-	return ok
+	if _, ok := m.supportedModelSet[modelKey]; ok {
+		return true
+	}
+	// Cursor: "-fast" / "-thinking-high" are variant selectors on a base catalog id.
+	if m.auth != nil && strings.EqualFold(strings.TrimSpace(m.auth.Provider), "cursor") {
+		if base := util.RegistryModelID(modelKey); base != "" && base != modelKey {
+			if _, ok := m.supportedModelSet[base]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // upsertEntryLocked updates or inserts one auth entry and rebuilds indexes when ordering changes.

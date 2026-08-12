@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -20,6 +21,7 @@ type ChatMessage struct {
 	Name       string
 	ToolCallID string
 	ToolCalls  []ToolCall
+	Images     []ChatImage
 }
 
 // AccountCredentials are the fields required to open an Agent run.
@@ -116,17 +118,25 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 	selection := ResolveRequestedModel(model)
 	model = selection.ModelID
 	blobStore := map[string][]byte{}
-	systemPrompt := "You are a helpful assistant."
+
+	// Pull client system prompts out so we don't bury them behind a dummy
+	// "You are a helpful assistant." blob (that was a major context-loss source).
+	systemPrompt, conversation := splitSystemMessages(messages)
+	if strings.TrimSpace(systemPrompt) == "" {
+		systemPrompt = "You are a helpful assistant."
+	}
 	systemBlob := storeBlob(blobStore, mustJSON(map[string]any{
-		"role":    "system",
-		"content": systemPrompt,
+		"role": "system",
+		"content": []map[string]string{
+			{"type": "text", "text": systemPrompt},
+		},
 	}))
 
 	var activeUser *ChatMessage
-	historyEnd := len(messages)
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
-			activeUser = &messages[i]
+	historyEnd := len(conversation)
+	for i := len(conversation) - 1; i >= 0; i-- {
+		if conversation[i].Role == "user" && strings.TrimSpace(conversation[i].Content) != "" {
+			activeUser = &conversation[i]
 			historyEnd = i
 			break
 		}
@@ -135,10 +145,12 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		return nil, nil, "", fmt.Errorf("cursor: request has no user message")
 	}
 
+	history := trimConversationHistory(conversation[:historyEnd])
+
 	// Track tool names so tool-result parts can include toolName (cursor2api).
 	toolNames := map[string]string{}
 	rootIDs := [][]byte{systemBlob}
-	for _, msg := range messages[:historyEnd] {
+	for _, msg := range history {
 		switch msg.Role {
 		case "user":
 			if strings.TrimSpace(msg.Content) == "" {
@@ -205,18 +217,35 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 					resultPart,
 				},
 			})))
-		case "system":
-			if strings.TrimSpace(msg.Content) == "" {
-				continue
-			}
-			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
-				"role":    "system",
-				"content": msg.Content,
-			})))
 		}
 	}
 
-	conversationID := uuid.NewString()
+	// Keep the Agent's user message as the user's actual instruction; client
+	// injected context rides along as a preceding history blob instead.
+	activeText := activeUser.Content
+	if injected, ask := splitInjectedContext(activeText); ask != "" {
+		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+			"role": "user",
+			"content": []map[string]string{
+				{"type": "text", "text": injected},
+			},
+		})))
+		activeText = ask
+	}
+
+	activeUserMessage := &agentv1.UserMessage{
+		Text:      activeText,
+		MessageId: uuid.NewString(),
+	}
+	// Images ride on the active turn; without this they were dropped and the
+	// model answered as if no picture had been sent.
+	images := collectImages(conversation[historyEnd:])
+	if len(images) > 0 {
+		attachImages(activeUserMessage, images)
+		log.Debugf("cursor: attached %d inline image(s) to the user turn", len(images))
+	}
+
+	conversationID := reuseConversationID(conversationKeyFor(model, systemPrompt, conversation))
 	// Desktop / cursor2api do not set exclude_workspace_context by default;
 	// forcing it true is rejected for many accounts ("Workspace context
 	// exclusion is not allowed…").
@@ -225,7 +254,10 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 	if publicID == "" {
 		publicID = model
 	}
-	wireID := selection.ModelID
+	modelID := selection.ModelID
+	if modelID == "" {
+		modelID = publicID
+	}
 	displayID := publicID
 	displayName := publicID
 	if entry, ok := catalogEntry(publicID); ok {
@@ -239,12 +271,11 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		if !selection.VariantStringRepr && len(selection.Parameters) == 0 && len(entry.Parameters) > 0 {
 			selection.Parameters = append([]ModelParameter(nil), entry.Parameters...)
 		}
-		if selection.VariantStringRepr && strings.TrimSpace(entry.WireID) != "" {
-			wireID = entry.WireID
-			selection.ModelID = wireID
+		if selection.VariantStringRepr && strings.TrimSpace(selection.ModelID) != "" {
+			modelID = selection.ModelID
 		}
 	}
-	details := &agentv1.ModelDetails{ModelId: wireID, DisplayModelId: displayID, DisplayName: displayName}
+	details := &agentv1.ModelDetails{ModelId: modelID, DisplayModelId: displayID, DisplayName: displayName}
 	if selection.MaxMode {
 		maxMode := true
 		details.MaxMode = &maxMode
@@ -258,10 +289,7 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		Action: &agentv1.ConversationAction{
 			Action: &agentv1.ConversationAction_UserMessageAction{
 				UserMessageAction: &agentv1.UserMessageAction{
-					UserMessage: &agentv1.UserMessage{
-						Text:      activeUser.Content,
-						MessageId: uuid.NewString(),
-					},
+					UserMessage: activeUserMessage,
 				},
 			},
 		},
@@ -273,6 +301,77 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
 	}
 	return client, blobStore, conversationID, nil
+}
+
+const (
+	maxHistoryMessages   = 48
+	maxHistoryChars      = 120_000
+	maxSystemPromptRunes = 40_000
+)
+
+func splitSystemMessages(messages []ChatMessage) (systemPrompt string, conversation []ChatMessage) {
+	parts := make([]string, 0)
+	conversation = make([]ChatMessage, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			if text := strings.TrimSpace(msg.Content); text != "" {
+				parts = append(parts, text)
+			}
+			continue
+		}
+		conversation = append(conversation, msg)
+	}
+	return truncateRunes(strings.Join(parts, "\n\n"), maxSystemPromptRunes), conversation
+}
+
+// trimConversationHistory keeps the newest turns when history is huge so Cursor
+// does not silently drop the head (which looked like "context truncation").
+func trimConversationHistory(history []ChatMessage) []ChatMessage {
+	if len(history) == 0 {
+		return history
+	}
+	start := 0
+	if len(history) > maxHistoryMessages {
+		start = len(history) - maxHistoryMessages
+		// Don't start in the middle of a tool-result suffix.
+		for start < len(history) && history[start].Role == "tool" {
+			start++
+		}
+	}
+	out := history[start:]
+	total := 0
+	for _, msg := range out {
+		total += len(msg.Content)
+		for _, tc := range msg.ToolCalls {
+			total += len(tc.Name) + 32
+		}
+	}
+	for total > maxHistoryChars && len(out) > 2 {
+		drop := 1
+		// Drop a whole assistant+tool group when possible.
+		if out[0].Role == "assistant" {
+			drop = 1
+			for drop < len(out) && out[drop].Role == "tool" {
+				drop++
+			}
+		} else if out[0].Role == "tool" {
+			for drop < len(out) && out[drop].Role == "tool" {
+				drop++
+			}
+		}
+		for i := 0; i < drop && i < len(out); i++ {
+			total -= len(out[i].Content)
+			for _, tc := range out[i].ToolCalls {
+				total -= len(tc.Name) + 32
+			}
+		}
+		out = out[drop:]
+		for len(out) > 0 && out[0].Role == "tool" {
+			total -= len(out[0].Content)
+			out = out[1:]
+		}
+	}
+	return out
 }
 
 func mustJSON(v any) []byte {

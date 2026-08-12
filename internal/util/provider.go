@@ -62,12 +62,23 @@ func GetProviderName(modelName string) []string {
 		providers = append(providers, name)
 	}
 
-	for _, provider := range registry.GetGlobalRegistry().GetModelProviders(modelName) {
-		appendProvider(provider)
+	try := func(id string) {
+		if id == "" {
+			return
+		}
+		for _, provider := range registry.GetGlobalRegistry().GetModelProviders(id) {
+			appendProvider(provider)
+		}
 	}
 
+	try(modelName)
 	if len(providers) > 0 {
 		return providers
+	}
+	// Cursor / cursor2api: "grok-4.5-fast" is a variant selector, not a
+	// registered public model id. Fall back to the base catalog name.
+	if base := RegistryModelID(modelName); base != modelName {
+		try(base)
 	}
 
 	return providers

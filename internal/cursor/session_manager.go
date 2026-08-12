@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 const (
@@ -53,6 +55,8 @@ func (m *SessionManager) Register(session *Session) {
 }
 
 // BindPending indexes a tool_call_id to its owning session.
+// Both the raw id and its Claude-safe form are indexed so clients that only
+// see SanitizeClaudeToolID(id) can still resume the same session.
 func (m *SessionManager) BindPending(toolCallID string, session *Session) {
 	if m == nil || session == nil || toolCallID == "" {
 		return
@@ -60,6 +64,9 @@ func (m *SessionManager) BindPending(toolCallID string, session *Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pending[toolCallID] = session
+	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
+		m.pending[safe] = session
+	}
 	session.touch()
 }
 
@@ -71,6 +78,9 @@ func (m *SessionManager) UnbindPending(toolCallID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.pending, toolCallID)
+	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
+		delete(m.pending, safe)
+	}
 }
 
 // LookupPending returns the session waiting for the given tool call.
@@ -80,11 +90,21 @@ func (m *SessionManager) LookupPending(toolCallID string) *Session {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	session := m.pending[toolCallID]
+	session := m.lookupPendingLocked(toolCallID)
 	if session != nil {
 		session.touch()
 	}
 	return session
+}
+
+func (m *SessionManager) lookupPendingLocked(toolCallID string) *Session {
+	if session := m.pending[toolCallID]; session != nil {
+		return session
+	}
+	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
+		return m.pending[safe]
+	}
+	return nil
 }
 
 // ResolveForToolResults finds the single live session that owns all results.
@@ -99,7 +119,7 @@ func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, 
 		if result.ToolCallID == "" {
 			return nil, fmt.Errorf("cursor: tool result missing tool_call_id")
 		}
-		session := m.pending[result.ToolCallID]
+		session := m.lookupPendingLocked(result.ToolCallID)
 		if session == nil {
 			return nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
 		}
