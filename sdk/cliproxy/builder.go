@@ -252,13 +252,20 @@ func (b *Builder) Build() (*Service, error) {
 			selector = &coreauth.RoundRobinSelector{}
 		}
 
-		// Wrap with session affinity if enabled (failover is always on)
+		// Cursor's upstream conversation/cache is account-scoped. Moving one
+		// client conversation between Cursor accounts rewrites the entire prompt
+		// (commonly 150k-200k tokens), so Cursor affinity is a protocol invariant
+		// rather than an optional routing preference. The config flag expands the
+		// same behavior to every provider; it is no longer required for Cursor.
+		affinityProviders := []string{"cursor"}
 		if sessionAffinity {
-			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      sessionAffinityTTL,
-			})
+			affinityProviders = nil
 		}
+		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+			Fallback:        selector,
+			TTL:             sessionAffinityTTL,
+			ProviderFilters: affinityProviders,
+		})
 
 		coreManager = coreauth.NewManager(tokenStore, selector, nil)
 	}

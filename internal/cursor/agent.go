@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 
@@ -22,6 +21,8 @@ type ChatMessage struct {
 	Content    string
 	Name       string
 	ToolCallID string
+	ToolKind   string
+	Namespace  string
 	ToolCalls  []ToolCall
 	Images     []ChatImage
 }
@@ -164,6 +165,8 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 
 	// Track tool names so tool-result parts can include toolName (cursor2api).
 	toolNames := map[string]string{}
+	toolKinds := map[string]string{}
+	toolNamespaces := map[string]string{}
 	rootIDs := [][]byte{systemBlob}
 	for _, msg := range history {
 		switch msg.Role {
@@ -191,6 +194,8 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 			for _, tc := range msg.ToolCalls {
 				if strings.TrimSpace(tc.ID) != "" && strings.TrimSpace(tc.Name) != "" {
 					toolNames[tc.ID] = tc.Name
+					toolKinds[tc.ID] = cursorHistoryToolKind(tc.Kind)
+					toolNamespaces[tc.ID] = tc.Namespace
 				}
 				args := any(tc.Arguments)
 				if args == nil {
@@ -218,12 +223,16 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 			if toolName == "" {
 				toolName = toolNames[msg.ToolCallID]
 			}
+			toolKind := cursorHistoryToolKind(firstNonEmpty(msg.ToolKind, toolKinds[msg.ToolCallID]))
 			resultPart := map[string]any{
 				"type":       "tool-result",
 				"toolName":   toolName,
 				"toolCallId": msg.ToolCallID,
 				"result":     msg.Content,
-				"toolKind":   "mcp",
+				"toolKind":   toolKind,
+			}
+			if namespace := firstNonEmpty(msg.Namespace, toolNamespaces[msg.ToolCallID]); namespace != "" {
+				resultPart["namespace"] = namespace
 			}
 			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
 				"role": "tool",
@@ -274,62 +283,6 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 	// forcing it true is rejected for many accounts ("Workspace context
 	// exclusion is not allowed…").
 	supportsImages := true
-	details, selection := resolveModelDetails(model, selection)
-	run := &agentv1.AgentRunRequest{
-		ConversationId:             &conversationID,
-		ConversationState:          &agentv1.ConversationStateStructure{RootPromptMessagesJson: rootIDs},
-		ModelDetails:               details,
-		RequestedModel:             toRequestedModelProto(selection),
-		ClientSupportsInlineImages: &supportsImages,
-		Action:                     &agentv1.ConversationAction{},
-	}
-	if activeUserMessage != nil {
-		run.Action.Action = &agentv1.ConversationAction_UserMessageAction{
-			UserMessageAction: &agentv1.UserMessageAction{UserMessage: activeUserMessage},
-		}
-	} else {
-		run.Action.Action = &agentv1.ConversationAction_ResumeAction{
-			ResumeAction: &agentv1.ResumeAction{},
-		}
-	}
-	if defs := buildMcpToolDefinitions(tools); len(defs) > 0 {
-		run.McpTools = &agentv1.McpTools{McpTools: defs}
-	}
-	run.PreFetchedBlobs = preFetchedBlobs(blobStore)
-	client := &agentv1.AgentClientMessage{
-		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
-	}
-	return client, blobStore, conversationID, nil
-}
-
-// preFetchedBlobs uploads the run's content-addressed blobs with the request,
-// the way the desktop client does. Without them the server asks for each blob
-// over the KV channel, and any blob we cannot serve — one written by a turn
-// whose session has since gone — makes it rebuild the context instead.
-// Ordered by id so the encoding stays byte-stable across identical runs.
-func preFetchedBlobs(store map[string][]byte) []*agentv1.PreFetchedBlob {
-	if len(store) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(store))
-	for key := range store {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	out := make([]*agentv1.PreFetchedBlob, 0, len(keys))
-	for _, key := range keys {
-		id, err := hex.DecodeString(key)
-		if err != nil {
-			continue
-		}
-		out = append(out, &agentv1.PreFetchedBlob{Id: id, Value: store[key]})
-	}
-	return out
-}
-
-// resolveModelDetails derives the wire ModelDetails for a public model id and
-// returns the (possibly enriched) selection for toRequestedModelProto.
-func resolveModelDetails(model string, selection ModelSelection) (*agentv1.ModelDetails, ModelSelection) {
 	publicID := selection.PublicID
 	if publicID == "" {
 		publicID = model
@@ -359,7 +312,42 @@ func resolveModelDetails(model string, selection ModelSelection) (*agentv1.Model
 		maxMode := true
 		details.MaxMode = &maxMode
 	}
-	return details, selection
+	run := &agentv1.AgentRunRequest{
+		ConversationId:             &conversationID,
+		ConversationState:          &agentv1.ConversationStateStructure{RootPromptMessagesJson: rootIDs},
+		ModelDetails:               details,
+		RequestedModel:             toRequestedModelProto(selection),
+		ClientSupportsInlineImages: &supportsImages,
+		Action:                     &agentv1.ConversationAction{},
+	}
+	if activeUserMessage != nil {
+		run.Action.Action = &agentv1.ConversationAction_UserMessageAction{
+			UserMessageAction: &agentv1.UserMessageAction{UserMessage: activeUserMessage},
+		}
+	} else {
+		run.Action.Action = &agentv1.ConversationAction_ResumeAction{
+			ResumeAction: &agentv1.ResumeAction{},
+		}
+	}
+	if defs := buildMcpToolDefinitions(customMcpTools(tools)); len(defs) > 0 {
+		run.McpTools = &agentv1.McpTools{McpTools: defs}
+	}
+	client := &agentv1.AgentClientMessage{
+		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
+	}
+	return client, blobStore, conversationID, nil
+}
+
+func cursorHistoryToolKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	switch kind {
+	case "shell", "local_shell", "apply_patch", "custom", "function":
+		return kind
+	case "":
+		return "function"
+	default:
+		return kind
+	}
 }
 
 const (

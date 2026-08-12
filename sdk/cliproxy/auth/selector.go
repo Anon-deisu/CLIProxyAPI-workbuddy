@@ -371,12 +371,19 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 type SessionAffinitySelector struct {
 	fallback Selector
 	cache    *SessionCache
+	// providerFilter keeps protocol-required affinity narrow. Cursor's prompt
+	// cache is conversation/account scoped, so round-robin between Cursor
+	// accounts inside one client conversation forces a full prompt rewrite.
+	// Other providers retain the configured routing semantics unless universal
+	// affinity was explicitly requested.
+	providerFilter map[string]struct{}
 }
 
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
-	Fallback Selector
-	TTL      time.Duration
+	Fallback        Selector
+	TTL             time.Duration
+	ProviderFilters []string
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -395,9 +402,16 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	providerFilter := make(map[string]struct{}, len(cfg.ProviderFilters))
+	for _, provider := range cfg.ProviderFilters {
+		if provider = strings.ToLower(strings.TrimSpace(provider)); provider != "" {
+			providerFilter[provider] = struct{}{}
+		}
+	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:       cfg.Fallback,
+		cache:          NewSessionCache(cfg.TTL),
+		providerFilter: providerFilter,
 	}
 }
 
@@ -415,6 +429,11 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if len(s.providerFilter) > 0 {
+		if _, ok := s.providerFilter[strings.ToLower(strings.TrimSpace(provider))]; !ok {
+			return s.fallback.Pick(ctx, provider, model, opts, auths)
+		}
+	}
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
 	if primaryID == "" {
@@ -563,8 +582,26 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		}
 	}
 
-	// 2. X-Session-ID header
+	// The API handlers attach a stable execution-session ID for clients whose
+	// transport owns the conversation identity outside the request JSON.
+	if raw := metadata[cliproxyexecutor.ExecutionSessionMetadataKey]; raw != nil {
+		var sessionID string
+		switch value := raw.(type) {
+		case string:
+			sessionID = strings.TrimSpace(value)
+		case []byte:
+			sessionID = strings.TrimSpace(string(value))
+		}
+		if sessionID != "" {
+			return "execution:" + sessionID, ""
+		}
+	}
+
+	// 2. Claude Code / explicit session headers
 	if headers != nil {
+		if sid := headers.Get("X-Claude-Code-Session-Id"); sid != "" {
+			return "claude:" + sid, ""
+		}
 		if sid := headers.Get("X-Session-ID"); sid != "" {
 			return "header:" + sid, ""
 		}
@@ -577,6 +614,9 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		}
 		if sid := headers.Get("Session_id"); sid != "" {
 			return "codex:" + sid, ""
+		}
+		if sid := headers.Get("Conversation-Id"); sid != "" {
+			return "conversation:" + sid, ""
 		}
 	}
 
@@ -597,7 +637,13 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		return "user:" + userID, ""
 	}
 
-	// 7. conversation_id field
+	// 7. Cursor and generic conversation fields
+	if convID := gjson.GetBytes(payload, "cursor_conversation_id").String(); convID != "" {
+		return "cursor:" + convID, ""
+	}
+	if convID := gjson.GetBytes(payload, "metadata.cursor_conversation_id").String(); convID != "" {
+		return "cursor:" + convID, ""
+	}
 	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
 		return "conv:" + convID, ""
 	}

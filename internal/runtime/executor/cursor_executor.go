@@ -32,6 +32,12 @@ type CursorExecutor struct {
 	svc *cursorauth.AuthService
 }
 
+// Cursor normally sends TurnEnded immediately behind the formal tool batch.
+// A small bounded wait captures its authoritative cache counters without
+// imposing the multi-second delay that a full turn timeout would add to every
+// client-side tool step.
+const cursorTrailingUsageWait = 150 * time.Millisecond
+
 // NewCursorExecutor creates a Cursor executor.
 func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
 	return &CursorExecutor{cfg: cfg, svc: cursorauth.NewAuthService()}
@@ -66,11 +72,11 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	resolved := cursorlib.ResolveRequestedModel(upstreamModel)
 	body, _ = sjson.SetBytes(body, "model", resolved.ModelID)
 
-	messages, err := extractChatMessages(body)
+	messages, err := extractCursorChatMessages(body, originalPayloadSource, from)
 	if err != nil {
 		return resp, cursorInvalidRequest(err)
 	}
-	tools := prepareCursorTools(messages, extractTools(body), 0)
+	tools := prepareCursorTools(messages, extractCursorTools(body, originalPayloadSource, from), 0)
 	messages, tools, toolConstraint, err := applyCursorToolChoice(body, messages, tools)
 	if err != nil {
 		return resp, cursorInvalidRequest(err)
@@ -121,6 +127,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.TrackFailure(ctx, &err)
 
 	to := sdktranslator.FromString("openai")
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
 	body := translateCursorRequest(from, baseModel, req.Payload, true)
 
 	upstreamModel := strings.TrimPrefix(baseModel, "cursor-")
@@ -132,11 +142,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	resolved := cursorlib.ResolveRequestedModel(upstreamModel)
 	body, _ = sjson.SetBytes(body, "model", resolved.ModelID)
 
-	messages, err := extractChatMessages(body)
+	messages, err := extractCursorChatMessages(body, originalPayloadSource, from)
 	if err != nil {
 		return nil, cursorInvalidRequest(err)
 	}
-	tools := prepareCursorTools(messages, extractTools(body), 0)
+	tools := prepareCursorTools(messages, extractCursorTools(body, originalPayloadSource, from), 0)
 	messages, tools, toolConstraint, err := applyCursorToolChoice(body, messages, tools)
 	if err != nil {
 		return nil, cursorInvalidRequest(err)
@@ -147,10 +157,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		return nil, err
 	}
 
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
 	conversationID := resolveCursorConversationID(ctx, auth, req, opts, originalPayloadSource, body)
 	parallelTools := true
 	if value := gjson.GetBytes(body, "parallel_tool_calls"); value.Exists() {
@@ -361,19 +367,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			session = retrySession
 			errIter = iterate(session)
 		}
-		// A provider 400 caused by a tool-name collision gets exactly one retry
-		// with the same messages and complete tool catalog, changing names only.
-		if errIter != nil && isCursorHardProviderError(errIter) && !contentEmitted && len(tools) > 0 {
-			_ = session.Close()
-			aliasOpts := append(append([]cursorlib.StartOption(nil), startOpts...), cursorlib.WithForceToolAlias())
-			aliased, aliasErr := openCursorSession(ctx, creds, upstreamModel, messages, tools, aliasOpts...)
-			if aliasErr == nil {
-				session = aliased
-				errIter = iterate(session)
-			} else {
-				errIter = aliasErr
-			}
-		}
 		if errIter != nil {
 			errIter = humanizeCursorError(errIter)
 			reporter.PublishFailure(ctx, errIter)
@@ -396,17 +389,20 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 		// TurnEnded can land after the segment loop has already stopped
 		// reading, which leaves the counters sitting unread. Collect them if
-		// they are there, but never wait: when a turn pauses for a client tool
-		// Cursor sends no TurnEnded at all, and blocking for it would tax every
-		// step of an agent loop for nothing.
+		// they are there. A bounded 150 ms wait is long enough for the adjacent
+		// frame while keeping tool latency effectively unchanged when a Cursor
+		// version emits no TurnEnded at a pause.
 		if usageFinal.InputTokens == 0 && usageFinal.OutputTokens == 0 &&
 			usageFinal.CacheReadTokens == 0 && usageFinal.CacheWriteTokens == 0 {
-			if late, ok := session.TakeUsage(0); ok {
+			if late, ok := session.TakeUsage(cursorTrailingUsageWait); ok {
 				usageFinal = late
 			}
 		}
-		reporter.Publish(ctx, cursorUsageDetail(usageFinal.InputTokens, usageFinal.OutputTokens,
-			usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens, usageFinal.ReasoningTokens))
+		if usageFinal.InputTokens > 0 || usageFinal.OutputTokens > 0 ||
+			usageFinal.CacheReadTokens > 0 || usageFinal.CacheWriteTokens > 0 || usageFinal.ReasoningTokens > 0 {
+			reporter.Publish(ctx, cursorUsageDetail(usageFinal.InputTokens, usageFinal.OutputTokens,
+				usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens, usageFinal.ReasoningTokens))
+		}
 		// Do not Close() on stop here: TurnEnded can precede trailing
 		// checkpoint/text frames. readLoop EndStream/EOF owns teardown;
 		// the session manager reaper cleans any stranded runs.
@@ -742,6 +738,8 @@ func trailingToolResults(messages []cursorlib.ChatMessage) []cursorlib.ToolResul
 						ToolCallID: msg.ToolCallID,
 						Name:       msg.Name,
 						Content:    msg.Content,
+						Kind:       msg.ToolKind,
+						Namespace:  msg.Namespace,
 					})
 				}
 				return out
@@ -900,6 +898,73 @@ func extractChatMessages(body []byte) ([]cursorlib.ChatMessage, error) {
 	return out, nil
 }
 
+func extractCursorChatMessages(body, original []byte, from sdktranslator.Format) ([]cursorlib.ChatMessage, error) {
+	messages, err := extractChatMessages(body)
+	if err != nil || !sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) || !gjson.ValidBytes(original) {
+		return messages, err
+	}
+	descriptors := responseHistoryToolDescriptors(original)
+	for messageIndex := range messages {
+		message := &messages[messageIndex]
+		for callIndex := range message.ToolCalls {
+			call := &message.ToolCalls[callIndex]
+			if descriptor, ok := descriptors[call.ID]; ok {
+				call.Kind = descriptor.kind
+				call.Namespace = descriptor.namespace
+			}
+		}
+		if message.Role == "tool" {
+			if descriptor, ok := descriptors[message.ToolCallID]; ok {
+				message.ToolKind = descriptor.kind
+				message.Namespace = descriptor.namespace
+				if message.Name == "" {
+					message.Name = descriptor.name
+				}
+			}
+		}
+	}
+	return messages, nil
+}
+
+type cursorHistoryToolDescriptor struct {
+	kind      string
+	name      string
+	namespace string
+}
+
+func responseHistoryToolDescriptors(body []byte) map[string]cursorHistoryToolDescriptor {
+	out := map[string]cursorHistoryToolDescriptor{}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return out
+	}
+	input.ForEach(func(_, item gjson.Result) bool {
+		kind := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		callID := strings.TrimSpace(item.Get("call_id").String())
+		if callID == "" {
+			return true
+		}
+		descriptor := cursorHistoryToolDescriptor{name: strings.TrimSpace(item.Get("name").String()), namespace: strings.TrimSpace(item.Get("namespace").String())}
+		switch kind {
+		case "function_call":
+			descriptor.kind = "function"
+		case "custom_tool_call":
+			descriptor.kind = "custom"
+		case "shell_call":
+			descriptor.kind, descriptor.name = "shell", "shell"
+		case "local_shell_call":
+			descriptor.kind, descriptor.name = "local_shell", "local_shell"
+		case "apply_patch_call":
+			descriptor.kind, descriptor.name = "apply_patch", "apply_patch"
+		default:
+			return true
+		}
+		out[callID] = descriptor
+		return true
+	})
+	return out
+}
+
 // extractInlineImage reads both content-block shapes clients send: Anthropic
 // `image` blocks and OpenAI `image_url` data URLs.
 func extractInlineImage(part gjson.Result) (cursorlib.ChatImage, bool) {
@@ -916,6 +981,75 @@ func extractInlineImage(part gjson.Result) (cursorlib.ChatImage, bool) {
 	default:
 		return cursorlib.ChatImage{}, false
 	}
+}
+
+func extractCursorTools(body, original []byte, from sdktranslator.Format) []cursorlib.ToolDefinition {
+	tools := extractTools(body)
+	if !sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) || !gjson.ValidBytes(original) {
+		return tools
+	}
+	descriptors := responseToolDescriptors(original)
+	for i := range tools {
+		if descriptor, ok := descriptors[strings.ToLower(strings.TrimSpace(tools[i].Name))]; ok {
+			tools[i].Kind = descriptor.kind
+			tools[i].Namespace = descriptor.namespace
+		}
+	}
+	return tools
+}
+
+type cursorResponseToolDescriptor struct {
+	kind      string
+	namespace string
+}
+
+func responseToolDescriptors(body []byte) map[string]cursorResponseToolDescriptor {
+	out := map[string]cursorResponseToolDescriptor{}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.IsArray() {
+		return out
+	}
+	tools.ForEach(func(_, item gjson.Result) bool {
+		kind := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		if kind == "namespace" {
+			namespace := strings.TrimSpace(item.Get("name").String())
+			children := item.Get("tools")
+			if children.IsArray() {
+				children.ForEach(func(_, child gjson.Result) bool {
+					childKind := strings.ToLower(strings.TrimSpace(child.Get("type").String()))
+					if childKind == "" {
+						childKind = "function"
+					}
+					name := strings.TrimSpace(child.Get("name").String())
+					if name == "" {
+						name = strings.TrimSpace(child.Get("function.name").String())
+					}
+					qualified := name
+					if namespace != "" && !strings.HasPrefix(name, "mcp__") {
+						qualified = namespace + "__" + name
+					}
+					out[strings.ToLower(qualified)] = cursorResponseToolDescriptor{kind: childKind, namespace: namespace}
+					return true
+				})
+			}
+			return true
+		}
+		if kind == "" {
+			kind = "function"
+		}
+		name := strings.TrimSpace(item.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(item.Get("function.name").String())
+		}
+		if kind == "shell" || kind == "local_shell" || kind == "apply_patch" {
+			name = kind
+		}
+		if name != "" {
+			out[strings.ToLower(name)] = cursorResponseToolDescriptor{kind: kind}
+		}
+		return true
+	})
+	return out
 }
 
 func extractTools(body []byte) []cursorlib.ToolDefinition {
@@ -960,6 +1094,7 @@ func extractTools(body []byte) []cursorlib.ToolDefinition {
 			Name:        name,
 			Description: desc,
 			Parameters:  params,
+			Kind:        "function",
 		})
 	}
 	return cursorlib.SanitizeToolDefinitions(out)
@@ -1150,18 +1285,6 @@ func retryRunCursorChat(ctx context.Context, creds cursorlib.AccountCredentials,
 		}
 	}
 
-	// A tool name that collides with a Cursor built-in is the most common hard
-	// 400, so try aliasing before giving up any capability.
-	if isCursorHardProviderError(err) && len(tools) > 0 && retryBudgetLeft(start) {
-		log.Warnf("cursor: hard400 with %d tools; retrying with all tool names aliased: %v", len(tools), err)
-		aliasOpts := append(append([]cursorlib.StartOption(nil), opts...), cursorlib.WithForceToolAlias())
-		result, nextErr := cursorlib.RunChat(ctx, creds, model, messages, tools, aliasOpts...)
-		if nextErr == nil {
-			return result, nil
-		}
-		err = nextErr
-	}
-
 	return nil, err
 }
 
@@ -1185,18 +1308,6 @@ func retryOpenCursorSession(ctx context.Context, creds cursorlib.AccountCredenti
 				break
 			}
 		}
-	}
-
-	// A tool name that collides with a Cursor built-in is the most common hard
-	// 400, so try aliasing before giving up any capability.
-	if isCursorHardProviderError(err) && len(tools) > 0 && retryBudgetLeft(start) {
-		log.Warnf("cursor: stream hard400 with %d tools; retrying with all tool names aliased: %v", len(tools), err)
-		aliasOpts := append(append([]cursorlib.StartOption(nil), opts...), cursorlib.WithForceToolAlias())
-		session, nextErr := openCursorSession(ctx, creds, model, messages, tools, aliasOpts...)
-		if nextErr == nil {
-			return session, nil
-		}
-		err = nextErr
 	}
 
 	return nil, err

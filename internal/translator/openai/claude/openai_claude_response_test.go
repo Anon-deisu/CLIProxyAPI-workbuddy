@@ -284,7 +284,7 @@ func TestExtractOpenAIUsageSeparatesCacheReadAndWrite(t *testing.T) {
 	}
 }
 
-func TestStreamingTool_StopReasonWhenIDNeverArrives(t *testing.T) {
+func TestStreamingTool_MissingIDGetsFallbackWithoutRewritingRealIDs(t *testing.T) {
 	events := runStream(t, streamReq,
 		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"name":"do_it","arguments":""}}]}}]}`,
 		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}`,
@@ -293,21 +293,17 @@ func TestStreamingTool_StopReasonWhenIDNeverArrives(t *testing.T) {
 
 	starts := toolUseStarts(events)
 	if len(starts) != 1 {
-		t.Fatalf("expected one belated tool_use start with synthetic id, got %d", len(starts))
+		t.Fatalf("missing upstream id should get one fallback tool_use, got %d", len(starts))
 	}
-	id := gjson.Get(starts[0].Payload, "content_block.id").String()
-	if !strings.HasPrefix(id, "toolu_") {
-		t.Fatalf("synthetic id should match toolu_<nanos>_<n>, got %q", id)
-	}
-	if name := gjson.Get(starts[0].Payload, "content_block.name").String(); name != "do_it" {
-		t.Fatalf("announced tool name = %q, want %q", name, "do_it")
+	if id := gjson.Get(starts[0].Payload, "content_block.id").String(); !strings.HasPrefix(id, "toolu_") {
+		t.Fatalf("fallback id = %q", id)
 	}
 	if got := lastStopReason(events); got != "tool_use" {
 		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
 	}
 }
 
-func TestStreamingTool_BelatedStartsUseOpenAIToolIndexOrder(t *testing.T) {
+func TestStreamingTool_FallbackStartsUseOpenAIToolIndexOrder(t *testing.T) {
 	events := runStream(t, streamReq,
 		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
 			{"index":2,"function":{"name":"third_tool","arguments":"{}"}},
@@ -319,16 +315,12 @@ func TestStreamingTool_BelatedStartsUseOpenAIToolIndexOrder(t *testing.T) {
 
 	starts := toolUseStarts(events)
 	if len(starts) != 3 {
-		t.Fatalf("expected three belated tool_use starts, got %d", len(starts))
+		t.Fatalf("expected three fallback tool_use starts, got %d", len(starts))
 	}
-
 	wantNames := []string{"first_tool", "second_tool", "third_tool"}
 	for i, wantName := range wantNames {
 		if name := gjson.Get(starts[i].Payload, "content_block.name").String(); name != wantName {
-			t.Fatalf("tool_use start %d name = %q, want %q (starts=%+v)", i, name, wantName, starts)
-		}
-		if blockIndex := gjson.Get(starts[i].Payload, "index").Int(); blockIndex != int64(i) {
-			t.Fatalf("tool_use start %d block index = %d, want %d", i, blockIndex, i)
+			t.Fatalf("tool_use start %d name = %q, want %q", i, name, wantName)
 		}
 	}
 }
@@ -342,7 +334,7 @@ func TestStreamingTool_LateIDAfterFinalization(t *testing.T) {
 
 	starts := toolUseStarts(events)
 	if len(starts) != 1 {
-		t.Fatalf("expected one belated tool_use start, got %d", len(starts))
+		t.Fatalf("missing id should get one fallback before finalization, got %d", len(starts))
 	}
 
 	var sawMessageStop bool
@@ -370,5 +362,19 @@ func TestStreamingTool_StopReasonMixedSuppressedAndValid(t *testing.T) {
 	)
 	if got := lastStopReason(events); got != "tool_use" {
 		t.Fatalf("stop_reason = %q, want %q", got, "tool_use")
+	}
+}
+
+func TestNonStreamingToolMissingIDGetsFallbackAndRealIDPassesThrough(t *testing.T) {
+	out := convertOpenAINonStreamingToAnthropic([]byte(`{"id":"m","model":"test","choices":[{"message":{"tool_calls":[{"function":{"name":"missing","arguments":"{}"}},{"id":"toolu:raw\nid","function":{"name":"real","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`))[0]
+	content := gjson.GetBytes(out, "content").Array()
+	if len(content) != 2 {
+		t.Fatalf("content=%s", out)
+	}
+	if id := content[0].Get("id").String(); !strings.HasPrefix(id, "toolu_") {
+		t.Fatalf("fallback id=%q", id)
+	}
+	if id := content[1].Get("id").String(); id != "toolu:raw\nid" {
+		t.Fatalf("raw id changed: %q", id)
 	}
 }

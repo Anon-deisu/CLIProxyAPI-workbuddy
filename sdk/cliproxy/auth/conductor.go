@@ -1410,6 +1410,8 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
+	// Affinity selectors deliberately separate a session that changes models;
+	// built-in flat selectors do not need the route model as a cache key.
 	if isBuiltInSelector(selector) {
 		return ""
 	}
@@ -5387,8 +5389,6 @@ func (m *Manager) StopAutoRefresh() {
 		stoppable.Stop()
 	}
 }
-
-
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
 	m.mu.RLock()

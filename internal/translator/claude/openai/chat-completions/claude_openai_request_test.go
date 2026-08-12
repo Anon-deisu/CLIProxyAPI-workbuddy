@@ -6,7 +6,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func TestConvertOpenAIRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T) {
+func TestConvertOpenAIRequestToClaude_PreservesToolCallIDs(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",
 		"messages": [
@@ -36,11 +36,11 @@ func TestConvertOpenAIRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T
 	toolUseID := resultJSON.Get("messages.0.content.0.id").String()
 	toolResultID := resultJSON.Get("messages.1.content.0.tool_use_id").String()
 
-	if toolUseID != "call_with_space_1" {
-		t.Fatalf("tool_use id = %q, want %q", toolUseID, "call_with_space_1")
+	if toolUseID != "call.with space:1" {
+		t.Fatalf("tool_use id = %q, want raw id", toolUseID)
 	}
 	if toolResultID != toolUseID {
-		t.Fatalf("tool_result tool_use_id = %q, want same sanitized id %q", toolResultID, toolUseID)
+		t.Fatalf("tool_result tool_use_id = %q, want same raw id %q", toolResultID, toolUseID)
 	}
 }
 

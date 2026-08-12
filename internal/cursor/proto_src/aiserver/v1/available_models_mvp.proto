@@ -4,7 +4,12 @@ package aiserver.v1;
 
 option go_package = "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1;aiserverv1";
 
-import "agent/v1/agent_mvp.proto";
+// Kept local to this catalog schema to avoid a generated Go import cycle: the
+// complete Agent schema imports aiserver_common.proto.
+message RequestedModelParameterValue {
+  string id = 1;
+  string value = 2;
+}
 
 // Slim AvailableModels surface for Cursor desktop 3.7.12.
 
@@ -59,7 +64,7 @@ message AvailableModelsResponse {
   }
 
   message ModelVariantConfig {
-    repeated agent.v1.RequestedModel.ModelParameterValue parameter_values = 1;
+    repeated RequestedModelParameterValue parameter_values = 1;
     string display_name = 2;
     bool is_max_mode = 3;
     optional bool is_default_max_config = 4;
