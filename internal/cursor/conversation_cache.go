@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -25,20 +26,31 @@ var conversationIDs = struct {
 	byKey map[string]conversationEntry
 }{byKey: map[string]conversationEntry{}}
 
+// stableForConversationKey drops the context agents re-render on every turn
+// (todo state, command output, interrupt notices). Leaving it in made the key
+// change mid-chat, which mints a new conversation id and costs a full prompt
+// cache write on a turn whose content was otherwise identical.
+func stableForConversationKey(text string) string {
+	if injected, ask := splitInjectedContext(text); injected != "" && ask != "" {
+		return ask
+	}
+	return text
+}
+
 // conversationKeyFor derives a stable identity for a logical conversation from
 // the parts that do not change as turns are appended.
 func conversationKeyFor(model, systemPrompt string, conversation []ChatMessage) string {
 	h := sha256.New()
 	h.Write([]byte(BaseModelID(model)))
 	h.Write([]byte{0})
-	h.Write([]byte(systemPrompt))
+	h.Write([]byte(stableForConversationKey(systemPrompt)))
 	h.Write([]byte{0})
 	// The first user turn anchors the conversation; later turns only append.
 	for _, msg := range conversation {
 		if msg.Role != "user" {
 			continue
 		}
-		text := strings.TrimSpace(msg.Content)
+		text := strings.TrimSpace(stableForConversationKey(msg.Content))
 		if text == "" {
 			continue
 		}
@@ -82,6 +94,9 @@ func reuseConversationID(key string) string {
 	}
 	id := uuid.NewString()
 	conversationIDs.byKey[key] = conversationEntry{id: id, lastSeen: now}
+	// Each mint is a fresh prompt prefix upstream, so a chat that mints on
+	// every turn is paying a full cache write each time.
+	log.Debugf("cursor: new conversation id (%d tracked)", len(conversationIDs.byKey))
 	return id
 }
 
