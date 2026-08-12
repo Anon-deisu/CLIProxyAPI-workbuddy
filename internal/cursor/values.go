@@ -86,7 +86,7 @@ func coerceArgumentToSchema(value any, propSchema map[string]any) any {
 		}
 		switch nested.(type) {
 		case float64:
-			if declared == "number" || declared == "integer" {
+			if declared == "number" || (declared == "integer" && nested == float64(int64(nested.(float64)))) {
 				return nested
 			}
 		case bool:

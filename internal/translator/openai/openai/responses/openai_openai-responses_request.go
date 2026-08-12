@@ -60,7 +60,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		inputItems := input.Array()
 		outputCallIDs := make(map[string]struct{})
 		for _, item := range inputItems {
-			if item.Get("type").String() != "function_call_output" {
+			if !isResponsesToolOutputType(item.Get("type").String()) {
 				continue
 			}
 			callID := strings.TrimSpace(item.Get("call_id").String())
@@ -138,7 +138,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
 			}
-			if itemType != "function_call" {
+			if !isResponsesToolCallType(itemType) {
 				flushPendingToolCalls()
 			}
 
@@ -216,7 +216,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					pendingReasoningContent += reasoningContent
 				}
 
-			case "function_call":
+			case "function_call", "custom_tool_call", "shell_call", "local_shell_call", "apply_patch_call":
 				// Buffer consecutive function calls and emit them as one assistant message.
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
@@ -224,19 +224,15 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolCall, _ = sjson.SetBytes(toolCall, "id", callId.String())
 				}
 
-				if name := item.Get("name"); name.Exists() {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.name", name.String())
-				}
-
-				if arguments := item.Get("arguments"); arguments.Exists() {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments.String())
-				}
+				name, arguments := responsesToolCallNameAndArguments(itemType, item)
+				toolCall, _ = sjson.SetBytes(toolCall, "function.name", name)
+				toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments)
 				pendingToolCalls = append(pendingToolCalls, gjson.ParseBytes(toolCall).Value())
 				if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
 					pendingToolCallIDs = append(pendingToolCallIDs, callID)
 				}
 
-			case "function_call_output":
+			case "function_call_output", "custom_tool_call_output", "shell_call_output", "local_shell_call_output", "apply_patch_call_output":
 				// Handle function call output conversion to tool message
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 				callID := ""
@@ -285,6 +281,20 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			out, _ = sjson.SetBytes(out, "tools", chatCompletionsTools)
 		}
 	}
+	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			if item.Get("type").String() != "additional_tools" {
+				return true
+			}
+			item.Get("tools").ForEach(func(_, tool gjson.Result) bool {
+				for _, chatTool := range convertResponsesToolToOpenAIChatTools(tool) {
+					out, _ = sjson.SetRawBytes(out, "tools.-1", chatTool)
+				}
+				return true
+			})
+			return true
+		})
+	}
 
 	if reasoningEffort := root.Get("reasoning.effort"); reasoningEffort.Exists() {
 		effort := strings.ToLower(strings.TrimSpace(reasoningEffort.String()))
@@ -299,6 +309,53 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	}
 
 	return out
+}
+
+func isResponsesToolCallType(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call", "shell_call", "local_shell_call", "apply_patch_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponsesToolOutputType(itemType string) bool {
+	switch itemType {
+	case "function_call_output", "custom_tool_call_output", "shell_call_output", "local_shell_call_output", "apply_patch_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
+func responsesToolCallNameAndArguments(itemType string, item gjson.Result) (string, string) {
+	name := strings.TrimSpace(item.Get("name").String())
+	arguments := item.Get("arguments").String()
+	switch itemType {
+	case "custom_tool_call":
+		if arguments == "" {
+			raw, _ := sjson.Set(`{"input":""}`, "input", item.Get("input").String())
+			arguments = raw
+		}
+	case "shell_call":
+		name = "shell"
+		arguments = item.Get("action").Raw
+	case "local_shell_call":
+		name = "local_shell"
+		arguments = item.Get("action").Raw
+	case "apply_patch_call":
+		name = "apply_patch"
+		operation := item.Get("operation")
+		if operation.Exists() {
+			raw, _ := sjson.SetRaw(`{"operation":{}}`, "operation", operation.Raw)
+			arguments = raw
+		}
+	}
+	if arguments == "" {
+		arguments = "{}"
+	}
+	return name, arguments
 }
 
 func collectOpenAIResponsesReasoningContent(item gjson.Result) string {

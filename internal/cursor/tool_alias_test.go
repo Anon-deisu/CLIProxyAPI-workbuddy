@@ -19,6 +19,9 @@ func TestAliasToolsForCursorRenamesShell(t *testing.T) {
 	if alias.ClientName("cpa_Shell") != "Shell" {
 		t.Fatal("reverse mapping missing for Shell")
 	}
+	if alias.ClientName("CPA_SHELL") != "Shell" {
+		t.Fatal("reverse mapping must be case-insensitive")
+	}
 	if !strings.Contains(out[0].Description, `"Shell"`) {
 		t.Fatalf("aliased tool needs steering text, got %q", out[0].Description)
 	}

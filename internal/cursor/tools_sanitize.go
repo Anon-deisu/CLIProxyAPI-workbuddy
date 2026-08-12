@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"math"
 	"sort"
 	"strings"
 )
@@ -18,15 +19,9 @@ const (
 // metaSchemaKeys are JSON Schema meta fields that Cursor/provider often reject
 // when tools are projected into Agent MCP definitions (seen as provider 400).
 var metaSchemaKeys = map[string]struct{}{
-	"$schema":            {},
-	"$id":                {},
-	"$comment":           {},
-	"$vocabulary":        {},
-	"$anchor":            {},
-	"$dynamicAnchor":     {},
-	"$dynamicRef":        {},
-	"$recursiveAnchor":   {},
-	"$recursiveRef":      {},
+	"$schema":  {},
+	"$id":      {},
+	"$comment": {},
 }
 
 // SanitizeToolDefinitions cleans client tool definitions before they are sent
@@ -73,16 +68,37 @@ func sanitizeToolSchema(schema map[string]any) map[string]any {
 			"properties": map[string]any{},
 		}
 	}
-	if typ, _ := obj["type"].(string); typ == "object" {
-		if _, hasProps := obj["properties"]; !hasProps {
-			obj["properties"] = map[string]any{}
-		}
-	}
-	if _, hasType := obj["type"]; !hasType {
+	typ, hasType := obj["type"]
+	if !hasType || typ != "object" {
 		// Anthropic/OpenAI tools are JSON-object argument bags.
 		obj["type"] = "object"
-		if _, hasProps := obj["properties"]; !hasProps {
-			obj["properties"] = map[string]any{}
+	}
+	properties, ok := obj["properties"].(map[string]any)
+	if !ok || properties == nil {
+		properties = map[string]any{}
+		obj["properties"] = properties
+	}
+	if required, ok := obj["required"].([]any); ok {
+		seen := map[string]struct{}{}
+		cleaned := make([]any, 0, len(required))
+		for _, raw := range required {
+			name, ok := raw.(string)
+			if !ok {
+				continue
+			}
+			if _, exists := properties[name]; !exists {
+				continue
+			}
+			if _, duplicate := seen[name]; duplicate {
+				continue
+			}
+			seen[name] = struct{}{}
+			cleaned = append(cleaned, name)
+		}
+		if len(cleaned) == 0 {
+			delete(obj, "required")
+		} else {
+			obj["required"] = cleaned
 		}
 	}
 	return obj
@@ -105,6 +121,11 @@ func sanitizeSchemaValue(value any) any {
 			out[i] = sanitizeSchemaValue(child)
 		}
 		return out
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil
+		}
+		return v
 	default:
 		return value
 	}

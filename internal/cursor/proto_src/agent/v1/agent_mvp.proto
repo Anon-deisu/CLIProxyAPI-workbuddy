@@ -29,6 +29,7 @@ message ConversationAction {
 message ConversationStateStructure {
   repeated bytes root_prompt_messages_json = 1;
   repeated bytes turns = 2;
+  repeated string pending_tool_calls = 4;
 }
 
 message ModelDetails {

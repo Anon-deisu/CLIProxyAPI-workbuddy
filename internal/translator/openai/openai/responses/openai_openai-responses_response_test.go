@@ -593,3 +593,21 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_Restores
 		t.Fatalf("non-stream output namespace = %q, want mcp__test_mcp__; response=%s", got, resp)
 	}
 }
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_RestoresTypedCalls(t *testing.T) {
+	request := []byte(`{"tools":[{"type":"shell"},{"type":"custom","name":"render"}]}`)
+	raw := []byte(`{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_shell","type":"function","function":{"name":"shell","arguments":"{\"commands\":[\"pwd\"]}"}},{"id":"call_custom","type":"function","function":{"name":"render","arguments":"{\"input\":\"raw text\"}"}}]}}]}`)
+	resp := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, raw, nil)
+	if got := gjson.GetBytes(resp, "output.0.type").String(); got != "shell_call" {
+		t.Fatalf("first item type=%q body=%s", got, resp)
+	}
+	if got := gjson.GetBytes(resp, "output.0.action.commands.0").String(); got != "pwd" {
+		t.Fatalf("shell action lost: body=%s", resp)
+	}
+	if got := gjson.GetBytes(resp, "output.1.type").String(); got != "custom_tool_call" {
+		t.Fatalf("second item type=%q body=%s", got, resp)
+	}
+	if got := gjson.GetBytes(resp, "output.1.input").String(); got != "raw text" {
+		t.Fatalf("custom input lost: body=%s", resp)
+	}
+}

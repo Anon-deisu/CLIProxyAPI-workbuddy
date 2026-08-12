@@ -31,7 +31,8 @@ const cursorToolAliasPrefix = "cpa_"
 // ToolAliasMap translates between the tool names a client declared and the
 // names actually sent to Cursor.
 type ToolAliasMap struct {
-	toClient map[string]string
+	toClient   map[string]string
+	toUpstream map[string]string
 }
 
 // ClientName maps an upstream (Cursor-facing) tool name back to the client name.
@@ -39,10 +40,22 @@ func (m *ToolAliasMap) ClientName(upstream string) string {
 	if m == nil || len(m.toClient) == 0 {
 		return upstream
 	}
-	if name, ok := m.toClient[upstream]; ok {
+	if name, ok := m.toClient[strings.ToLower(strings.TrimSpace(upstream))]; ok {
 		return name
 	}
 	return upstream
+}
+
+// UpstreamName maps a client-declared tool name to the name advertised to
+// Cursor. Names that were not aliased are returned unchanged.
+func (m *ToolAliasMap) UpstreamName(client string) string {
+	if m == nil || len(m.toUpstream) == 0 {
+		return client
+	}
+	if name, ok := m.toUpstream[strings.ToLower(strings.TrimSpace(client))]; ok {
+		return name
+	}
+	return client
 }
 
 // Empty reports whether any renaming happened.
@@ -56,7 +69,10 @@ func AliasToolsForCursor(tools []ToolDefinition, forceAll bool) ([]ToolDefinitio
 	if len(tools) == 0 {
 		return tools, &ToolAliasMap{}
 	}
-	alias := &ToolAliasMap{toClient: map[string]string{}}
+	alias := &ToolAliasMap{
+		toClient:   map[string]string{},
+		toUpstream: map[string]string{},
+	}
 	out := make([]ToolDefinition, 0, len(tools))
 	used := make(map[string]struct{}, len(tools))
 	for _, tool := range tools {
@@ -77,7 +93,8 @@ func AliasToolsForCursor(tools []ToolDefinition, forceAll bool) ([]ToolDefinitio
 		used[strings.ToLower(upstream)] = struct{}{}
 		copied := tool
 		if upstream != client {
-			alias.toClient[upstream] = client
+			alias.toClient[strings.ToLower(upstream)] = client
+			alias.toUpstream[strings.ToLower(client)] = upstream
 			// Renaming alone is not enough: Cursor keeps its own built-in tool
 			// of the original name, and a model told to "use Read" picks that
 			// one, which cannot execute here ("No exec result"). Steering the
@@ -112,14 +129,10 @@ func ApplyToolAliasToMessages(messages []ChatMessage, alias *ToolAliasMap) []Cha
 	if alias.Empty() || len(messages) == 0 {
 		return messages
 	}
-	toUpstream := make(map[string]string, len(alias.toClient))
-	for upstream, client := range alias.toClient {
-		toUpstream[client] = upstream
-	}
 	out := make([]ChatMessage, len(messages))
 	copy(out, messages)
 	for i := range out {
-		if name, ok := toUpstream[strings.TrimSpace(out[i].Name)]; ok {
+		if name, ok := alias.toUpstream[strings.ToLower(strings.TrimSpace(out[i].Name))]; ok {
 			out[i].Name = name
 		}
 		if len(out[i].ToolCalls) == 0 {
@@ -128,7 +141,7 @@ func ApplyToolAliasToMessages(messages []ChatMessage, alias *ToolAliasMap) []Cha
 		calls := make([]ToolCall, len(out[i].ToolCalls))
 		copy(calls, out[i].ToolCalls)
 		for j := range calls {
-			if name, ok := toUpstream[strings.TrimSpace(calls[j].Name)]; ok {
+			if name, ok := alias.toUpstream[strings.ToLower(strings.TrimSpace(calls[j].Name))]; ok {
 				calls[j].Name = name
 			}
 		}

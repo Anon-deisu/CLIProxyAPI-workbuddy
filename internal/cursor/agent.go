@@ -114,11 +114,11 @@ func storeBlob(store map[string][]byte, data []byte) []byte {
 	return id
 }
 
-func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, cfgs ...startConfig) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
-	var cfg startConfig
-	if len(cfgs) > 0 {
-		cfg = cfgs[0]
-	}
+func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinition) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
+	return buildRunRequestForConversation(model, messages, tools, "")
+}
+
+func buildRunRequestForConversation(model string, messages []ChatMessage, tools []ToolDefinition, conversationID string) (*agentv1.AgentClientMessage, map[string][]byte, string, error) {
 	selection := ResolveRequestedModel(model)
 	model = selection.ModelID
 	blobStore := map[string][]byte{}
@@ -138,23 +138,27 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 
 	var activeUser *ChatMessage
 	historyEnd := len(conversation)
-	for i := len(conversation) - 1; i >= 0; i-- {
-		if conversation[i].Role == "user" && strings.TrimSpace(conversation[i].Content) != "" {
-			activeUser = &conversation[i]
-			historyEnd = i
-			break
+	if len(conversation) > 0 {
+		last := &conversation[len(conversation)-1]
+		if last.Role == "user" && (strings.TrimSpace(last.Content) != "" || len(last.Images) > 0) {
+			activeUser = last
+			historyEnd = len(conversation) - 1
 		}
 	}
 	if activeUser == nil {
-		return nil, nil, "", fmt.Errorf("cursor: request has no user message")
+		hasUserHistory := false
+		for i := range conversation {
+			if conversation[i].Role == "user" {
+				hasUserHistory = true
+				break
+			}
+		}
+		if !hasUserHistory {
+			return nil, nil, "", fmt.Errorf("cursor: request has no user message or tool continuation")
+		}
 	}
-	// The live turn bypasses trimConversationHistory, so clamp it too: a huge
-	// paste in the current message overflows the model on its own.
-	current := *activeUser
-	current.Content = clampMessageContent(current.Content)
-	activeUser = &current
 
-	history := trimConversationHistory(conversation[:historyEnd])
+	history := conversation[:historyEnd]
 
 	// Track tool names so tool-result parts can include toolName (cursor2api).
 	toolNames := map[string]string{}
@@ -231,33 +235,35 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 
 	// Keep the Agent's user message as the user's actual instruction; client
 	// injected context rides along as a preceding history blob instead.
-	activeText := activeUser.Content
-	if injected, ask := splitInjectedContext(activeText); ask != "" {
-		rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
-			"role": "user",
-			"content": []map[string]string{
-				{"type": "text", "text": injected},
-			},
-		})))
-		activeText = ask
+	var activeUserMessage *agentv1.UserMessage
+	if activeUser != nil {
+		activeText := activeUser.Content
+		if injected, ask := splitInjectedContext(activeText); ask != "" {
+			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "text", "text": injected},
+				},
+			})))
+			activeText = ask
+		}
+
+		activeUserMessage = &agentv1.UserMessage{
+			Text:      activeText,
+			MessageId: uuid.NewString(),
+		}
+		// Images ride on the active turn; without this they were dropped and the
+		// model answered as if no picture had been sent.
+		images := collectImages(conversation[historyEnd:])
+		if len(images) > 0 {
+			attachImages(activeUserMessage, images)
+			log.Debugf("cursor: attached %d inline image(s) to the user turn", len(images))
+		}
 	}
 
-	activeUserMessage := &agentv1.UserMessage{
-		Text:      activeText,
-		MessageId: uuid.NewString(),
-	}
-	// Images ride on the active turn; without this they were dropped and the
-	// model answered as if no picture had been sent.
-	images := collectImages(conversation[historyEnd:])
-	if len(images) > 0 {
-		attachImages(activeUserMessage, images)
-		log.Debugf("cursor: attached %d inline image(s) to the user turn", len(images))
-	}
-
-	conversationKey := conversationKeyFor(model, systemPrompt, conversation)
-	conversationID := reuseConversationID(conversationKey)
-	if cfg.freshConversation {
-		conversationID = rotateConversationID(conversationKey)
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		conversationID = uuid.NewString()
 	}
 	// Desktop / cursor2api do not set exclude_workspace_context by default;
 	// forcing it true is rejected for many accounts ("Workspace context
@@ -299,13 +305,16 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		ModelDetails:               details,
 		RequestedModel:             toRequestedModelProto(selection),
 		ClientSupportsInlineImages: &supportsImages,
-		Action: &agentv1.ConversationAction{
-			Action: &agentv1.ConversationAction_UserMessageAction{
-				UserMessageAction: &agentv1.UserMessageAction{
-					UserMessage: activeUserMessage,
-				},
-			},
-		},
+		Action:                     &agentv1.ConversationAction{},
+	}
+	if activeUserMessage != nil {
+		run.Action.Action = &agentv1.ConversationAction_UserMessageAction{
+			UserMessageAction: &agentv1.UserMessageAction{UserMessage: activeUserMessage},
+		}
+	} else {
+		run.Action.Action = &agentv1.ConversationAction_ResumeAction{
+			ResumeAction: &agentv1.ResumeAction{},
+		}
 	}
 	if defs := buildMcpToolDefinitions(tools); len(defs) > 0 {
 		run.McpTools = &agentv1.McpTools{McpTools: defs}
@@ -314,36 +323,6 @@ func buildRunRequest(model string, messages []ChatMessage, tools []ToolDefinitio
 		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
 	}
 	return client, blobStore, conversationID, nil
-}
-
-const (
-	maxHistoryMessages   = 48
-	maxHistoryChars      = 120_000
-	maxSystemPromptRunes = 40_000
-	// maxMessageChars bounds a single turn. Dropping whole messages cannot
-	// save a history whose *last* message is a 500 KB tool result, and the
-	// provider answers the oversized prompt with a 400 that no retry tier can
-	// undo.
-	maxMessageChars = 60_000
-)
-
-// clampMessageContent keeps the head and tail of an oversized turn: the request
-// is stated at the top and the newest output sits at the bottom, so cutting the
-// middle preserves what the model actually needs.
-func clampMessageContent(content string) string {
-	if len(content) <= maxMessageChars {
-		return content
-	}
-	runes := []rune(content)
-	if len(runes) <= maxMessageChars {
-		return content
-	}
-	head := maxMessageChars * 2 / 3
-	tail := maxMessageChars - head
-	omitted := len(runes) - head - tail
-	return string(runes[:head]) +
-		fmt.Sprintf("\n\n…[CLIProxyAPI truncated %d characters]…\n\n", omitted) +
-		string(runes[len(runes)-tail:])
 }
 
 func splitSystemMessages(messages []ChatMessage) (systemPrompt string, conversation []ChatMessage) {
@@ -358,61 +337,7 @@ func splitSystemMessages(messages []ChatMessage) (systemPrompt string, conversat
 		}
 		conversation = append(conversation, msg)
 	}
-	return truncateRunes(strings.Join(parts, "\n\n"), maxSystemPromptRunes), conversation
-}
-
-// trimConversationHistory keeps the newest turns when history is huge so Cursor
-// does not silently drop the head (which looked like "context truncation").
-func trimConversationHistory(history []ChatMessage) []ChatMessage {
-	if len(history) == 0 {
-		return history
-	}
-	start := 0
-	if len(history) > maxHistoryMessages {
-		start = len(history) - maxHistoryMessages
-		// Don't start in the middle of a tool-result suffix.
-		for start < len(history) && history[start].Role == "tool" {
-			start++
-		}
-	}
-	out := make([]ChatMessage, 0, len(history)-start)
-	for _, msg := range history[start:] {
-		msg.Content = clampMessageContent(msg.Content)
-		out = append(out, msg)
-	}
-	total := 0
-	for _, msg := range out {
-		total += len(msg.Content)
-		for _, tc := range msg.ToolCalls {
-			total += len(tc.Name) + 32
-		}
-	}
-	for total > maxHistoryChars && len(out) > 2 {
-		drop := 1
-		// Drop a whole assistant+tool group when possible.
-		if out[0].Role == "assistant" {
-			drop = 1
-			for drop < len(out) && out[drop].Role == "tool" {
-				drop++
-			}
-		} else if out[0].Role == "tool" {
-			for drop < len(out) && out[drop].Role == "tool" {
-				drop++
-			}
-		}
-		for i := 0; i < drop && i < len(out); i++ {
-			total -= len(out[i].Content)
-			for _, tc := range out[i].ToolCalls {
-				total -= len(tc.Name) + 32
-			}
-		}
-		out = out[drop:]
-		for len(out) > 0 && out[0].Role == "tool" {
-			total -= len(out[0].Content)
-			out = out[1:]
-		}
-	}
-	return out
+	return strings.Join(parts, "\n\n"), conversation
 }
 
 func mustJSON(v any) []byte {
