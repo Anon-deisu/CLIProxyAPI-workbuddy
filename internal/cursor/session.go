@@ -1182,10 +1182,12 @@ func (s *Session) handleThinkingDelta(text string) {
 // occasionally missing leading token. After this opening window, deltas stream
 // immediately instead of buffering the whole response.
 //
-// It is deliberately short: the window is paid on the first token of every
-// answer, and a checkpoint that is going to arrive usually arrives well inside
-// it. Waiting longer only trades visible latency for a rarely-needed repair.
-const textHoldWindow = 400 * time.Millisecond
+// The checkpoint is the only thing that can restore a dropped opening, so this
+// is the deadline for waiting on one. Shortening it to 400ms to save latency
+// cost claude-fable-5 the first nine characters of a reply in one run out of
+// three. The checkpoint now releases the hold as soon as it lands, so a fast
+// turn no longer pays the full window anyway.
+const textHoldWindow = 1200 * time.Millisecond
 
 func (s *Session) handleTextDelta(text string) {
 	if text == "" {
