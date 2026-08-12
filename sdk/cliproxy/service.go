@@ -2049,11 +2049,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	case "cursor":
-		if fetched := s.fetchCursorModelsForAuth(ctx, a); len(fetched) > 0 {
-			models = fetched
-		} else {
-			models = registry.GetCursorModels()
-		}
+		models = cursorModelsOrPrevious(a.ID, s.fetchCursorModelsForAuth(ctx, a))
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config

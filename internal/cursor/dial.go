@@ -61,7 +61,44 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+// proxyConnectBackoff paces retries of the CONNECT handshake. The upstream
+// proxy intermittently accepts the TCP connection and then closes it without a
+// response ("unexpected EOF"), which surfaced as accounts losing their model
+// catalog and as spurious request failures.
+var proxyConnectBackoff = []time.Duration{200 * time.Millisecond, 600 * time.Millisecond}
+
 func dialTLSViaConnectProxy(ctx context.Context, network, addr string, cfg *tls.Config, proxyURL *url.URL) (net.Conn, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		conn, err := dialTLSViaConnectProxyOnce(ctx, network, addr, cfg, proxyURL)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		// Only the handshake itself is safe to repeat: a rejected CONNECT
+		// (bad credentials, blocked host) returns the same answer every time.
+		if !isRetryableProxyConnectError(err) || attempt >= len(proxyConnectBackoff) {
+			return nil, lastErr
+		}
+		select {
+		case <-time.After(proxyConnectBackoff[attempt]):
+		case <-ctx.Done():
+			return nil, lastErr
+		}
+	}
+}
+
+func isRetryableProxyConnectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "cursor proxy dial ") ||
+		strings.Contains(msg, "cursor proxy connect write") ||
+		strings.Contains(msg, "cursor proxy connect read")
+}
+
+func dialTLSViaConnectProxyOnce(ctx context.Context, network, addr string, cfg *tls.Config, proxyURL *url.URL) (net.Conn, error) {
 	if scheme := strings.ToLower(proxyURL.Scheme); scheme != "" && scheme != "http" {
 		return nil, fmt.Errorf("cursor proxy: unsupported scheme %q (only http CONNECT proxies)", proxyURL.Scheme)
 	}
