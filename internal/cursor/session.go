@@ -968,6 +968,11 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			s.mu.Unlock()
 			if turnEnded {
 				s.flushAssistantText(false)
+			} else {
+				// The checkpoint is the authoritative copy of the opening, so
+				// there is nothing left to wait for: release the held text now
+				// instead of sitting out the rest of the hold window.
+				s.releaseTextStream()
 			}
 			if s.pendingToolBatchReady() {
 				return true, nil
@@ -1176,7 +1181,11 @@ func (s *Session) handleThinkingDelta(text string) {
 // textHoldWindow gives the checkpoint a short chance to repair Cursor's
 // occasionally missing leading token. After this opening window, deltas stream
 // immediately instead of buffering the whole response.
-const textHoldWindow = 1200 * time.Millisecond
+//
+// It is deliberately short: the window is paid on the first token of every
+// answer, and a checkpoint that is going to arrive usually arrives well inside
+// it. Waiting longer only trades visible latency for a rarely-needed repair.
+const textHoldWindow = 400 * time.Millisecond
 
 func (s *Session) handleTextDelta(text string) {
 	if text == "" {

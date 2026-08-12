@@ -231,7 +231,14 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if !emitLine([]byte("data: " + string(chunk))) {
 				return context.Canceled
 			}
-			contentEmitted = true
+			// Reasoning alone does not close the door on a retry. The recovery
+			// paths all key off contentEmitted, and a turn that has only shown
+			// its thinking so far can still be restarted; the cost is at worst
+			// some repeated reasoning text, against never retrying again once
+			// a thinking model starts.
+			if !deltaIsReasoningOnly(delta) {
+				contentEmitted = true
+			}
 			return nil
 		}
 		flushPending := func() error {
@@ -253,6 +260,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					flush = flush || strings.TrimSpace(ev.Text) != ""
 				case "thinking_delta":
 					delta = map[string]any{"reasoning_content": ev.Text}
+					// Reasoning goes out as it arrives. Holding it until the
+					// first text or tool call left thinking models silent for
+					// as long as they reasoned — measured first-token times of
+					// 8 to 51 seconds, all of them equal to the total time
+					// because the whole answer landed in one burst.
+					flush = true
 				case "tool_call":
 					if ev.ToolCall == nil {
 						return nil
@@ -1258,6 +1271,16 @@ func applyCursorReasoningEffort(model string, body []byte) string {
 // publishing it verbatim alongside the buckets made every consumer that sums
 // them — the relay's own total among them — count the cache twice. A long agent
 // session then showed millions of input tokens for a few hundred output.
+// deltaIsReasoningOnly reports whether a streamed chunk carries nothing but
+// the model's thinking.
+func deltaIsReasoningOnly(delta map[string]any) bool {
+	if len(delta) != 1 {
+		return false
+	}
+	_, ok := delta["reasoning_content"]
+	return ok
+}
+
 func cursorUsageDetail(input, output, cacheRead, cacheWrite, reasoning int64) usage.Detail {
 	uncached := input - cacheRead - cacheWrite
 	if uncached < 0 {
