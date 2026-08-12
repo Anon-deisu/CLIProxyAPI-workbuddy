@@ -669,9 +669,6 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 				if result.FinishReason == "tool_calls" && toolCalls == 0 {
 					return nil, fmt.Errorf("%w: tool boundary contained no tool call", ErrEmptyTerminal)
 				}
-				if result.FinishReason == "stop" && strings.TrimSpace(result.Text) == "" && toolCalls == 0 {
-					return nil, ErrEmptyTerminal
-				}
 				return result, nil
 			}
 		}
@@ -689,7 +686,6 @@ func (s *Session) wasResumed() bool {
 
 // IterSegment invokes fn for each event until segment_end (inclusive).
 func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) error {
-	hasText := false
 	toolCalls := 0
 	for {
 		select {
@@ -708,9 +704,6 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 			if !ok {
 				return fmt.Errorf("%w: stream closed before a terminal boundary", ErrEmptyTerminal)
 			}
-			if ev.Type == "text_delta" && strings.TrimSpace(ev.Text) != "" {
-				hasText = true
-			}
 			if ev.Type == "tool_call" && ev.ToolCall != nil {
 				toolCalls++
 			}
@@ -720,9 +713,6 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 			if ev.Type == "segment_end" {
 				if ev.Reason == "tool_calls" && toolCalls == 0 {
 					return fmt.Errorf("%w: tool boundary contained no tool call", ErrEmptyTerminal)
-				}
-				if ev.Reason == "stop" && !hasText && toolCalls == 0 {
-					return ErrEmptyTerminal
 				}
 				return nil
 			}
@@ -737,9 +727,11 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 // history instead of reading more events on a half-closed Connect stream.
 var ErrToolResumeRebuild = fmt.Errorf("cursor: tool resume requires rebuild")
 
-// ErrEmptyTerminal means Cursor ended a billed turn without a final assistant
-// message or a client-visible tool call. Treating this as stop silently loses
-// the answer and prevents downstream credential failover.
+// ErrEmptyTerminal is reserved for malformed stream termination or a formal
+// tool boundary without any corresponding tool call. A clean Cursor
+// TurnEnded/END_STREAM is authoritative even when the selected provider emits
+// no text delta; rejecting such turns caused an account-wide outage in
+// production because output text is not guaranteed on every Agent turn.
 var ErrEmptyTerminal = errors.New("cursor: turn ended without final assistant text or tool calls")
 
 // SubmitToolResults replies on the live exec stream and resumes reading.

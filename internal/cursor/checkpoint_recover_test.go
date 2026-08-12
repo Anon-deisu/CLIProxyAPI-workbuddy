@@ -183,7 +183,7 @@ func TestFlushAssistantTextRecoversTypedTurnStep(t *testing.T) {
 	}
 }
 
-func TestCollectSegmentRejectsEmptyStop(t *testing.T) {
+func TestCollectSegmentAcceptsAuthoritativeEmptyStop(t *testing.T) {
 	s := &Session{
 		ConversationID: "conversation",
 		ID:             "session",
@@ -192,9 +192,12 @@ func TestCollectSegmentRejectsEmptyStop(t *testing.T) {
 	}
 	s.events <- StreamEvent{Type: "segment_end", Reason: "stop"}
 
-	_, err := s.CollectSegment(context.Background())
-	if !errors.Is(err, ErrEmptyTerminal) {
-		t.Fatalf("error = %v, want ErrEmptyTerminal", err)
+	result, err := s.CollectSegment(context.Background())
+	if err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if result.FinishReason != "stop" || result.Text != "" {
+		t.Fatalf("result = %#v", result)
 	}
 }
 
@@ -211,7 +214,7 @@ func TestIterSegmentRejectsToolBoundaryWithoutToolCall(t *testing.T) {
 	}
 }
 
-func TestIterSegmentRejectsReasoningOnlyStop(t *testing.T) {
+func TestIterSegmentAcceptsReasoningOnlyAuthoritativeStop(t *testing.T) {
 	s := &Session{
 		events: make(chan StreamEvent, 2),
 		errCh:  make(chan error, 1),
@@ -224,8 +227,8 @@ func TestIterSegmentRejectsReasoningOnlyStop(t *testing.T) {
 		events = append(events, ev)
 		return nil
 	})
-	if !errors.Is(err, ErrEmptyTerminal) {
-		t.Fatalf("error = %v, want ErrEmptyTerminal", err)
+	if err != nil {
+		t.Fatalf("error = %v", err)
 	}
 	if len(events) != 2 || events[0].Type != "thinking_delta" {
 		t.Fatalf("events = %#v", events)
