@@ -276,6 +276,14 @@ func TestStreamingTool_StopReasonWithEmittedTool(t *testing.T) {
 	}
 }
 
+func TestExtractOpenAIUsageSeparatesCacheReadAndWrite(t *testing.T) {
+	usage := gjson.Parse(`{"prompt_tokens":9000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":8000,"cache_creation_tokens":200}}`)
+	input, output, cached := extractOpenAIUsage(usage)
+	if input != 800 || output != 50 || cached != 8000 {
+		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
+	}
+}
+
 func TestStreamingTool_StopReasonWhenIDNeverArrives(t *testing.T) {
 	events := runStream(t, streamReq,
 		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"name":"do_it","arguments":""}}]}}]}`,

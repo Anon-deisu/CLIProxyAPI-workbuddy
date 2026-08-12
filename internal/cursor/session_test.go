@@ -1,11 +1,17 @@
 package cursor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestExtractToolResultsTrailingOnly(t *testing.T) {
@@ -23,7 +29,7 @@ func TestExtractToolResultsTrailingOnly(t *testing.T) {
 	}
 }
 
-func TestSplitSystemMessagesAndTrimHistory(t *testing.T) {
+func TestSplitSystemMessagesAndPreserveHistory(t *testing.T) {
 	sys, conv := splitSystemMessages([]ChatMessage{
 		{Role: "system", Content: "A"},
 		{Role: "user", Content: "u1"},
@@ -91,17 +97,32 @@ func TestSplitSystemMessagesAndTrimHistory(t *testing.T) {
 		t.Fatal("must not inject System instructions into user text")
 	}
 
-	history := make([]ChatMessage, 0, 60)
+	history := make([]ChatMessage, 0, 121)
 	for i := 0; i < 60; i++ {
 		history = append(history, ChatMessage{Role: "user", Content: fmt.Sprintf("m%d", i)})
 		history = append(history, ChatMessage{Role: "assistant", Content: fmt.Sprintf("a%d", i)})
 	}
-	trimmed := trimConversationHistory(history)
-	if len(trimmed) > maxHistoryMessages {
-		t.Fatalf("trimmed len=%d > %d", len(trimmed), maxHistoryMessages)
+	history = append(history, ChatMessage{Role: "user", Content: "active"})
+	_, historyBlobs, _, err := buildRunRequest("default", history, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if trimmed[len(trimmed)-1].Content != "a59" {
-		t.Fatalf("expected newest kept, last=%q", trimmed[len(trimmed)-1].Content)
+	var sawFirst, sawLast bool
+	for _, data := range historyBlobs {
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) != nil {
+			continue
+		}
+		content, _ := payload["content"].([]any)
+		for _, raw := range content {
+			part, _ := raw.(map[string]any)
+			text, _ := part["text"].(string)
+			sawFirst = sawFirst || text == "m0"
+			sawLast = sawLast || text == "a59"
+		}
+	}
+	if !sawFirst || !sawLast {
+		t.Fatalf("full history was not preserved: first=%v last=%v", sawFirst, sawLast)
 	}
 }
 
@@ -180,6 +201,44 @@ func TestBuildRunRequestNativeToolJSON(t *testing.T) {
 	}
 }
 
+func TestBuildRunRequestUsesResumeActionForToolContinuation(t *testing.T) {
+	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
+		{Role: "user", Content: "weather?"},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "get_weather", Arguments: map[string]any{"city": "Beijing"}}}},
+		{Role: "tool", ToolCallID: "c1", Name: "get_weather", Content: `{"temperature":30}`},
+	}, []ToolDefinition{{Name: "get_weather", Parameters: map[string]any{"type": "object"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := msg.GetRunRequest()
+	if run.GetAction().GetResumeAction() == nil {
+		t.Fatalf("tool continuation must use resume_action, got %#v", run.GetAction())
+	}
+	if run.GetAction().GetUserMessageAction() != nil {
+		t.Fatal("tool continuation must not replay the previous user as a new action")
+	}
+	var sawCall, sawResult bool
+	for _, data := range blobs {
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) != nil {
+			continue
+		}
+		content, _ := payload["content"].([]any)
+		for _, raw := range content {
+			part, _ := raw.(map[string]any)
+			if part["type"] == "tool-call" && part["toolCallId"] == "c1" {
+				sawCall = true
+			}
+			if part["type"] == "tool-result" && part["toolCallId"] == "c1" {
+				sawResult = true
+			}
+		}
+	}
+	if !sawCall || !sawResult {
+		t.Fatalf("structured continuation missing call=%v result=%v", sawCall, sawResult)
+	}
+}
+
 func TestCookieJarRemembersSetCookie(t *testing.T) {
 	jar := &CookieJar{byHost: map[string]map[string]string{}}
 	hdr := make(http.Header)
@@ -240,6 +299,61 @@ func TestSubmitToolResultsRebuildsWhenResponseEnded(t *testing.T) {
 	}
 }
 
+func TestReadLoopKeepsReadingTrailingUsageWhileWaitingForTools(t *testing.T) {
+	requestReader, requestWriter := io.Pipe()
+	go func() {
+		_, _ = io.Copy(io.Discard, requestReader)
+	}()
+	responseReader, responseWriter := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Session{
+		stream:       &BidiStream{writer: requestWriter, body: responseReader},
+		events:       make(chan StreamEvent, 4),
+		errCh:        make(chan error, 1),
+		waitingTools: true,
+		pauseCh:      make(chan struct{}),
+		done:         ctx.Done(),
+		cancel:       cancel,
+		lastActivity: time.Now(),
+	}
+	go s.readLoop(ctx)
+
+	inputTokens := int64(120)
+	cacheWriteTokens := int64(80)
+	serverMessage := &agentv1.AgentServerMessage{
+		Message: &agentv1.AgentServerMessage_InteractionUpdate{
+			InteractionUpdate: &agentv1.InteractionUpdate{
+				Message: &agentv1.InteractionUpdate_TurnEnded{
+					TurnEnded: &agentv1.TurnEndedUpdate{
+						InputTokens:      &inputTokens,
+						CacheWriteTokens: &cacheWriteTokens,
+					},
+				},
+			},
+		},
+	}
+	payload, err := proto.Marshal(serverMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = responseWriter.Write(EncodeEnvelope(payload, false)); err != nil {
+		t.Fatal(err)
+	}
+
+	usage, ok := s.TakeUsage(time.Second)
+	if !ok {
+		t.Fatal("trailing TurnEnded was not read while waiting for tools")
+	}
+	if usage.InputTokens != inputTokens || usage.CacheWriteTokens != cacheWriteTokens {
+		t.Fatalf("usage=%+v", usage)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = responseWriter.Close()
+	_ = requestReader.Close()
+}
+
 func TestReleasePendingExecClearsAllAliases(t *testing.T) {
 	m := NewSessionManager()
 	pend := &pendingExec{call: ToolCall{ID: "toolu_abc", Name: "Bash"}}
@@ -260,6 +374,79 @@ func TestReleasePendingExecClearsAllAliases(t *testing.T) {
 	}
 	if m.LookupPending("call_raw") != nil || m.LookupPending("toolu_abc") != nil {
 		t.Fatal("manager aliases should be unbound")
+	}
+}
+
+func TestCheckpointToolBatchUsesFormalOrderAndAliases(t *testing.T) {
+	first := &pendingExec{call: ToolCall{ID: "toolu_second", Name: "Read"}}
+	second := &pendingExec{call: ToolCall{ID: "toolu_first", Name: "Bash"}}
+	s := &Session{
+		pendingOrder:  []*pendingExec{first, second},
+		parallelTools: true,
+		toolAlias: &ToolAliasMap{
+			toUpstream: map[string]string{"read": "cpa_Read", "bash": "cpa_Bash"},
+		},
+		events: make(chan StreamEvent, 4),
+	}
+	s.conversationState = &agentv1.ConversationStateStructure{PendingToolCalls: []string{
+		`{"role":"assistant","content":[{"type":"tool-call","toolCallId":"toolu_first","toolName":"cpa_Bash"},{"type":"tool-call","toolCallId":"toolu_second","toolName":"cpa_Read"}]}`,
+	}}
+	if !s.pendingToolBatchReady() || !s.emitPendingToolBatch(false) {
+		t.Fatal("formal checkpoint batch was not emitted")
+	}
+	if got := (<-s.events).ToolCall.Name; got != "Bash" {
+		t.Fatalf("first tool=%q want Bash", got)
+	}
+	if got := (<-s.events).ToolCall.Name; got != "Read" {
+		t.Fatalf("second tool=%q want Read", got)
+	}
+}
+
+func TestSerialToolBatchEmitsOneCallPerContinuation(t *testing.T) {
+	first := &pendingExec{call: ToolCall{ID: "call_1", Name: "one"}}
+	second := &pendingExec{call: ToolCall{ID: "call_2", Name: "two"}}
+	s := &Session{
+		pending:       map[string]*pendingExec{"call_1": first, "call_2": second},
+		pendingOrder:  []*pendingExec{first, second},
+		parallelTools: false,
+		events:        make(chan StreamEvent, 4),
+		done:          context.Background().Done(),
+	}
+	if !s.emitPendingToolBatch(true) {
+		t.Fatal("serial batch did not emit first call")
+	}
+	if got := (<-s.events).ToolCall.ID; got != "call_1" {
+		t.Fatalf("first call=%q", got)
+	}
+	if second.emitted {
+		t.Fatal("second serial call must remain staged")
+	}
+	if !s.emitNextPendingTool() {
+		t.Fatal("serial continuation did not emit next call")
+	}
+	if got := (<-s.events).ToolCall.ID; got != "call_2" {
+		t.Fatalf("second call=%q", got)
+	}
+}
+
+func TestParallelToolBatchRejectsPartialNativeResumeForHistoryRebuild(t *testing.T) {
+	first := &pendingExec{call: ToolCall{ID: "call_1", Name: "one"}, emitted: true}
+	second := &pendingExec{call: ToolCall{ID: "call_2", Name: "two"}, emitted: true}
+	s := &Session{
+		pending:       map[string]*pendingExec{"call_1": first, "call_2": second},
+		pendingOrder:  []*pendingExec{first, second},
+		parallelTools: true,
+		events:        make(chan StreamEvent, 4),
+		errCh:         make(chan error, 1),
+		pauseCh:       make(chan struct{}),
+		lastActivity:  time.Now(),
+	}
+	err := s.SubmitToolResults([]ToolResult{{ToolCallID: "call_1", Content: "ok"}})
+	if err != ErrToolResumeRebuild {
+		t.Fatalf("partial parallel batch error=%v", err)
+	}
+	if !s.closed {
+		t.Fatal("partial native batch must close before structured history rebuild")
 	}
 }
 

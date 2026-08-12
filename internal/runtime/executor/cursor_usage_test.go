@@ -6,17 +6,15 @@ import (
 )
 
 func TestCursorUsagePayloadIncludesCacheTokens(t *testing.T) {
-	// Cursor's input_tokens covers both the cache-read prefix and the newly
-	// written cache segment; only the remainder is uncached input.
+	// Cursor's input_tokens is the complete input; cache details are subsets.
 	got := cursorUsagePayload(9000, 50, 8000, 200, 30)
 	raw, _ := json.Marshal(got)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatal(err)
 	}
-	// uncached = 9000 - 8000 - 200 = 800; prompt_tokens = 800 + 8000
-	if out["prompt_tokens"].(float64) != 8800 {
-		t.Fatalf("prompt_tokens should exclude cache writes: %v", out["prompt_tokens"])
+	if out["prompt_tokens"].(float64) != 9000 {
+		t.Fatalf("prompt_tokens should preserve Cursor input: %v", out["prompt_tokens"])
 	}
 	details, _ := out["prompt_tokens_details"].(map[string]any)
 	if details == nil || details["cached_tokens"].(float64) != 8000 {
@@ -46,7 +44,7 @@ func TestCursorUsagePayloadBucketsSumToPrompt(t *testing.T) {
 	const input, cacheRead, cacheWrite = 50740, 25332, 25404
 	got := cursorUsagePayload(input, 121, cacheRead, cacheWrite, 0)
 	prompt := got["prompt_tokens"].(int64)
-	anthropicInput := prompt - cacheRead
+	anthropicInput := prompt - cacheRead - cacheWrite
 	if anthropicInput != 4 {
 		t.Fatalf("uncached input = %d, want 4", anthropicInput)
 	}

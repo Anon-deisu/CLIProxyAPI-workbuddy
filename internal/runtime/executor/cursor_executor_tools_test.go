@@ -1,12 +1,53 @@
 package executor
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
-	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
+
+func TestApplyCursorToolChoicePreservesExactSemantics(t *testing.T) {
+	tools := []cursor.ToolDefinition{{Name: "read"}, {Name: "write"}}
+	messages := []cursor.ChatMessage{{Role: "user", Content: "go"}}
+
+	_, none, constraint, err := applyCursorToolChoice([]byte(`{"tool_choice":"none"}`), messages, tools)
+	if err != nil || len(none) != 0 || constraint.required {
+		t.Fatalf("none: tools=%v constraint=%+v err=%v", none, constraint, err)
+	}
+	requiredMessages, required, constraint, err := applyCursorToolChoice([]byte(`{"tool_choice":"required"}`), messages, tools)
+	if err != nil || len(required) != 2 || !constraint.required || len(requiredMessages) != 2 {
+		t.Fatalf("required: tools=%v constraint=%+v messages=%v err=%v", required, constraint, requiredMessages, err)
+	}
+	_, named, constraint, err := applyCursorToolChoice([]byte(`{"tool_choice":{"type":"function","name":"WRITE"}}`), messages, tools)
+	if err != nil || len(named) != 1 || named[0].Name != "write" || constraint.name != "write" {
+		t.Fatalf("named: tools=%v constraint=%+v err=%v", named, constraint, err)
+	}
+	_, allowed, constraint, err := applyCursorToolChoice([]byte(`{"tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"read"}]}}`), messages, tools)
+	if err != nil || len(allowed) != 1 || allowed[0].Name != "read" || !constraint.required {
+		t.Fatalf("allowed: tools=%v constraint=%+v err=%v", allowed, constraint, err)
+	}
+}
+
+func TestResolveCursorConversationIDIsAccountScoped(t *testing.T) {
+	request := cliproxyexecutor.Request{Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "session-1"}}
+	opts := cliproxyexecutor.Options{SourceFormat: translator.FormatOpenAI, Headers: make(http.Header)}
+	a := &cliproxyauth.Auth{ID: "account-a"}
+	b := &cliproxyauth.Auth{ID: "account-b"}
+	first := resolveCursorConversationID(context.Background(), a, request, opts, nil, nil)
+	if repeat := resolveCursorConversationID(context.Background(), a, request, opts, nil, nil); repeat != first {
+		t.Fatalf("same account/session changed: %q != %q", repeat, first)
+	}
+	if other := resolveCursorConversationID(context.Background(), b, request, opts, nil, nil); other == first {
+		t.Fatal("different accounts must not share a Cursor conversation")
+	}
+}
 
 func TestExtractToolsAcceptsAnthropicInputSchema(t *testing.T) {
 	body := []byte(`{
@@ -87,45 +128,6 @@ func TestCursorErrorClassification(t *testing.T) {
 	}
 	if isCursorTransientProviderError(hard) {
 		t.Fatal("hard 400 should not be transient")
-	}
-}
-
-func TestCompactMessagesAlwaysKeepsAUserTurn(t *testing.T) {
-	// A long tool-only tail: trimming used to leave no user message at all.
-	msgs := []cursorlib.ChatMessage{{Role: "system", Content: "rules"}}
-	for i := 0; i < 12; i++ {
-		msgs = append(msgs,
-			cursorlib.ChatMessage{Role: "assistant", ToolCalls: []cursorlib.ToolCall{{ID: fmt.Sprintf("c%d", i), Name: "Bash"}}},
-			cursorlib.ChatMessage{Role: "tool", ToolCallID: fmt.Sprintf("c%d", i), Content: "output"},
-		)
-	}
-	out := compactMessagesForRetry(msgs)
-	if !hasUserTurn(out) {
-		t.Fatalf("compacted request must keep a user turn: %#v", out)
-	}
-}
-
-func TestCompactMessagesKeepsExistingUserTurn(t *testing.T) {
-	msgs := []cursorlib.ChatMessage{
-		{Role: "system", Content: "rules"},
-		{Role: "user", Content: "the real question"},
-	}
-	out := compactMessagesForRetry(msgs)
-	last := out[len(out)-1]
-	if last.Role != "user" || last.Content != "the real question" {
-		t.Fatalf("existing user turn must be preserved, got %#v", out)
-	}
-}
-
-func TestStripTrailingToolRound(t *testing.T) {
-	in := []cursorlib.ChatMessage{
-		{Role: "user", Content: "hi"},
-		{Role: "assistant", ToolCalls: []cursorlib.ToolCall{{ID: "c1", Name: "t"}}},
-		{Role: "tool", ToolCallID: "c1", Content: "ok"},
-	}
-	out := stripTrailingToolRound(in)
-	if len(out) != 1 || out[0].Role != "user" {
-		t.Fatalf("got %#v", out)
 	}
 }
 

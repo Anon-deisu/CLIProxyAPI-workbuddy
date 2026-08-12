@@ -19,8 +19,18 @@ func TestAliasToolsForCursorRenamesShell(t *testing.T) {
 	if alias.ClientName("cpa_Shell") != "Shell" {
 		t.Fatal("reverse mapping missing for Shell")
 	}
-	if !strings.Contains(out[0].Description, `"Shell"`) {
+	if alias.ClientName("CPA_SHELL") != "Shell" {
+		t.Fatal("reverse mapping must be case-insensitive")
+	}
+	if !strings.Contains(out[0].Description, "cpa_Shell") || !strings.Contains(out[0].Description, "Shell tool") {
 		t.Fatalf("aliased tool needs steering text, got %q", out[0].Description)
+	}
+	// Models relayed the old "the built-in tool is unavailable and returns no
+	// result" wording to the user as a broken tool environment.
+	for _, alarming := range []string{"unavailable", "returns no result", "IMPORTANT"} {
+		if strings.Contains(out[0].Description, alarming) {
+			t.Fatalf("steering text must not describe the environment as broken: %q", out[0].Description)
+		}
 	}
 	if !strings.Contains(out[0].Description, "Run a shell command") {
 		t.Fatal("original description must be preserved")

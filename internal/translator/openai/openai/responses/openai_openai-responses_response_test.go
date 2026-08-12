@@ -503,6 +503,35 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_OmitsTop
 	}
 }
 
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_PreservesCacheWriteUsage(t *testing.T) {
+	request := []byte(`{"model":"gpt-5.4"}`)
+	chunks := []string{
+		`data: {"id":"resp_usage","object":"chat.completion.chunk","created":1,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}`,
+		`data: {"id":"resp_usage","object":"chat.completion.chunk","created":1,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: {"id":"resp_usage","object":"chat.completion.chunk","created":1,"model":"model","choices":[],"usage":{"prompt_tokens":13,"completion_tokens":2,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":10,"cache_creation_tokens":3}}}`,
+		`data: [DONE]`,
+	}
+	var param any
+	var completed gjson.Result
+	for _, line := range chunks {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			event, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			if event == "response.completed" {
+				completed = data
+			}
+		}
+	}
+	if !completed.Exists() {
+		t.Fatal("expected response.completed")
+	}
+	if got := completed.Get("response.usage.input_tokens_details.cached_tokens").Int(); got != 10 {
+		t.Fatalf("cached tokens = %d, want 10", got)
+	}
+	if got := completed.Get("response.usage.input_tokens_details.cache_write_tokens").Int(); got != 3 {
+		t.Fatalf("cache write tokens = %d, want 3", got)
+	}
+}
+
 func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_RestoresNamespaceFunctionCall(t *testing.T) {
 	originalRequest := []byte(`{
 		"model":"deepseek-v4-flash",
@@ -591,5 +620,23 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_Restores
 	}
 	if got := data.Get("output.0.namespace").String(); got != "mcp__test_mcp__" {
 		t.Fatalf("non-stream output namespace = %q, want mcp__test_mcp__; response=%s", got, resp)
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_RestoresTypedCalls(t *testing.T) {
+	request := []byte(`{"tools":[{"type":"shell"},{"type":"custom","name":"render"}]}`)
+	raw := []byte(`{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_shell","type":"function","function":{"name":"shell","arguments":"{\"commands\":[\"pwd\"]}"}},{"id":"call_custom","type":"function","function":{"name":"render","arguments":"{\"input\":\"raw text\"}"}}]}}]}`)
+	resp := ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(context.Background(), "model", request, request, raw, nil)
+	if got := gjson.GetBytes(resp, "output.0.type").String(); got != "shell_call" {
+		t.Fatalf("first item type=%q body=%s", got, resp)
+	}
+	if got := gjson.GetBytes(resp, "output.0.action.commands.0").String(); got != "pwd" {
+		t.Fatalf("shell action lost: body=%s", resp)
+	}
+	if got := gjson.GetBytes(resp, "output.1.type").String(); got != "custom_tool_call" {
+		t.Fatalf("second item type=%q body=%s", got, resp)
+	}
+	if got := gjson.GetBytes(resp, "output.1.input").String(); got != "raw text" {
+		t.Fatalf("custom input lost: body=%s", resp)
 	}
 }

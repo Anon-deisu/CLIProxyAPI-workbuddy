@@ -61,3 +61,48 @@ func TestTrimHistoryDoesNotMutateCaller(t *testing.T) {
 		t.Fatal("caller's messages must not be rewritten in place")
 	}
 }
+
+func TestLongChatOfShortTurnsIsKeptWhole(t *testing.T) {
+	// Bounding by turn count used to throw away context that comfortably fit.
+	history := make([]ChatMessage, 0, 200)
+	for i := 0; i < 100; i++ {
+		history = append(history,
+			ChatMessage{Role: "user", Content: "question"},
+			ChatMessage{Role: "assistant", Content: "answer"})
+	}
+	if got := len(trimConversationHistory(history)); got != len(history) {
+		t.Fatalf("kept %d of %d small turns", got, len(history))
+	}
+}
+
+func TestOversizedHistoryStillGetsCut(t *testing.T) {
+	history := make([]ChatMessage, 0, 20)
+	for i := 0; i < 20; i++ {
+		history = append(history, ChatMessage{Role: "user", Content: strings.Repeat("q", 20_000)})
+	}
+	out := trimConversationHistory(history)
+	total := 0
+	for _, msg := range out {
+		total += len(msg.Content)
+	}
+	if total > maxHistoryChars {
+		t.Fatalf("history total %d exceeds %d", total, maxHistoryChars)
+	}
+	if len(out) == len(history) {
+		t.Fatal("nothing was dropped from an oversized history")
+	}
+	if out[len(out)-1].Content != history[len(history)-1].Content {
+		t.Fatal("the newest turn must survive")
+	}
+}
+
+func TestSystemPromptIsBounded(t *testing.T) {
+	huge := strings.Repeat("s", maxSystemPromptRunes*2)
+	system, _ := splitSystemMessages([]ChatMessage{
+		{Role: "system", Content: huge},
+		{Role: "user", Content: "hi"},
+	})
+	if len([]rune(system)) > maxSystemPromptRunes {
+		t.Fatalf("system prompt left at %d runes", len([]rune(system)))
+	}
+}

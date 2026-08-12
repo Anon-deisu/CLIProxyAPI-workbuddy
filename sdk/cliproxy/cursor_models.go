@@ -33,7 +33,7 @@ func (s *Service) fetchCursorModelsForAuth(ctx context.Context, auth *coreauth.A
 		models, err := fetchCursorCatalogOnce(ctx, creds)
 		if err == nil && len(models) > 0 {
 			log.Infof("cursor: AvailableModels loaded %d models for auth %s", len(models), auth.ID)
-			return cursorlib.CatalogToModelInfos(models)
+			return registry.WithCursorBuiltins(cursorlib.CatalogToModelInfos(models))
 		}
 		if err == nil {
 			log.Warnf("cursor: AvailableModels returned an empty catalog for auth %s", auth.ID)

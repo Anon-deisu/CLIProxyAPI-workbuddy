@@ -16,6 +16,7 @@ import (
 	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
@@ -52,8 +53,7 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
-	_ = originalPayloadSource
+	body := translateCursorRequest(from, baseModel, req.Payload, false)
 
 	// Keep hyphen variant suffixes (-thinking/-xhigh/…) for Cursor resolution.
 	// Public wire model id is the base name; parameters ride on RequestedModel.
@@ -70,26 +70,47 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, err
 	}
-	tools := prepareCursorTools(messages, extractTools(body), cursorlib.DefaultMaxCursorTools)
+	tools := prepareCursorTools(messages, extractTools(body), 0)
+	messages, tools, toolConstraint, err := applyCursorToolChoice(body, messages, tools)
+	if err != nil {
+		return resp, err
+	}
 
 	creds, err := e.ensureCredentials(ctx, auth)
 	if err != nil {
 		return resp, err
 	}
 
-	result, err := runCursorChatWithRetries(ctx, creds, upstreamModel, messages, tools)
+	conversationID := resolveCursorConversationID(ctx, auth, req, opts, originalPayloadSource, body)
+	parallelTools := true
+	if value := gjson.GetBytes(body, "parallel_tool_calls"); value.Exists() {
+		parallelTools = value.Bool()
+	}
+	result, err := runCursorChatWithRetries(
+		ctx,
+		creds,
+		upstreamModel,
+		messages,
+		tools,
+		cursorlib.WithConversationID(conversationID),
+		cursorlib.WithParallelToolCalls(parallelTools),
+	)
 	if err != nil {
 		return resp, humanizeCursorError(err)
+	}
+	if err = toolConstraint.Validate(result.ToolCalls); err != nil {
+		return resp, err
 	}
 
 	outPayload := buildOpenAIChatCompletion(req.Model, result)
 	reporter.Publish(ctx, usage.Detail{
-		InputTokens:     result.InputTokens,
-		OutputTokens:    result.OutputTokens,
-		CachedTokens:    result.CacheReadTokens,
-		CacheReadTokens: result.CacheReadTokens,
-		ReasoningTokens: result.ReasoningTokens,
-		TotalTokens:     result.InputTokens + result.OutputTokens,
+		InputTokens:         result.InputTokens,
+		OutputTokens:        result.OutputTokens,
+		CachedTokens:        result.CacheReadTokens,
+		CacheReadTokens:     result.CacheReadTokens,
+		CacheCreationTokens: result.CacheWriteTokens,
+		ReasoningTokens:     result.ReasoningTokens,
+		TotalTokens:         result.InputTokens + result.OutputTokens,
 	})
 
 	var param any
@@ -107,7 +128,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	defer reporter.TrackFailure(ctx, &err)
 
 	to := sdktranslator.FromString("openai")
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), true)
+	body := translateCursorRequest(from, baseModel, req.Payload, true)
 
 	upstreamModel := strings.TrimPrefix(baseModel, "cursor-")
 	if upstreamModel == "" {
@@ -122,14 +143,31 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return nil, err
 	}
-	tools := prepareCursorTools(messages, extractTools(body), cursorlib.DefaultMaxCursorTools)
+	tools := prepareCursorTools(messages, extractTools(body), 0)
+	messages, tools, toolConstraint, err := applyCursorToolChoice(body, messages, tools)
+	if err != nil {
+		return nil, err
+	}
 
 	creds, err := e.ensureCredentials(ctx, auth)
 	if err != nil {
 		return nil, err
 	}
 
-	session, err := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools)
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	conversationID := resolveCursorConversationID(ctx, auth, req, opts, originalPayloadSource, body)
+	parallelTools := true
+	if value := gjson.GetBytes(body, "parallel_tool_calls"); value.Exists() {
+		parallelTools = value.Bool()
+	}
+	startOpts := []cursorlib.StartOption{
+		cursorlib.WithConversationID(conversationID),
+		cursorlib.WithParallelToolCalls(parallelTools),
+	}
+	session, err := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
 	if err != nil {
 		return nil, humanizeCursorError(err)
 	}
@@ -143,6 +181,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		toolIndex := 0
 		finishReason := "stop"
 		var usageFinal cursorlib.StreamEvent
+		observedToolCalls := make([]cursorlib.ToolCall, 0)
 
 		emitLine := func(line []byte) bool {
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, line, &param)
@@ -190,6 +229,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						return nil
 					}
 					contentEmitted = true
+					observedToolCalls = append(observedToolCalls, *ev.ToolCall)
 					args, _ := json.Marshal(ev.ToolCall.Arguments)
 					if args == nil {
 						args = []byte("{}")
@@ -211,12 +251,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				case "usage_final":
 					usageFinal = ev
 					reporter.Publish(ctx, usage.Detail{
-						InputTokens:     ev.InputTokens,
-						OutputTokens:    ev.OutputTokens,
-						CachedTokens:    ev.CacheReadTokens,
-						CacheReadTokens: ev.CacheReadTokens,
-						ReasoningTokens: ev.ReasoningTokens,
-						TotalTokens:     ev.InputTokens + ev.OutputTokens,
+						InputTokens:         ev.InputTokens,
+						OutputTokens:        ev.OutputTokens,
+						CachedTokens:        ev.CacheReadTokens,
+						CacheReadTokens:     ev.CacheReadTokens,
+						CacheCreationTokens: ev.CacheWriteTokens,
+						ReasoningTokens:     ev.ReasoningTokens,
+						TotalTokens:         ev.InputTokens + ev.OutputTokens,
 					})
 					return nil
 				case "error":
@@ -253,7 +294,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			// The resumed run went silent. Closing it above unbound the tool
 			// ids, so opening again naturally rebuilds from history.
 			_ = session.Close()
-			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools)
+			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
 			if rebuildErr == nil {
 				session = rebuilt
 				errIter = iterate(session)
@@ -261,24 +302,19 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				errIter = rebuildErr
 			}
 		}
-		// These providers fail while the stream is being read, not while it is
-		// opened, so opening again always succeeds and the open-time retry
-		// ladder never engages. Re-run the whole attempt instead, pacing it so
-		// a brief upstream outage has time to clear.
-		for attempt := 0; errIter != nil && isCursorProviderError(errIter) && !contentEmitted; attempt++ {
+		// Provider connectivity failures usually arrive in Connect trailers
+		// while reading, after the HTTP stream itself opened successfully. Retry
+		// the complete attempt only while no model content has reached the client.
+		for attempt := 0; errIter != nil && isCursorTransientProviderError(errIter) && !contentEmitted; attempt++ {
 			_ = session.Close()
-			if attempt >= len(cursorTransientBackoff) || !isCursorTransientProviderError(errIter) {
+			if attempt >= len(cursorTransientBackoff) {
 				break
 			}
-			select {
-			case <-time.After(cursorTransientBackoff[attempt]):
-			case <-ctx.Done():
-				errIter = ctx.Err()
-			}
-			if ctx.Err() != nil {
+			if sleepErr := sleepCtx(ctx, cursorTransientBackoff[attempt]); sleepErr != nil {
+				errIter = sleepErr
 				break
 			}
-			retrySession, retryErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools)
+			retrySession, retryErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
 			if retryErr != nil {
 				errIter = retryErr
 				break
@@ -286,13 +322,17 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			session = retrySession
 			errIter = iterate(session)
 		}
-		// A hard 400 mid-stream is usually a tool-name collision with a Cursor
-		// built-in, so give the aliased tool set one shot.
-		if errIter != nil && isCursorHardProviderError(errIter) && !contentEmitted {
-			aliased, aliasErr := openCursorSession(ctx, creds, upstreamModel, messages, tools, cursorlib.WithForceToolAlias())
+		// A provider 400 caused by a tool-name collision gets exactly one retry
+		// with the same messages and complete tool catalog, changing names only.
+		if errIter != nil && isCursorHardProviderError(errIter) && !contentEmitted && len(tools) > 0 {
+			_ = session.Close()
+			aliasOpts := append(append([]cursorlib.StartOption(nil), startOpts...), cursorlib.WithForceToolAlias())
+			aliased, aliasErr := openCursorSession(ctx, creds, upstreamModel, messages, tools, aliasOpts...)
 			if aliasErr == nil {
 				session = aliased
 				errIter = iterate(session)
+			} else {
+				errIter = aliasErr
 			}
 		}
 		if errIter != nil {
@@ -300,6 +340,15 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			reporter.PublishFailure(ctx, errIter)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errIter}:
+			case <-ctx.Done():
+			}
+			_ = session.Close()
+			return
+		}
+		if constraintErr := toolConstraint.Validate(observedToolCalls); constraintErr != nil {
+			reporter.PublishFailure(ctx, constraintErr)
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Err: constraintErr}:
 			case <-ctx.Done():
 			}
 			_ = session.Close()
@@ -319,12 +368,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if late, ok := session.TakeUsage(0); ok {
 				usageFinal = late
 				reporter.Publish(ctx, usage.Detail{
-					InputTokens:     late.InputTokens,
-					OutputTokens:    late.OutputTokens,
-					CachedTokens:    late.CacheReadTokens,
-					CacheReadTokens: late.CacheReadTokens,
-					ReasoningTokens: late.ReasoningTokens,
-					TotalTokens:     late.InputTokens + late.OutputTokens,
+					InputTokens:         late.InputTokens,
+					OutputTokens:        late.OutputTokens,
+					CachedTokens:        late.CacheReadTokens,
+					CacheReadTokens:     late.CacheReadTokens,
+					CacheCreationTokens: late.CacheWriteTokens,
+					ReasoningTokens:     late.ReasoningTokens,
+					TotalTokens:         late.InputTokens + late.OutputTokens,
 				})
 			}
 		}
@@ -344,12 +394,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if !emitLine([]byte("data: " + string(endChunk))) {
 			return
 		}
-
-		// Usage rides in its own trailing chunk with an empty choices array,
-		// which is where the OpenAI streaming spec puts it; attaching it to the
-		// finish_reason chunk made strict clients report zero tokens. Emit it
-		// only when Cursor actually reported counters so an all-zero block
-		// cannot overwrite what the client already tracked.
+		// OpenAI stream usage belongs in a trailing chunk with an empty choices
+		// array. Responses and Anthropic translators retain the finish reason
+		// from the preceding chunk and merge these authoritative counters before
+		// producing response.completed/message_stop.
 		if usageFinal.InputTokens > 0 || usageFinal.OutputTokens > 0 || usageFinal.CacheReadTokens > 0 || usageFinal.CacheWriteTokens > 0 {
 			usageChunk, _ := json.Marshal(map[string]any{
 				"id":      completionID,
@@ -357,7 +405,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				"created": created,
 				"model":   req.Model,
 				"choices": []map[string]any{},
-				"usage":   cursorUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens, usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens, usageFinal.ReasoningTokens),
+				"usage": cursorUsagePayload(usageFinal.InputTokens, usageFinal.OutputTokens,
+					usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens, usageFinal.ReasoningTokens),
 			})
 			if !emitLine([]byte("data: " + string(usageChunk))) {
 				return
@@ -396,39 +445,250 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 		} else {
 			log.Warnf("cursor: stream resume tool session failed (%v); rebuilding turn from history", err)
 		}
-		messages = append(append([]cursorlib.ChatMessage(nil), messages...), cursorlib.ChatMessage{
-			Role:    "user",
-			Content: "Tool results have been provided above. Continue the task based on those results.",
-		})
-		// Keep the tool set exactly as the client sent it. Re-capping here
-		// changed the prompt prefix on every rebuild, which cost a full
-		// uncached re-read of the whole conversation.
-		//
-		// Rotate the conversation id only when a live run actually died
-		// holding this tool call. Rotating whenever the session is simply gone
-		// (a restart, an expired index) changes the prompt prefix and turns
-		// every step of an agent loop into a full cache write.
+		// The structured assistant tool calls and tool result messages already
+		// carry the complete continuation. Do not add a synthetic user message:
+		// it changes role ordering and can make the provider reject the request.
+		// Rotate only if a live run actually died while owning this result. A
+		// missing in-memory session (restart/cross-instance routing) must keep
+		// the explicit conversation id or every agent step rewrites the cache.
 		if hadLiveRun {
-			opts = append(opts, cursorlib.WithFreshConversation())
+			opts = append(opts, cursorlib.WithConversationID(uuid.NewString()))
 		}
 	}
 	return cursorlib.StartSession(ctx, creds, model, messages, tools, opts...)
 }
 
-func openCursorSessionWithRetries(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) (*cursorlib.Session, error) {
-	session, err := openCursorSession(ctx, creds, model, messages, tools)
+// translateCursorRequest gives the Responses entrypoint a deterministic
+// conversion dependency. Relying on a process-wide init side effect allowed
+// embedded builds to pass the original `input` payload to the chat parser.
+func translateCursorRequest(from sdktranslator.Format, model string, payload []byte, stream bool) []byte {
+	if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
+		return responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(
+			model,
+			bytes.Clone(payload),
+			stream,
+		)
+	}
+	return sdktranslator.TranslateRequest(
+		from,
+		sdktranslator.FormatOpenAI,
+		model,
+		bytes.Clone(payload),
+		stream,
+	)
+}
+
+type cursorToolConstraint struct {
+	required bool
+	name     string
+}
+
+func (c cursorToolConstraint) Validate(calls []cursorlib.ToolCall) error {
+	if !c.required {
+		return nil
+	}
+	if c.name == "" {
+		if len(calls) == 0 {
+			return fmt.Errorf("cursor: tool_choice required at least one declared tool call")
+		}
+		return nil
+	}
+	for _, call := range calls {
+		if strings.EqualFold(strings.TrimSpace(call.Name), c.name) {
+			return nil
+		}
+	}
+	return fmt.Errorf("cursor: tool_choice required tool %s", c.name)
+}
+
+func applyCursorToolChoice(body []byte, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) ([]cursorlib.ChatMessage, []cursorlib.ToolDefinition, cursorToolConstraint, error) {
+	choice := gjson.GetBytes(body, "tool_choice")
+	if !choice.Exists() {
+		return messages, tools, cursorToolConstraint{}, nil
+	}
+	if choice.Type == gjson.String {
+		switch strings.ToLower(strings.TrimSpace(choice.String())) {
+		case "", "auto":
+			return messages, tools, cursorToolConstraint{}, nil
+		case "none":
+			return messages, nil, cursorToolConstraint{}, nil
+		case "required", "any":
+			if len(tools) == 0 {
+				return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: tool_choice=%s requires tools", choice.String())
+			}
+			return appendCursorToolInstruction(messages, "At least one declared tool must be called before answering the user."), tools, cursorToolConstraint{required: true}, nil
+		default:
+			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: unsupported tool_choice %q", choice.String())
+		}
+	}
+
+	typ := strings.ToLower(strings.TrimSpace(choice.Get("type").String()))
+	if typ == "auto" || typ == "" {
+		return messages, tools, cursorToolConstraint{}, nil
+	}
+	if typ == "none" {
+		return messages, nil, cursorToolConstraint{}, nil
+	}
+	if typ == "required" || typ == "any" {
+		if len(tools) == 0 {
+			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: tool_choice=%s requires tools", typ)
+		}
+		return appendCursorToolInstruction(messages, "At least one declared tool must be called before answering the user."), tools, cursorToolConstraint{required: true}, nil
+	}
+	if typ == "allowed_tools" {
+		selectors := choice.Get("tools")
+		if !selectors.IsArray() || len(selectors.Array()) == 0 {
+			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: allowed_tools requires a non-empty tools array")
+		}
+		selected := make(map[string]struct{})
+		for _, selector := range selectors.Array() {
+			name := cursorToolChoiceName(selector)
+			if name == "" {
+				return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: allowed_tools selector is missing a tool name")
+			}
+			selected[strings.ToLower(name)] = struct{}{}
+		}
+		filtered := make([]cursorlib.ToolDefinition, 0, len(selected))
+		for _, tool := range tools {
+			if _, ok := selected[strings.ToLower(strings.TrimSpace(tool.Name))]; ok {
+				filtered = append(filtered, tool)
+			}
+		}
+		if len(filtered) != len(selected) {
+			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: allowed_tools selected an unknown tool")
+		}
+		mode := strings.ToLower(strings.TrimSpace(choice.Get("mode").String()))
+		if mode == "" || mode == "auto" {
+			return messages, filtered, cursorToolConstraint{}, nil
+		}
+		if mode != "required" {
+			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: unsupported allowed_tools mode %q", mode)
+		}
+		return appendCursorToolInstruction(messages, "At least one declared tool must be called before answering the user."), filtered, cursorToolConstraint{required: true}, nil
+	}
+
+	name := cursorToolChoiceName(choice)
+	if name == "" {
+		return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: named tool_choice is missing a tool name")
+	}
+	matched := make([]cursorlib.ToolDefinition, 0, 1)
+	for _, tool := range tools {
+		if strings.EqualFold(strings.TrimSpace(tool.Name), name) {
+			matched = append(matched, tool)
+			name = tool.Name
+			break
+		}
+	}
+	if len(matched) == 0 {
+		return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: tool_choice selected unknown tool %s", name)
+	}
+	instruction := fmt.Sprintf("Call the declared tool %s before producing a final answer.", name)
+	return appendCursorToolInstruction(messages, instruction), matched, cursorToolConstraint{required: true, name: name}, nil
+}
+
+func cursorToolChoiceName(choice gjson.Result) string {
+	for _, path := range []string{"function.name", "name"} {
+		if name := strings.TrimSpace(choice.Get(path).String()); name != "" {
+			return name
+		}
+	}
+	typ := strings.ToLower(strings.TrimSpace(choice.Get("type").String()))
+	if typ == "shell" || typ == "local_shell" || typ == "apply_patch" {
+		return typ
+	}
+	return ""
+}
+
+func appendCursorToolInstruction(messages []cursorlib.ChatMessage, instruction string) []cursorlib.ChatMessage {
+	out := append([]cursorlib.ChatMessage(nil), messages...)
+	for i := range out {
+		if out[i].Role != "system" {
+			continue
+		}
+		if strings.TrimSpace(out[i].Content) == "" {
+			out[i].Content = instruction
+		} else {
+			out[i].Content += "\n\n" + instruction
+		}
+		return out
+	}
+	return append([]cursorlib.ChatMessage{{Role: "system", Content: instruction}}, out...)
+}
+
+func resolveCursorConversationID(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, originalBody, translatedBody []byte) string {
+	if explicit := cursorConversationIDFromPayload(originalBody); explicit != "" {
+		return scopeCursorConversationID(auth, "cursor:"+explicit)
+	}
+	if explicit := cursorConversationIDFromPayload(translatedBody); explicit != "" {
+		return scopeCursorConversationID(auth, "cursor:"+explicit)
+	}
+	if value := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
+		return scopeCursorConversationID(auth, "execution:"+value)
+	}
+	if value := metadataString(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); value != "" {
+		return scopeCursorConversationID(auth, "execution:"+value)
+	}
+	if value := cursorSessionIDFromHeaders(opts.Headers); value != "" {
+		return scopeCursorConversationID(auth, value)
+	}
+	if sourceFormatEqual(opts.SourceFormat, sdktranslator.FormatClaude) {
+		if value := helps.ExtractClaudeCodeSessionID(ctx, originalBody, opts.Headers); value != "" {
+			return scopeCursorConversationID(auth, "claude:"+value)
+		}
+	}
+	// Plenty of clients send no identifier at all. Minting a fresh id for them
+	// would hand Cursor a new prompt prefix on every turn, which costs a full
+	// cache write each time, so fall back to what the conversation itself
+	// looks like.
+	if fingerprint := cursorlib.ConversationFingerprint(req.Model, originalBody, translatedBody); fingerprint != "" {
+		return scopeCursorConversationID(auth, "content:"+fingerprint)
+	}
+	return uuid.NewString()
+}
+
+func cursorConversationIDFromPayload(body []byte) string {
+	for _, path := range []string{"cursor_conversation_id", "metadata.cursor_conversation_id", "conversation.id", "conversation"} {
+		value := gjson.GetBytes(body, path)
+		if value.Type == gjson.String {
+			if id := strings.TrimSpace(value.String()); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func cursorSessionIDFromHeaders(headers http.Header) string {
+	for _, name := range []string{"X-Claude-Code-Session-Id", "Session_id", "Session-Id", "Conversation_id"} {
+		if id := strings.TrimSpace(headers.Get(name)); id != "" {
+			return strings.ToLower(name) + ":" + id
+		}
+	}
+	return ""
+}
+
+func scopeCursorConversationID(auth *cliproxyauth.Auth, sessionKey string) string {
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:cursor:"+authID+":"+sessionKey)).String()
+}
+
+func openCursorSessionWithRetries(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts ...cursorlib.StartOption) (*cursorlib.Session, error) {
+	session, err := openCursorSession(ctx, creds, model, messages, tools, opts...)
 	if err == nil || !isCursorProviderError(err) {
 		return session, err
 	}
-	return retryOpenCursorSession(ctx, creds, model, messages, tools, err)
+	return retryOpenCursorSession(ctx, creds, model, messages, tools, err, opts...)
 }
 
-func runCursorChatWithRetries(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) (*cursorlib.ChatResult, error) {
-	result, err := cursorlib.RunChat(ctx, creds, model, messages, tools)
+func runCursorChatWithRetries(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts ...cursorlib.StartOption) (*cursorlib.ChatResult, error) {
+	result, err := cursorlib.RunChat(ctx, creds, model, messages, tools, opts...)
 	if err == nil || !isCursorProviderError(err) {
 		return result, err
 	}
-	return retryRunCursorChat(ctx, creds, model, messages, tools, err)
+	return retryRunCursorChat(ctx, creds, model, messages, tools, err, opts...)
 }
 
 func trailingToolResults(messages []cursorlib.ChatMessage) []cursorlib.ToolResult {
@@ -707,8 +967,20 @@ func isCursorProviderError(err error) bool {
 		return false
 	}
 	return isCursorTransientProviderError(err) || isCursorHardProviderError(err) ||
-		(err != nil && (strings.Contains(err.Error(), "end-stream error") ||
-			strings.Contains(err.Error(), "resource_exhausted")))
+		(err != nil && strings.Contains(err.Error(), "resource_exhausted"))
+}
+
+// isCursorRateLimited detects account throttling. Replaying the same request
+// only deepens the throttle; returning 429 lets the caller select another
+// account without entering the provider retry path.
+func isCursorRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "RATE_LIMIT_EXCEEDED") ||
+		strings.Contains(msg, "Rate limit exceeded") ||
+		strings.Contains(msg, "ERROR_RESOURCE_EXHAUSTED")
 }
 
 // isCursorPolicyBlock detects Anthropic's content-policy refusal, which Cursor
@@ -723,19 +995,6 @@ func isCursorPolicyBlock(err error) bool {
 		strings.Contains(msg, "Usage Policy")
 }
 
-// isCursorRateLimited detects Cursor throttling the account itself. Retrying,
-// shrinking tools or switching wires only deepens the throttle, so this class
-// must bypass the degrade ladder entirely.
-func isCursorRateLimited(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "RATE_LIMIT_EXCEEDED") ||
-		strings.Contains(msg, "Rate limit exceeded") ||
-		strings.Contains(msg, "ERROR_RESOURCE_EXHAUSTED")
-}
-
 // humanizeCursorError replaces the raw Connect trailer with something a client
 // (and the agent reading it) can act on.
 func humanizeCursorError(err error) error {
@@ -744,9 +1003,6 @@ func humanizeCursorError(err error) error {
 		return fmt.Errorf("cursor: upstream refused this request under Anthropic's usage policy (cyber content review). " +
 			"Rephrase or remove the flagged content; retrying the same prompt will not help")
 	case isCursorRateLimited(err):
-		// Surfacing a real 429 lets the conductor rotate to another account
-		// instead of burning the degrade ladder on a throttled one. No
-		// retry-after hint: Cursor does not advertise the window length.
 		return statusErr{code: http.StatusTooManyRequests, msg: "cursor: account rate limit exceeded " +
 			"(ERROR_PRO_USER_RATE_LIMIT_EXCEEDED). Wait for the window to reset or add another Cursor account"}
 	}
@@ -780,10 +1036,7 @@ func isCursorHardProviderError(err error) bool {
 		(strings.Contains(msg, "Provider Error") && strings.Contains(msg, "400"))
 }
 
-// cursorTransientBackoff paces retries for "unable to reach the model provider".
-// Sub-second gaps were useless: the upstream typically needs a couple of
-// seconds, so every tier fired into the same outage and the turn failed.
-var cursorTransientBackoff = []time.Duration{1 * time.Second, 3 * time.Second, 6 * time.Second}
+var cursorTransientBackoff = []time.Duration{time.Second, 3 * time.Second, 6 * time.Second}
 
 // cursorRetryBudget caps how long the whole degrade ladder may run. Each tier
 // is a fresh upstream turn, so an unbounded ladder used to leave Claude Code
@@ -803,7 +1056,7 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func retryRunCursorChat(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, err error) (*cursorlib.ChatResult, error) {
+func retryRunCursorChat(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, err error, opts ...cursorlib.StartOption) (*cursorlib.ChatResult, error) {
 	start := time.Now()
 	if isCursorTransientProviderError(err) {
 		for i, delay := range cursorTransientBackoff {
@@ -814,7 +1067,7 @@ func retryRunCursorChat(ctx context.Context, creds cursorlib.AccountCredentials,
 			if sleepErr := sleepCtx(ctx, delay); sleepErr != nil {
 				return nil, sleepErr
 			}
-			result, nextErr := cursorlib.RunChat(ctx, creds, model, messages, tools)
+			result, nextErr := cursorlib.RunChat(ctx, creds, model, messages, tools, opts...)
 			if nextErr == nil {
 				return result, nil
 			}
@@ -829,59 +1082,18 @@ func retryRunCursorChat(ctx context.Context, creds cursorlib.AccountCredentials,
 	// 400, so try aliasing before giving up any capability.
 	if isCursorHardProviderError(err) && len(tools) > 0 && retryBudgetLeft(start) {
 		log.Warnf("cursor: hard400 with %d tools; retrying with all tool names aliased: %v", len(tools), err)
-		result, nextErr := cursorlib.RunChat(ctx, creds, model, messages, tools, cursorlib.WithForceToolAlias())
+		aliasOpts := append(append([]cursorlib.StartOption(nil), opts...), cursorlib.WithForceToolAlias())
+		result, nextErr := cursorlib.RunChat(ctx, creds, model, messages, tools, aliasOpts...)
 		if nextErr == nil {
 			return result, nil
 		}
 		err = nextErr
 	}
 
-	if isCursorProviderError(err) && retryBudgetLeft(start) && len(tools) > cursorlib.RetryMaxCursorTools {
-		retryTools := prepareCursorTools(messages, tools, cursorlib.RetryMaxCursorTools)
-		kind := "shrink"
-		if isCursorHardProviderError(err) {
-			kind = "hard400 shrink"
-		}
-		log.Warnf("cursor: %s tools %d→%d: %v", kind, len(tools), len(retryTools), err)
-		result, nextErr := cursorlib.RunChat(ctx, creds, model, messages, retryTools)
-		if nextErr == nil {
-			return result, nil
-		}
-		err = nextErr
-		tools = retryTools
-	}
-
-	if !isCursorProviderError(err) || !retryBudgetLeft(start) {
-		return nil, err
-	}
-	coreTools := prepareCursorTools(messages, tools, 6)
-	compact := compactMessagesForRetry(messages)
-	log.Warnf("cursor: last attempt compact+core(%d) tools: %v", len(coreTools), err)
-	result, nextErr := cursorlib.RunChat(ctx, creds, model, compact, coreTools)
-	if nextErr == nil {
-		return result, nil
-	}
-	err = nextErr
-	if isCursorHardProviderError(err) && len(coreTools) > 0 && retryBudgetLeft(start) {
-		log.Warnf("cursor: hard400 persists; retrying with all tool names aliased: %v", err)
-		result, nextErr = cursorlib.RunChat(ctx, creds, model, compact, coreTools, cursorlib.WithForceToolAlias())
-		if nextErr == nil {
-			return result, nil
-		}
-		err = nextErr
-	}
-	if alt := cursorlib.AlternateUsableModelID(model); alt != "" && retryBudgetLeft(start) && !strings.EqualFold(alt, model) {
-		log.Warnf("cursor: transient/hard still failing; trying alternate wire %q (was %q): %v", alt, model, err)
-		result, nextErr = cursorlib.RunChat(ctx, creds, alt, compact, coreTools)
-		if nextErr == nil {
-			return result, nil
-		}
-		err = nextErr
-	}
 	return nil, err
 }
 
-func retryOpenCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, err error) (*cursorlib.Session, error) {
+func retryOpenCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, err error, opts ...cursorlib.StartOption) (*cursorlib.Session, error) {
 	start := time.Now()
 	if isCursorTransientProviderError(err) {
 		for i, delay := range cursorTransientBackoff {
@@ -892,7 +1104,7 @@ func retryOpenCursorSession(ctx context.Context, creds cursorlib.AccountCredenti
 			if sleepErr := sleepCtx(ctx, delay); sleepErr != nil {
 				return nil, sleepErr
 			}
-			session, nextErr := openCursorSession(ctx, creds, model, messages, tools)
+			session, nextErr := openCursorSession(ctx, creds, model, messages, tools, opts...)
 			if nextErr == nil {
 				return session, nil
 			}
@@ -907,128 +1119,15 @@ func retryOpenCursorSession(ctx context.Context, creds cursorlib.AccountCredenti
 	// 400, so try aliasing before giving up any capability.
 	if isCursorHardProviderError(err) && len(tools) > 0 && retryBudgetLeft(start) {
 		log.Warnf("cursor: stream hard400 with %d tools; retrying with all tool names aliased: %v", len(tools), err)
-		session, nextErr := openCursorSession(ctx, creds, model, messages, tools, cursorlib.WithForceToolAlias())
+		aliasOpts := append(append([]cursorlib.StartOption(nil), opts...), cursorlib.WithForceToolAlias())
+		session, nextErr := openCursorSession(ctx, creds, model, messages, tools, aliasOpts...)
 		if nextErr == nil {
 			return session, nil
 		}
 		err = nextErr
 	}
 
-	if isCursorProviderError(err) && retryBudgetLeft(start) && len(tools) > cursorlib.RetryMaxCursorTools {
-		retryTools := prepareCursorTools(messages, tools, cursorlib.RetryMaxCursorTools)
-		kind := "shrink"
-		if isCursorHardProviderError(err) {
-			kind = "hard400 shrink"
-		}
-		log.Warnf("cursor: stream %s tools %d→%d: %v", kind, len(tools), len(retryTools), err)
-		session, nextErr := openCursorSession(ctx, creds, model, messages, retryTools)
-		if nextErr == nil {
-			return session, nil
-		}
-		err = nextErr
-		tools = retryTools
-	}
-
-	if !isCursorProviderError(err) || !retryBudgetLeft(start) {
-		return nil, err
-	}
-	coreTools := prepareCursorTools(messages, tools, 6)
-	compact := compactMessagesForRetry(messages)
-	log.Warnf("cursor: stream last attempt compact+core(%d) tools: %v", len(coreTools), err)
-	session, nextErr := openCursorSession(ctx, creds, model, compact, coreTools)
-	if nextErr == nil {
-		return session, nil
-	}
-	err = nextErr
-	if isCursorHardProviderError(err) && len(coreTools) > 0 && retryBudgetLeft(start) {
-		log.Warnf("cursor: stream hard400 persists; retrying with all tool names aliased: %v", err)
-		session, nextErr = openCursorSession(ctx, creds, model, compact, coreTools, cursorlib.WithForceToolAlias())
-		if nextErr == nil {
-			return session, nil
-		}
-		err = nextErr
-	}
-	if alt := cursorlib.AlternateUsableModelID(model); alt != "" && retryBudgetLeft(start) && !strings.EqualFold(alt, model) {
-		log.Warnf("cursor: stream still failing; trying alternate wire %q (was %q): %v", alt, model, err)
-		session, nextErr = openCursorSession(ctx, creds, alt, compact, coreTools)
-		if nextErr == nil {
-			return session, nil
-		}
-		err = nextErr
-	}
 	return nil, err
-}
-
-// compactMessagesForRetry keeps a lean prompt when Cursor's provider 400s on
-// full Claude Code system + tool catalogs. Preserves the latest user/tool turn.
-func compactMessagesForRetry(messages []cursorlib.ChatMessage) []cursorlib.ChatMessage {
-	messages = stripTrailingToolRound(messages)
-	if len(messages) == 0 {
-		return messages
-	}
-	var system []cursorlib.ChatMessage
-	var rest []cursorlib.ChatMessage
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			content := msg.Content
-			runes := []rune(content)
-			if len(runes) > 8000 {
-				content = string(runes[:8000]) + "…"
-			}
-			system = append(system, cursorlib.ChatMessage{Role: "system", Content: content})
-			continue
-		}
-		rest = append(rest, msg)
-	}
-	if len(rest) > 8 {
-		rest = rest[len(rest)-8:]
-		for len(rest) > 0 && rest[0].Role == "tool" {
-			rest = rest[1:]
-		}
-	}
-	out := make([]cursorlib.ChatMessage, 0, len(system)+len(rest))
-	out = append(out, system...)
-	out = append(out, rest...)
-	// Trimming can leave only assistant/tool rows, and a run without a user
-	// turn is rejected outright ("request has no user message"), which killed
-	// the remaining degrade tiers instead of recovering.
-	if !hasUserTurn(out) {
-		out = append(out, cursorlib.ChatMessage{
-			Role:    "user",
-			Content: "Continue the task based on the conversation above.",
-		})
-	}
-	return out
-}
-
-func hasUserTurn(messages []cursorlib.ChatMessage) bool {
-	for _, msg := range messages {
-		if msg.Role == "user" && strings.TrimSpace(msg.Content) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// stripTrailingToolRound drops a dangling assistant tool_calls + tool results
-// suffix so a no-tools retry does not try to resume a dead Cursor session.
-func stripTrailingToolRound(messages []cursorlib.ChatMessage) []cursorlib.ChatMessage {
-	if len(messages) == 0 {
-		return messages
-	}
-	end := len(messages)
-	for end > 0 && messages[end-1].Role == "tool" {
-		end--
-	}
-	if end > 0 && messages[end-1].Role == "assistant" && len(messages[end-1].ToolCalls) > 0 {
-		end--
-	}
-	if end == len(messages) {
-		return messages
-	}
-	out := make([]cursorlib.ChatMessage, end)
-	copy(out, messages[:end])
-	return out
 }
 
 // applyCursorSpeed maps Anthropic/cursor2api `speed` (fast|standard) onto a
@@ -1087,22 +1186,15 @@ func applyCursorReasoningEffort(model string, body []byte) string {
 
 // cursorUsagePayload renders Cursor's TurnEnded counters as OpenAI usage.
 //
-// Cursor's input_tokens counts the whole prompt it processed, which already
-// covers both the cache-read prefix and the freshly written cache segment.
-// Anthropic clients expect those three buckets to be disjoint
-// (input + cache_read + cache_creation = prompt), so the uncached remainder is
-// what belongs in input_tokens. The Anthropic translator subtracts
-// cached_tokens from prompt_tokens, so prompt_tokens carries uncached + read.
+// Cursor's input_tokens is the complete processed input. OpenAI and Responses
+// define cache details as subsets of that total, so keep the authoritative
+// number intact here. The Anthropic translator separates cache read/write from
+// uncached input when it maps this OpenAI-shaped usage block.
 func cursorUsagePayload(input, output, cacheRead, cacheWrite, reasoning int64) map[string]any {
-	uncached := input - cacheRead - cacheWrite
-	if uncached < 0 {
-		uncached = 0
-	}
-	promptTokens := uncached + cacheRead
 	usagePayload := map[string]any{
-		"prompt_tokens":     promptTokens,
+		"prompt_tokens":     input,
 		"completion_tokens": output,
-		"total_tokens":      promptTokens + cacheWrite + output,
+		"total_tokens":      input + output,
 	}
 	details := map[string]any{}
 	if cacheRead > 0 {

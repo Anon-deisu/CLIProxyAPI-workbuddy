@@ -164,8 +164,19 @@ func (m *SessionManager) Sweep(ttl time.Duration) {
 	}
 	cutoff := time.Now().Add(-ttl)
 	m.mu.Lock()
+	pendingOwners := make(map[*Session]struct{}, len(m.pending))
+	for _, owner := range m.pending {
+		if owner != nil {
+			pendingOwners[owner] = struct{}{}
+		}
+	}
 	stale := make([]*Session, 0)
 	for _, session := range m.sessions {
+		// A pending tool result is durable protocol state, not idle traffic. The
+		// client may return after a long-running shell or approval workflow.
+		if _, pending := pendingOwners[session]; pending {
+			continue
+		}
 		if session.lastActivity.Before(cutoff) {
 			stale = append(stale, session)
 		}

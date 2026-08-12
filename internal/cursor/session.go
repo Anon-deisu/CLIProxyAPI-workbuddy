@@ -61,6 +61,7 @@ type StreamEvent struct {
 type pendingExec struct {
 	request *agentv1.ExecServerMessage
 	call    ToolCall
+	emitted bool
 }
 
 // Session is a live Agent Connect run that can pause for client tools.
@@ -76,6 +77,7 @@ type Session struct {
 	toolIndex    map[string]*ToolDefinition
 	toolAlias    *ToolAliasMap
 	pending      map[string]*pendingExec
+	pendingOrder []*pendingExec
 	events       chan StreamEvent
 	errCh        chan error
 	closed       bool
@@ -86,8 +88,10 @@ type Session struct {
 	// but no further InteractionUpdates will arrive — resume must rebuild.
 	responseEnded bool
 	cancel        context.CancelFunc
+	done          <-chan struct{}
 	lastActivity  time.Time
 	manager       *SessionManager
+	parallelTools bool
 	// usageSeen carries TurnEnded counters that land after the caller already
 	// stopped reading the segment, which is the normal ordering when a turn
 	// pauses for client tools.
@@ -104,6 +108,8 @@ type Session struct {
 	emittedThinking     strings.Builder // reasoning already sent to the client
 	seenAssistantMsgIDs map[string]struct{}
 	turnEndedSeen       bool
+	terminalUsage       StreamEvent
+	terminalUsageReady  bool
 	segmentEnded        bool
 	textFlushed         bool
 	thinkingFlushed     bool
@@ -135,8 +141,9 @@ type ChatResult struct {
 type StartOption func(*startConfig)
 
 type startConfig struct {
-	forceToolAlias    bool
-	freshConversation bool
+	forceToolAlias bool
+	conversationID string
+	parallelTools  bool
 }
 
 // WithForceToolAlias prefixes every client tool name before sending it to
@@ -146,11 +153,16 @@ func WithForceToolAlias() StartOption {
 	return func(c *startConfig) { c.forceToolAlias = true }
 }
 
-// WithFreshConversation mints a new Cursor conversation id instead of reusing
-// the cached one. Needed when the previous run on that conversation died mid
-// tool call: Cursor rejects the follow-up run until the id is rotated.
-func WithFreshConversation() StartOption {
-	return func(c *startConfig) { c.freshConversation = true }
+// WithConversationID pins the Cursor conversation identity to an explicit
+// downstream session. Without it every request starts an isolated conversation.
+func WithConversationID(conversationID string) StartOption {
+	return func(c *startConfig) { c.conversationID = strings.TrimSpace(conversationID) }
+}
+
+// WithParallelToolCalls controls whether a formal Cursor provider batch is
+// exposed to the downstream client at once or one call per continuation.
+func WithParallelToolCalls(enabled bool) StartOption {
+	return func(c *startConfig) { c.parallelTools = enabled }
 }
 
 // StartSession opens a new Agent run for the given messages/tools.
@@ -158,7 +170,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	if strings.TrimSpace(creds.AccessToken) == "" {
 		return nil, fmt.Errorf("cursor: access_token is required")
 	}
-	cfg := startConfig{}
+	cfg := startConfig{parallelTools: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
@@ -171,7 +183,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		log.Debugf("cursor: renamed %d tool(s) that collide with Cursor built-ins", len(toolAlias.toClient))
 	}
 	selection := ResolveRequestedModel(model)
-	clientMsg, blobStore, conversationID, err := buildRunRequest(model, messages, tools, cfg)
+	clientMsg, blobStore, conversationID, err := buildRunRequestForConversation(model, messages, tools, cfg.conversationID)
 	if err != nil {
 		return nil, err
 	}
@@ -214,12 +226,15 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		toolIndex:           indexTools(tools),
 		toolAlias:           toolAlias,
 		pending:             map[string]*pendingExec{},
+		pendingOrder:        make([]*pendingExec, 0),
 		events:              make(chan StreamEvent, 256),
 		errCh:               make(chan error, 1),
 		pauseCh:             make(chan struct{}),
 		cancel:              cancel,
+		done:                runCtx.Done(),
 		lastActivity:        time.Now(),
 		manager:             DefaultSessionManager(),
+		parallelTools:       cfg.parallelTools,
 		seenAssistantMsgIDs: map[string]struct{}{},
 	}
 	session.seedSeenAssistantMessages()
@@ -288,6 +303,7 @@ func (s *Session) readLoop(ctx context.Context) {
 	for {
 		s.mu.Lock()
 		waiting := s.waitingTools
+		responseEnded := s.responseEnded
 		closed := s.closed
 		stream := s.stream
 		pauseCh := s.pauseCh
@@ -297,18 +313,6 @@ func (s *Session) readLoop(ctx context.Context) {
 		}
 		select {
 		case <-ctx.Done():
-			// runCtx is normally independent of the HTTP request; if it is
-			// canceled while tools are pending, keep the session indexed.
-			if s.awaitingClientTools() {
-				log.Warnf("cursor: run context canceled while awaiting tools; keeping session (pending=%d)", s.pendingToolCount())
-				select {
-				case <-pauseCh:
-					continue
-				case <-time.After(10 * time.Minute):
-					_ = s.Close()
-					return
-				}
-			}
 			s.mu.Lock()
 			alreadyClosed := s.closed
 			s.mu.Unlock()
@@ -319,19 +323,13 @@ func (s *Session) readLoop(ctx context.Context) {
 			return
 		default:
 		}
-		if waiting {
+		// Keep reading while a live run is waiting for client tools. Cursor may
+		// send a trailing TurnEnded after the formal tool boundary; pausing here
+		// discarded those authoritative cache counters. Once the response has
+		// actually ended, wait for SubmitToolResults to rebuild or resume.
+		if waiting && responseEnded {
 			select {
 			case <-ctx.Done():
-				if s.awaitingClientTools() {
-					log.Warnf("cursor: run context canceled while paused for tools; keeping session (pending=%d)", s.pendingToolCount())
-					select {
-					case <-pauseCh:
-						continue
-					case <-time.After(10 * time.Minute):
-						_ = s.Close()
-						return
-					}
-				}
 				return
 			case <-pauseCh:
 				continue
@@ -388,13 +386,27 @@ func (s *Session) readLoop(ctx context.Context) {
 			}
 			if endForTools {
 				s.flushAssistantText(true)
-				s.beginWaitingTools()
-				s.mu.Lock()
-				s.segmentEnded = true
-				s.mu.Unlock()
-				s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+				if s.emitPendingToolBatch(false) {
+					s.emitTerminalUsage()
+					s.beginWaitingTools()
+					s.mu.Lock()
+					s.segmentEnded = true
+					s.mu.Unlock()
+					s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+				}
 			}
 			if sawEndStream {
+				if s.emitPendingToolBatch(true) {
+					s.emitTerminalUsage()
+					s.beginWaitingTools()
+					s.mu.Lock()
+					alreadyEnded := s.segmentEnded
+					s.segmentEnded = true
+					s.mu.Unlock()
+					if !alreadyEnded {
+						s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+					}
+				}
 				// Cursor often half-closes the Connect response when pausing for
 				// client tools. Do NOT Close() yet — that drops BindPending and
 				// forces a blind rebuild — but mark responseEnded so
@@ -408,6 +420,7 @@ func (s *Session) readLoop(ctx context.Context) {
 					continue
 				}
 				s.flushAssistantText(true)
+				s.emitTerminalUsage()
 				s.mu.Lock()
 				alreadyEnded := s.segmentEnded
 				s.segmentEnded = true
@@ -420,6 +433,17 @@ func (s *Session) readLoop(ctx context.Context) {
 			}
 		}
 		if errRead == io.EOF {
+			if s.emitPendingToolBatch(true) {
+				s.emitTerminalUsage()
+				s.beginWaitingTools()
+				s.mu.Lock()
+				alreadyEnded := s.segmentEnded
+				s.segmentEnded = true
+				s.mu.Unlock()
+				if !alreadyEnded {
+					s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+				}
+			}
 			if s.awaitingClientTools() {
 				s.mu.Lock()
 				s.responseEnded = true
@@ -429,6 +453,7 @@ func (s *Session) readLoop(ctx context.Context) {
 				continue
 			}
 			s.flushAssistantText(true)
+			s.emitTerminalUsage()
 			s.mu.Lock()
 			alreadyEnded := s.segmentEnded
 			s.segmentEnded = true
@@ -554,18 +579,25 @@ func (s *Session) resumeReading() {
 
 func (s *Session) emit(ev StreamEvent) {
 	s.touch()
-	// Never drop deltas: a full buffer previously timed out and silently
-	// discarded leading text/thinking, which showed up as mid-sentence replies.
+	// Event order is part of the downstream streaming protocol. Never discard a
+	// delta or terminal event merely because the consumer is temporarily slow.
 	select {
 	case s.events <- ev:
+	case <-s.done:
+	}
+}
+
+func (s *Session) emitTerminalUsage() {
+	s.mu.Lock()
+	if !s.terminalUsageReady {
+		s.mu.Unlock()
 		return
-	default:
 	}
-	select {
-	case s.events <- ev:
-	case <-time.After(30 * time.Second):
-		log.Warnf("cursor: event delivery stalled; dropping %s", ev.Type)
-	}
+	ev := s.terminalUsage
+	s.terminalUsageReady = false
+	s.terminalUsage = StreamEvent{}
+	s.mu.Unlock()
+	s.emit(ev)
 }
 
 func (s *Session) fail(err error) {
@@ -593,24 +625,8 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 	}
 	var text strings.Builder
 	var thinking strings.Builder
-	sawEvent := false
-	idle := time.NewTimer(s.firstEventTimeout())
-	defer idle.Stop()
 	for {
 		select {
-		case <-idle.C:
-			if s.awaitingClientTools() || s.upstreamActiveWithin(streamIdleTimeout) {
-				resetIdleTimer(idle, streamIdleTimeout)
-				continue
-			}
-			if !sawEvent && s.wasResumed() {
-				log.Warnf("cursor: resumed run produced no events within %s; rebuilding turn from history", resumeFirstEventTimeout)
-				_ = s.Close()
-				return nil, ErrToolResumeRebuild
-			}
-			log.Warnf("cursor: no upstream event for %s; aborting run", streamIdleTimeout)
-			_ = s.Close()
-			return nil, fmt.Errorf("cursor: upstream idle for %s", streamIdleTimeout)
 		case <-ctx.Done():
 			if !s.awaitingClientTools() {
 				_ = s.Close()
@@ -626,8 +642,6 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 				result.Thinking = thinking.String()
 				return result, nil
 			}
-			sawEvent = true
-			resetIdleTimer(idle, streamIdleTimeout)
 			switch ev.Type {
 			case "text_delta":
 				text.WriteString(ev.Text)
@@ -660,23 +674,6 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 	}
 }
 
-// streamIdleTimeout bounds how long a segment may go without any upstream
-// event. Cursor occasionally leaves a run open without ever completing it,
-// which used to stall clients until their own (10 minute) timeout.
-const streamIdleTimeout = 90 * time.Second
-
-// resumeFirstEventTimeout bounds how long a resumed run may stay silent. Cursor
-// frequently accepts the mcp_result write and then never continues that run;
-// waiting out streamIdleTimeout turned those into 90s stalls and 500s.
-const resumeFirstEventTimeout = 20 * time.Second
-
-func (s *Session) firstEventTimeout() time.Duration {
-	if s.wasResumed() {
-		return resumeFirstEventTimeout
-	}
-	return streamIdleTimeout
-}
-
 func (s *Session) wasResumed() bool {
 	if s == nil {
 		return false
@@ -686,49 +683,10 @@ func (s *Session) wasResumed() bool {
 	return s.resumed
 }
 
-// upstreamActiveWithin reports whether Cursor sent anything recently, even if
-// nothing was surfaced to the client (long thinking phases buffer silently).
-func (s *Session) upstreamActiveWithin(d time.Duration) bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return !s.lastFrame.IsZero() && time.Since(s.lastFrame) < d
-}
-
-func resetIdleTimer(t *time.Timer, d time.Duration) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	t.Reset(d)
-}
-
 // IterSegment invokes fn for each event until segment_end (inclusive).
 func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) error {
-	sawEvent := false
-	idle := time.NewTimer(s.firstEventTimeout())
-	defer idle.Stop()
 	for {
 		select {
-		case <-idle.C:
-			if s.awaitingClientTools() || s.upstreamActiveWithin(streamIdleTimeout) {
-				resetIdleTimer(idle, streamIdleTimeout)
-				continue
-			}
-			if !sawEvent && s.wasResumed() {
-				// A resumed run that never produces an event is dead; rebuild
-				// from history instead of burning the full idle timeout.
-				log.Warnf("cursor: resumed run produced no events within %s; rebuilding turn from history", resumeFirstEventTimeout)
-				_ = s.Close()
-				return ErrToolResumeRebuild
-			}
-			log.Warnf("cursor: no upstream event for %s; aborting segment", streamIdleTimeout)
-			_ = s.Close()
-			return fmt.Errorf("cursor: upstream idle for %s", streamIdleTimeout)
 		case <-ctx.Done():
 			// Keep tool-paused sessions alive across the inbound HTTP cancel
 			// (clients disconnect SSE after tool_use and resume on the next request).
@@ -744,8 +702,6 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 			if !ok {
 				return nil
 			}
-			sawEvent = true
-			resetIdleTimer(idle, streamIdleTimeout)
 			if err := fn(ev); err != nil {
 				return err
 			}
@@ -776,6 +732,7 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	responseEnded := s.responseEnded
 	pending := make([]*pendingExec, 0, len(results))
 	ids := make([]string, 0, len(results))
+	selected := make(map[*pendingExec]struct{}, len(results))
 	for _, result := range results {
 		item, id := s.lookupPendingTool(result.ToolCallID)
 		if item == nil {
@@ -784,6 +741,19 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 		}
 		pending = append(pending, item)
 		ids = append(ids, id)
+		selected[item] = struct{}{}
+	}
+	if s.parallelTools {
+		for _, item := range s.pendingOrder {
+			if item == nil || !item.emitted {
+				continue
+			}
+			if _, ok := selected[item]; !ok {
+				s.mu.Unlock()
+				_ = s.Close()
+				return ErrToolResumeRebuild
+			}
+		}
 	}
 	s.mu.Unlock()
 
@@ -812,10 +782,25 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 		}
 		s.releasePendingExec(item, ids[i], result.ToolCallID)
 	}
+	// A downstream client that explicitly disabled parallel tool calls must see
+	// one formal Cursor batch member per HTTP continuation. Keep the provider
+	// read side paused, expose the next staged call, and only resume Cursor once
+	// every member has received its result.
+	if !s.parallelTools && s.emitNextPendingTool() {
+		s.beginWaitingTools()
+		s.mu.Lock()
+		s.segmentEnded = true
+		s.mu.Unlock()
+		s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+		return nil
+	}
 	s.mu.Lock()
 	s.segmentEnded = false
 	s.textFlushed = false
 	s.turnEndedSeen = false
+	s.terminalUsageReady = false
+	s.terminalUsage = StreamEvent{}
+	s.usageSeen = nil
 	s.thinkingFlushed = false
 	s.textStreamLive = false
 	if s.holdTimer != nil {
@@ -875,6 +860,10 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+		s.holdTimer = nil
+	}
 	stream := s.stream
 	cancel := s.cancel
 	s.mu.Unlock()
@@ -919,25 +908,20 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			if u.TurnEnded.ReasoningTokens != nil {
 				ev.ReasoningTokens = *u.TurnEnded.ReasoningTokens
 			}
-			// cursor2api: some transports emit turn_ended for the pre-tool
-			// segment before mcp_result is returned. Keep the bidi run open
-			// while client tools are still pending, but still report usage —
-			// dropping it left every tool-calling turn with zero tokens and no
-			// cache numbers on the client.
+			// Keep an out-of-band copy for callers whose formal tool boundary
+			// was reached in the same read batch. It is still only a candidate:
+			// public usage is emitted at that boundary or at clean END_STREAM.
 			s.recordUsage(ev)
-			s.mu.Lock()
-			pendingCount := len(s.pending)
-			waiting := s.waitingTools
-			s.mu.Unlock()
-			if pendingCount > 0 || waiting {
-				s.emit(ev)
-				return false, nil
-			}
+			// TurnEnded is a candidate terminal update. Cursor can still deliver
+			// the authoritative checkpoint or terminate this attempt with an
+			// error, so usage is published only at a formal tool boundary or a
+			// clean Connect END_STREAM/EOF.
 			log.Debugf("cursor: turn_ended usage in=%d out=%d read=%d write=%d",
 				ev.InputTokens, ev.OutputTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
-			s.emit(ev)
 			s.mu.Lock()
 			s.turnEndedSeen = true
+			s.terminalUsage = ev
+			s.terminalUsageReady = true
 			s.mu.Unlock()
 			// Do not segment_end here — checkpoint / trailing text follow.
 		case *agentv1.InteractionUpdate_ToolCallStarted,
@@ -969,6 +953,9 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			s.mu.Unlock()
 			if turnEnded {
 				s.flushAssistantText(false)
+			}
+			if s.pendingToolBatchReady() {
+				return true, nil
 			}
 		}
 	case *agentv1.AgentServerMessage_ServerMetrics:
@@ -1109,10 +1096,9 @@ func (s *Session) handleThinkingDelta(text string) {
 	s.emit(StreamEvent{Type: "thinking_delta", Text: text})
 }
 
-// textHoldWindow is how long the opening of an answer is withheld so the
-// conversation checkpoint can repair Cursor's dropped leading token. Everything
-// after the release streams live, so the cost is a short initial delay instead
-// of the whole answer landing in one burst.
+// textHoldWindow gives the checkpoint a short chance to repair Cursor's
+// occasionally missing leading token. After this opening window, deltas stream
+// immediately instead of buffering the whole response.
 const textHoldWindow = 1200 * time.Millisecond
 
 func (s *Session) handleTextDelta(text string) {
@@ -1137,8 +1123,9 @@ func (s *Session) handleTextDelta(text string) {
 	}
 }
 
-// releaseTextStream emits the withheld opening — reconciled against the
-// checkpoint when one has already arrived — and switches to live streaming.
+// releaseTextStream emits the withheld opening, using an already available
+// checkpoint as the authoritative copy, then switches subsequent deltas to
+// live streaming.
 func (s *Session) releaseTextStream() {
 	s.mu.Lock()
 	if s.textStreamLive || s.textFlushed {
@@ -1164,17 +1151,21 @@ func (s *Session) releaseTextStream() {
 		newIDs = append(newIDs, msg.identity)
 		final = reconcileAssistantText(final, msg.text)
 	}
-
 	out := final
 	if emitted != "" && strings.HasPrefix(final, emitted) {
 		out = final[len(emitted):]
 	}
 
 	s.mu.Lock()
+	if s.textStreamLive || s.textFlushed {
+		s.mu.Unlock()
+		return
+	}
 	for _, id := range newIDs {
 		s.seenAssistantMsgIDs[id] = struct{}{}
 	}
 	s.textStreamLive = true
+	s.holdTimer = nil
 	s.emittedText.Reset()
 	s.emittedText.WriteString(final)
 	s.visibleText.Reset()
@@ -1223,17 +1214,17 @@ func (s *Session) flushAssistantText(force bool) {
 			finalThink = reconcileAssistantText(finalThink, msg.thinking)
 		}
 	}
+	if !haveCheckpoint && !force {
+		return
+	}
 	if haveCheckpoint {
-		// The authoritative copy is here: stop withholding the opening.
 		s.mu.Lock()
 		s.textStreamLive = true
 		if s.holdTimer != nil {
 			s.holdTimer.Stop()
+			s.holdTimer = nil
 		}
 		s.mu.Unlock()
-	}
-	if !haveCheckpoint && !force {
-		return
 	}
 	s.flushThinking(finalThink, emittedThink)
 	if force {
@@ -1262,9 +1253,8 @@ func (s *Session) flushAssistantText(force bool) {
 	case strings.HasPrefix(final, emitted):
 		out = final[len(emitted):]
 	default:
-		// Once the opening has been released the client already holds that
-		// text, so the checkpoint may only append; re-sending the reconciled
-		// copy would duplicate the answer.
+		// Once text is live the downstream already owns the emitted prefix.
+		// Replaying a diverging checkpoint would duplicate the answer.
 		log.Debugf("cursor: checkpoint text diverges from streamed text (streamed=%d checkpoint=%d); keeping streamed copy",
 			len(emitted), len(final))
 		out = ""
@@ -1450,20 +1440,152 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
 	if nativeID != clientID {
 		s.pending[nativeID] = pending
 	}
+	s.pendingOrder = append(s.pendingOrder, pending)
 	s.mu.Unlock()
 	if s.manager != nil {
 		s.manager.BindPending(clientID, s)
 		if nativeID != clientID {
 			s.manager.BindPending(nativeID, s)
 		}
-		if clientID != nativeID {
-			// Cursor's OpenAI-family ids embed a newline; clients only ever see
-			// the sanitized form, so both must stay indexed.
-			log.Debugf("cursor: tool_call_id sanitized %q -> %q", nativeID, clientID)
+	}
+	// Exec frames can arrive before Cursor's checkpoint proves the complete
+	// provider tool batch. Keep reading until that boundary is available.
+	return false, nil
+}
+
+type checkpointToolCall struct {
+	id   string
+	name string
+}
+
+func (s *Session) emitPendingToolBatch(force bool) bool {
+	pending, ready := s.orderedPendingToolBatch(force)
+	if !ready {
+		return false
+	}
+	if !s.parallelTools && len(pending) > 1 {
+		pending = pending[:1]
+	}
+	for _, item := range pending {
+		s.mu.Lock()
+		if item.emitted {
+			s.mu.Unlock()
+			continue
+		}
+		item.emitted = true
+		call := item.call
+		s.mu.Unlock()
+		s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
+	}
+	return len(pending) > 0
+}
+
+func (s *Session) emitNextPendingTool() bool {
+	s.mu.Lock()
+	var next *pendingExec
+	for _, item := range s.pendingOrder {
+		if item != nil && !item.emitted {
+			item.emitted = true
+			next = item
+			break
 		}
 	}
+	s.mu.Unlock()
+	if next == nil {
+		return false
+	}
+	call := next.call
 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
-	return true, nil
+	return true
+}
+
+func (s *Session) pendingToolBatchReady() bool {
+	_, ready := s.orderedPendingToolBatch(false)
+	return ready
+}
+
+func (s *Session) orderedPendingToolBatch(force bool) ([]*pendingExec, bool) {
+	s.mu.Lock()
+	pending := make([]*pendingExec, 0, len(s.pendingOrder))
+	for _, item := range s.pendingOrder {
+		if item != nil && !item.emitted {
+			pending = append(pending, item)
+		}
+	}
+	state := s.conversationState
+	s.mu.Unlock()
+	if len(pending) == 0 {
+		return nil, false
+	}
+
+	checkpointCalls, checkpointPresent := checkpointToolCalls(state)
+	if checkpointPresent {
+		byID := make(map[string]*pendingExec, len(pending))
+		for _, item := range pending {
+			byID[item.call.ID] = item
+		}
+		ordered := make([]*pendingExec, 0, len(checkpointCalls))
+		for _, call := range checkpointCalls {
+			item := byID[util.SanitizeClaudeToolID(call.id)]
+			if item == nil {
+				item = byID[call.id]
+			}
+			if item == nil || !s.toolCallNameMatches(item.call.Name, call.name) {
+				return nil, false
+			}
+			ordered = append(ordered, item)
+		}
+		if len(ordered) != len(pending) {
+			return nil, false
+		}
+		pending = ordered
+		s.mu.Lock()
+		s.pendingOrder = append([]*pendingExec(nil), ordered...)
+		s.mu.Unlock()
+	} else if !force {
+		return nil, false
+	}
+	return pending, true
+}
+
+func (s *Session) toolCallNameMatches(clientName, checkpointName string) bool {
+	checkpointName = strings.TrimSpace(checkpointName)
+	if strings.EqualFold(strings.TrimSpace(clientName), checkpointName) {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(s.toolAlias.UpstreamName(clientName)), checkpointName)
+}
+
+func checkpointToolCalls(state *agentv1.ConversationStateStructure) ([]checkpointToolCall, bool) {
+	if state == nil || len(state.GetPendingToolCalls()) == 0 {
+		return nil, false
+	}
+	out := make([]checkpointToolCall, 0)
+	seen := make(map[string]struct{})
+	for _, raw := range state.GetPendingToolCalls() {
+		var message struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type       string `json:"type"`
+				ToolCallID string `json:"toolCallId"`
+				ToolName   string `json:"toolName"`
+			} `json:"content"`
+		}
+		if json.Unmarshal([]byte(raw), &message) != nil || message.Role != "assistant" {
+			continue
+		}
+		for _, part := range message.Content {
+			if part.Type != "tool-call" || strings.TrimSpace(part.ToolCallID) == "" || strings.TrimSpace(part.ToolName) == "" {
+				continue
+			}
+			if _, duplicate := seen[part.ToolCallID]; duplicate {
+				return nil, false
+			}
+			seen[part.ToolCallID] = struct{}{}
+			out = append(out, checkpointToolCall{id: part.ToolCallID, name: part.ToolName})
+		}
+	}
+	return out, len(out) > 0
 }
 
 func (s *Session) replyMcp(req *agentv1.ExecServerMessage, result *agentv1.McpResult) error {
@@ -1572,6 +1694,12 @@ func (s *Session) releasePendingExec(item *pendingExec, keys ...string) {
 		}
 	}
 	s.clearPendingTool(aliasKeys...)
+	for i, pending := range s.pendingOrder {
+		if pending == item {
+			s.pendingOrder = append(s.pendingOrder[:i], s.pendingOrder[i+1:]...)
+			break
+		}
+	}
 	s.mu.Unlock()
 	if s.manager == nil {
 		return
@@ -1728,10 +1856,8 @@ func RunChat(ctx context.Context, creds AccountCredentials, model string, messag
 		// run went silent. Rebuild a new Agent run that keeps the tool history
 		// in conversation state instead of hard-failing the client.
 		log.Warnf("cursor: resume tool session unusable (%v); rebuilding turn from history", err)
-		messages = append(append([]ChatMessage(nil), messages...), ChatMessage{
-			Role:    "user",
-			Content: "Tool results have been provided above. Continue the task based on those results.",
-		})
+		// The structured history is a complete resume input. A synthetic user
+		// message changes the transcript and must not be added.
 	}
 	session, err := StartSession(ctx, creds, model, messages, tools, opts...)
 	if err != nil {

@@ -804,10 +804,15 @@ func extractOpenAIUsage(usage gjson.Result) (int64, int64, int64) {
 	inputTokens := usage.Get("prompt_tokens").Int()
 	outputTokens := usage.Get("completion_tokens").Int()
 	cachedTokens := usage.Get("prompt_tokens_details.cached_tokens").Int()
+	cacheWriteTokens := usage.Get("prompt_tokens_details.cache_creation_tokens").Int()
+	if cacheWriteTokens <= 0 {
+		cacheWriteTokens = usage.Get("input_tokens_details.cache_write_tokens").Int()
+	}
 
-	if cachedTokens > 0 {
-		if inputTokens >= cachedTokens {
-			inputTokens -= cachedTokens
+	cachedInput := cachedTokens + cacheWriteTokens
+	if cachedInput > 0 {
+		if inputTokens >= cachedInput {
+			inputTokens -= cachedInput
 		} else {
 			inputTokens = 0
 		}

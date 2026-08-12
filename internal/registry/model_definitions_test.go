@@ -31,6 +31,34 @@ func TestWithXAIBuiltinsIncludesVideoPreviewModel(t *testing.T) {
 	t.Fatalf("expected xAI builtin model %s", xaiBuiltinVideo15PreviewModelID)
 }
 
+func TestWithCursorBuiltinsIncludesFableAndPreservesCatalogMetadata(t *testing.T) {
+	const dynamicDescription = "account catalog metadata"
+	models := WithCursorBuiltins([]*ModelInfo{
+		{
+			ID:                  "claude-fable-5",
+			Description:         dynamicDescription,
+			ContextLength:       262144,
+			SupportedParameters: []string{"reasoning"},
+		},
+	})
+
+	var fable *ModelInfo
+	for _, model := range models {
+		if model != nil && model.ID == "claude-fable-5" {
+			if fable != nil {
+				t.Fatal("claude-fable-5 was registered more than once")
+			}
+			fable = model
+		}
+	}
+	if fable == nil {
+		t.Fatal("Cursor builtins do not include claude-fable-5")
+	}
+	if fable.Description != dynamicDescription || fable.ContextLength != 262144 {
+		t.Fatalf("dynamic Cursor catalog metadata was replaced: %#v", fable)
+	}
+}
+
 func TestAntigravityWebSearchModelForRequiresRequestedModelCapability(t *testing.T) {
 	registryRef := GetGlobalRegistry()
 	registryRef.RegisterClient("test-antigravity-websearch-route", "antigravity", []*ModelInfo{

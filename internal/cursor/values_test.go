@@ -75,6 +75,22 @@ func TestDecodeUnwrapsStructuredStringsWhenSchemaAsks(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsFractionalStringForIntegerSchema(t *testing.T) {
+	def := &ToolDefinition{
+		Name: "Counter",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"count": map[string]any{"type": "integer"},
+			},
+		},
+	}
+	got := decode(t, def, map[string]any{"count": "1.5"})
+	if v, ok := got["count"].(string); !ok || v != "1.5" {
+		t.Fatalf("fractional integer input must stay a string, got %#v", got["count"])
+	}
+}
+
 func TestDecodeLeavesUnknownPropertiesUntouched(t *testing.T) {
 	got := decode(t, stringTool(), map[string]any{"surprise": "123"})
 	if v, ok := got["surprise"].(string); !ok || v != "123" {
