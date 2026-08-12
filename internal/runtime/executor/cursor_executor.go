@@ -103,15 +103,8 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 
 	outPayload := buildOpenAIChatCompletion(req.Model, result)
-	reporter.Publish(ctx, usage.Detail{
-		InputTokens:         result.InputTokens,
-		OutputTokens:        result.OutputTokens,
-		CachedTokens:        result.CacheReadTokens,
-		CacheReadTokens:     result.CacheReadTokens,
-		CacheCreationTokens: result.CacheWriteTokens,
-		ReasoningTokens:     result.ReasoningTokens,
-		TotalTokens:         result.InputTokens + result.OutputTokens,
-	})
+	reporter.Publish(ctx, cursorUsageDetail(result.InputTokens, result.OutputTokens,
+		result.CacheReadTokens, result.CacheWriteTokens, result.ReasoningTokens))
 
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, outPayload, &param)
@@ -250,15 +243,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					toolIndex++
 				case "usage_final":
 					usageFinal = ev
-					reporter.Publish(ctx, usage.Detail{
-						InputTokens:         ev.InputTokens,
-						OutputTokens:        ev.OutputTokens,
-						CachedTokens:        ev.CacheReadTokens,
-						CacheReadTokens:     ev.CacheReadTokens,
-						CacheCreationTokens: ev.CacheWriteTokens,
-						ReasoningTokens:     ev.ReasoningTokens,
-						TotalTokens:         ev.InputTokens + ev.OutputTokens,
-					})
+					reporter.Publish(ctx, cursorUsageDetail(ev.InputTokens, ev.OutputTokens,
+						ev.CacheReadTokens, ev.CacheWriteTokens, ev.ReasoningTokens))
 					return nil
 				case "error":
 					return fmt.Errorf("%s", ev.Message)
@@ -367,15 +353,8 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			usageFinal.CacheReadTokens == 0 && usageFinal.CacheWriteTokens == 0 {
 			if late, ok := session.TakeUsage(0); ok {
 				usageFinal = late
-				reporter.Publish(ctx, usage.Detail{
-					InputTokens:         late.InputTokens,
-					OutputTokens:        late.OutputTokens,
-					CachedTokens:        late.CacheReadTokens,
-					CacheReadTokens:     late.CacheReadTokens,
-					CacheCreationTokens: late.CacheWriteTokens,
-					ReasoningTokens:     late.ReasoningTokens,
-					TotalTokens:         late.InputTokens + late.OutputTokens,
-				})
+				reporter.Publish(ctx, cursorUsageDetail(late.InputTokens, late.OutputTokens,
+					late.CacheReadTokens, late.CacheWriteTokens, late.ReasoningTokens))
 			}
 		}
 		// Do not Close() on stop here: TurnEnded can precede trailing
@@ -1190,6 +1169,31 @@ func applyCursorReasoningEffort(model string, body []byte) string {
 // define cache details as subsets of that total, so keep the authoritative
 // number intact here. The Anthropic translator separates cache read/write from
 // uncached input when it maps this OpenAI-shaped usage block.
+// cursorUsageDetail splits Cursor's counters into the shape the rest of the
+// proxy accounts in: input is the uncached remainder, with cache read and cache
+// write in their own buckets.
+//
+// Cursor reports an input figure that already contains both cache buckets
+// (measured: prompt_tokens 25249 = cached 25117 + written 130 + 2 fresh), so
+// publishing it verbatim alongside the buckets made every consumer that sums
+// them — the relay's own total among them — count the cache twice. A long agent
+// session then showed millions of input tokens for a few hundred output.
+func cursorUsageDetail(input, output, cacheRead, cacheWrite, reasoning int64) usage.Detail {
+	uncached := input - cacheRead - cacheWrite
+	if uncached < 0 {
+		uncached = 0
+	}
+	return usage.Detail{
+		InputTokens:         uncached,
+		OutputTokens:        output,
+		CachedTokens:        cacheRead,
+		CacheReadTokens:     cacheRead,
+		CacheCreationTokens: cacheWrite,
+		ReasoningTokens:     reasoning,
+		TotalTokens:         uncached + output + cacheRead + cacheWrite,
+	}
+}
+
 func cursorUsagePayload(input, output, cacheRead, cacheWrite, reasoning int64) map[string]any {
 	usagePayload := map[string]any{
 		"prompt_tokens":     input,
