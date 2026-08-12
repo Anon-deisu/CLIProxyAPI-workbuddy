@@ -373,7 +373,59 @@ func TestReleasePendingExecClearsAllAliases(t *testing.T) {
 		t.Fatalf("pending leftover %#v", s.pending)
 	}
 	if m.LookupPending("call_raw") != nil || m.LookupPending("toolu_abc") != nil {
-		t.Fatal("manager aliases should be unbound")
+		t.Fatal("manager lookup keys should be unbound")
+	}
+}
+
+func TestSubmitToolResultsKeepsPendingAfterWriteFailure(t *testing.T) {
+	reader, writer := io.Pipe()
+	_ = reader.Close()
+	item := &pendingExec{
+		request: &agentv1.ExecServerMessage{
+			Id:      7,
+			Message: &agentv1.ExecServerMessage_McpArgs{McpArgs: &agentv1.McpArgs{ToolCallId: "tool_raw"}},
+		},
+		call:    ToolCall{ID: "tool_raw", Name: "weather"},
+		variant: "mcp_args",
+		emitted: true,
+	}
+	s := &Session{
+		stream:       &BidiStream{writer: writer},
+		pending:      map[string]*pendingExec{"tool_raw": item},
+		pendingOrder: []*pendingExec{item},
+		batches:      map[string]*pendingToolBatch{},
+	}
+	err := s.SubmitToolResults([]ToolResult{{ToolCallID: "tool_raw", Content: "sunny"}})
+	if err == nil {
+		t.Fatal("expected request-stream write failure")
+	}
+	if s.pending["tool_raw"] != item || len(s.pendingOrder) != 1 {
+		t.Fatalf("pending state was lost after write failure: %#v", s.pending)
+	}
+}
+
+func TestPiEditGroupRollsBackFinalResultAfterWriteFailure(t *testing.T) {
+	reader, writer := io.Pipe()
+	_ = reader.Close()
+	request := &agentv1.ExecServerMessage{
+		Id:      8,
+		Message: &agentv1.ExecServerMessage_PiEditArgs{PiEditArgs: &agentv1.PiEditExecArgs{Path: "a.go"}},
+	}
+	group := &nativeExecGroup{request: request, variant: "pi_edit_args", results: map[int]ToolResult{}}
+	first := &pendingExec{request: request, call: ToolCall{ID: "edit_1"}, variant: "pi_edit_args", group: group, index: 0}
+	second := &pendingExec{request: request, call: ToolCall{ID: "edit_2"}, variant: "pi_edit_args", group: group, index: 1}
+	group.items = []*pendingExec{first, second}
+	s := &Session{stream: &BidiStream{writer: writer}}
+	completed, err := s.submitNativeGroupResult(first, ToolResult{ToolCallID: "edit_1", Content: "one"})
+	if err != nil || completed {
+		t.Fatalf("first result completed=%v err=%v", completed, err)
+	}
+	completed, err = s.submitNativeGroupResult(second, ToolResult{ToolCallID: "edit_2", Content: "two"})
+	if err == nil || completed {
+		t.Fatalf("final result completed=%v err=%v", completed, err)
+	}
+	if group.sent || len(group.results) != 1 || group.results[0].Content != "one" {
+		t.Fatalf("group state was not rolled back: sent=%v results=%#v", group.sent, group.results)
 	}
 }
 
@@ -383,14 +435,12 @@ func TestCheckpointToolBatchUsesFormalOrderAndAliases(t *testing.T) {
 	s := &Session{
 		pendingOrder:  []*pendingExec{first, second},
 		parallelTools: true,
-		toolAlias: &ToolAliasMap{
-			toUpstream: map[string]string{"read": "cpa_Read", "bash": "cpa_Bash"},
-		},
-		events: make(chan StreamEvent, 4),
+		events:        make(chan StreamEvent, 4),
 	}
 	s.conversationState = &agentv1.ConversationStateStructure{PendingToolCalls: []string{
-		`{"role":"assistant","content":[{"type":"tool-call","toolCallId":"toolu_first","toolName":"cpa_Bash"},{"type":"tool-call","toolCallId":"toolu_second","toolName":"cpa_Read"}]}`,
+		`{"role":"assistant","content":[{"type":"tool-call","toolCallId":"toolu_first","toolName":"Bash"},{"type":"tool-call","toolCallId":"toolu_second","toolName":"Read"}]}`,
 	}}
+	s.applyCheckpointToolBatches(s.conversationState)
 	if !s.pendingToolBatchReady() || !s.emitPendingToolBatch(false) {
 		t.Fatal("formal checkpoint batch was not emitted")
 	}
@@ -405,9 +455,13 @@ func TestCheckpointToolBatchUsesFormalOrderAndAliases(t *testing.T) {
 func TestSerialToolBatchEmitsOneCallPerContinuation(t *testing.T) {
 	first := &pendingExec{call: ToolCall{ID: "call_1", Name: "one"}}
 	second := &pendingExec{call: ToolCall{ID: "call_2", Name: "two"}}
+	batch := &pendingToolBatch{id: "model_1", modelCallID: "model_1", ordered: []*pendingExec{first, second}, terminal: true}
+	first.batch, second.batch = batch, batch
 	s := &Session{
 		pending:       map[string]*pendingExec{"call_1": first, "call_2": second},
 		pendingOrder:  []*pendingExec{first, second},
+		batches:       map[string]*pendingToolBatch{"model_1": batch},
+		batchOrder:    []*pendingToolBatch{batch},
 		parallelTools: false,
 		events:        make(chan StreamEvent, 4),
 		done:          context.Background().Done(),
@@ -415,6 +469,7 @@ func TestSerialToolBatchEmitsOneCallPerContinuation(t *testing.T) {
 	if !s.emitPendingToolBatch(true) {
 		t.Fatal("serial batch did not emit first call")
 	}
+	batch.emitted = true
 	if got := (<-s.events).ToolCall.ID; got != "call_1" {
 		t.Fatalf("first call=%q", got)
 	}

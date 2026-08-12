@@ -625,6 +625,29 @@ func TestExtractSessionID_ClaudeCodePriorityOverHeader(t *testing.T) {
 	}
 }
 
+func TestExtractSessionIDExecutionMetadataAndClaudeHeader(t *testing.T) {
+	t.Parallel()
+
+	metadata := map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "execution-123"}
+	if got := ExtractSessionID(nil, nil, metadata); got != "execution:execution-123" {
+		t.Fatalf("execution metadata session = %q", got)
+	}
+
+	headers := http.Header{}
+	headers.Set("X-Claude-Code-Session-Id", "claude-header-123")
+	if got := ExtractSessionID(headers, nil, nil); got != "claude:claude-header-123" {
+		t.Fatalf("Claude Code header session = %q", got)
+	}
+}
+
+func TestExtractSessionIDCursorConversationField(t *testing.T) {
+	t.Parallel()
+	payload := []byte(`{"cursor_conversation_id":"cursor-conversation-123"}`)
+	if got := ExtractSessionID(nil, payload, nil); got != "cursor:cursor-conversation-123" {
+		t.Fatalf("Cursor conversation session = %q", got)
+	}
+}
+
 func TestExtractSessionID_ClaudeCodePriorityOverIdempotencyKey(t *testing.T) {
 	t.Parallel()
 

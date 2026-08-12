@@ -21,6 +21,8 @@ type ChatMessage struct {
 	Content    string
 	Name       string
 	ToolCallID string
+	ToolKind   string
+	Namespace  string
 	ToolCalls  []ToolCall
 	Images     []ChatImage
 }
@@ -163,6 +165,8 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 
 	// Track tool names so tool-result parts can include toolName (cursor2api).
 	toolNames := map[string]string{}
+	toolKinds := map[string]string{}
+	toolNamespaces := map[string]string{}
 	rootIDs := [][]byte{systemBlob}
 	for _, msg := range history {
 		switch msg.Role {
@@ -190,6 +194,8 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 			for _, tc := range msg.ToolCalls {
 				if strings.TrimSpace(tc.ID) != "" && strings.TrimSpace(tc.Name) != "" {
 					toolNames[tc.ID] = tc.Name
+					toolKinds[tc.ID] = cursorHistoryToolKind(tc.Kind)
+					toolNamespaces[tc.ID] = tc.Namespace
 				}
 				args := any(tc.Arguments)
 				if args == nil {
@@ -217,12 +223,16 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 			if toolName == "" {
 				toolName = toolNames[msg.ToolCallID]
 			}
+			toolKind := cursorHistoryToolKind(firstNonEmpty(msg.ToolKind, toolKinds[msg.ToolCallID]))
 			resultPart := map[string]any{
 				"type":       "tool-result",
 				"toolName":   toolName,
 				"toolCallId": msg.ToolCallID,
 				"result":     msg.Content,
-				"toolKind":   "mcp",
+				"toolKind":   toolKind,
+			}
+			if namespace := firstNonEmpty(msg.Namespace, toolNamespaces[msg.ToolCallID]); namespace != "" {
+				resultPart["namespace"] = namespace
 			}
 			rootIDs = append(rootIDs, storeBlob(blobStore, mustJSON(map[string]any{
 				"role": "tool",
@@ -319,13 +329,25 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 			ResumeAction: &agentv1.ResumeAction{},
 		}
 	}
-	if defs := buildMcpToolDefinitions(tools); len(defs) > 0 {
+	if defs := buildMcpToolDefinitions(customMcpTools(tools)); len(defs) > 0 {
 		run.McpTools = &agentv1.McpTools{McpTools: defs}
 	}
 	client := &agentv1.AgentClientMessage{
 		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
 	}
 	return client, blobStore, conversationID, nil
+}
+
+func cursorHistoryToolKind(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	switch kind {
+	case "shell", "local_shell", "apply_patch", "custom", "function":
+		return kind
+	case "":
+		return "function"
+	default:
+		return kind
+	}
 }
 
 const (

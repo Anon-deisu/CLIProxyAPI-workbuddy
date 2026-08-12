@@ -6,8 +6,6 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 const (
@@ -57,8 +55,6 @@ func (m *SessionManager) Register(session *Session) {
 }
 
 // BindPending indexes a tool_call_id to its owning session.
-// Both the raw id and its Claude-safe form are indexed so clients that only
-// see SanitizeClaudeToolID(id) can still resume the same session.
 func (m *SessionManager) BindPending(toolCallID string, session *Session) {
 	if m == nil || session == nil || toolCallID == "" {
 		return
@@ -66,9 +62,6 @@ func (m *SessionManager) BindPending(toolCallID string, session *Session) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pending[toolCallID] = session
-	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
-		m.pending[safe] = session
-	}
 	session.touch()
 }
 
@@ -80,8 +73,27 @@ func (m *SessionManager) UnbindPending(toolCallID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.pending, toolCallID)
-	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
-		delete(m.pending, safe)
+}
+
+// RebindSessionPending atomically replaces every tool_call_id index owned by a
+// session. Lifecycle/checkpoint ids may arrive after Exec, so rebinding must
+// never leave the process-wide resolver pointing at a provisional id only.
+func (m *SessionManager) RebindSessionPending(session *Session, toolCallIDs []string) {
+	if m == nil || session == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, owner := range m.pending {
+		if owner == session || owner != nil && owner.ID == session.ID {
+			delete(m.pending, id)
+		}
+	}
+	for _, id := range toolCallIDs {
+		if id == "" {
+			continue
+		}
+		m.pending[id] = session
 	}
 }
 
@@ -100,13 +112,7 @@ func (m *SessionManager) LookupPending(toolCallID string) *Session {
 }
 
 func (m *SessionManager) lookupPendingLocked(toolCallID string) *Session {
-	if session := m.pending[toolCallID]; session != nil {
-		return session
-	}
-	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
-		return m.pending[safe]
-	}
-	return nil
+	return m.pending[toolCallID]
 }
 
 // ResolveForToolResults finds the single live session that owns all results.

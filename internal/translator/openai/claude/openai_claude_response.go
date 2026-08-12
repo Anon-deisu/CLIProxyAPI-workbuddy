@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/google/uuid"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -309,11 +310,15 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
 				accumulator := param.ToolCallsAccumulator[index]
 				if !accumulator.StartEmitted {
-					// Belated emit for streams that supplied a valid name but
-					// never sent an id. SanitizeClaudeToolID("") produces the
-					// expected stable synthetic toolu_<nanos>_<n> ID shape.
 					if accumulator.Name == "" {
 						continue
+					}
+					if accumulator.ID == "" {
+						// Preserve every non-empty upstream id byte-for-byte. A
+						// fallback is only for malformed streams that never supplied
+						// any id, so the tool can still complete instead of aborting
+						// the whole response.
+						accumulator.ID = "toolu_" + uuid.NewString()
 					}
 					emitToolUseStart(param, index, accumulator, &results)
 				}
@@ -453,7 +458,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 		if toolCalls := choice.Get("message.tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 				toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
-				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
+				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", openAIToolCallID(toolCall))
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolCall.Get("function.name").String())
 
 				argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
@@ -590,7 +595,7 @@ func emitToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolI
 	blockIndex := param.toolContentBlockIndex(openAIToolIndex)
 	contentBlockStartJSON := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
 	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "index", blockIndex)
-	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.id", util.SanitizeClaudeToolID(accumulator.ID))
+	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.id", accumulator.ID)
 	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.name", accumulator.Name)
 	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSON, 2))
 	accumulator.StartEmitted = true
@@ -675,7 +680,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 								toolCalls.ForEach(func(_, tc gjson.Result) bool {
 									hasToolCall = true
 									toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
-									toolUse, _ = sjson.SetBytes(toolUse, "id", util.SanitizeClaudeToolID(tc.Get("id").String()))
+									toolUse, _ = sjson.SetBytes(toolUse, "id", openAIToolCallID(tc))
 									toolUse, _ = sjson.SetBytes(toolUse, "name", util.MapToolName(toolNameMap, tc.Get("function.name").String()))
 
 									argsStr := util.FixJSON(tc.Get("function.arguments").String())
@@ -732,7 +737,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 				toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 					hasToolCall = true
 					toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
-					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
+					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", openAIToolCallID(toolCall))
 					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", util.MapToolName(toolNameMap, toolCall.Get("function.name").String()))
 
 					argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
@@ -773,6 +778,14 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 	}
 
 	return out
+}
+
+func openAIToolCallID(toolCall gjson.Result) string {
+	id := toolCall.Get("id")
+	if id.Exists() && id.Type == gjson.String && id.String() != "" {
+		return id.String()
+	}
+	return "toolu_" + uuid.NewString()
 }
 
 func ClaudeTokenCount(ctx context.Context, count int64) []byte {

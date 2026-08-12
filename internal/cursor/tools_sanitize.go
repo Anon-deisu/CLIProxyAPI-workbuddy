@@ -31,8 +31,16 @@ func SanitizeToolDefinitions(tools []ToolDefinition) []ToolDefinition {
 		return tools
 	}
 	out := make([]ToolDefinition, 0, len(tools))
-	// Cursor merges these with its own tools before calling the model provider;
-	// duplicate names (even case-only) make the provider reject with HTTP 400.
+	// A Cursor native tool owns its public name. If an external MCP definition
+	// uses the same name, keep the native definition and do not advertise an
+	// ambiguous MCP leaf.
+	nativeNames := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		name := strings.ToLower(strings.TrimSpace(tool.Name))
+		if name != "" && hasNativeCursorToolMapping(tool) {
+			nativeNames[name] = struct{}{}
+		}
+	}
 	seen := make(map[string]struct{}, len(tools))
 	for _, tool := range tools {
 		name := strings.TrimSpace(tool.Name)
@@ -40,6 +48,11 @@ func SanitizeToolDefinitions(tools []ToolDefinition) []ToolDefinition {
 			continue
 		}
 		key := strings.ToLower(name)
+		if !hasNativeCursorToolMapping(tool) {
+			if _, conflicts := nativeNames[key]; conflicts {
+				continue
+			}
+		}
 		if _, dup := seen[key]; dup {
 			continue
 		}
@@ -48,6 +61,8 @@ func SanitizeToolDefinitions(tools []ToolDefinition) []ToolDefinition {
 			Name:        name,
 			Description: truncateRunes(strings.TrimSpace(tool.Description), maxToolDescriptionRunes),
 			Parameters:  sanitizeToolSchema(tool.Parameters),
+			Kind:        strings.ToLower(strings.TrimSpace(tool.Kind)),
+			Namespace:   strings.TrimSpace(tool.Namespace),
 		})
 	}
 	return out

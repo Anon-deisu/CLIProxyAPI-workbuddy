@@ -33,6 +33,9 @@ func TestTakeUsageIsImmediateWhenAlreadySeen(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
 		t.Fatalf("waited %s for counters that were already there", elapsed)
 	}
+	if _, duplicate := s.TakeUsage(0); duplicate {
+		t.Fatal("the same turn usage was returned twice")
+	}
 }
 
 func TestTakeUsageGivesUpWithinTheBudget(t *testing.T) {

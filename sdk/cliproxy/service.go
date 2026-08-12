@@ -1328,18 +1328,21 @@ func (s *Service) applyConfigUpdateWithAuthSynthesis(newCfg *config.Config, synt
 			selector = &coreauth.RoundRobinSelector{}
 		}
 
-		if nextSessionAffinity {
-			ttl := time.Hour
-			if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
-				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
-					ttl = parsed
-				}
+		ttl := time.Hour
+		if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
+			if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
+				ttl = parsed
 			}
-			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      ttl,
-			})
 		}
+		affinityProviders := []string{"cursor"}
+		if nextSessionAffinity {
+			affinityProviders = nil
+		}
+		selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+			Fallback:        selector,
+			TTL:             ttl,
+			ProviderFilters: affinityProviders,
+		})
 
 		s.coreManager.SetSelector(selector)
 	}
