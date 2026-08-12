@@ -1003,6 +1003,12 @@ func writeRequestInfoWithBody(
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("Version: %s\n", buildinfo.Version)); errWrite != nil {
 		return errWrite
 	}
+	if _, errWrite := io.WriteString(w, fmt.Sprintf("Commit: %s\n", buildinfo.Commit)); errWrite != nil {
+		return errWrite
+	}
+	if _, errWrite := io.WriteString(w, fmt.Sprintf("BuiltAt: %s\n", buildinfo.BuildDate)); errWrite != nil {
+		return errWrite
+	}
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("URL: %s\n", url)); errWrite != nil {
 		return errWrite
 	}
@@ -1600,6 +1606,8 @@ func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[st
 
 	content.WriteString("=== REQUEST INFO ===\n")
 	content.WriteString(fmt.Sprintf("Version: %s\n", buildinfo.Version))
+	content.WriteString(fmt.Sprintf("Commit: %s\n", buildinfo.Commit))
+	content.WriteString(fmt.Sprintf("BuiltAt: %s\n", buildinfo.BuildDate))
 	content.WriteString(fmt.Sprintf("URL: %s\n", url))
 	content.WriteString(fmt.Sprintf("Method: %s\n", method))
 	if strings.TrimSpace(downstreamTransport) != "" {

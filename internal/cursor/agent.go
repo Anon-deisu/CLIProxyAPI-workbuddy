@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
@@ -427,12 +428,16 @@ func mustJSON(v any) []byte {
 	return b
 }
 
-func handleKV(stream *BidiStream, req *agentv1.KvServerMessage, blobStore map[string][]byte) error {
+func handleKV(stream *BidiStream, req *agentv1.KvServerMessage, blobStore map[string][]byte, blobMu *sync.Mutex) error {
 	resp := &agentv1.KvClientMessage{Id: req.Id}
 	switch m := req.Message.(type) {
 	case *agentv1.KvServerMessage_GetBlobArgs:
 		key := hex.EncodeToString(m.GetBlobArgs.GetBlobId())
-		if data, ok := blobStore[key]; ok {
+		blobMu.Lock()
+		data, ok := blobStore[key]
+		data = append([]byte(nil), data...)
+		blobMu.Unlock()
+		if ok {
 			resp.Message = &agentv1.KvClientMessage_GetBlobResult{
 				GetBlobResult: &agentv1.GetBlobResult{BlobData: data},
 			}
@@ -441,7 +446,9 @@ func handleKV(stream *BidiStream, req *agentv1.KvServerMessage, blobStore map[st
 		}
 	case *agentv1.KvServerMessage_SetBlobArgs:
 		key := hex.EncodeToString(m.SetBlobArgs.GetBlobId())
+		blobMu.Lock()
 		blobStore[key] = append([]byte(nil), m.SetBlobArgs.GetBlobData()...)
+		blobMu.Unlock()
 		resp.Message = &agentv1.KvClientMessage_SetBlobResult{SetBlobResult: &agentv1.SetBlobResult{}}
 	default:
 		return nil

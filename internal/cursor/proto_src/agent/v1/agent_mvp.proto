@@ -32,6 +32,42 @@ message ConversationStateStructure {
   repeated string pending_tool_calls = 4;
 }
 
+message AssistantMessage {
+  string text = 1;
+}
+
+message ThinkingMessage {
+  string text = 1;
+  uint32 duration_ms = 2;
+}
+
+message ConversationStep {
+  oneof message {
+    AssistantMessage assistant_message = 1;
+    ToolCall tool_call = 2;
+    ThinkingMessage thinking_message = 3;
+  }
+}
+
+message ConversationTurnStructure {
+  oneof turn {
+    AgentConversationTurnStructure agent_conversation_turn = 1;
+    ShellConversationTurnStructure shell_conversation_turn = 2;
+  }
+}
+
+message AgentConversationTurnStructure {
+  bytes user_message = 1;
+  repeated bytes steps = 2;
+  optional string request_id = 3;
+  optional string encrypted_model = 4;
+}
+
+message ShellConversationTurnStructure {
+  bytes shell_command = 1;
+  bytes shell_output = 2;
+}
+
 message ModelDetails {
   string model_id = 1;
   string display_model_id = 3;

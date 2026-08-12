@@ -68,12 +68,12 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	messages, err := extractChatMessages(body)
 	if err != nil {
-		return resp, err
+		return resp, cursorInvalidRequest(err)
 	}
 	tools := prepareCursorTools(messages, extractTools(body), 0)
 	messages, tools, toolConstraint, err := applyCursorToolChoice(body, messages, tools)
 	if err != nil {
-		return resp, err
+		return resp, cursorInvalidRequest(err)
 	}
 
 	creds, err := e.ensureCredentials(ctx, auth)
@@ -134,12 +134,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	messages, err := extractChatMessages(body)
 	if err != nil {
-		return nil, err
+		return nil, cursorInvalidRequest(err)
 	}
 	tools := prepareCursorTools(messages, extractTools(body), 0)
 	messages, tools, toolConstraint, err := applyCursorToolChoice(body, messages, tools)
 	if err != nil {
-		return nil, err
+		return nil, cursorInvalidRequest(err)
 	}
 
 	creds, err := e.ensureCredentials(ctx, auth)
@@ -202,26 +202,61 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				{"index": 0, "delta": map[string]any{"role": "assistant", "content": ""}, "finish_reason": nil},
 			},
 		})
-		if !emitLine([]byte("data: " + string(roleChunk))) {
-			return
-		}
-
 		contentEmitted := false
+		roleEmitted := false
+		pendingDeltas := make([]map[string]any, 0, 4)
+		emitRole := func() bool {
+			if roleEmitted {
+				return true
+			}
+			if !emitLine([]byte("data: " + string(roleChunk))) {
+				return false
+			}
+			roleEmitted = true
+			return true
+		}
+		emitDelta := func(delta map[string]any) error {
+			if !emitRole() {
+				return context.Canceled
+			}
+			chunk, _ := json.Marshal(map[string]any{
+				"id":      completionID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   req.Model,
+				"choices": []map[string]any{
+					{"index": 0, "delta": delta, "finish_reason": nil},
+				},
+			})
+			if !emitLine([]byte("data: " + string(chunk))) {
+				return context.Canceled
+			}
+			contentEmitted = true
+			return nil
+		}
+		flushPending := func() error {
+			for _, delta := range pendingDeltas {
+				if errEmit := emitDelta(delta); errEmit != nil {
+					return errEmit
+				}
+			}
+			pendingDeltas = pendingDeltas[:0]
+			return nil
+		}
 		iterate := func(active *cursorlib.Session) error {
 			return active.IterSegment(ctx, func(ev cursorlib.StreamEvent) error {
 				var delta map[string]any
+				flush := contentEmitted
 				switch ev.Type {
 				case "text_delta":
-					contentEmitted = true
 					delta = map[string]any{"content": ev.Text}
+					flush = flush || strings.TrimSpace(ev.Text) != ""
 				case "thinking_delta":
-					contentEmitted = true
 					delta = map[string]any{"reasoning_content": ev.Text}
 				case "tool_call":
 					if ev.ToolCall == nil {
 						return nil
 					}
-					contentEmitted = true
 					observedToolCalls = append(observedToolCalls, *ev.ToolCall)
 					args, _ := json.Marshal(ev.ToolCall.Arguments)
 					if args == nil {
@@ -241,10 +276,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						},
 					}
 					toolIndex++
+					flush = true
 				case "usage_final":
 					usageFinal = ev
-					reporter.Publish(ctx, cursorUsageDetail(ev.InputTokens, ev.OutputTokens,
-						ev.CacheReadTokens, ev.CacheWriteTokens, ev.ReasoningTokens))
 					return nil
 				case "error":
 					return fmt.Errorf("%s", ev.Message)
@@ -259,19 +293,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				if delta == nil {
 					return nil
 				}
-				chunk, _ := json.Marshal(map[string]any{
-					"id":      completionID,
-					"object":  "chat.completion.chunk",
-					"created": created,
-					"model":   req.Model,
-					"choices": []map[string]any{
-						{"index": 0, "delta": delta, "finish_reason": nil},
-					},
-				})
-				if !emitLine([]byte("data: " + string(chunk))) {
-					return context.Canceled
+				pendingDeltas = append(pendingDeltas, delta)
+				if !flush {
+					return nil
 				}
-				return nil
+				return flushPending()
 			})
 		}
 
@@ -283,6 +309,20 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
 			if rebuildErr == nil {
 				session = rebuilt
+				errIter = iterate(session)
+			} else {
+				errIter = rebuildErr
+			}
+		}
+		if errors.Is(errIter, cursorlib.ErrEmptyTerminal) && !contentEmitted {
+			_ = session.Close()
+			log.Warnf("cursor: retrying stream once after empty terminal response")
+			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
+			if rebuildErr == nil {
+				session = rebuilt
+				pendingDeltas = pendingDeltas[:0]
+				finishReason = "stop"
+				usageFinal = cursorlib.StreamEvent{}
 				errIter = iterate(session)
 			} else {
 				errIter = rebuildErr
@@ -341,9 +381,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			return
 		}
 
-		if finishReason == "tool_calls" && toolIndex == 0 {
-			finishReason = "stop"
-		}
 		// TurnEnded can land after the segment loop has already stopped
 		// reading, which leaves the counters sitting unread. Collect them if
 		// they are there, but never wait: when a turn pauses for a client tool
@@ -353,10 +390,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			usageFinal.CacheReadTokens == 0 && usageFinal.CacheWriteTokens == 0 {
 			if late, ok := session.TakeUsage(0); ok {
 				usageFinal = late
-				reporter.Publish(ctx, cursorUsageDetail(late.InputTokens, late.OutputTokens,
-					late.CacheReadTokens, late.CacheWriteTokens, late.ReasoningTokens))
 			}
 		}
+		reporter.Publish(ctx, cursorUsageDetail(usageFinal.InputTokens, usageFinal.OutputTokens,
+			usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens, usageFinal.ReasoningTokens))
 		// Do not Close() on stop here: TurnEnded can precede trailing
 		// checkpoint/text frames. readLoop EndStream/EOF owns teardown;
 		// the session manager reaper cleans any stranded runs.
@@ -664,6 +701,10 @@ func openCursorSessionWithRetries(ctx context.Context, creds cursorlib.AccountCr
 
 func runCursorChatWithRetries(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts ...cursorlib.StartOption) (*cursorlib.ChatResult, error) {
 	result, err := cursorlib.RunChat(ctx, creds, model, messages, tools, opts...)
+	if errors.Is(err, cursorlib.ErrEmptyTerminal) {
+		log.Warnf("cursor: retrying once after empty terminal response")
+		result, err = cursorlib.RunChat(ctx, creds, model, messages, tools, opts...)
+	}
 	if err == nil || !isCursorProviderError(err) {
 		return result, err
 	}
@@ -945,8 +986,7 @@ func isCursorProviderError(err error) bool {
 		// switching wires cannot help, and every attempt is billed.
 		return false
 	}
-	return isCursorTransientProviderError(err) || isCursorHardProviderError(err) ||
-		(err != nil && strings.Contains(err.Error(), "resource_exhausted"))
+	return isCursorTransientProviderError(err) || isCursorHardProviderError(err)
 }
 
 // isCursorRateLimited detects account throttling. Replaying the same request
@@ -956,10 +996,17 @@ func isCursorRateLimited(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "RATE_LIMIT_EXCEEDED") ||
-		strings.Contains(msg, "Rate limit exceeded") ||
-		strings.Contains(msg, "ERROR_RESOURCE_EXHAUSTED")
+	msg := strings.ToLower(err.Error())
+	// Cursor also wraps permanent downstream-provider rejections in a
+	// resource_exhausted envelope. The typed provider reason takes precedence.
+	if strings.Contains(msg, "error_provider_error") {
+		return false
+	}
+	return strings.Contains(msg, "rate_limit_exceeded") ||
+		strings.Contains(msg, "rate limit exceeded") ||
+		strings.Contains(msg, "error_resource_exhausted") ||
+		strings.Contains(msg, "resource_exhausted") ||
+		strings.Contains(msg, "grpc status 8")
 }
 
 // isCursorPolicyBlock detects Anthropic's content-policy refusal, which Cursor
@@ -981,11 +1028,39 @@ func humanizeCursorError(err error) error {
 	case isCursorPolicyBlock(err):
 		return fmt.Errorf("cursor: upstream refused this request under Anthropic's usage policy (cyber content review). " +
 			"Rephrase or remove the flagged content; retrying the same prompt will not help")
+	case isCursorProviderBadRequest(err):
+		return cursorInvalidRequest(fmt.Errorf("cursor model provider rejected the request: %w", err))
+	case errors.Is(err, cursorlib.ErrEmptyTerminal):
+		return statusErr{code: http.StatusBadGateway, msg: err.Error()}
 	case isCursorRateLimited(err):
-		return statusErr{code: http.StatusTooManyRequests, msg: "cursor: account rate limit exceeded " +
-			"(ERROR_PRO_USER_RATE_LIMIT_EXCEEDED). Wait for the window to reset or add another Cursor account"}
+		return statusErr{code: http.StatusTooManyRequests, msg: "cursor: rate limit or upstream resource exhaustion. " +
+			"Retry with another Cursor account or wait for the cooldown window"}
 	}
 	return err
+}
+
+func cursorInvalidRequest(err error) error {
+	if err == nil {
+		return nil
+	}
+	return statusErr{code: http.StatusBadRequest, msg: "invalid_request_error: " + err.Error()}
+}
+
+func isCursorProviderBadRequest(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	providerError := strings.Contains(msg, "error_provider_error") || strings.Contains(msg, "provider error")
+	if !providerError {
+		return false
+	}
+	return strings.Contains(msg, `"providerstatuscode":"400"`) ||
+		strings.Contains(msg, `"providerstatuscode": "400"`) ||
+		strings.Contains(msg, "providerstatuscode=400") ||
+		strings.Contains(msg, "isretryable=false") ||
+		strings.Contains(msg, `"isretryable":false`) ||
+		strings.Contains(msg, `"isretryable": false`)
 }
 
 // isCursorTransientProviderError is Cursor→model-provider connectivity failure.
@@ -994,13 +1069,13 @@ func isCursorTransientProviderError(err error) bool {
 	if err == nil || isCursorPolicyBlock(err) || isCursorRateLimited(err) {
 		return false
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "ERROR_PROVIDER_ERROR") || strings.Contains(msg, "providerStatusCode") {
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "error_provider_error") || strings.Contains(msg, "providerstatuscode") {
 		// Hard provider rejection (usually HTTP 400), not a blip.
 		return false
 	}
-	return strings.Contains(msg, "ERROR_OPENAI") ||
-		strings.Contains(msg, "Unable to reach the model provider") ||
+	return strings.Contains(msg, "error_openai") ||
+		strings.Contains(msg, "unable to reach the model provider") ||
 		strings.Contains(msg, `"code":"unavailable"`)
 }
 
@@ -1009,10 +1084,15 @@ func isCursorHardProviderError(err error) bool {
 	if err == nil || isCursorPolicyBlock(err) || isCursorRateLimited(err) {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "ERROR_PROVIDER_ERROR") ||
-		strings.Contains(msg, "providerStatusCode") ||
-		(strings.Contains(msg, "Provider Error") && strings.Contains(msg, "400"))
+	msg := strings.ToLower(err.Error())
+	if isCursorProviderBadRequest(err) && (strings.Contains(msg, `"isretryable":false`) ||
+		strings.Contains(msg, `"isretryable": false`) ||
+		strings.Contains(msg, "isretryable=false")) {
+		return false
+	}
+	return strings.Contains(msg, "error_provider_error") ||
+		strings.Contains(msg, "providerstatuscode") ||
+		(strings.Contains(msg, "provider error") && strings.Contains(msg, "400"))
 }
 
 var cursorTransientBackoff = []time.Duration{time.Second, 3 * time.Second, 6 * time.Second}

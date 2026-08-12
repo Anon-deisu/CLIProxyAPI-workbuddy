@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
 )
 
 const rateLimitTrailer = `cursor connect end-stream error: {"code":"resource_exhausted",` +
@@ -37,6 +39,32 @@ func TestRateLimitSurfacesAs429(t *testing.T) {
 	}
 	if !strings.Contains(se.Error(), "rate limit") {
 		t.Errorf("message not actionable: %q", se.Error())
+	}
+}
+
+func TestUntypedResourceExhaustionSurfacesAs429WithoutRetry(t *testing.T) {
+	err := errors.New(`cursor connect end-stream error: {"code":"resource_exhausted","message":"Error"}`)
+	if isCursorProviderError(err) {
+		t.Fatal("untyped resource exhaustion must not enter the retry ladder")
+	}
+	humanized := humanizeCursorError(err)
+	var se statusErr
+	if !errors.As(humanized, &se) {
+		t.Fatalf("want statusErr, got %T", humanized)
+	}
+	if se.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", se.StatusCode())
+	}
+}
+
+func TestEmptyCursorTerminalSurfacesAs502(t *testing.T) {
+	humanized := humanizeCursorError(cursorlib.ErrEmptyTerminal)
+	var se statusErr
+	if !errors.As(humanized, &se) {
+		t.Fatalf("want statusErr, got %T", humanized)
+	}
+	if se.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", se.StatusCode())
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -625,6 +626,7 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 	}
 	var text strings.Builder
 	var thinking strings.Builder
+	toolCalls := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -638,9 +640,7 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 			}
 		case ev, ok := <-s.events:
 			if !ok {
-				result.Text = text.String()
-				result.Thinking = thinking.String()
-				return result, nil
+				return nil, fmt.Errorf("%w: stream closed before a terminal boundary", ErrEmptyTerminal)
 			}
 			switch ev.Type {
 			case "text_delta":
@@ -650,6 +650,7 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 			case "tool_call":
 				if ev.ToolCall != nil {
 					result.ToolCalls = append(result.ToolCalls, *ev.ToolCall)
+					toolCalls++
 				}
 			case "usage_final":
 				result.InputTokens = ev.InputTokens
@@ -665,8 +666,11 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 				if ev.Reason != "" {
 					result.FinishReason = ev.Reason
 				}
-				if result.FinishReason == "tool_calls" && len(result.ToolCalls) == 0 {
-					result.FinishReason = "stop"
+				if result.FinishReason == "tool_calls" && toolCalls == 0 {
+					return nil, fmt.Errorf("%w: tool boundary contained no tool call", ErrEmptyTerminal)
+				}
+				if result.FinishReason == "stop" && strings.TrimSpace(result.Text) == "" && toolCalls == 0 {
+					return nil, ErrEmptyTerminal
 				}
 				return result, nil
 			}
@@ -685,6 +689,8 @@ func (s *Session) wasResumed() bool {
 
 // IterSegment invokes fn for each event until segment_end (inclusive).
 func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) error {
+	hasText := false
+	toolCalls := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -700,12 +706,24 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 			}
 		case ev, ok := <-s.events:
 			if !ok {
-				return nil
+				return fmt.Errorf("%w: stream closed before a terminal boundary", ErrEmptyTerminal)
+			}
+			if ev.Type == "text_delta" && strings.TrimSpace(ev.Text) != "" {
+				hasText = true
+			}
+			if ev.Type == "tool_call" && ev.ToolCall != nil {
+				toolCalls++
 			}
 			if err := fn(ev); err != nil {
 				return err
 			}
 			if ev.Type == "segment_end" {
+				if ev.Reason == "tool_calls" && toolCalls == 0 {
+					return fmt.Errorf("%w: tool boundary contained no tool call", ErrEmptyTerminal)
+				}
+				if ev.Reason == "stop" && !hasText && toolCalls == 0 {
+					return ErrEmptyTerminal
+				}
 				return nil
 			}
 			if ev.Type == "error" {
@@ -718,6 +736,11 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 // ErrToolResumeRebuild tells the executor to start a fresh Agent turn from
 // history instead of reading more events on a half-closed Connect stream.
 var ErrToolResumeRebuild = fmt.Errorf("cursor: tool resume requires rebuild")
+
+// ErrEmptyTerminal means Cursor ended a billed turn without a final assistant
+// message or a client-visible tool call. Treating this as stop silently loses
+// the answer and prevents downstream credential failover.
+var ErrEmptyTerminal = errors.New("cursor: turn ended without final assistant text or tool calls")
 
 // SubmitToolResults replies on the live exec stream and resumes reading.
 func (s *Session) SubmitToolResults(results []ToolResult) error {
@@ -930,7 +953,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			// Client-visible tool calls are driven by Exec mcp_args for declared tools.
 		}
 	case *agentv1.AgentServerMessage_KvServerMessage:
-		if err := handleKV(s.stream, m.KvServerMessage, s.blobStore); err != nil {
+		if err := handleKV(s.stream, m.KvServerMessage, s.blobStore, &s.mu); err != nil {
 			return false, err
 		}
 		// Blobs often arrive after conversation_checkpoint_update. Retry flush
@@ -980,42 +1003,91 @@ type checkpointAssistantMessage struct {
 	thinking string
 }
 
-func (s *Session) checkpointBlobIDs() [][]byte {
+type checkpointSnapshot struct {
+	state *agentv1.ConversationStateStructure
+	blobs map[string][]byte
+}
+
+func (s *Session) checkpointSnapshot() checkpointSnapshot {
 	s.mu.Lock()
-	state := s.conversationState
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+
+	var state *agentv1.ConversationStateStructure
+	if s.conversationState != nil {
+		state = proto.Clone(s.conversationState).(*agentv1.ConversationStateStructure)
+	}
+	blobs := make(map[string][]byte, len(s.blobStore))
+	for key, raw := range s.blobStore {
+		blobs[key] = append([]byte(nil), raw...)
+	}
+	return checkpointSnapshot{state: state, blobs: blobs}
+}
+
+func checkpointBlobIDs(snapshot checkpointSnapshot) [][]byte {
+	state := snapshot.state
 	if state == nil {
 		return nil
 	}
-	return append([][]byte(nil), state.GetRootPromptMessagesJson()...)
+
+	ids := make([][]byte, 0, len(state.GetRootPromptMessagesJson())+len(state.GetTurns()))
+	seen := make(map[string]struct{})
+	appendID := func(id []byte) {
+		if len(id) == 0 {
+			return
+		}
+		key := fmt.Sprintf("%x", id)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		ids = append(ids, append([]byte(nil), id...))
+	}
+	for _, id := range state.GetRootPromptMessagesJson() {
+		appendID(id)
+	}
+	for _, turnID := range state.GetTurns() {
+		raw := snapshot.blobs[fmt.Sprintf("%x", turnID)]
+		if len(raw) == 0 {
+			continue
+		}
+		turn := &agentv1.ConversationTurnStructure{}
+		if err := proto.Unmarshal(raw, turn); err != nil {
+			continue
+		}
+		agentTurn := turn.GetAgentConversationTurn()
+		if agentTurn == nil {
+			continue
+		}
+		for _, stepID := range agentTurn.GetSteps() {
+			appendID(stepID)
+		}
+	}
+	return ids
 }
 
 func (s *Session) checkpointAssistantMessages() []checkpointAssistantMessage {
-	ids := s.checkpointBlobIDs()
+	snapshot := s.checkpointSnapshot()
+	ids := checkpointBlobIDs(snapshot)
 	if len(ids) == 0 {
-		// Fall back to whatever blobs we already hold (initial prompt roots).
-		s.mu.Lock()
-		keys := make([]string, 0, len(s.blobStore))
-		for k := range s.blobStore {
-			keys = append(keys, k)
+		// Fall back to initial prompt blobs when no checkpoint has arrived yet.
+		keys := make([]string, 0, len(snapshot.blobs))
+		for key := range snapshot.blobs {
+			keys = append(keys, key)
 		}
-		s.mu.Unlock()
+		sort.Strings(keys)
 		out := make([]checkpointAssistantMessage, 0)
 		for _, key := range keys {
-			if msg, ok := parseAssistantBlob(key, s.blobStore[key]); ok {
+			if msg, ok := parseAssistantBlob(key, snapshot.blobs[key]); ok {
 				out = append(out, msg)
 			}
 		}
 		return out
 	}
 	out := make([]checkpointAssistantMessage, 0)
-	s.mu.Lock()
-	store := s.blobStore
-	s.mu.Unlock()
 	for _, id := range ids {
 		key := fmt.Sprintf("%x", id)
-		raw, ok := store[key]
-		if !ok || len(raw) == 0 {
+		raw := snapshot.blobs[key]
+		if len(raw) == 0 {
 			continue
 		}
 		if msg, ok := parseAssistantBlob(key, raw); ok {
@@ -1027,50 +1099,63 @@ func (s *Session) checkpointAssistantMessages() []checkpointAssistantMessage {
 
 func parseAssistantBlob(key string, raw []byte) (checkpointAssistantMessage, bool) {
 	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return checkpointAssistantMessage{}, false
-	}
-	role, _ := payload["role"].(string)
-	if role != "assistant" {
-		return checkpointAssistantMessage{}, false
-	}
-	identity := key
-	if id, ok := payload["id"].(string); ok && strings.TrimSpace(id) != "" {
-		identity = id
-	} else {
-		identity = "blob:" + key
-	}
-	content, _ := payload["content"].([]any)
-	var b strings.Builder
-	var think strings.Builder
-	for _, part := range content {
-		m, ok := part.(map[string]any)
-		if !ok {
-			continue
-		}
-		switch typ, _ := m["type"].(string); typ {
-		case "text", "output_text":
-			text, _ := m["text"].(string)
-			b.WriteString(text)
-		case "thinking", "reasoning", "redacted_thinking":
-			// Cursor names the payload "thinking" on some blobs and "text" on
-			// others; the wire deltas drop the first token, so the checkpoint
-			// copy is the only authoritative source.
-			text, _ := m["thinking"].(string)
-			if text == "" {
-				text, _ = m["text"].(string)
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		role, _ := payload["role"].(string)
+		if role == "assistant" {
+			identity := key
+			if id, ok := payload["id"].(string); ok && strings.TrimSpace(id) != "" {
+				identity = id
+			} else {
+				identity = "blob:" + key
 			}
-			think.WriteString(text)
-		default:
-			log.Debugf("cursor: checkpoint assistant block type %q ignored", typ)
+			content, _ := payload["content"].([]any)
+			var text strings.Builder
+			var thinking strings.Builder
+			for _, part := range content {
+				block, ok := part.(map[string]any)
+				if !ok {
+					continue
+				}
+				switch typ, _ := block["type"].(string); typ {
+				case "text", "output_text":
+					value, _ := block["text"].(string)
+					text.WriteString(value)
+				case "thinking", "reasoning", "redacted_thinking":
+					value, _ := block["thinking"].(string)
+					if value == "" {
+						value, _ = block["text"].(string)
+					}
+					thinking.WriteString(value)
+				default:
+					log.Debugf("cursor: checkpoint assistant block type %q ignored", typ)
+				}
+			}
+			if text.Len() > 0 || thinking.Len() > 0 {
+				return checkpointAssistantMessage{
+					identity: identity,
+					text:     text.String(),
+					thinking: thinking.String(),
+				}, true
+			}
 		}
 	}
-	text := b.String()
-	thinking := think.String()
-	if text == "" && thinking == "" {
+
+	step := &agentv1.ConversationStep{}
+	if err := proto.Unmarshal(raw, step); err != nil {
 		return checkpointAssistantMessage{}, false
 	}
-	return checkpointAssistantMessage{identity: identity, text: text, thinking: thinking}, true
+	identity := "blob:" + key
+	switch message := step.GetMessage().(type) {
+	case *agentv1.ConversationStep_AssistantMessage:
+		if text := message.AssistantMessage.GetText(); text != "" {
+			return checkpointAssistantMessage{identity: identity, text: text}, true
+		}
+	case *agentv1.ConversationStep_ThinkingMessage:
+		if thinking := message.ThinkingMessage.GetText(); thinking != "" {
+			return checkpointAssistantMessage{identity: identity, thinking: thinking}, true
+		}
+	}
+	return checkpointAssistantMessage{}, false
 }
 
 // handleThinkingDelta buffers reasoning for the same reason text is buffered:

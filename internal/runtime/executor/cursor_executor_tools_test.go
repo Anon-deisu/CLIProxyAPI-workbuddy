@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -81,8 +82,12 @@ func TestExtractToolsAcceptsAnthropicInputSchema(t *testing.T) {
 }
 
 func TestIsCursorProviderError(t *testing.T) {
-	if !isCursorProviderError(fmt.Errorf(`cursor connect end-stream error: {"code":"resource_exhausted","message":"Error"}`)) {
-		t.Fatal("expected provider error detection")
+	resourceExhausted := fmt.Errorf(`cursor connect end-stream error: {"code":"resource_exhausted","message":"Error"}`)
+	if isCursorProviderError(resourceExhausted) {
+		t.Fatal("untyped resource exhaustion must not enter the provider retry ladder")
+	}
+	if !isCursorRateLimited(resourceExhausted) {
+		t.Fatal("untyped resource exhaustion should be surfaced as a 429")
 	}
 	if isCursorProviderError(fmt.Errorf("cursor: unknown or expired tool_call_id x")) {
 		t.Fatal("tool_call_id errors are not provider errors")
@@ -128,6 +133,21 @@ func TestCursorErrorClassification(t *testing.T) {
 	}
 	if isCursorTransientProviderError(hard) {
 		t.Fatal("hard 400 should not be transient")
+	}
+	nonRetryable := fmt.Errorf(`cursor connect end-stream error: {"code":"resource_exhausted","details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"isRetryable":false,"additionalInfo":{"providerStatusCode":"400"}}}}]}`)
+	if isCursorProviderError(nonRetryable) || isCursorHardProviderError(nonRetryable) {
+		t.Fatal("explicitly non-retryable provider 400 must not be replayed")
+	}
+	if isCursorRateLimited(nonRetryable) {
+		t.Fatal("provider 400 must not be misclassified as account throttling")
+	}
+	humanized := humanizeCursorError(nonRetryable)
+	var invalid statusErr
+	if !errors.As(humanized, &invalid) || invalid.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("provider 400 must surface as a terminal bad request, got %T %v", humanized, humanized)
+	}
+	if !strings.Contains(humanized.Error(), "invalid_request_error") {
+		t.Fatalf("provider 400 must stop outer credential retries: %v", humanized)
 	}
 }
 
