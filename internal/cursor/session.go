@@ -1723,6 +1723,17 @@ func (s *Session) lookupTool(name, provider string) *ToolDefinition {
 	}
 	def := s.toolIndex[name]
 	if def == nil {
+		// Everything else that maps tool names does so case-insensitively; a
+		// miss here answers ToolNotFound and loses the call outright.
+		lower := strings.ToLower(strings.TrimSpace(name))
+		for indexed, candidate := range s.toolIndex {
+			if strings.ToLower(indexed) == lower {
+				def = candidate
+				break
+			}
+		}
+	}
+	if def == nil {
 		return nil
 	}
 	if provider == "" || provider == MCPProviderIdentifier {

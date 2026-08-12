@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -1545,10 +1546,29 @@ func nativeInteractionsExecutionError() *interfaces.ErrorMessage {
 	}
 }
 
+// contextWindowSuffix matches the bracketed long-context marker clients append
+// to a model id, such as "claude-opus-4-8[1m]".
+var contextWindowSuffix = regexp.MustCompile(`\[[0-9]+[kKmM]\]$`)
+
+// stripContextWindowSuffix drops that marker so the id resolves to the model it
+// names. There is no separate long-context entry to route to, and failing the
+// lookup instead surfaced on clients as "<model> is temporarily unavailable"
+// for every call that carried the suffix — including the command-approval
+// checks some agents run before each shell command.
+func stripContextWindowSuffix(model string) string {
+	trimmed := strings.TrimSpace(model)
+	if stripped := contextWindowSuffix.ReplaceAllString(trimmed, ""); stripped != trimmed {
+		return strings.TrimSpace(stripped)
+	}
+	return trimmed
+}
+
 // providersForExecution resolves the providers and normalized model for a request. When a model
 // router selected a built-in provider, it skips model->provider resolution and uses the router's
 // provider (with an optional target model); otherwise it falls back to the registry-based path.
 func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
+	modelName = stripContextWindowSuffix(modelName)
+	originalRequestedModel = stripContextWindowSuffix(originalRequestedModel)
 	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
 	if forcedProvider != "" {
 		if routeDecision.ExecutorPluginID != "" {

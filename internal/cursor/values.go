@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strconv"
 
+	log "github.com/sirupsen/logrus"
+
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -155,7 +157,32 @@ func decodeMcpArguments(args *agentv1.McpArgs, def *ToolDefinition) map[string]a
 		}
 		out[k] = value
 	}
+	if missing := missingRequiredArguments(def, out); len(missing) > 0 {
+		// The client validates against the same schema and answers "Invalid
+		// tool parameters", which on its own says nothing about which argument
+		// the model left out.
+		log.Warnf("cursor: tool %q called without required argument(s) %v", def.Name, missing)
+	}
 	return out
+}
+
+// missingRequiredArguments lists schema-required properties the call omitted.
+func missingRequiredArguments(def *ToolDefinition, args map[string]any) []string {
+	if def == nil || def.Parameters == nil {
+		return nil
+	}
+	required, _ := def.Parameters["required"].([]any)
+	var missing []string
+	for _, raw := range required {
+		name, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		if _, present := args[name]; !present {
+			missing = append(missing, name)
+		}
+	}
+	return missing
 }
 
 func toolSchemaProperties(def *ToolDefinition) map[string]map[string]any {
