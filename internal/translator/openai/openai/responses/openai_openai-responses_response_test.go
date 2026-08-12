@@ -503,6 +503,35 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream_OmitsTop
 	}
 }
 
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_PreservesCacheWriteUsage(t *testing.T) {
+	request := []byte(`{"model":"gpt-5.4"}`)
+	chunks := []string{
+		`data: {"id":"resp_usage","object":"chat.completion.chunk","created":1,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}`,
+		`data: {"id":"resp_usage","object":"chat.completion.chunk","created":1,"model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`data: {"id":"resp_usage","object":"chat.completion.chunk","created":1,"model":"model","choices":[],"usage":{"prompt_tokens":13,"completion_tokens":2,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":10,"cache_creation_tokens":3}}}`,
+		`data: [DONE]`,
+	}
+	var param any
+	var completed gjson.Result
+	for _, line := range chunks {
+		for _, chunk := range ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param) {
+			event, data := parseOpenAIResponsesSSEEvent(t, chunk)
+			if event == "response.completed" {
+				completed = data
+			}
+		}
+	}
+	if !completed.Exists() {
+		t.Fatal("expected response.completed")
+	}
+	if got := completed.Get("response.usage.input_tokens_details.cached_tokens").Int(); got != 10 {
+		t.Fatalf("cached tokens = %d, want 10", got)
+	}
+	if got := completed.Get("response.usage.input_tokens_details.cache_write_tokens").Int(); got != 3 {
+		t.Fatalf("cache write tokens = %d, want 3", got)
+	}
+}
+
 func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_RestoresNamespaceFunctionCall(t *testing.T) {
 	originalRequest := []byte(`{
 		"model":"deepseek-v4-flash",

@@ -113,6 +113,8 @@ type Session struct {
 	segmentEnded        bool
 	textFlushed         bool
 	thinkingFlushed     bool
+	textStreamLive      bool
+	holdTimer           *time.Timer
 	resumed             bool
 	// lastFrame is the last time anything arrived from Cursor. Thinking and
 	// text deltas are buffered rather than emitted, so consumer-side idle
@@ -794,6 +796,11 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	s.terminalUsageReady = false
 	s.terminalUsage = StreamEvent{}
 	s.thinkingFlushed = false
+	s.textStreamLive = false
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+		s.holdTimer = nil
+	}
 	s.resumed = true
 	s.visibleText.Reset()
 	s.emittedText.Reset()
@@ -847,6 +854,10 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+		s.holdTimer = nil
+	}
 	stream := s.stream
 	cancel := s.cancel
 	s.mu.Unlock()
@@ -1079,15 +1090,85 @@ func (s *Session) handleThinkingDelta(text string) {
 	s.emit(StreamEvent{Type: "thinking_delta", Text: text})
 }
 
+// textHoldWindow gives the checkpoint a short chance to repair Cursor's
+// occasionally missing leading token. After this opening window, deltas stream
+// immediately instead of buffering the whole response.
+const textHoldWindow = 1200 * time.Millisecond
+
 func (s *Session) handleTextDelta(text string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.textFlushed {
+	if text == "" {
 		return
 	}
-	// Always buffer. Emitting live races the checkpoint and shows truncated
-	// leading tokens (MARKER→ARKER).
+	s.mu.Lock()
+	if s.textFlushed {
+		s.mu.Unlock()
+		return
+	}
 	s.visibleText.WriteString(text)
+	live := s.textStreamLive
+	if live {
+		s.emittedText.WriteString(text)
+	} else if s.holdTimer == nil {
+		s.holdTimer = time.AfterFunc(textHoldWindow, s.releaseTextStream)
+	}
+	s.mu.Unlock()
+	if live {
+		s.emit(StreamEvent{Type: "text_delta", Text: text})
+	}
+}
+
+// releaseTextStream emits the withheld opening, using an already available
+// checkpoint as the authoritative copy, then switches subsequent deltas to
+// live streaming.
+func (s *Session) releaseTextStream() {
+	s.mu.Lock()
+	if s.textStreamLive || s.textFlushed {
+		s.mu.Unlock()
+		return
+	}
+	emitted := s.emittedText.String()
+	visible := s.visibleText.String()
+	if s.seenAssistantMsgIDs == nil {
+		s.seenAssistantMsgIDs = map[string]struct{}{}
+	}
+	s.mu.Unlock()
+
+	final := visible
+	var newIDs []string
+	for _, msg := range s.checkpointAssistantMessages() {
+		s.mu.Lock()
+		_, seen := s.seenAssistantMsgIDs[msg.identity]
+		s.mu.Unlock()
+		if seen {
+			continue
+		}
+		newIDs = append(newIDs, msg.identity)
+		final = reconcileAssistantText(final, msg.text)
+	}
+	out := final
+	if emitted != "" && strings.HasPrefix(final, emitted) {
+		out = final[len(emitted):]
+	}
+
+	s.mu.Lock()
+	if s.textStreamLive || s.textFlushed {
+		s.mu.Unlock()
+		return
+	}
+	for _, id := range newIDs {
+		s.seenAssistantMsgIDs[id] = struct{}{}
+	}
+	s.textStreamLive = true
+	s.holdTimer = nil
+	s.emittedText.Reset()
+	s.emittedText.WriteString(final)
+	s.visibleText.Reset()
+	s.visibleText.WriteString(final)
+	s.mu.Unlock()
+
+	for _, part := range splitTextForSSE(out, sseChunkBytes) {
+		s.emit(StreamEvent{Type: "text_delta", Text: part})
+	}
 }
 
 // flushAssistantText reconciles buffered deltas with the conversation
@@ -1130,6 +1211,15 @@ func (s *Session) flushAssistantText(force bool) {
 	if !haveCheckpoint && !force {
 		return
 	}
+	if haveCheckpoint {
+		s.mu.Lock()
+		s.textStreamLive = true
+		if s.holdTimer != nil {
+			s.holdTimer.Stop()
+			s.holdTimer = nil
+		}
+		s.mu.Unlock()
+	}
 	s.flushThinking(finalThink, emittedThink)
 	if force {
 		s.mu.Lock()
@@ -1156,12 +1246,12 @@ func (s *Session) flushAssistantText(force bool) {
 		out = final
 	case strings.HasPrefix(final, emitted):
 		out = final[len(emitted):]
-	case strings.HasSuffix(final, emitted):
-		// Live/partial emit lost a prefix; replace with the full checkpoint
-		// text so buffering clients (Claude Code) still see a correct answer.
-		out = final
 	default:
-		out = final
+		// Once text is live the downstream already owns the emitted prefix.
+		// Replaying a diverging checkpoint would duplicate the answer.
+		log.Debugf("cursor: checkpoint text diverges from streamed text (streamed=%d checkpoint=%d); keeping streamed copy",
+			len(emitted), len(final))
+		out = ""
 	}
 
 	s.mu.Lock()

@@ -49,6 +49,7 @@ type oaiToResponsesState struct {
 	// usage aggregation
 	PromptTokens     int64
 	CachedTokens     int64
+	CacheWriteTokens int64
 	CompletionTokens int64
 	TotalTokens      int64
 	ReasoningTokens  int64
@@ -180,6 +181,9 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 	if st.UsageSeen {
 		completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens", st.PromptTokens)
 		completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens_details.cached_tokens", st.CachedTokens)
+		if st.CacheWriteTokens > 0 {
+			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens_details.cache_write_tokens", st.CacheWriteTokens)
+		}
 		completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", st.CompletionTokens)
 		if st.ReasoningTokens > 0 {
 			completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens_details.reasoning_tokens", st.ReasoningTokens)
@@ -249,6 +253,13 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			st.CachedTokens = v.Int()
 			st.UsageSeen = true
 		}
+		if v := usage.Get("prompt_tokens_details.cache_creation_tokens"); v.Exists() {
+			st.CacheWriteTokens = v.Int()
+			st.UsageSeen = true
+		} else if v := usage.Get("input_tokens_details.cache_write_tokens"); v.Exists() {
+			st.CacheWriteTokens = v.Int()
+			st.UsageSeen = true
+		}
 		if v := usage.Get("completion_tokens"); v.Exists() {
 			st.CompletionTokens = v.Int()
 			st.UsageSeen = true
@@ -299,6 +310,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.FuncItemDone = make(map[string]bool)
 		st.PromptTokens = 0
 		st.CachedTokens = 0
+		st.CacheWriteTokens = 0
 		st.CompletionTokens = 0
 		st.TotalTokens = 0
 		st.ReasoningTokens = 0
@@ -794,6 +806,11 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 			resp, _ = sjson.SetBytes(resp, "usage.input_tokens", usage.Get("prompt_tokens").Int())
 			if d := usage.Get("prompt_tokens_details.cached_tokens"); d.Exists() {
 				resp, _ = sjson.SetBytes(resp, "usage.input_tokens_details.cached_tokens", d.Int())
+			}
+			if d := usage.Get("prompt_tokens_details.cache_creation_tokens"); d.Exists() {
+				resp, _ = sjson.SetBytes(resp, "usage.input_tokens_details.cache_write_tokens", d.Int())
+			} else if d := usage.Get("input_tokens_details.cache_write_tokens"); d.Exists() {
+				resp, _ = sjson.SetBytes(resp, "usage.input_tokens_details.cache_write_tokens", d.Int())
 			}
 			resp, _ = sjson.SetBytes(resp, "usage.output_tokens", usage.Get("completion_tokens").Int())
 			// Reasoning tokens not available in Chat Completions; set only if present under output_tokens_details
