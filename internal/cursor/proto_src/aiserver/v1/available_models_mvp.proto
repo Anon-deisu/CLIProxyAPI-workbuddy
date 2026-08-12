@@ -47,19 +47,22 @@ message AvailableModelsResponse {
     string name = 1;
     optional bool supports_thinking = 9;
     optional bool supports_images = 10;
+    optional bool supports_max_mode = 14;
+    optional int32 context_token_limit = 15;
+    optional int32 context_token_limit_for_max_mode = 16;
     optional string client_display_name = 17;
     optional string server_model_name = 18;
     optional bool supports_non_max_mode = 19;
     repeated ModelParameterDefinition parameter_definitions = 29;
     repeated ModelVariantConfig variants = 30;
     repeated string id_aliases = 37;
-    optional int32 context_token_limit = 15;
   }
 
   message ModelVariantConfig {
     repeated agent.v1.RequestedModel.ModelParameterValue parameter_values = 1;
     string display_name = 2;
     bool is_max_mode = 3;
+    optional bool is_default_max_config = 4;
     optional bool is_default_non_max_config = 5;
     optional string variant_string_representation = 9;
     optional string legacy_slug = 11;

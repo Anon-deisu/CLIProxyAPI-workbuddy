@@ -290,7 +290,6 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 		if entry.DisplayName != "" {
 			displayName = entry.DisplayName
 		}
-		selection.MaxMode = selection.MaxMode || entry.MaxMode
 		if !selection.VariantStringRepr && len(selection.Parameters) == 0 && len(entry.Parameters) > 0 {
 			selection.Parameters = append([]ModelParameter(nil), entry.Parameters...)
 		}

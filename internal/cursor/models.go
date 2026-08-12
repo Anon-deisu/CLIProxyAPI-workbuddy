@@ -23,6 +23,7 @@ const (
 type CatalogVariant struct {
 	Parameters        []ModelParameter
 	MaxMode           bool
+	IsDefaultMax      bool
 	IsDefaultNonMax   bool
 	LegacySlug        string
 	VariantStringRepr string
@@ -37,6 +38,7 @@ type CatalogModel struct {
 	Thinking     bool
 	SupportsImg  bool
 	MaxMode      bool
+	SupportsMax  bool
 	ContextLimit int
 	Parameters   []ModelParameter
 	Variants     []CatalogVariant
@@ -129,7 +131,7 @@ func FetchAvailableModels(ctx context.Context, creds AccountCredentials) ([]Cata
 	usePicker := true
 	req := &aiserverv1.AvailableModelsRequest{
 		IsNightly:                strings.Contains(strings.ToLower(creds.ClientVersion), "nightly"),
-		IncludeLongContextModels: false,
+		IncludeLongContextModels: true,
 		ExcludeMaxNamedModels:    true,
 		UseModelParameters:       &useParams,
 		UseReactModelPicker:      &usePicker,
@@ -316,9 +318,15 @@ func normalizeAvailableModels(resp *aiserverv1.AvailableModelsResponse) []Catalo
 			params = validVariantParameters(model, raw)
 		}
 		nonMaxDisabled := model.SupportsNonMaxMode != nil && !model.GetSupportsNonMaxMode()
-		maxMode := nonMaxDisabled
-		if variant != nil {
-			maxMode = maxMode || variant.MaxMode
+		supportsMax := model.SupportsMaxMode != nil && model.GetSupportsMaxMode()
+		for _, candidate := range variants {
+			supportsMax = supportsMax || candidate.MaxMode
+		}
+		supportsMax = supportsMax || nonMaxDisabled
+		maxMode := supportsMax
+		contextLimit := int(model.GetContextTokenLimit())
+		if maxMode && model.ContextTokenLimitForMaxMode != nil && model.GetContextTokenLimitForMaxMode() > 0 {
+			contextLimit = int(model.GetContextTokenLimitForMaxMode())
 		}
 		entry := CatalogModel{
 			ID:           id,
@@ -328,7 +336,8 @@ func normalizeAvailableModels(resp *aiserverv1.AvailableModelsResponse) []Catalo
 			Thinking:     model.GetSupportsThinking(),
 			SupportsImg:  model.GetSupportsImages(),
 			MaxMode:      maxMode,
-			ContextLimit: int(model.GetContextTokenLimit()),
+			SupportsMax:  supportsMax,
+			ContextLimit: contextLimit,
 			Variants:     variants,
 		}
 		if resp.GetUseModelParameters() && params != nil {
@@ -371,6 +380,7 @@ func collectCatalogVariants(model *aiserverv1.AvailableModelsResponse_AvailableM
 		out = append(out, CatalogVariant{
 			Parameters:        params,
 			MaxMode:           variant.GetIsMaxMode(),
+			IsDefaultMax:      variant.IsDefaultMaxConfig != nil && variant.GetIsDefaultMaxConfig(),
 			IsDefaultNonMax:   variant.IsDefaultNonMaxConfig != nil && variant.GetIsDefaultNonMaxConfig(),
 			LegacySlug:        strings.TrimSpace(variant.GetLegacySlug()),
 			VariantStringRepr: strings.TrimSpace(variant.GetVariantStringRepresentation()),
@@ -409,9 +419,13 @@ func variantParametersLoose(variant *aiserverv1.AvailableModelsResponse_ModelVar
 	return out
 }
 
-// preferCatalogVariant mirrors cursor2api apply_request_model_variant ranking:
-// non-max → thinking-on → fast=true → default_non_max / baseline overlap.
+// preferCatalogVariant mirrors cursor2api's maximum-context default:
+// max mode -> thinking-on -> fast=true -> mode-specific advertised default.
 func preferCatalogVariant(variants []CatalogVariant, explicitFast bool, desireFast *bool) *CatalogVariant {
+	return preferCatalogVariantForMode(variants, explicitFast, desireFast, nil)
+}
+
+func preferCatalogVariantForMode(variants []CatalogVariant, explicitFast bool, desireFast *bool, desiredMax *bool) *CatalogVariant {
 	if len(variants) == 0 {
 		return nil
 	}
@@ -419,6 +433,9 @@ func preferCatalogVariant(variants []CatalogVariant, explicitFast bool, desireFa
 	bestScore := [4]int{-1, -1, -1, -1}
 	for i := range variants {
 		v := variants[i]
+		if desiredMax != nil && v.MaxMode != *desiredMax {
+			continue
+		}
 		if explicitFast && desireFast != nil {
 			fastVal := paramValue(v.Parameters, "fast") == "true"
 			if fastVal != *desireFast {
@@ -433,10 +450,10 @@ func preferCatalogVariant(variants []CatalogVariant, explicitFast bool, desireFa
 			(paramValue(v.Parameters, "thinking") == "" &&
 				(paramValue(v.Parameters, "effort") != "" || paramValue(v.Parameters, "reasoning") != ""))
 		score := [4]int{
-			boolToInt(!v.MaxMode),
+			boolToInt(v.MaxMode),
 			boolToInt(thinkingOn),
 			boolToInt(!explicitFast && valuesFast),
-			boolToInt(v.IsDefaultNonMax),
+			boolToInt((v.MaxMode && v.IsDefaultMax) || (!v.MaxMode && v.IsDefaultNonMax)),
 		}
 		if bestIdx < 0 || compareScore(score, bestScore) > 0 {
 			bestIdx = i
@@ -444,6 +461,9 @@ func preferCatalogVariant(variants []CatalogVariant, explicitFast bool, desireFa
 		}
 	}
 	if bestIdx < 0 {
+		if desiredMax != nil {
+			return nil
+		}
 		return &variants[0]
 	}
 	return &variants[bestIdx]
@@ -491,9 +511,12 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
 			}
 		}
 	}
+	maxVariants := make([]*aiserverv1.AvailableModelsResponse_ModelVariantConfig, 0, len(variants))
 	nonMax := make([]*aiserverv1.AvailableModelsResponse_ModelVariantConfig, 0, len(variants))
 	for _, variant := range variants {
-		if !variant.GetIsMaxMode() {
+		if variant.GetIsMaxMode() {
+			maxVariants = append(maxVariants, variant)
+		} else {
 			nonMax = append(nonMax, variant)
 		}
 	}
@@ -505,9 +528,13 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
 		}
 		return ""
 	}
+	preferredMode := maxVariants
+	if len(preferredMode) == 0 {
+		preferredMode = nonMax
+	}
 	if thinkingSupported {
 		thinkingVariants := make([]*aiserverv1.AvailableModelsResponse_ModelVariantConfig, 0)
-		for _, variant := range nonMax {
+		for _, variant := range preferredMode {
 			if parameterValue(variant, "thinking") == "true" {
 				thinkingVariants = append(thinkingVariants, variant)
 			}
@@ -519,7 +546,8 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
 			}
 		}
 		for _, variant := range thinkingVariants {
-			if variant.IsDefaultNonMaxConfig != nil && variant.GetIsDefaultNonMaxConfig() {
+			if (variant.GetIsMaxMode() && variant.IsDefaultMaxConfig != nil && variant.GetIsDefaultMaxConfig()) ||
+				(!variant.GetIsMaxMode() && variant.IsDefaultNonMaxConfig != nil && variant.GetIsDefaultNonMaxConfig()) {
 				return variant
 			}
 		}
@@ -527,18 +555,26 @@ func defaultVariant(model *aiserverv1.AvailableModelsResponse_AvailableModel) *a
 			return thinkingVariants[0]
 		}
 	}
-	for _, variant := range nonMax {
+	for _, variant := range preferredMode {
 		if parameterValue(variant, "fast") == "true" {
 			return variant
 		}
+	}
+	for _, variant := range variants {
+		if variant.GetIsMaxMode() && variant.IsDefaultMaxConfig != nil && variant.GetIsDefaultMaxConfig() {
+			return variant
+		}
+	}
+	if len(maxVariants) > 0 {
+		return maxVariants[0]
 	}
 	for _, variant := range variants {
 		if variant.IsDefaultNonMaxConfig != nil && variant.GetIsDefaultNonMaxConfig() {
 			return variant
 		}
 	}
-	if len(nonMax) > 0 {
-		return nonMax[0]
+	if len(preferredMode) > 0 {
+		return preferredMode[0]
 	}
 	return variants[0]
 }
