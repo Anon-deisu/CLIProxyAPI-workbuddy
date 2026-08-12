@@ -368,12 +368,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			if late, ok := session.TakeUsage(0); ok {
 				usageFinal = late
 				reporter.Publish(ctx, usage.Detail{
-					InputTokens:     late.InputTokens,
-					OutputTokens:    late.OutputTokens,
-					CachedTokens:    late.CacheReadTokens,
-					CacheReadTokens: late.CacheReadTokens,
-					ReasoningTokens: late.ReasoningTokens,
-					TotalTokens:     late.InputTokens + late.OutputTokens,
+					InputTokens:         late.InputTokens,
+					OutputTokens:        late.OutputTokens,
+					CachedTokens:        late.CacheReadTokens,
+					CacheReadTokens:     late.CacheReadTokens,
+					CacheCreationTokens: late.CacheWriteTokens,
+					ReasoningTokens:     late.ReasoningTokens,
+					TotalTokens:         late.InputTokens + late.OutputTokens,
 				})
 			}
 		}
