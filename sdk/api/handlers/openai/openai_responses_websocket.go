@@ -239,12 +239,24 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			if subscriber, ok := exec.(upstreamDisconnectSubscriber); ok && subscriber != nil {
 				disconnectCh := subscriber.UpstreamDisconnectChan(passthroughSessionID)
 				if disconnectCh != nil {
+					// Do NOT force-close the downstream websocket when the upstream
+					// execution session disconnects. Forcing a close here kills the
+					// client's whole conversation on any transient upstream drop
+					// (idle read timeout, network blip, upstream server hiccup),
+					// which users see as "会话莫名其妙结束". The next response.create
+					// on the same session transparently re-dials upstream, and an
+					// in-flight generation is terminated through the normal forward
+					// error path (readCh close -> consumer error -> terminal event).
+					// We only drain the channel so the executor's send never blocks.
 					go func() {
 						select {
 						case <-wsDone:
 							return
 						case <-disconnectCh:
-							_ = conn.Close()
+							log.Infof(
+								"responses websocket: upstream execution session disconnected id=%s (downstream kept alive)",
+								passthroughSessionID,
+							)
 						}
 					}()
 				}

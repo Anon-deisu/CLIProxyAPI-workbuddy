@@ -63,3 +63,7 @@ _bmad-output/*
 
 # Scratch output
 .tmp-*
+
+# Handoff backups (never commit or ship these)
+*.handoff.bak
+handoff.bak
