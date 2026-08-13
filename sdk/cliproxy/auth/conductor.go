@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/google/uuid"
@@ -212,6 +213,11 @@ type Manager struct {
 	mu            sync.RWMutex
 	auths         map[string]*Auth
 	scheduler     *authScheduler
+	// startedAt marks process warmup: auth credentials and their model
+	// catalogs load asynchronously after start, and requests that arrive in
+	// that window used to fail with auth_unavailable — a restart burst of
+	// 503s that tripped downstream gateway circuit breakers.
+	startedAt time.Time
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -266,6 +272,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		homeRuntimeAuths: make(map[string]map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
+		startedAt:        time.Now(),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -1410,8 +1417,6 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
-	// Affinity selectors deliberately separate a session that changes models;
-	// built-in flat selectors do not need the route model as a cache key.
 	if isBuiltInSelector(selector) {
 		return ""
 	}
@@ -3525,9 +3530,44 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 	return false
 }
 
+// startupGraceWindow covers asynchronous credential/model-catalog loading
+// after a restart; startupGraceRetryDelay paces selection retries within it,
+// and startupGraceMaxAttempts bounds how long one request is held (~14s).
+const (
+	startupGraceWindow      = 120 * time.Second
+	startupGraceRetryDelay  = 2 * time.Second
+	startupGraceMaxAttempts = 7
+)
+
+// startupGraceEnabledForTests lets the grace's own tests exercise it; under
+// `go test` an empty credential set is otherwise a fixture, not warmup.
+var startupGraceEnabledForTests = false
+
+func (m *Manager) withinStartupGrace() bool {
+	if testing.Testing() && !startupGraceEnabledForTests {
+		return false
+	}
+	return m != nil && !m.startedAt.IsZero() && time.Since(m.startedAt) < startupGraceWindow
+}
+
+func isAuthSelectionUnavailable(err error) bool {
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return false
+	}
+	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
+}
+
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
+	}
+	// During warmup a selection failure means "not loaded yet", not "not
+	// configured": hold the request briefly instead of answering 503, which
+	// downstream gateways count against their circuit breakers. Bounded per
+	// request so a genuinely empty credential set still fails within ~14s.
+	if isAuthSelectionUnavailable(err) && attempt < startupGraceMaxAttempts && m.withinStartupGrace() {
+		return startupGraceRetryDelay, true
 	}
 	if maxWait <= 0 {
 		return 0, false
@@ -5389,6 +5429,8 @@ func (m *Manager) StopAutoRefresh() {
 		stoppable.Stop()
 	}
 }
+
+
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
 	m.mu.RLock()

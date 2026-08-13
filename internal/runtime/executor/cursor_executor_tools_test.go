@@ -49,6 +49,18 @@ func TestCursorToolChoiceConstraintNeverTurnsCompletedResponseIntoError(t *testi
 	// `cursor: tool_choice required tool Read`.
 }
 
+func TestToolResumeRebuildKeepsSharedSessionAlive(t *testing.T) {
+	if shouldCloseCursorSessionAfterToolSubmit(cursor.ErrToolResumeRebuild) {
+		t.Fatal("rebuild signal must not close a session shared by parallel tool-result requests")
+	}
+	if !shouldCloseCursorSessionAfterToolSubmit(errors.New("submit failed")) {
+		t.Fatal("ordinary submit failures must close the unusable live session")
+	}
+	if shouldCloseCursorSessionAfterToolSubmit(nil) {
+		t.Fatal("successful submit must not close the session")
+	}
+}
+
 func TestToolChoiceUndeclaredNamedToolIsAdvisoryNotError(t *testing.T) {
 	// `tool_choice` asks for a Cursor-native tool (`Read`) that was not in the
 	// declared set of this request. Cursor's wire has no exact named-tool

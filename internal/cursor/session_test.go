@@ -3,6 +3,7 @@ package cursor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -201,7 +202,11 @@ func TestBuildRunRequestNativeToolJSON(t *testing.T) {
 	}
 }
 
-func TestBuildRunRequestUsesResumeActionForToolContinuation(t *testing.T) {
+func TestBuildRunRequestGivesToolContinuationAnExecutableAction(t *testing.T) {
+	// This used to assert ResumeAction. Live traffic disproved that design: a
+	// fresh conversation id carries no server-side state, so a bare
+	// ResumeAction gets an immediate empty END_STREAM — the "N in / 0 out"
+	// dashboard rows and the endless 502 retry loops.
 	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
 		{Role: "user", Content: "weather?"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "get_weather", Arguments: map[string]any{"city": "Beijing"}}}},
@@ -211,11 +216,12 @@ func TestBuildRunRequestUsesResumeActionForToolContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := msg.GetRunRequest()
-	if run.GetAction().GetResumeAction() == nil {
-		t.Fatalf("tool continuation must use resume_action, got %#v", run.GetAction())
+	action := run.GetAction().GetUserMessageAction()
+	if action == nil {
+		t.Fatalf("tool continuation needs an executable action, got %#v", run.GetAction())
 	}
-	if run.GetAction().GetUserMessageAction() != nil {
-		t.Fatal("tool continuation must not replay the previous user as a new action")
+	if action.GetUserMessage().GetText() != toolContinuationNudge {
+		t.Fatalf("tool continuation must use the constant nudge, got %q", action.GetUserMessage().GetText())
 	}
 	var sawCall, sawResult bool
 	for _, data := range blobs {
@@ -500,8 +506,37 @@ func TestParallelToolBatchRejectsPartialNativeResumeForHistoryRebuild(t *testing
 	if err != ErrToolResumeRebuild {
 		t.Fatalf("partial parallel batch error=%v", err)
 	}
-	if !s.closed {
-		t.Fatal("partial native batch must close before structured history rebuild")
+	// Closing here used to kill the whole session including the events
+	// channel of any sibling request still streaming from it, which surfaced
+	// downstream as "stream closed before a terminal boundary". The session
+	// stays alive (parked for rebuild) and the sweep tears it down.
+	if s.closed {
+		t.Fatal("partial batch must not close the session under a live sibling consumer")
+	}
+	if !s.parkedForRebuild() {
+		t.Fatal("partial batch must park the session for rebuild")
+	}
+}
+
+// An externally closed session under an active collector routes to the
+// rebuild path while tools are pending, never to a client-facing error.
+func TestCollectorTreatsExternalCloseAsRebuildWhileToolsPending(t *testing.T) {
+	s := &Session{
+		waitingTools: true,
+		pending:      map[string]*pendingExec{"call_1": {}},
+		events:       make(chan StreamEvent, 1),
+		errCh:        make(chan error, 1),
+	}
+	close(s.events)
+
+	if _, err := s.CollectSegment(context.Background()); !errors.Is(err, ErrToolResumeRebuild) {
+		t.Fatalf("collect: want rebuild signal, got %v", err)
+	}
+
+	s2 := &Session{events: make(chan StreamEvent, 1), errCh: make(chan error, 1)}
+	close(s2.events)
+	if _, err := s2.CollectSegment(context.Background()); !errors.Is(err, ErrEmptyTerminal) {
+		t.Fatalf("collect without pending tools: want empty terminal, got %v", err)
 	}
 }
 

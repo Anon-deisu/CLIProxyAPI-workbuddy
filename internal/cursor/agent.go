@@ -248,6 +248,20 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 	// Keep the Agent's user message as the user's actual instruction; client
 	// injected context rides along as a preceding history blob instead.
 	var activeUserMessage *agentv1.UserMessage
+	if activeUser == nil && conversationEndsWithToolResults(conversation) {
+		// A rebuilt run whose history ends in tool results has no plain user
+		// message left, and a bare ResumeAction dies silently: the server has
+		// no state for this fresh conversation id and answers with an
+		// immediate empty END_STREAM. Those were the dashboard's "N tokens in,
+		// 0 out" rows, and each client retry repeated the loop. The results
+		// themselves already sit in the history blobs; this only gives the
+		// turn an action to execute. Constant wording keeps the prompt prefix
+		// cache-stable.
+		activeUserMessage = &agentv1.UserMessage{
+			Text:      toolContinuationNudge,
+			MessageId: uuid.NewString(),
+		}
+	}
 	if activeUser != nil {
 		// The live turn bypasses trimConversationHistory, so clamp it too: a
 		// huge paste in the current message overflows the model on its own and
@@ -293,14 +307,19 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 		ClientSupportsInlineImages: &supportsImages,
 		Action:                     &agentv1.ConversationAction{},
 	}
-	if activeUserMessage != nil {
-		run.Action.Action = &agentv1.ConversationAction_UserMessageAction{
-			UserMessageAction: &agentv1.UserMessageAction{UserMessage: activeUserMessage},
+	if activeUserMessage == nil {
+		// Continuation of a partial assistant message (client prefill /
+		// "continue" pattern). Same failure class as the tool tail: a bare
+		// ResumeAction on a conversation id the server has no state for gets
+		// an immediate empty END_STREAM. Every fresh run request therefore
+		// carries an executable user action, always.
+		activeUserMessage = &agentv1.UserMessage{
+			Text:      assistantContinuationNudge,
+			MessageId: uuid.NewString(),
 		}
-	} else {
-		run.Action.Action = &agentv1.ConversationAction_ResumeAction{
-			ResumeAction: &agentv1.ResumeAction{},
-		}
+	}
+	run.Action.Action = &agentv1.ConversationAction_UserMessageAction{
+		UserMessageAction: &agentv1.UserMessageAction{UserMessage: activeUserMessage},
 	}
 	if defs := buildMcpToolDefinitions(customMcpTools(tools)); len(defs) > 0 {
 		run.McpTools = &agentv1.McpTools{McpTools: defs}
@@ -395,6 +414,34 @@ const (
 // clampMessageContent keeps the head and tail of an oversized turn: the request
 // is stated at the top and the newest output sits at the bottom, so cutting the
 // middle preserves what the model actually needs.
+// toolContinuationNudge is the executable action for a rebuilt turn whose
+// history ends in tool results. Wording is constant so the prompt prefix stays
+// cache-stable, and it forbids re-running finished calls because a rebuilt
+// model otherwise sometimes repeated the previous tool round.
+const toolContinuationNudge = "The tool results above have been delivered. " +
+	"Continue the turn using them and finish the pending request. " +
+	"Do not re-run tool calls that already have results."
+
+// assistantContinuationNudge drives the client prefill / "continue" pattern,
+// where the newest message is a partial assistant turn to extend.
+const assistantContinuationNudge = "Continue exactly from where the assistant " +
+	"message above stopped. Do not repeat any text that was already written."
+
+// conversationEndsWithToolResults reports whether the newest substantive
+// message is a tool result, i.e. the request is a tool continuation.
+func conversationEndsWithToolResults(conversation []ChatMessage) bool {
+	sawTool := false
+	for i := len(conversation) - 1; i >= 0; i-- {
+		switch conversation[i].Role {
+		case "tool":
+			sawTool = true
+		case "user", "assistant":
+			return sawTool
+		}
+	}
+	return sawTool
+}
+
 func clampMessageContent(content string) string {
 	if len(content) <= maxMessageChars {
 		return content

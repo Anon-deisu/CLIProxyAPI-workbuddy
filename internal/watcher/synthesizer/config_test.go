@@ -216,6 +216,71 @@ func TestConfigSynthesizer_InteractionsKeys(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_CursorKeys(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			CursorKey: []config.CursorKey{{
+				APIKey:         "crsr-test",
+				Prefix:         "team",
+				BaseURL:        "https://cursor.example/",
+				Priority:       4,
+				DisableCooling: true,
+				ExcludedModels: []string{"claude-opus-*"},
+			}},
+		},
+		Now:         time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("Synthesize() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auth count = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "cursor" || auth.Label != "cursor-apikey" {
+		t.Fatalf("cursor auth = provider %q label %q", auth.Provider, auth.Label)
+	}
+	if auth.AuthKind() != coreauth.AuthKindAPIKey {
+		t.Fatalf("auth kind = %q", auth.AuthKind())
+	}
+	if auth.Prefix != "team" || auth.Attributes["api_key"] != "crsr-test" {
+		t.Fatalf("cursor auth routing fields = %#v", auth)
+	}
+	if auth.Attributes["base_url"] != "https://cursor.example" || auth.Attributes["priority"] != "4" {
+		t.Fatalf("cursor auth attributes = %#v", auth.Attributes)
+	}
+	if disabled, _ := auth.Metadata["disable_cooling"].(bool); !disabled {
+		t.Fatal("disable_cooling was not preserved")
+	}
+}
+
+func TestConfigSynthesizer_CursorKeysDeduplicatesDefaultBaseURL(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	auths, err := synth.Synthesize(&SynthesisContext{
+		Config: &config.Config{
+			CursorKey: []config.CursorKey{
+				{APIKey: "same-key"},
+				{APIKey: "same-key", BaseURL: config.DefaultCursorBaseURL + "/"},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("Synthesize() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("equivalent Cursor credentials produced %d auths, want 1", len(auths))
+	}
+	if baseURL := auths[0].Attributes["base_url"]; baseURL != "" {
+		t.Fatalf("default base URL must use the canonical empty override, got %q", baseURL)
+	}
+}
+
 func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

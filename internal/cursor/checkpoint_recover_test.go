@@ -106,12 +106,12 @@ func drainEvents(s *Session) {
 	}
 }
 
-// A checkpoint that arrives AFTER the truncated opening was released must still
-// repair it: emit only the recovered leading token(s), never replay what the
-// client already owns. Cursor drops the opening token ("每次" → "次"), the
-// checkpoint is the only authoritative copy, and it can land after the hold
-// window already released the truncated text live.
-func TestFlushAssistantTextRepairsLateOpening(t *testing.T) {
+// Once the opening has reached an append-only SSE client, a later checkpoint
+// cannot repair it by emitting the missing prefix as another delta: that would
+// move the prefix to the end ("次它…" + "每"). The longer hold window handles
+// the normal recovery path; this guard prevents a late checkpoint from
+// corrupting the already-streamed order.
+func TestFlushAssistantTextNeverAppendsLateOpeningAtTail(t *testing.T) {
 	blobID := []byte{0xab, 0xcd, 0xef, 0x0a}
 	full := "每次它返回的都有变化"
 	payload, _ := json.Marshal(map[string]any{
@@ -119,44 +119,25 @@ func TestFlushAssistantTextRepairsLateOpening(t *testing.T) {
 		"role":    "assistant",
 		"content": []map[string]string{{"type": "text", "text": full}},
 	})
-
-	// No checkpoint present yet: releasing emits the truncated streamed copy.
 	s := &Session{
 		blobStore:           map[string][]byte{},
 		events:              make(chan StreamEvent, 16),
 		seenAssistantMsgIDs: map[string]struct{}{},
 	}
-	s.handleTextDelta(strings.TrimPrefix(full, "每")) // wire delta dropped the leading "每"
+	s.handleTextDelta(strings.TrimPrefix(full, "每"))
 	s.releaseTextStream()
+	drainEvents(s)
 
-	var got strings.Builder
-	for len(s.events) > 0 {
-		ev := <-s.events
-		if ev.Type == "text_delta" {
-			got.WriteString(ev.Text)
-		}
-	}
-	if got.String() != strings.TrimPrefix(full, "每") {
-		t.Fatalf("pre-checkpoint release = %q, want truncated %q", got.String(), strings.TrimPrefix(full, "每"))
-	}
-
-	// The authoritative checkpoint lands late.
 	s.conversationState = &agentv1.ConversationStateStructure{
 		RootPromptMessagesJson: [][]byte{blobID},
 	}
 	s.blobStore[sprintfHex(blobID)] = payload
 	s.flushAssistantText(false)
 
-	got.Reset()
-	for len(s.events) > 0 {
-		ev := <-s.events
-		if ev.Type == "text_delta" {
-			got.WriteString(ev.Text)
-		}
-	}
-	// Only the recovered first character ("每") may be re-emitted.
-	if got.String() != "每" {
-		t.Fatalf("late checkpoint recovery = %q, want %q", got.String(), "每")
+	select {
+	case ev := <-s.events:
+		t.Fatalf("late recovered prefix must not be appended out of order, got %#v", ev)
+	default:
 	}
 }
 

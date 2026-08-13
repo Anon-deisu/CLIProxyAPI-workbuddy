@@ -631,6 +631,34 @@ func (s *Session) readLoop(ctx context.Context) {
 			return
 		}
 		if errRead != nil {
+			// A dying stream while the run is paused for client tools is the
+			// EOF situation with a different error string — Cursor's side can
+			// drop the idle stream with RST_STREAM (INTERNAL_ERROR) instead of
+			// a clean close. The tool calls were already delivered; failing
+			// here would kill the session, drop the continuation checkpoint
+			// and strand the client. Park like EOF does and let
+			// SubmitToolResults rebuild.
+			s.markPendingBatchesTerminal()
+			if s.emitPendingToolBatch(true) {
+				s.emitTerminalUsage(s.SegmentID())
+				s.beginWaitingTools()
+				s.mu.Lock()
+				alreadyEnded := s.segmentEnded
+				s.segmentEnded = true
+				s.mu.Unlock()
+				if !alreadyEnded {
+					s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+				}
+			}
+			if s.awaitingClientTools() {
+				s.mu.Lock()
+				s.responseEnded = true
+				s.mu.Unlock()
+				log.Warnf("cursor: stream error while awaiting client tool results (pending=%d): %v; will rebuild after tool results",
+					s.pendingToolCount(), errRead)
+				s.beginWaitingTools()
+				continue
+			}
 			s.fail(errRead)
 			return
 		}
@@ -792,6 +820,18 @@ func (s *Session) awaitingClientTools() bool {
 // inbound HTTP/SSE context is canceled after tool_use.
 func (s *Session) AwaitingClientTools() bool { return s.awaitingClientTools() }
 
+// parkedForRebuild reports a session whose upstream response already ended
+// while client tools were pending: resuming it always rebuilds, so it only
+// needs to live long enough to route that rebuild.
+func (s *Session) parkedForRebuild() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return (s.waitingTools || len(s.pending) > 0) && s.responseEnded
+}
+
 func (s *Session) pendingToolCount() int {
 	if s == nil {
 		return 0
@@ -910,6 +950,13 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 			}
 		case ev, ok := <-s.events:
 			if !ok {
+				// The session died under the collector without a boundary
+				// (external close: sweep, sibling teardown). While tools are
+				// pending this is exactly the resume-rebuild situation, not a
+				// client-facing failure.
+				if s.awaitingClientTools() {
+					return nil, ErrToolResumeRebuild
+				}
 				return nil, fmt.Errorf("%w: stream closed before a terminal boundary", ErrEmptyTerminal)
 			}
 			switch ev.Type {
@@ -972,6 +1019,12 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 			}
 		case ev, ok := <-s.events:
 			if !ok {
+				// See CollectSegment: an external close while tools are
+				// pending routes to the rebuild path instead of failing the
+				// client's request.
+				if s.awaitingClientTools() {
+					return ErrToolResumeRebuild
+				}
 				return fmt.Errorf("%w: stream closed before a terminal boundary", ErrEmptyTerminal)
 			}
 			if ev.Type == "tool_call" && ev.ToolCall != nil {
@@ -1045,8 +1098,16 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 				}
 			}
 			if _, ok := selected[item]; !ok {
+				// A partial batch: the client answered a subset and will (or
+				// already did) carry the rest in other requests. Closing here
+				// used to kill the whole session — including the events
+				// channel of any sibling request still streaming from it,
+				// which surfaced downstream as "stream closed before a
+				// terminal boundary". Mark the response ended so the eventual
+				// full submission rebuilds, and leave teardown to the parked
+				// sweep.
+				s.responseEnded = true
 				s.mu.Unlock()
-				_ = s.Close()
 				return ErrToolResumeRebuild
 			}
 		}
@@ -2319,7 +2380,7 @@ func parseAssistantBlob(key string, raw []byte) (checkpointAssistantMessage, boo
 		// A completed inline Task is a subagent Cursor already executed
 		// server-side. Its concluding text lives inside TaskToolCall.result's
 		// nested conversation steps. Without this branch the agent visibly "turns
-		// on" but its answer never reaches the client ("子代理开不起来"); surface
+		// on" but its answer never reaches the client ("瀛愪唬鐞嗗紑涓嶈捣鏉?); surface
 		// the final conclusion as assistant text, never a status word.
 		if text := taskToolCallFinalText(message.ToolCall.GetTaskToolCall()); text != "" {
 			return checkpointAssistantMessage{identity: identity + ":task", text: text}, true
@@ -2383,9 +2444,12 @@ func (s *Session) handleThinkingDelta(text string) {
 // The checkpoint is the only thing that can restore a dropped opening, so this
 // is the deadline for waiting on one. Shortening it to 400ms to save latency
 // cost claude-fable-5 the first nine characters of a reply in one run out of
-// three. The checkpoint now releases the hold as soon as it lands, so a fast
-// turn no longer pays the full window anyway.
-const textHoldWindow = 1200 * time.Millisecond
+// three, and 1200ms still allowed a late checkpoint to miss the window. A
+// recovered prefix cannot be appended after streamed text without moving it to
+// the end of the answer, so wait longer for the authoritative opening instead.
+// The checkpoint releases the hold as soon as it lands, so fast turns do not
+// pay the full window.
+const textHoldWindow = 3 * time.Second
 
 func (s *Session) handleTextDelta(text string) {
 	if text == "" {
@@ -2444,21 +2508,12 @@ func (s *Session) releaseTextStream() {
 	final := reconcileAssistantText(s.visibleText.String(), checkpointFinal)
 	out := final
 	if emitted != "" {
-		begin := strings.Index(final, emitted)
 		switch {
 		case strings.HasPrefix(final, emitted):
 			out = final[len(emitted):]
-		case begin > 0:
-			// Checkpoint recovered a leading token the wire deltas dropped.
-			// Emit just the recovered prefix, not the whole final, so the
-			// already-streamed text is never duplicated.
-			log.Debugf("cursor: release recovered %d leading char(s) (streamed=%d checkpoint=%d)",
-				begin, len(emitted), len(final))
-			out = final[:begin]
 		case strings.HasSuffix(final, emitted):
 			// Same live text, possibly prefixed by a recovered opening token.
-			// Emit only the recovered prefix; the emitted suffix is already owned.
-			out = final[:len(final)-len(emitted)]
+			out = final
 		default:
 			// Once text is live the downstream already owns the emitted prefix.
 			// Replaying a diverging checkpoint would duplicate the answer.
@@ -2466,11 +2521,6 @@ func (s *Session) releaseTextStream() {
 				len(emitted), len(final))
 			out = ""
 		}
-	}
-
-	if s.textStreamLive || s.textFlushed {
-		s.mu.Unlock()
-		return
 	}
 	s.textStreamLive = true
 	s.holdTimer = nil
@@ -2551,7 +2601,6 @@ func (s *Session) flushAssistantText(force bool) {
 	}
 
 	var out string
-	begin := strings.Index(final, emitted)
 	switch {
 	case final == emitted:
 		out = ""
@@ -2559,16 +2608,6 @@ func (s *Session) flushAssistantText(force bool) {
 		out = final
 	case strings.HasPrefix(final, emitted):
 		out = final[len(emitted):]
-	case begin > 0:
-		// The checkpoint recovered a leading token that the wire deltas
-		// dropped (the "每次" → "次" case). final is the whole repaired text,
-		// but the downstream already owns all of emitted, and a clean prefix
-		// match was excluded above. Emit only the recovered prefix that sits
-		// BEFORE emitted, never the whole final, so nothing already streamed
-		// is duplicated.
-		log.Debugf("cursor: checkpoint recovered %d leading char(s) (streamed=%d checkpoint=%d)",
-			begin, len(emitted), len(final))
-		out = final[:begin]
 	default:
 		// Once text is live the downstream already owns the emitted prefix.
 		// Replaying a diverging checkpoint would duplicate the answer.
@@ -2579,9 +2618,6 @@ func (s *Session) flushAssistantText(force bool) {
 
 	s.mu.Lock()
 	if out != "" {
-		// emittedText/visibleText absorb the WHOLE repaired final (not just the
-		// emitted prefix), so a later reconcile treats the recovered opening as
-		// already sent and never re-emits it.
 		s.emittedText.Reset()
 		s.emittedText.WriteString(final)
 		s.visibleText.Reset()
@@ -2883,13 +2919,10 @@ func (s *Session) rebindPendingLocked(item *pendingExec, authoritativeID string)
 	if s.pending == nil {
 		s.pending = map[string]*pendingExec{}
 	}
-	wasEmitted := item.emitted
-	oldIDs := make([]string, 0, len(items))
 	for _, member := range items {
 		for id, pending := range s.pending {
 			if pending == member {
 				delete(s.pending, id)
-				oldIDs = append(oldIDs, id)
 			}
 		}
 	}
@@ -2901,11 +2934,6 @@ func (s *Session) rebindPendingLocked(item *pendingExec, authoritativeID string)
 		member.call.ID = id
 		member.provisional = false
 		s.pending[id] = member
-	}
-	if wasEmitted {
-		log.Debugf("cursor: rebind-EMITTED %q -> %q (old=%v)", item.call.ID, authoritativeID, oldIDs)
-	} else {
-		log.Debugf("cursor: rebind pre-emit %q -> %q (old=%v)", item.call.ID, authoritativeID, oldIDs)
 	}
 }
 
@@ -3100,7 +3128,7 @@ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
 	switch m := req.Message.(type) {
 	case nil:
 		if len(unknownExecFieldNumbers(req)) > 0 {
-			return false, rejectUnsupportedExec(s.stream, req)
+			return false, s.rejectUnsupportedExec(s.stream, req)
 		}
 		return false, sendExecStreamClose(s.stream, req.Id)
 	case *agentv1.ExecServerMessage_RequestContextArgs:
@@ -3168,7 +3196,7 @@ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
 	case *agentv1.ExecServerMessage_SubagentArgs:
 		return s.handleNativeArgs(req, "subagent_args", m.SubagentArgs)
 	}
-	return false, rejectUnsupportedExec(s.stream, req)
+	return false, s.rejectUnsupportedExec(s.stream, req)
 }
 
 var nativeExecToolNames = map[string][]string{
@@ -3576,30 +3604,30 @@ func nativeToolArguments(variant string, raw proto.Message, def *ToolDefinition)
 	case "subagent_args":
 		args := raw.(*agentv1.SubagentArgs)
 		out := map[string]any{"prompt": args.GetPrompt()}
-		// Claude Code's client-side Task/Agent/Subagent tools declare
-		// "description" as a required argument. Cursor's SubagentArgs proto has
-		// no description field, so when the model invokes the subagent tool the
-		// relayed tool_use would arrive without it and Claude Code rejects it
-		// with InputValidationError. Synthesize one from the prompt instead, so
-		// the relayed tool call is always valid.
-		out["description"] = subagentDescription(args.GetPrompt(), args.GetSubagentType())
-		if args.GetSubagentType() != "" {
-			out[nativeArgumentName(def, "subagent_type", "subagent_type_name")] = args.GetSubagentType()
+		// Cursor's SubagentArgs has no description field, while Claude Code's
+		// Task/Agent/Subagent schemas require one. Only synthesize it when the
+		// downstream declaration accepts the field so strict custom tools do
+		// not receive an undeclared argument.
+		if nativeToolHasProperty(def, "description") {
+			out["description"] = subagentDescription(args.GetPrompt(), args.GetSubagentType())
 		}
-		// Claude Code's Agent/Task/Subagent tools only accept the abbreviated
-		// model family name ("sonnet"|"opus"|"haiku"|"fable"); Cursor passes its
-		// internal wire id (e.g. "cursor-claude-4.6-sonnet") here. Map it down to
-		// the family token so the relayed tool_use validates, and drop the field
-		// entirely when the family is unrecognized so Claude Code falls back to
-		// its default instead of failing the whole tool call.
-		if model := claudeCodeModelName(args.GetModelId()); model != "" {
+		if args.GetSubagentType() != "" {
+			if name, ok := nativeDeclaredArgumentName(def, "subagent_type", "subagent_type_name"); ok {
+				out[name] = args.GetSubagentType()
+			}
+		}
+		if model, ok := nativeSubagentModelArgument(def, args.GetModelId()); ok {
 			out["model"] = model
 		}
 		if args.GetResumeAgentId() != "" {
-			out["resume"] = args.GetResumeAgentId()
+			if name, ok := nativeDeclaredArgumentName(def, "resume", "resume_agent_id"); ok {
+				out[name] = args.GetResumeAgentId()
+			}
 		}
 		if args.RunInBackground != nil {
-			out["run_in_background"] = args.GetRunInBackground()
+			if name, ok := nativeDeclaredArgumentName(def, "run_in_background", "runInBackground"); ok {
+				out[name] = args.GetRunInBackground()
+			}
 		}
 		return out, nil
 	default:
@@ -3607,67 +3635,27 @@ func nativeToolArguments(variant string, raw proto.Message, def *ToolDefinition)
 	}
 }
 
-// subagentDescription synthesizes the "description" argument that Claude Code's
-// client-side Task/Agent/Subagent tools require. Cursor's SubagentArgs carries
-// no description, so we derive a short human-readable one from the prompt's
-// first non-blank line. This keeps the relayed tool_use valid even when the
-// model omits the context that would make a better summary.
+// subagentDescription derives the required downstream description from the
+// first non-empty prompt line and keeps it within Claude Code's short summary
+// convention.
 func subagentDescription(prompt, subagentType string) string {
-	const maxLen = 120
+	const maxRunes = 120
 	summary := strings.TrimSpace(prompt)
 	if index := strings.IndexAny(summary, "\n\r"); index >= 0 {
 		summary = strings.TrimSpace(summary[:index])
 	}
 	if summary == "" {
 		if subagentType != "" {
-			summary = "Delegate this task to a " + subagentType + " subagent."
+			summary = "Delegate this task to the " + subagentType + " subagent."
 		} else {
 			summary = "Delegate this task to a subagent."
 		}
 	}
 	runes := []rune(summary)
-	if len(runes) > maxLen {
-		summary = string(runes[:maxLen]) + "…"
+	if len(runes) > maxRunes {
+		summary = string(runes[:maxRunes-1]) + "…"
 	}
 	return summary
-}
-
-// claudeCodeModelName maps a Cursor wire model id onto the abbreviated family
-// name that Claude Code's Agent/Task/Subagent tools accept ("sonnet"|"opus"|
-// "haiku"|"fable"). Cursor passes internal ids like "cursor-claude-4.6-sonnet"
-// or "cursor-claude-opus-5", which fail Claude Code's InputValidationError.
-// The family token, when present, is matched on the lower-cased id; "fable" is
-// the current flagship family but we map any of the four to keep parity. An
-// empty result means the family is unrecognized and the caller omits the field.
-func claudeCodeModelName(modelID string) string {
-	modelID = strings.ToLower(strings.TrimSpace(modelID))
-	switch {
-	case containsModelFamily(modelID, "sonnet"):
-		return "sonnet"
-	case containsModelFamily(modelID, "opus"):
-		return "opus"
-	case containsModelFamily(modelID, "haiku"):
-		return "haiku"
-	case containsModelFamily(modelID, "fable"):
-		return "fable"
-	default:
-		return ""
-	}
-}
-
-// containsModelFamily reports whether id containsfamily as a standalone token
-// (split on non-alphanumeric boundaries), so a longer id like
-// "cursor-claude-opus-5-fast" still matches but "sonsonnet" or a bare name like
-// "myopus-v3" does not accidentally collide.
-func containsModelFamily(id, family string) bool {
-	for _, part := range strings.FieldsFunc(id, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
-	}) {
-		if part == family {
-			return true
-		}
-	}
-	return false
 }
 
 func localShellCommand(command string) []string {
@@ -3751,6 +3739,95 @@ func nativeToolHasProperty(def *ToolDefinition, name string) bool {
 	return ok
 }
 
+func nativeDeclaredArgumentName(def *ToolDefinition, candidates ...string) (string, bool) {
+	if def == nil {
+		return "", false
+	}
+	properties, ok := def.Parameters["properties"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	for _, candidate := range candidates {
+		if _, exists := properties[candidate]; exists {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// nativeSubagentModelArgument projects Cursor's concrete model ID onto the
+// downstream Task/Agent schema. Claude Code accepts short families such as
+// "sonnet" or "opus", while Cursor emits IDs such as "claude-opus-5" and
+// "composer-2.5-fast". An unrepresentable optional value must be omitted:
+// forwarding it verbatim makes the client reject the entire tool call before
+// it can run.
+func nativeSubagentModelArgument(def *ToolDefinition, modelID string) (string, bool) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" || !nativeToolHasProperty(def, "model") {
+		return "", false
+	}
+	properties, _ := def.Parameters["properties"].(map[string]any)
+	allowed := nativeStringEnum(properties["model"])
+	if len(allowed) == 0 {
+		return modelID, true
+	}
+	for _, value := range allowed {
+		if strings.EqualFold(value, modelID) {
+			return value, true
+		}
+	}
+	for _, family := range []string{"sonnet", "opus", "haiku", "fable"} {
+		if !nativeModelHasFamilyToken(modelID, family) {
+			continue
+		}
+		for _, value := range allowed {
+			if strings.EqualFold(value, family) {
+				return value, true
+			}
+		}
+	}
+	return "", false
+}
+
+func nativeModelHasFamilyToken(modelID, family string) bool {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	family = strings.ToLower(strings.TrimSpace(family))
+	if modelID == "" || family == "" {
+		return false
+	}
+	for _, token := range strings.FieldsFunc(modelID, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		if token == family {
+			return true
+		}
+	}
+	return false
+}
+
+func nativeStringEnum(schema any) []string {
+	node, ok := schema.(map[string]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	switch values := node["enum"].(type) {
+	case []any:
+		for _, value := range values {
+			if text, okText := value.(string); okText && strings.TrimSpace(text) != "" {
+				out = append(out, strings.TrimSpace(text))
+			}
+		}
+	case []string:
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				out = append(out, value)
+			}
+		}
+	}
+	return out
+}
+
 func putNativeOptional[T comparable](out map[string]any, key string, value *T) {
 	if value != nil {
 		out[key] = *value
@@ -3821,7 +3898,6 @@ func (s *Session) emitPendingToolBatch(force bool) bool {
 		item.emitted = true
 		call := item.call
 		s.mu.Unlock()
-		log.Debugf("cursor: emit tool_call id=%q kind=%s name=%s pendingKeys=%d", call.ID, call.Kind, call.Name, len(s.pending))
 		s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
 	}
 	if batch != nil {
@@ -3865,7 +3941,6 @@ func (s *Session) emitNextPendingTool() bool {
 		return false
 	}
 	call := next.call
-	log.Debugf("cursor: emit-next tool_call id=%q kind=%s name=%s", call.ID, call.Kind, call.Name)
 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
 	return true
 }
@@ -4068,21 +4143,6 @@ func (s *Session) replyMcp(req *agentv1.ExecServerMessage, result *agentv1.McpRe
 	return sendExecStreamClose(s.stream, req.Id)
 }
 
-func (s *Session) lookupPendingTool(toolCallID string) (*pendingExec, string) {
-	if s == nil || toolCallID == "" {
-		return nil, ""
-	}
-	if item := s.pending[toolCallID]; item != nil {
-		return item, toolCallID
-	}
-	for id, item := range s.pending {
-		if item != nil && item.call.ID == toolCallID {
-			return item, id
-		}
-	}
-	return nil, ""
-}
-
 // PendingCallIDAlive reports whether any pending exec in this session still
 // indexes the given tool_call_id (either by key or by item.call.ID). Used by
 // the manager to explain id-space divergences across a rebuild boundary.
@@ -4102,6 +4162,21 @@ func (s *Session) PendingCallIDAlive(toolCallID string) bool {
 		}
 	}
 	return false
+}
+
+func (s *Session) lookupPendingTool(toolCallID string) (*pendingExec, string) {
+	if s == nil || toolCallID == "" {
+		return nil, ""
+	}
+	if item := s.pending[toolCallID]; item != nil {
+		return item, toolCallID
+	}
+	for id, item := range s.pending {
+		if item != nil && item.call.ID == toolCallID {
+			return item, id
+		}
+	}
+	return nil, ""
 }
 
 func (s *Session) clearPendingTool(keys ...string) {
@@ -4231,17 +4306,25 @@ func (s *Session) requestContext() *agentv1.RequestContext {
 	return ctx
 }
 
-func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
+func (s *Session) rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
 	// Preserve an explicit refusal for genuinely unknown future oneof variants.
 	// Known native variants use their typed result schema, including when the
 	// current downstream request did not expose a compatible tool.
 	log.Warnf("cursor: unsupported exec variant, refusing (unknown proto fields=%v)", unknownExecFieldNumbers(req))
 	code := "exec_variant_unsupported"
+	// The error text is read by the model. A bare "no handler" was relayed to
+	// users as a broken tool environment and made models retry the same
+	// built-in until the turn timed out; naming the declared tools steers the
+	// next attempt somewhere that works.
+	hint := "This built-in tool is not available in this environment."
+	if names := s.availableToolNames(); len(names) > 0 {
+		hint += " Use the declared tools instead: " + strings.Join(names, ", ") + "."
+	}
 	control := &agentv1.ExecClientControlMessage{
 		Message: &agentv1.ExecClientControlMessage_Throw{
 			Throw: &agentv1.ExecClientThrow{
 				Id:        req.Id,
-				Error:     "No handler for Cursor exec message",
+				Error:     hint,
 				ErrorCode: &code,
 			},
 		},

@@ -263,6 +263,19 @@ nonstream-keepalive-interval: 0
 #       - "*-mini"          # wildcard matching suffix (e.g. gpt-5-codex-mini)
 #       - "*codex*"         # wildcard matching substring (e.g. gpt-5-codex-low)
 
+# Cursor API keys
+# Keys are exchanged for short-lived Agent Connect credentials automatically;
+# no interactive Cursor OAuth login is required.
+# cursor-api-key:
+#   - api-key: "crsr_..."
+#     # Leave prefix empty to share the same model names, executor, tools, and
+#     # failover pool as Cursor OAuth. Set one only when deliberate isolation is needed.
+#     priority: 0
+#     base-url: "https://api2.cursor.sh" # optional
+#     disable-cooling: false
+#     excluded-models:
+#       - "claude-opus-*"
+
 # Claude API keys
 # claude-api-key:
 #   - api-key: "sk-atSM..." # use the official claude API key, no need to set the base url
