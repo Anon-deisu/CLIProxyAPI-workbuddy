@@ -2399,7 +2399,6 @@ func (s *Session) releaseTextStream() {
 		}
 	}
 
-	s.mu.Lock()
 	if s.textStreamLive || s.textFlushed {
 		s.mu.Unlock()
 		return
