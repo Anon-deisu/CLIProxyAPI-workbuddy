@@ -146,9 +146,9 @@ type Session struct {
 	// Cursor can send TurnEnded after the public tool boundary. Keep counters
 	// keyed by the Agent segment they belong to so a late previous-turn update
 	// can never be charged to the next HTTP continuation.
-	segmentID    uint64
-	usageByID    map[uint64]StreamEvent
-	usageSignals map[uint64]chan struct{}
+	segmentID     uint64
+	usageByID     map[uint64]StreamEvent
+	usageSignals  map[uint64]chan struct{}
 	usageRecorded map[uint64]struct{}
 	// usageConsumed marks segments whose authoritative usage was already handed
 	// out via the event channel (emitTerminalUsage) or TakeUsageForSegment. A
@@ -169,15 +169,15 @@ type Session struct {
 	// assistant history. Content at the same history position is therefore the
 	// stable identity used to suppress checkpoint replay.
 	seenAssistantHistory []checkpointAssistantMessage
-	turnEndedSeen       bool
-	terminalUsage       StreamEvent
-	terminalUsageReady  bool
-	segmentEnded        bool
-	textFlushed         bool
-	thinkingFlushed     bool
-	textStreamLive      bool
-	holdTimer           *time.Timer
-	resumed             bool
+	turnEndedSeen        bool
+	terminalUsage        StreamEvent
+	terminalUsageReady   bool
+	segmentEnded         bool
+	textFlushed          bool
+	thinkingFlushed      bool
+	textStreamLive       bool
+	holdTimer            *time.Timer
+	resumed              bool
 	// usedContinuation marks a run opened from a server checkpoint. If that
 	// run fails, the stale checkpoint is dropped and the retry rebuilds from
 	// the caller's complete history.
@@ -2255,8 +2255,42 @@ func parseAssistantBlob(key string, raw []byte) (checkpointAssistantMessage, boo
 		if thinking := message.ThinkingMessage.GetText(); thinking != "" {
 			return checkpointAssistantMessage{identity: identity, thinking: thinking}, true
 		}
+	case *agentv1.ConversationStep_ToolCall:
+		// A completed inline Task is a subagent Cursor already executed
+		// server-side. Its concluding text lives inside TaskToolCall.result's
+		// nested conversation steps. Without this branch the agent visibly "turns
+		// on" but its answer never reaches the client ("子代理开不起来"); surface
+		// the final conclusion as assistant text, never a status word.
+		if text := taskToolCallFinalText(message.ToolCall.GetTaskToolCall()); text != "" {
+			return checkpointAssistantMessage{identity: identity + ":task", text: text}, true
+		}
 	}
 	return checkpointAssistantMessage{}, false
+}
+
+// taskToolCallFinalText extracts the concluding text of a server-executed
+// inline Task subagent. Cursor stores the result as an error string or, on
+// success, as a sequence of nested conversation steps; the last non-empty
+// assistant message is the subagent's final conclusion. Status shells and
+// empty results yield "" so the caller keeps waiting for real content.
+func taskToolCallFinalText(task *agentv1.TaskToolCall) string {
+	if task == nil {
+		return ""
+	}
+	result := task.GetResult()
+	if result == nil {
+		return ""
+	}
+	if success := result.GetSuccess(); success != nil {
+		steps := success.GetConversationSteps()
+		for i := len(steps) - 1; i >= 0; i-- {
+			if text := steps[i].GetAssistantMessage().GetText(); strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+		return ""
+	}
+	return strings.TrimSpace(result.GetError().GetError())
 }
 
 // handleThinkingDelta buffers reasoning for the same reason text is buffered:
@@ -2325,20 +2359,44 @@ func (s *Session) releaseTextStream() {
 		return
 	}
 	emitted := s.emittedText.String()
-	visible := s.visibleText.String()
 	if s.seenAssistantMsgIDs == nil {
 		s.seenAssistantMsgIDs = map[string]struct{}{}
 	}
 	s.mu.Unlock()
 
-	final := visible
+	var checkpointFinal string
 	newMessages := s.unseenCheckpointAssistantMessages()
 	for _, msg := range newMessages {
-		final = reconcileAssistantText(final, msg.text)
+		checkpointFinal = reconcileAssistantText(checkpointFinal, msg.text)
 	}
+
+	s.mu.Lock()
+	if s.textStreamLive || s.textFlushed {
+		s.mu.Unlock()
+		return
+	}
+	// Re-capture the live buffer now: text_deltas can keep arriving while the
+	// checkpoint messages above were being read. Merging the snapshot we took
+	// before that read into the buffers (the previous behaviour) would wipe
+	// those in-flight deltas from the opening — source of intermittent lost
+	// first characters. reconcileAssistantText never shrinks the live copy, so
+	// the checkpoint can still restore a missing opening token on top of it.
+	final := reconcileAssistantText(s.visibleText.String(), checkpointFinal)
 	out := final
-	if emitted != "" && strings.HasPrefix(final, emitted) {
-		out = final[len(emitted):]
+	if emitted != "" {
+		switch {
+		case strings.HasPrefix(final, emitted):
+			out = final[len(emitted):]
+		case strings.HasSuffix(final, emitted):
+			// Same live text, possibly prefixed by a recovered opening token.
+			out = final
+		default:
+			// Once text is live the downstream already owns the emitted prefix.
+			// Replaying a diverging checkpoint would duplicate the answer.
+			log.Debugf("cursor: release checkpoint text diverges from streamed text (streamed=%d checkpoint=%d); keeping streamed copy",
+				len(emitted), len(final))
+			out = ""
+		}
 	}
 
 	s.mu.Lock()
@@ -2355,6 +2413,9 @@ func (s *Session) releaseTextStream() {
 	s.mu.Unlock()
 	s.markCheckpointAssistantMessages(newMessages)
 
+	if out == "" {
+		return
+	}
 	for _, part := range splitTextForSSE(out, sseChunkBytes) {
 		s.emit(StreamEvent{Type: "text_delta", Text: part})
 	}
@@ -2527,11 +2588,14 @@ func reconcileAssistantText(streamed, checkpoint string) string {
 		return checkpoint
 	}
 	if strings.Contains(streamed, checkpoint) {
+		// The streamed copy already owns the checkpoint text (the checkpoint is
+		// lagging or partial). Never shrink the live copy back down to it.
 		return streamed
 	}
-	if len(checkpoint) > len(streamed) {
-		return checkpoint
-	}
+	// Total divergence. The client already owns the streamed bytes (or they are
+	// about to be emitted), so a longer/rewritten checkpoint can never be
+	// replayed without duplicating or relocating already-sent text. The live
+	// copy wins, byte for byte.
 	return streamed
 }
 
