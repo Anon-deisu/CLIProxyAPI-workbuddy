@@ -951,7 +951,19 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	data, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		log.WithError(errRead).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	patchedData, errPatch := managementasset.AddCursorOAuthToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support Cursor OAuth injection")
+	} else {
+		data = patchedData
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
