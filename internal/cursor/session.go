@@ -218,7 +218,12 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 			return nil, err
 		}
 	}
-	first, err := proto.Marshal(clientMsg)
+	// Deterministic encoding: protobuf map fields (tool input schemas arrive as
+	// structpb, which is map-backed) serialize in Go map order otherwise, so an
+	// unchanged request could hit the wire differently every time and move the
+	// tool section of the prompt — a cache miss for a payload that never
+	// actually changed.
+	first, err := (proto.MarshalOptions{Deterministic: true}).Marshal(clientMsg)
 	if err != nil {
 		return nil, err
 	}

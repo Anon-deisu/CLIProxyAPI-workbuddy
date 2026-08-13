@@ -28,8 +28,13 @@ message ConversationAction {
 
 message ConversationStateStructure {
   repeated bytes root_prompt_messages_json = 1;
-  repeated bytes turns = 2;
+  // Field numbers must match the full protocol exactly: turns is 8, not 2.
+  // Reading it at 2 made every server checkpoint look turn-less, so the
+  // conversation could never be continued from the state the server built.
+  repeated bytes todos = 3;
   repeated string pending_tool_calls = 4;
+  repeated bytes turns = 8;
+  optional int32 mode = 10;
 }
 
 message AssistantMessage {
@@ -111,6 +116,11 @@ message McpTools {
   repeated McpToolDefinition mcp_tools = 1;
 }
 
+message PreFetchedBlob {
+  bytes id = 1;
+  bytes value = 2;
+}
+
 message AgentRunRequest {
   ConversationStateStructure conversation_state = 1;
   ConversationAction action = 2;
@@ -119,6 +129,10 @@ message AgentRunRequest {
   optional string conversation_id = 5;
   optional RequestedModel requested_model = 9;
   optional bool exclude_workspace_context = 12;
+  // Content-addressed blobs the run references. Sending them up front is what
+  // the desktop client does; without it the server has to ask for each one
+  // over the KV channel and rebuilds context whenever we cannot serve it.
+  repeated PreFetchedBlob pre_fetched_blobs = 17;
   optional bool client_supports_inline_images = 19;
 }
 

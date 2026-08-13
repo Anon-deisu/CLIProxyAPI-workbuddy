@@ -244,6 +244,9 @@ func buildContinuationRunRequest(model string, messages []ChatMessage, tools []T
 	if defs := buildMcpToolDefinitions(tools); len(defs) > 0 {
 		run.McpTools = &agentv1.McpTools{McpTools: defs}
 	}
+	// The state we are sending back references blobs from earlier turns whose
+	// sessions are gone; ship them so the server never has to ask.
+	run.PreFetchedBlobs = preFetchedBlobs(snapshot.blobs)
 	// Turns typically live in fields the MVP schema does not name; they ride
 	// along as preserved unknown fields, so report size, not GetTurns().
 	log.Infof("cursor: continuing conversation natively (state=%dB, blobs=%d)",

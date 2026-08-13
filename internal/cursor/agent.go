@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -294,10 +295,36 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 	if defs := buildMcpToolDefinitions(tools); len(defs) > 0 {
 		run.McpTools = &agentv1.McpTools{McpTools: defs}
 	}
+	run.PreFetchedBlobs = preFetchedBlobs(blobStore)
 	client := &agentv1.AgentClientMessage{
 		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
 	}
 	return client, blobStore, conversationID, nil
+}
+
+// preFetchedBlobs uploads the run's content-addressed blobs with the request,
+// the way the desktop client does. Without them the server asks for each blob
+// over the KV channel, and any blob we cannot serve — one written by a turn
+// whose session has since gone — makes it rebuild the context instead.
+// Ordered by id so the encoding stays byte-stable across identical runs.
+func preFetchedBlobs(store map[string][]byte) []*agentv1.PreFetchedBlob {
+	if len(store) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(store))
+	for key := range store {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]*agentv1.PreFetchedBlob, 0, len(keys))
+	for _, key := range keys {
+		id, err := hex.DecodeString(key)
+		if err != nil {
+			continue
+		}
+		out = append(out, &agentv1.PreFetchedBlob{Id: id, Value: store[key]})
+	}
+	return out
 }
 
 // resolveModelDetails derives the wire ModelDetails for a public model id and
