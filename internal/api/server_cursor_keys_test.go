@@ -35,12 +35,22 @@ func TestCursorAPIKeyManagementRouteMasksSecret(t *testing.T) {
 	}
 }
 
-func TestManagementPageAlwaysShowsCursorEntryAndDisablesCaching(t *testing.T) {
+// 管理面板的 Cursor API Key 管理界面已按需求从「漂浮按钮」重构为
+// 「原生集成到 #/oauth 设计系统」：只有当上游面板存在 /oauth 导航与路由锚点时，
+// 服务端才会注入原生路由挂载点；同时管理页关闭缓存，避免刷新时拿到旧版本。
+func TestManagementPageIntegratesCursorEntryAndDisablesCaching(t *testing.T) {
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
+	backtick := "\x60"
+	fixture := []byte("<!doctype html><html><body>" +
+		"<nav>{gateway:[{path:" + backtick + "/oauth" + backtick +
+		",labelKey:" + backtick + "nav.oauth" + backtick + ",icon:K9.oauth}]}</nav>" +
+		"<v>{path:" + backtick + "/oauth" + backtick + ",element:(0,H.jsx)(VM,{})}</v>" +
+		"<z>oauth:" + backtick + "OAuth Login" + backtick + ",quota_management:" + backtick + "Quota" + backtick + "</z>" +
+		"</body></html>")
 	if errWrite := os.WriteFile(
 		filepath.Join(staticDir, "management.html"),
-		[]byte("<!doctype html><html><body>management</body></html>"),
+		fixture,
 		0o600,
 	); errWrite != nil {
 		t.Fatalf("write management fixture: %v", errWrite)
@@ -54,9 +64,29 @@ func TestManagementPageAlwaysShowsCursorEntryAndDisablesCaching(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "管理 Cursor API Key") {
-		t.Fatal("management page does not contain the always-visible Cursor entry")
+	for _, want := range []string{
+		// 原生路由挂载点（非漂浮按钮）
+		`cursor-api-key`,
+		`id:"cpa-native-route-host"`,
+		// 原生导航文案
+		`cursor_api_key:` + backtick + `Cursor API Key` + backtick,
+		// 管理脚本
+		`/v0/management/cursor-api-key`,
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("management page missing native Cursor integration %q", want)
+		}
 	}
+	if strings.Contains(rec.Body.String(), ":host{position:fixed;inset:0;z-index:2147482999") {
+		t.Fatal("management page still contains the floating Cursor button (expected native integration)")
+	}
+	// 幂等：重复请求不应重复注入导航/路由/脚本。
+	rec2 := httptest.NewRecorder()
+	server.engine.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/management.html", nil))
+	if count := strings.Count(rec2.Body.String(), `id:"cpa-native-route-host"`); count != 1 {
+		t.Fatalf("native route host injected %d times, want 1 (idempotency broken)", count)
+	}
+
 	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
