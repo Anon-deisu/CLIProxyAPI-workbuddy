@@ -49,6 +49,28 @@
 - **确认接入流量后才清理备份**：healthz 200 + 进程为新 PID（启动 13s）+ 线上管理页实测包含 `cpa-native-route-host`、路由 `/cursor-api-key`、浮动按钮样式计数为 0；公网 `https://ovh.xem8k5.top:9443/management.html` 复测通过后，删除 `.bak`。
 - **最终状态**：`systemctl is-active cli-proxy-api` → `active`；配置 `debug: false`（生产要求保持）。
 
+### 修复记录 1：管理页空白（提交 13b459ff）
+
+面板路由 `#/cursor-api-key` 打开时白屏，控制台报 `Cannot read properties of null (reading 'addEventListener')`（`management.html:432`）。
+
+- **根因**：`list.addEventListener(...)` / `form.addEventListener(...)` 在 DOM 尚未构造完成前就执行，`panel.querySelector('#cpa-key-list')` / `#cpa-form` 返回 `null`。
+- **修复**：先在脚本末尾统一 `querySelector` 取回全部元素，**再**挂事件监听（监听器挂载严格放在 DOM 构造之后）。
+- **部署二进制**：`a352b8d62dbb154647ab119c79938238f830c7da0b4f2e420463f026d98f1ed6`。
+
+### 修复记录 2：移除手动「管理密钥」输入框（提交 65287d49）
+
+用户已在管理面板登录，但 `#/cursor-api-key` 页顶部仍显示一个割裂的**手动凭据输入框**「管理密钥（通常自动获取）」。要求：已登录时该框**完全不出现**，页面与 `#/oauth` 浑然一体，且通过同一套已登录的管理会话（`#/auth-files` 机制）工作。
+
+- **根因**：旧实现把「管理密钥」做成手动输入框兜底，破坏了已验证会话的复用。
+- **修复**（`internal/managementasset/cursor_api_key.go`）：
+  - 删除整个「管理凭据」卡片（`label for="cpa-management-key"`、`input#cpa-management-key`、提示文案），并移除 `managementKeyInput` 声明与其 DOM 查询。
+  - `currentManagementKey()` 改为仅返回 `capturedManagementKey || rememberedManagementKey()` —— 管理密钥完全来自**自动捕获的 `Authorization: Bearer` 头**（对 `/v0/management/` 的 XHR/fetch monkey-patch）或 `localStorage['cli-proxy-auth']`，不再有任何手工填写入口。
+  - `request()` 错误提示改为「尚未获取到管理密钥。请确认已登录管理面板，然后刷新页面重试。」
+  - `load()` 新增一次性 600ms 重试：覆盖**直接深链进入** `#/cursor-api-key` 的时序（此时面板自身的认证请求尚未发出，密钥暂缺；600ms 后面板已带 `Authorization` 头发起管理请求并被自动捕获）。
+  - 回归测试 `cursor_api_key_test.go` 新增「gone」断言循环：打补丁后的输出不得再出现 `cpa-management-key` / `管理密钥（通常自动获取）` / `managementKeyInput` / `在下方的管理密钥框中临时填写`。
+- **线上确认**（`/management.html`，非 `/static/management.html`）：`cpa-management-key` 计数 0、`仅在自动获取失败时填写` 0、`不会写入配置或浏览器永久存储` 0；`cursorAPIKeyManagerMarker` 计数 2、新提示语「尚未获取到管理密钥」出现 1 次、`#cpa-refresh`/`#cpa-add` 存在、`MutationObserver` 4 次、`OAuthPage provider section` 标题 4 处（oauth + cursor-api-key + auth-files + …均正常，oauth 集成未受影响）。
+- **部署二进制**：`5771d3ee2935b218ed663ec5b9e8403191c64439d52935f3a6457bf5bc651e26`（`sha256`；`debug: false` 保持，`systemctl is-active` → `active`）。
+
 ## 五、验证命令（可复用）
 
 ```bash
