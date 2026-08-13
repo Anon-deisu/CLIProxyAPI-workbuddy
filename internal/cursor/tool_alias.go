@@ -13,15 +13,45 @@ import (
 //
 // Verified against api2.cursor.sh one name at a time: these 400 on their own,
 // while Bash/Edit/MultiEdit/WebFetch/WebSearch/NotebookEdit/Skill/... pass.
+// The list is drawn from the ToolCall oneof in the full protocol: every arm
+// there is a tool Cursor's Agent already owns. A captured provider 400 carried
+// AskQuestion, AwaitShell, SwitchMode, PatchEdit, ReadLints, Delete,
+// GenerateImage, WebSearch, ForceBackgroundShell, CallMcpTool and
+// FetchMcpResource — Cursor's own client re-declaring Cursor's own tool names
+// through the relay, which is exactly the duplicate the provider rejects.
 var reservedCursorToolNames = map[string]struct{}{
-	"task":             {},
-	"glob":             {},
-	"grep":             {},
-	"read":             {},
-	"write":            {},
-	"todowrite":        {},
-	"listmcpresources": {},
-	"shell":            {},
+	"task":                 {},
+	"glob":                 {},
+	"grep":                 {},
+	"read":                 {},
+	"write":                {},
+	"todowrite":            {},
+	"listmcpresources":     {},
+	"shell":                {},
+	"delete":               {},
+	"ls":                   {},
+	"edit":                 {},
+	"patchedit":            {},
+	"readlints":            {},
+	"readtodos":            {},
+	"switchmode":           {},
+	"websearch":            {},
+	"webfetch":             {},
+	"fetch":                {},
+	"generateimage":        {},
+	"awaitshell":           {},
+	"await":                {},
+	"forcebackgroundshell": {},
+	"callmcptool":          {},
+	"getmcptools":          {},
+	"mcpauth":              {},
+	"readmcpresource":      {},
+	"fetchmcpresource":     {},
+	"askquestion":          {},
+	"askuserquestion":      {},
+	"searchconversations":  {},
+	"setactivebranch":      {},
+	"reportbug":            {},
 }
 
 // nativeServedToolNames are client tool names whose function is served by a

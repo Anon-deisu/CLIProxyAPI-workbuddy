@@ -56,16 +56,44 @@ func TestEveryNativelyServedNameIsUndeclared(t *testing.T) {
 	}
 }
 
-func TestEditStaysDeclaredWithoutAWriteTool(t *testing.T) {
+func TestEditStaysAvailableWithoutAWriteTool(t *testing.T) {
 	// The built-in edit lands as a full-content write exec; without a
 	// write-capable client tool there is nothing to bridge it onto, so the
-	// client's Edit must stay available as MCP.
-	out, _ := AliasToolsForCursor([]ToolDefinition{
+	// client's Edit must stay reachable — but under a renamed declaration,
+	// because Edit collides with a Cursor built-in and a duplicate name draws
+	// a provider 400.
+	out, alias := AliasToolsForCursor([]ToolDefinition{
 		{Name: "Edit"},
 		{Name: "mcp__x__y"},
 	}, false)
-	if len(out) != 2 || out[0].Name != "Edit" {
-		t.Fatalf("Edit must stay declared without Write, got %v", out)
+	if len(out) != 2 || out[0].Name != "cpa_Edit" {
+		t.Fatalf("Edit must stay declared (renamed) without Write, got %v", out)
+	}
+	if alias.ClientName("cpa_Edit") != "Edit" {
+		t.Fatal("reverse mapping missing for Edit")
+	}
+}
+
+// Cursor's own client re-declares Cursor's own tool names through the relay;
+// every one of them must be either natively served or renamed, never passed
+// through as a duplicate of a built-in.
+func TestCursorOwnToolNamesNeverPassThrough(t *testing.T) {
+	names := []string{
+		"AskQuestion", "AwaitShell", "SwitchMode", "PatchEdit", "ReadLints",
+		"Delete", "GenerateImage", "WebSearch", "ForceBackgroundShell",
+		"CallMcpTool", "FetchMcpResource", "Ls", "Task", "TodoWrite",
+	}
+	tools := make([]ToolDefinition, 0, len(names))
+	for _, name := range names {
+		tools = append(tools, ToolDefinition{Name: name})
+	}
+	out, _ := AliasToolsForCursor(tools, false)
+	for _, tool := range out {
+		for _, name := range names {
+			if tool.Name == name {
+				t.Errorf("%q was declared verbatim and collides with the built-in", name)
+			}
+		}
 	}
 }
 
