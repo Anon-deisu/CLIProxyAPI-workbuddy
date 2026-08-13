@@ -1,4 +1,4 @@
-package cursor
+﻿package cursor
 
 import (
 	"context"
@@ -571,6 +571,34 @@ func (s *Session) readLoop(ctx context.Context) {
 			return
 		}
 		if errRead != nil {
+			// A dying stream while the run is paused for client tools is the
+			// EOF situation with a different error string — Cursor's side can
+			// drop the idle stream with RST_STREAM (INTERNAL_ERROR) instead of
+			// a clean close. The tool calls were already delivered; failing
+			// here would kill the session, drop the continuation checkpoint
+			// and strand the client. Park like EOF does and let
+			// SubmitToolResults rebuild.
+			s.markPendingBatchesTerminal()
+			if s.emitPendingToolBatch(true) {
+				s.emitTerminalUsage(s.SegmentID())
+				s.beginWaitingTools()
+				s.mu.Lock()
+				alreadyEnded := s.segmentEnded
+				s.segmentEnded = true
+				s.mu.Unlock()
+				if !alreadyEnded {
+					s.emit(StreamEvent{Type: "segment_end", Reason: "tool_calls"})
+				}
+			}
+			if s.awaitingClientTools() {
+				s.mu.Lock()
+				s.responseEnded = true
+				s.mu.Unlock()
+				log.Warnf("cursor: stream error while awaiting client tool results (pending=%d): %v; will rebuild after tool results",
+					s.pendingToolCount(), errRead)
+				s.beginWaitingTools()
+				continue
+			}
 			s.fail(errRead)
 			return
 		}
@@ -731,6 +759,18 @@ func (s *Session) awaitingClientTools() bool {
 // AwaitingClientTools is the exported form used by the executor when the
 // inbound HTTP/SSE context is canceled after tool_use.
 func (s *Session) AwaitingClientTools() bool { return s.awaitingClientTools() }
+
+// parkedForRebuild reports a session whose upstream response already ended
+// while client tools were pending: resuming it always rebuilds, so it only
+// needs to live long enough to route that rebuild.
+func (s *Session) parkedForRebuild() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return (s.waitingTools || len(s.pending) > 0) && s.responseEnded
+}
 
 func (s *Session) pendingToolCount() int {
 	if s == nil {
@@ -2259,7 +2299,7 @@ func parseAssistantBlob(key string, raw []byte) (checkpointAssistantMessage, boo
 		// A completed inline Task is a subagent Cursor already executed
 		// server-side. Its concluding text lives inside TaskToolCall.result's
 		// nested conversation steps. Without this branch the agent visibly "turns
-		// on" but its answer never reaches the client ("子代理开不起来"); surface
+		// on" but its answer never reaches the client ("瀛愪唬鐞嗗紑涓嶈捣鏉?); surface
 		// the final conclusion as assistant text, never a status word.
 		if text := taskToolCallFinalText(message.ToolCall.GetTaskToolCall()); text != "" {
 			return checkpointAssistantMessage{identity: identity + ":task", text: text}, true
@@ -2398,12 +2438,8 @@ func (s *Session) releaseTextStream() {
 			out = ""
 		}
 	}
-
-	s.mu.Lock()
-	if s.textStreamLive || s.textFlushed {
-		s.mu.Unlock()
-		return
-	}
+	// Still under the lock taken above — re-locking here deadlocked every
+	// streaming turn's first text release.
 	s.textStreamLive = true
 	s.holdTimer = nil
 	s.emittedText.Reset()
@@ -3010,7 +3046,7 @@ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
 	switch m := req.Message.(type) {
 	case nil:
 		if len(unknownExecFieldNumbers(req)) > 0 {
-			return false, rejectUnsupportedExec(s.stream, req)
+			return false, s.rejectUnsupportedExec(s.stream, req)
 		}
 		return false, sendExecStreamClose(s.stream, req.Id)
 	case *agentv1.ExecServerMessage_RequestContextArgs:
@@ -3078,7 +3114,7 @@ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
 	case *agentv1.ExecServerMessage_SubagentArgs:
 		return s.handleNativeArgs(req, "subagent_args", m.SubagentArgs)
 	}
-	return false, rejectUnsupportedExec(s.stream, req)
+	return false, s.rejectUnsupportedExec(s.stream, req)
 }
 
 var nativeExecToolNames = map[string][]string{
@@ -4042,17 +4078,25 @@ func (s *Session) requestContext() *agentv1.RequestContext {
 	return ctx
 }
 
-func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
+func (s *Session) rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
 	// Preserve an explicit refusal for genuinely unknown future oneof variants.
 	// Known native variants use their typed result schema, including when the
 	// current downstream request did not expose a compatible tool.
 	log.Warnf("cursor: unsupported exec variant, refusing (unknown proto fields=%v)", unknownExecFieldNumbers(req))
 	code := "exec_variant_unsupported"
+	// The error text is read by the model. A bare "no handler" was relayed to
+	// users as a broken tool environment and made models retry the same
+	// built-in until the turn timed out; naming the declared tools steers the
+	// next attempt somewhere that works.
+	hint := "This built-in tool is not available in this environment."
+	if names := s.availableToolNames(); len(names) > 0 {
+		hint += " Use the declared tools instead: " + strings.Join(names, ", ") + "."
+	}
 	control := &agentv1.ExecClientControlMessage{
 		Message: &agentv1.ExecClientControlMessage_Throw{
 			Throw: &agentv1.ExecClientThrow{
 				Id:        req.Id,
-				Error:     "No handler for Cursor exec message",
+				Error:     hint,
 				ErrorCode: &code,
 			},
 		},

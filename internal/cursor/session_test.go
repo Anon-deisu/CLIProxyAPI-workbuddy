@@ -201,7 +201,11 @@ func TestBuildRunRequestNativeToolJSON(t *testing.T) {
 	}
 }
 
-func TestBuildRunRequestUsesResumeActionForToolContinuation(t *testing.T) {
+func TestBuildRunRequestGivesToolContinuationAnExecutableAction(t *testing.T) {
+	// This used to assert ResumeAction. Live traffic disproved that design: a
+	// fresh conversation id carries no server-side state, so a bare
+	// ResumeAction gets an immediate empty END_STREAM — the "N in / 0 out"
+	// dashboard rows and the endless 502 retry loops.
 	msg, blobs, _, err := buildRunRequest("default", []ChatMessage{
 		{Role: "user", Content: "weather?"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Name: "get_weather", Arguments: map[string]any{"city": "Beijing"}}}},
@@ -211,11 +215,12 @@ func TestBuildRunRequestUsesResumeActionForToolContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := msg.GetRunRequest()
-	if run.GetAction().GetResumeAction() == nil {
-		t.Fatalf("tool continuation must use resume_action, got %#v", run.GetAction())
+	action := run.GetAction().GetUserMessageAction()
+	if action == nil {
+		t.Fatalf("tool continuation needs an executable action, got %#v", run.GetAction())
 	}
-	if run.GetAction().GetUserMessageAction() != nil {
-		t.Fatal("tool continuation must not replay the previous user as a new action")
+	if action.GetUserMessage().GetText() != toolContinuationNudge {
+		t.Fatalf("tool continuation must use the constant nudge, got %q", action.GetUserMessage().GetText())
 	}
 	var sawCall, sawResult bool
 	for _, data := range blobs {

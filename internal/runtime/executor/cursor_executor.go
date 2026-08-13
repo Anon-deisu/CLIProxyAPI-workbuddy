@@ -110,6 +110,9 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		// valid model response after the upstream turn already completed.
 		log.Warnf("cursor: upstream completed without satisfying advisory tool_choice %q; returning the successful response", toolConstraint.name)
 	}
+	fillMissingChatResultUsage(result, conversationID, messages, tools)
+	cursorlib.RememberPromptTotal(conversationID,
+		promptTotalOf(result.InputTokens, result.CacheReadTokens, result.CacheWriteTokens))
 
 	outPayload := buildOpenAIChatCompletion(req.Model, result)
 	reporter.Publish(ctx, cursorUsageDetail(result.InputTokens, result.OutputTokens,
@@ -184,6 +187,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		finishReason := "stop"
 		var usageFinal cursorlib.StreamEvent
 		observedToolCalls := make([]cursorlib.ToolCall, 0)
+		var generated strings.Builder
 
 		emitLine := func(line []byte) bool {
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, body, line, &param)
@@ -266,9 +270,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				switch ev.Type {
 				case "text_delta":
 					delta = map[string]any{"content": ev.Text}
+					generated.WriteString(ev.Text)
 					flush = flush || strings.TrimSpace(ev.Text) != ""
 				case "thinking_delta":
 					delta = map[string]any{"reasoning_content": ev.Text}
+					generated.WriteString(ev.Text)
 					// Reasoning goes out as it arrives. Holding it until the
 					// first text or tool call left thinking models silent for
 					// as long as they reasoned — measured first-token times of
@@ -336,20 +342,6 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				errIter = rebuildErr
 			}
 		}
-		if errors.Is(errIter, cursorlib.ErrEmptyTerminal) && !contentEmitted {
-			_ = session.Close()
-			log.Warnf("cursor: retrying stream once after empty terminal response")
-			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
-			if rebuildErr == nil {
-				session = rebuilt
-				pendingDeltas = pendingDeltas[:0]
-				finishReason = "stop"
-				usageFinal = cursorlib.StreamEvent{}
-				errIter = iterate(session)
-			} else {
-				errIter = rebuildErr
-			}
-		}
 		// Provider connectivity failures usually arrive in Connect trailers
 		// while reading, after the HTTP stream itself opened successfully. Retry
 		// the complete attempt only while no model content has reached the client.
@@ -370,6 +362,55 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			session = retrySession
 			errIter = iterate(session)
 		}
+		// A provider 400 that survives the ladders is almost always a dead
+		// wire id: the catalog still lists the model but its provider rejects
+		// every call (claude-opus-4-7 died upstream this way — every account,
+		// even one-line prompts with no tools). This deliberately also covers
+		// isRetryable:false, which the hard-error classifier excludes: the
+		// retry is on a different wire, not a replay of the rejected one.
+		if errIter != nil && isCursorProviderBadRequest(errIter) && !isCursorPolicyBlock(errIter) && !contentEmitted {
+			if alt := cursorlib.AlternateUsableModelID(upstreamModel); alt != "" && !strings.EqualFold(alt, upstreamModel) {
+				log.Warnf("cursor: hard 400 persists on %q; serving via sibling wire %q: %v", upstreamModel, alt, errIter)
+				_ = session.Close()
+				altSession, altErr := openCursorSessionWithRetries(ctx, creds, alt, messages, tools, startOpts...)
+				if altErr == nil {
+					session = altSession
+					errIter = iterate(session)
+				} else {
+					errIter = altErr
+				}
+			}
+		}
+		// Empty-stream gate, deliberately after every retry ladder above so a
+		// retry that comes back clean-but-empty is caught too. A stream that
+		// ended without error yet delivered no text and no tool call gave the
+		// client nothing — with no usage reported, gateways then count the
+		// prompt locally and record rows like "389k in / 0 out". Tool calls
+		// and text count as content; reasoning alone does not, a turn that
+		// only thought out loud still answered nothing.
+		if (errIter == nil || errors.Is(errIter, cursorlib.ErrEmptyTerminal)) &&
+			!contentEmitted && toolIndex == 0 {
+			log.Warnf("cursor: stream ended empty (usage in=%d out=%d read=%d write=%d); retrying once",
+				usageFinal.InputTokens, usageFinal.OutputTokens,
+				usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens)
+			_ = session.Close()
+			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
+			if rebuildErr == nil {
+				session = rebuilt
+				pendingDeltas = pendingDeltas[:0]
+				finishReason = "stop"
+				usageFinal = cursorlib.StreamEvent{}
+				errIter = iterate(session)
+				if errIter == nil && !contentEmitted && toolIndex == 0 {
+					// Handing back an empty stream would bill the client for a
+					// reply that does not exist; say so instead.
+					errIter = statusErr{code: http.StatusBadGateway,
+						msg: "cursor: the model generated no output for this turn; retry or shorten the conversation"}
+				}
+			} else {
+				errIter = rebuildErr
+			}
+		}
 		if errIter != nil {
 			errIter = humanizeCursorError(errIter)
 			reporter.PublishFailure(ctx, errIter)
@@ -377,7 +418,16 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			case out <- cliproxyexecutor.StreamChunk{Err: errIter}:
 			case <-ctx.Done():
 			}
-			_ = session.Close()
+			// A canceled SSE right after tool_use is Claude Code's normal
+			// pattern — the tool results arrive on the next HTTP request.
+			// Closing here killed the paused session, so every resume failed
+			// and each tool round rebuilt into a fresh conversation: cache
+			// gone, and the model replayed its opening ("answers twice").
+			clientGone := errors.Is(errIter, context.Canceled) ||
+				strings.Contains(errIter.Error(), "context canceled")
+			if !(clientGone && session.AwaitingClientTools()) {
+				_ = session.Close()
+			}
 			return
 		}
 		if !toolConstraint.Satisfied(observedToolCalls) {
@@ -402,6 +452,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				usageFinal = late
 			}
 		}
+		// Without this the tool-calling step of every agent loop reports 0 in
+		// and 0 out despite having sent a full prompt and produced a tool call.
+		usageFinal = fillMissingCursorUsage(usageFinal, conversationID, messages, tools, generated.String(), observedToolCalls)
+		// Feed billed turns into the ledger too, so estimates for the next
+		// tool round split prefix from suffix against real numbers.
+		cursorlib.RememberPromptTotal(conversationID,
+			promptTotalOf(usageFinal.InputTokens, usageFinal.CacheReadTokens, usageFinal.CacheWriteTokens))
 		if usageFinal.InputTokens > 0 || usageFinal.OutputTokens > 0 ||
 			usageFinal.CacheReadTokens > 0 || usageFinal.CacheWriteTokens > 0 || usageFinal.ReasoningTokens > 0 {
 			reporter.Publish(ctx, cursorUsageDetail(usageFinal.InputTokens, usageFinal.OutputTokens,
@@ -734,14 +791,37 @@ func openCursorSessionWithRetries(ctx context.Context, creds cursorlib.AccountCr
 
 func runCursorChatWithRetries(ctx context.Context, creds cursorlib.AccountCredentials, model string, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition, opts ...cursorlib.StartOption) (*cursorlib.ChatResult, error) {
 	result, err := cursorlib.RunChat(ctx, creds, model, messages, tools, opts...)
-	if errors.Is(err, cursorlib.ErrEmptyTerminal) {
-		log.Warnf("cursor: retrying once after empty terminal response")
+	if errors.Is(err, cursorlib.ErrEmptyTerminal) || generatedNothing(result, err) {
+		log.Warnf("cursor: retrying once after a turn that generated nothing")
 		result, err = cursorlib.RunChat(ctx, creds, model, messages, tools, opts...)
+		if generatedNothing(result, err) {
+			// Returning the empty result would bill the client for a reply
+			// that does not exist; say so instead.
+			return nil, statusErr{code: http.StatusBadGateway,
+				msg: "cursor: the model generated no output for this turn; retry or shorten the conversation"}
+		}
 	}
-	if err == nil || !isCursorProviderError(err) {
+	// Provider bad-requests (even isRetryable:false) enter the ladder too:
+	// its final tier retries on a sibling wire, not a replay of the rejected
+	// request. Policy blocks stay out — a different wire cannot unblock them.
+	if err == nil || isCursorPolicyBlock(err) ||
+		!(isCursorProviderError(err) || isCursorProviderBadRequest(err)) {
 		return result, err
 	}
 	return retryRunCursorChat(ctx, creds, model, messages, tools, err, opts...)
+}
+
+// generatedNothing reports a turn whose result carries no text, no reasoning
+// and no tool call — nothing for the client, whatever the token counters say.
+// Turns that fail with an error keep their own handling.
+func generatedNothing(result *cursorlib.ChatResult, err error) bool {
+	if err != nil || result == nil {
+		return false
+	}
+	if len(result.ToolCalls) > 0 {
+		return false
+	}
+	return strings.TrimSpace(result.Text) == "" && strings.TrimSpace(result.Thinking) == ""
 }
 
 func trailingToolResults(messages []cursorlib.ChatMessage) []cursorlib.ToolResult {
@@ -1235,6 +1315,9 @@ func humanizeCursorError(err error) error {
 	case isCursorRateLimited(err):
 		return statusErr{code: http.StatusTooManyRequests, msg: "cursor: rate limit or upstream resource exhaustion. " +
 			"Retry with another Cursor account or wait for the cooldown window"}
+	case isCursorTransportReset(err):
+		return statusErr{code: http.StatusBadGateway,
+			msg: "cursor: upstream closed the connection mid-stream (transient); the request was retried and kept failing — try again"}
 	}
 	return err
 }
@@ -1276,7 +1359,28 @@ func isCursorTransientProviderError(err error) bool {
 	}
 	return strings.Contains(msg, "error_openai") ||
 		strings.Contains(msg, "unable to reach the model provider") ||
-		strings.Contains(msg, `"code":"unavailable"`)
+		strings.Contains(msg, `"code":"unavailable"`) ||
+		isCursorTransportReset(err)
+}
+
+// isCursorTransportReset detects the transport tearing down under the Connect
+// stream rather than Cursor answering with an error envelope: the server (or
+// its load balancer) sends RST_STREAM / GOAWAY / a TCP reset, and Go's HTTP/2
+// client surfaces strings like "stream error: stream ID 1; INTERNAL_ERROR;
+// received from peer". Nothing about the request caused it — request-shape
+// problems come back as error envelopes, not stream resets — so it retries
+// like any other connectivity blip instead of reaching the client raw.
+func isCursorTransportReset(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "stream error") && strings.Contains(msg, "received from peer") {
+		return true
+	}
+	return strings.Contains(msg, "http2: server sent goaway") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "unexpected eof")
 }
 
 // isCursorHardProviderError is a request-shape / provider 400 class failure.
@@ -1334,6 +1438,22 @@ func retryRunCursorChat(ctx context.Context, creds cursorlib.AccountCredentials,
 			if !isCursorTransientProviderError(err) {
 				break
 			}
+		}
+	}
+
+	// A provider 400 that survives everything above is almost always a dead
+	// wire id — the catalog lists the model but its provider rejects every
+	// call (claude-opus-4-7 died upstream this way). This deliberately also
+	// covers isRetryable:false, which the hard-error classifier excludes: the
+	// retry is on a different wire, not a replay of the rejected one.
+	if isCursorProviderBadRequest(err) && !isCursorPolicyBlock(err) && retryBudgetLeft(start) {
+		if alt := cursorlib.AlternateUsableModelID(model); alt != "" && !strings.EqualFold(alt, model) {
+			log.Warnf("cursor: hard 400 persists on %q; serving via sibling wire %q: %v", model, alt, err)
+			result, nextErr := cursorlib.RunChat(ctx, creds, alt, messages, tools, opts...)
+			if nextErr == nil {
+				return result, nil
+			}
+			err = nextErr
 		}
 	}
 

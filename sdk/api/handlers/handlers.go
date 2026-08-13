@@ -14,12 +14,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -1599,6 +1601,52 @@ func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel
 	return h.getRequestDetailsWithOptions(modelName, allowImageModel)
 }
 
+// handlersStartedAt marks process start for the registry warmup grace below.
+var handlersStartedAt = time.Now()
+
+const (
+	registryGraceWindow = 120 * time.Second
+	registryGraceBudget = 15 * time.Second
+	registryGraceStep   = 500 * time.Millisecond
+)
+
+func modelRegistryEmpty() bool {
+	_, err := registry.GetGlobalRegistry().GetFirstAvailableModel("")
+	return err != nil
+}
+
+// isTestBinary reports whether we run under `go test`, where an empty registry
+// is a fixture rather than warmup and waiting on it only slows suites down.
+func isTestBinary() bool { return testing.Testing() }
+
+// waitForModelRegistry holds a request while the model registry is still
+// empty during process warmup, so a restart does not answer early requests
+// with "unknown provider". Once the registry holds any models the request is
+// resolved immediately — an unknown model on a loaded registry fails fast,
+// warmup or not.
+func waitForModelRegistry(baseModel, resolvedModelName string) []string {
+	if isTestBinary() || time.Since(handlersStartedAt) >= registryGraceWindow || !modelRegistryEmpty() {
+		return nil
+	}
+	deadline := time.Now().Add(registryGraceBudget)
+	for time.Now().Before(deadline) {
+		time.Sleep(registryGraceStep)
+		if modelRegistryEmpty() {
+			continue
+		}
+		if providers := util.GetProviderName(baseModel); len(providers) > 0 {
+			return providers
+		}
+		if baseModel != resolvedModelName {
+			if providers := util.GetProviderName(resolvedModelName); len(providers) > 0 {
+				return providers
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
 func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowImageModel bool) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
@@ -1640,6 +1688,15 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 	// custom model registrations that include thinking suffixes.
 	if len(providers) == 0 && baseModel != resolvedModelName {
 		providers = util.GetProviderName(resolvedModelName)
+	}
+	if len(providers) == 0 {
+		// The model registry rebuilds asynchronously after a restart. Requests
+		// arriving in that window used to fail with "unknown provider" — a
+		// burst of errors that carried no usage, so downstream gateways
+		// token-counted the raw request bodies themselves and recorded rows
+		// like "2.5M in / 0 out", and their circuit breakers tripped. Hold the
+		// request briefly instead while the registry loads.
+		providers = waitForModelRegistry(baseModel, resolvedModelName)
 	}
 
 	if len(providers) == 0 {

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -54,6 +55,12 @@ func OpenAgentRun(ctx context.Context, baseURL string, headers map[string]string
 			NextProtos: []string{"h2", "http/1.1"},
 			ServerName: u.Hostname(),
 		},
+		// A black-holed connection (LB died, route flapped) otherwise hangs
+		// reads forever: agent runs are long-lived and detached from the
+		// client's request context, so nothing else cancels them. The ping
+		// pair turns silent death into a read error our retry paths handle.
+		ReadIdleTimeout: 75 * time.Second,
+		PingTimeout:     15 * time.Second,
 	}
 	client := &http.Client{Transport: transport}
 
@@ -72,10 +79,19 @@ func OpenAgentRun(ctx context.Context, baseURL string, headers map[string]string
 		return nil, fmt.Errorf("cursor h2 write first frame: %w", err)
 	}
 
+	// The run context is detached from the client's request on purpose (tool
+	// round-trips span multiple requests), so ctx alone never expires here. An
+	// upstream that accepts the connection but never sends response headers
+	// used to hang the request until the gateway's 504.
+	headerTimer := time.NewTimer(30 * time.Second)
+	defer headerTimer.Stop()
 	select {
 	case <-ctx.Done():
 		_ = pw.CloseWithError(ctx.Err())
 		return nil, ctx.Err()
+	case <-headerTimer.C:
+		_ = pw.CloseWithError(context.DeadlineExceeded)
+		return nil, fmt.Errorf("cursor h2 open: no response headers within 30s")
 	case r := <-ch:
 		if r.err != nil {
 			_ = pw.CloseWithError(r.err)

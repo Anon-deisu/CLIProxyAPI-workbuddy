@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 )
 
 // Native conversation continuation.
@@ -154,15 +156,70 @@ func snapshotAssistantMessages(snapshot checkpointSnapshot) []checkpointAssistan
 	return out
 }
 
+// trailingToolResultMessages returns the run of tool-result messages at the
+// end of the conversation, oldest first, or nil when the tail is not a tool
+// continuation.
+func trailingToolResultMessages(messages []ChatMessage) []ChatMessage {
+	end := len(messages)
+	for end > 0 && messages[end-1].Role == "system" {
+		end--
+	}
+	start := end
+	for start > 0 && messages[start-1].Role == "tool" {
+		start--
+	}
+	if start == end {
+		return nil
+	}
+	return messages[start:end]
+}
+
+// snapshotMentionsToolCall reports whether the checkpoint's blobs reference a
+// tool call id. Cursor's checkpoint at a tool boundary records the assistant
+// turn including its tool-call parts, so the ids of the calls the client is
+// answering must appear there — if they do not, the checkpoint belongs to a
+// different point of the conversation and continuing from it would corrupt
+// the transcript.
+func snapshotMentionsToolCall(snapshot checkpointSnapshot, toolCallID string) bool {
+	toolCallID = strings.TrimSpace(toolCallID)
+	if toolCallID == "" {
+		return false
+	}
+	needles := [][]byte{[]byte(toolCallID)}
+	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
+		needles = append(needles, []byte(safe))
+	}
+	for _, raw := range snapshot.blobs {
+		for _, needle := range needles {
+			if bytes.Contains(raw, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // continuationMatchesHistory decides whether the stored server state and the
 // history the client sent describe the same conversation at the same point.
 // The check is deliberately strict — on any doubt the caller falls back to a
 // full rebuild, which is always correct.
 func continuationMatchesHistory(snapshot checkpointSnapshot, messages []ChatMessage) bool {
-	// Only the clean text-turn shape continues natively: a fresh user ask on
-	// top of a completed assistant turn. Trailing tool results ride the live
-	// session resume instead, and if that session is gone the pending exec
-	// state a continuation would need is gone with it.
+	// Tool continuation: the checkpoint was written when the run paused (or
+	// its stream died) on exactly these calls. The pending exec frames are
+	// gone with the session, but the server-side conversation state is not.
+	// Continuing it keeps the prompt cache and stops the model from replaying
+	// the turn's opening — the full rebuild used to answer twice and pay the
+	// whole prompt again. The results ride inside the user action.
+	if trailing := trailingToolResultMessages(messages); len(trailing) > 0 {
+		for i := range trailing {
+			if !snapshotMentionsToolCall(snapshot, trailing[i].ToolCallID) {
+				return false
+			}
+		}
+		return true
+	}
+	// Otherwise only the clean text-turn shape continues natively: a fresh
+	// user ask on top of a completed assistant turn.
 	last := -1
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "system" {
@@ -202,32 +259,61 @@ scan:
 	return strings.TrimSpace(recorded[len(recorded)-1].text) == lastAssistant
 }
 
+// renderToolResultsForContinuation folds tool outputs into the continuation
+// action's text. Each result is clamped on its own so one oversized output
+// cannot sink the whole turn.
+func renderToolResultsForContinuation(results []ChatMessage) string {
+	var b strings.Builder
+	b.WriteString("Tool results:\n")
+	for i := range results {
+		name := strings.TrimSpace(results[i].Name)
+		if name == "" {
+			name = "tool"
+		}
+		b.WriteString("\n[")
+		b.WriteString(name)
+		b.WriteString(" ")
+		b.WriteString(strings.TrimSpace(results[i].ToolCallID))
+		b.WriteString("]\n")
+		b.WriteString(clampMessageContent(results[i].Content))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(toolContinuationNudge)
+	return b.String()
+}
+
 // buildContinuationRunRequest sends the server's own conversation state back
 // with just the new user message as the action.
 func buildContinuationRunRequest(model string, messages []ChatMessage, tools []ToolDefinition, conversationID string, snapshot checkpointSnapshot) (*agentv1.AgentClientMessage, map[string][]byte) {
 	selection := ResolveRequestedModel(model)
 	details, selection := resolveModelDetails(model, selection)
 
-	var newest *ChatMessage
-	newestIdx := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && (strings.TrimSpace(messages[i].Content) != "" || len(messages[i].Images) > 0) {
-			newest = &messages[i]
-			newestIdx = i
-			break
+	var text string
+	imagesFrom := len(messages)
+	if trailing := trailingToolResultMessages(messages); len(trailing) > 0 {
+		// The action delivers the tool outputs as message content: the exec
+		// frames of the dead session cannot be replayed, but the server-side
+		// conversation is still parked right at these calls.
+		text = renderToolResultsForContinuation(trailing)
+	} else {
+		var newest *ChatMessage
+		for i := len(messages) - 1; i >= 0; i-- {
+			if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+				newest = &messages[i]
+				imagesFrom = i
+				break
+			}
+		}
+		text = clampMessageContent(newest.Content)
+		if injected, ask := splitInjectedContext(text); ask != "" && injected != "" {
+			// The state blobs are the server's; context the client re-renders
+			// each turn stays inside the user message rather than mutating them.
+			text = injected + "\n\n" + ask
 		}
 	}
-	if newest == nil {
-		return nil, snapshot.blobs
-	}
-	text := clampMessageContent(newest.Content)
-	if injected, ask := splitInjectedContext(text); ask != "" && injected != "" {
-		// The state blobs are the server's; context the client re-renders each
-		// turn stays inside the user message rather than mutating them.
-		text = injected + "\n\n" + ask
-	}
 	userMessage := &agentv1.UserMessage{Text: text, MessageId: uuid.NewString()}
-	if images := collectImages(messages[newestIdx:]); len(images) > 0 {
+	if images := collectImages(messages[imagesFrom:]); len(images) > 0 {
 		attachImages(userMessage, images)
 	}
 
