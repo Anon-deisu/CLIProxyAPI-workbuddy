@@ -77,33 +77,30 @@
 - 部署后确认：`systemctl is-active` = active，`NRestarts=0`，日志见正常 `200 POST /v1/messages` 流量；工具续接失败时日志出现预期行
   `cursor: stream resume tool session failed (...); rebuilding turn from history`（走重建路径为预期行为，新构建已无 conversation id 轮换）。
 
-### 部署后 md5 校验
+### 部署后验证
 
-| 路径 | md5 |
+| 项 | 值 |
 |------|-----|
-| 运行中 `/usr/local/bin/cli-proxy-api` | `4a62620c84fdb4cb999d3127a228e5f3` |
-| `/usr/local/bin/cli-proxy-api.bak-latest` | `1619efc85e5380901545adfe42b84288`（部署前运行版本） |
-| `/usr/local/bin/cli-proxy-api.bak-prev` | （与 `.bak-latest` 相同，见回滚说明） |
+| 运行中 `/usr/local/bin/cli-proxy-api` md5 | `4a62620c84fdb4cb999d3127a228e5f3`（新构建，58MB） |
+| 部署前运行版 md5 | `77031607` 字节体积（旧构建，77MB） |
 | 服务 PID / 起始 | `776684` / `2026-08-13 15:27:51 UTC` |
+| `NRestarts` | 0（部署后无崩溃重启） |
+| 流量核对 | 部署后日志持续出现 `200 POST /v1/messages`，来源 `95.169.7.75` / `10.200.2.128` |
 
-## 六、回滚与备份清理
+> 备份（`.bak-latest` / `.bak-prev` / `config.yaml.bak-debug`）已在**确认新二进制持续接收流量**后清除。
 
-### 回滚（如新版本异常）
+## 六、备份清理
 
-```bash
-# 恢复上一代为运行版本
-install -m 0755 /usr/local/bin/cli-proxy-api.bak-latest /usr/local/bin/cli-proxy-api
-systemctl restart cli-proxy-api
-```
-
-### 备份清理（仅在确认流量已正常接收后执行）
+本次部署确认新二进制持续接收流量后（见上表），已清除全部 `.bak` 备份：
 
 ```bash
 rm -f /usr/local/bin/cli-proxy-api.bak-latest /usr/local/bin/cli-proxy-api.bak-prev \
       /etc/cli-proxy-api/config.yaml.bak-debug
 ```
 
-> 清理必须遵循"确认新二进制已接收流量"这一前提 —— 只有日志确认存在正常请求记录后才删除备份。**未确认前绝不删除。**
+> **原则：备份只在确认新版本已正常接收流量之后才删除。未确认前绝不删除。**
+>
+> 若需要回滚到上一发布版本：需先将要恢复的历史镜像重新部署（或从 git 重新构建 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64`）再 `install` 覆盖运行 `cli-proxy-api` 后 `systemctl restart`。备份本身不再长期驻留服务器。
 
 ## 七、遗留
 
