@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
+
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
 )
 
@@ -22,13 +24,16 @@ import (
 // nativeClientToolCandidates maps each built-in to the client tool names that
 // can serve it, in preference order. Matching is case-insensitive and exact.
 var nativeClientToolCandidates = map[string][]string{
-	"shell":  {"bash", "shell", "run_command", "run_terminal_cmd", "execute_command", "terminal"},
-	"read":   {"read", "read_file", "readfile", "view_file", "cat"},
-	"write":  {"write", "write_file", "create_file", "save_file"},
-	"delete": {"delete", "delete_file", "remove_file"},
-	"grep":   {"grep", "search_file_content", "ripgrep", "rg"},
-	"ls":     {"ls", "list_dir", "list_directory", "list_files"},
-	"fetch":  {"webfetch", "web_fetch", "fetch", "fetch_url"},
+	"shell":   {"bash", "shell", "run_command", "run_terminal_cmd", "execute_command", "terminal"},
+	"read":    {"read", "read_file", "readfile", "view_file", "cat"},
+	"write":   {"write", "write_file", "create_file", "save_file"},
+	"delete":  {"delete", "delete_file", "remove_file"},
+	"grep":    {"grep", "search_file_content", "ripgrep", "rg"},
+	"glob":    {"glob", "file_search", "find_files"},
+	"ls":      {"ls", "list_dir", "list_directory", "list_files"},
+	"fetch":   {"webfetch", "web_fetch", "fetch", "fetch_url"},
+	"task":    {"task", "agent", "subagent"},
+	"listmcp": {"listmcpresources", "list_mcp_resources"},
 }
 
 func findNativeClientTool(kind string, tools []ToolDefinition) *ToolDefinition {
@@ -93,6 +98,10 @@ func nativeBridge(req *agentv1.ExecServerMessage, clientTools []ToolDefinition) 
 		return bridgeLs(m.LsArgs, clientTools)
 	case *agentv1.ExecServerMessage_FetchArgs:
 		return bridgeFetch(m.FetchArgs, clientTools)
+	case *agentv1.ExecServerMessage_SubagentArgs:
+		return bridgeSubagent(m.SubagentArgs, clientTools)
+	case *agentv1.ExecServerMessage_ListMcpResourcesExecArgs:
+		return bridgeListMcpResources(clientTools)
 	}
 	return "", "", ToolCall{}, false
 }
@@ -104,7 +113,8 @@ func isNativeExec(req *agentv1.ExecServerMessage) bool {
 		*agentv1.ExecServerMessage_ReadArgs, *agentv1.ExecServerMessage_RedactedReadArgs,
 		*agentv1.ExecServerMessage_WriteArgs, *agentv1.ExecServerMessage_DeleteArgs,
 		*agentv1.ExecServerMessage_GrepArgs, *agentv1.ExecServerMessage_LsArgs,
-		*agentv1.ExecServerMessage_FetchArgs:
+		*agentv1.ExecServerMessage_FetchArgs, *agentv1.ExecServerMessage_SubagentArgs,
+		*agentv1.ExecServerMessage_ListMcpResourcesExecArgs:
 		return true
 	}
 	return false
@@ -181,6 +191,42 @@ func bridgeDelete(args *agentv1.DeleteArgs, tools []ToolDefinition) (string, str
 }
 
 func bridgeGrep(args *agentv1.GrepArgs, tools []ToolDefinition) (string, string, ToolCall, bool) {
+	// The built-in Glob executes over this same exec arm. A pattern-less
+	// request with a glob is a file search, which the client's own Glob tool
+	// serves more faithfully than a regex match.
+	if strings.TrimSpace(args.GetPattern()) == "" && strings.TrimSpace(args.GetGlob()) != "" {
+		log.Infof("cursor: glob-shaped grep exec (glob=%q path=%q mode=%q)", args.GetGlob(), args.GetPath(), args.GetOutputMode())
+		if def := findNativeClientTool("glob", tools); def != nil {
+			arguments := map[string]any{
+				schemaKey(def, "pattern", "glob_pattern", "glob"): args.GetGlob(),
+			}
+			if args.GetPath() != "" {
+				if key, exists := schemaHasKey(def, "path", "target_directory", "directory"); exists {
+					arguments[key] = args.GetPath()
+				}
+			}
+			return "grep", args.GetToolCallId(), ToolCall{Name: def.Name, Arguments: arguments}, true
+		}
+		// No glob tool: run it as a match-anything grep restricted by the glob.
+		if def := findNativeClientTool("grep", tools); def != nil {
+			arguments := map[string]any{
+				schemaKey(def, "pattern", "query", "regex"): ".",
+			}
+			if key, exists := schemaHasKey(def, "glob", "include"); exists {
+				arguments[key] = args.GetGlob()
+			}
+			if key, exists := schemaHasKey(def, "output_mode"); exists {
+				arguments[key] = "files_with_matches"
+			}
+			if args.GetPath() != "" {
+				if key, exists := schemaHasKey(def, "path", "directory"); exists {
+					arguments[key] = args.GetPath()
+				}
+			}
+			return "grep", args.GetToolCallId(), ToolCall{Name: def.Name, Arguments: arguments}, true
+		}
+		return "grep", args.GetToolCallId(), ToolCall{}, false
+	}
 	def := findNativeClientTool("grep", tools)
 	if def == nil {
 		return "grep", args.GetToolCallId(), ToolCall{}, false
@@ -249,6 +295,44 @@ func bridgeFetch(args *agentv1.FetchArgs, tools []ToolDefinition) (string, strin
 	return "fetch", args.GetToolCallId(), ToolCall{Name: def.Name, Arguments: arguments}, true
 }
 
+func bridgeSubagent(args *agentv1.SubagentArgs, tools []ToolDefinition) (string, string, ToolCall, bool) {
+	def := findNativeClientTool("task", tools)
+	if def == nil {
+		return "task", args.GetToolCallId(), ToolCall{}, false
+	}
+	arguments := map[string]any{
+		schemaKey(def, "prompt", "task", "instructions"): args.GetPrompt(),
+	}
+	subagentType := strings.TrimSpace(args.GetSubagentType())
+	if key, exists := schemaHasKey(def, "subagent_type", "agent_type", "type"); exists {
+		if subagentType == "" {
+			subagentType = "general-purpose"
+		}
+		arguments[key] = subagentType
+	}
+	if key, exists := schemaHasKey(def, "description"); exists {
+		description := subagentType
+		if description == "" {
+			description = "Run a subtask"
+		}
+		arguments[key] = description
+	}
+	if args.GetRunInBackground() {
+		if key, exists := schemaHasKey(def, "run_in_background"); exists {
+			arguments[key] = true
+		}
+	}
+	return "task", args.GetToolCallId(), ToolCall{Name: def.Name, Arguments: arguments}, true
+}
+
+func bridgeListMcpResources(tools []ToolDefinition) (string, string, ToolCall, bool) {
+	def := findNativeClientTool("listmcp", tools)
+	if def == nil {
+		return "listmcp", "", ToolCall{}, false
+	}
+	return "listmcp", "", ToolCall{Name: def.Name, Arguments: map[string]any{}}, true
+}
+
 // grepMode normalises the requested output mode; Cursor leaves it empty for
 // the default files listing.
 func grepMode(args *agentv1.GrepArgs) string {
@@ -268,8 +352,6 @@ func nativeResultReply(req *agentv1.ExecServerMessage, res ToolResult) *agentv1.
 	switch m := req.Message.(type) {
 	case *agentv1.ExecServerMessage_ShellArgs:
 		reply.Message = &agentv1.ExecClientMessage_ShellResult{ShellResult: buildShellResult(m.ShellArgs, res)}
-	case *agentv1.ExecServerMessage_ShellStreamArgs:
-		reply.Message = &agentv1.ExecClientMessage_ShellResult{ShellResult: buildShellResult(m.ShellStreamArgs, res)}
 	case *agentv1.ExecServerMessage_ReadArgs:
 		reply.Message = &agentv1.ExecClientMessage_ReadResult{ReadResult: buildReadResult(m.ReadArgs, res)}
 	case *agentv1.ExecServerMessage_RedactedReadArgs:
@@ -284,6 +366,10 @@ func nativeResultReply(req *agentv1.ExecServerMessage, res ToolResult) *agentv1.
 		reply.Message = &agentv1.ExecClientMessage_LsResult{LsResult: buildLsResult(m.LsArgs, res)}
 	case *agentv1.ExecServerMessage_FetchArgs:
 		reply.Message = &agentv1.ExecClientMessage_FetchResult{FetchResult: buildFetchResult(m.FetchArgs, res)}
+	case *agentv1.ExecServerMessage_SubagentArgs:
+		reply.Message = &agentv1.ExecClientMessage_SubagentResult{SubagentResult: buildSubagentResult(m.SubagentArgs, res)}
+	case *agentv1.ExecServerMessage_ListMcpResourcesExecArgs:
+		reply.Message = &agentv1.ExecClientMessage_ListMcpResourcesExecResult{ListMcpResourcesExecResult: buildListMcpResourcesResult(res)}
 	default:
 		return nil
 	}
@@ -294,7 +380,56 @@ func nativeResultReply(req *agentv1.ExecServerMessage, res ToolResult) *agentv1.
 // with a typed error, so the model can adapt instead of the run dying on a
 // protocol throw.
 func nativeUnsupportedReply(req *agentv1.ExecServerMessage, reason string) *agentv1.ExecClientMessage {
+	// Having no MCP resources is a legitimate answer, not a failure.
+	if _, isList := req.Message.(*agentv1.ExecServerMessage_ListMcpResourcesExecArgs); isList {
+		return &agentv1.ExecClientMessage{
+			Id:     req.GetId(),
+			ExecId: req.GetExecId(),
+			Message: &agentv1.ExecClientMessage_ListMcpResourcesExecResult{
+				ListMcpResourcesExecResult: &agentv1.ListMcpResourcesExecResult{
+					Result: &agentv1.ListMcpResourcesExecResult_Success{
+						Success: &agentv1.ListMcpResourcesSuccess{},
+					},
+				},
+			},
+		}
+	}
 	return nativeResultReply(req, ToolResult{Content: reason, IsError: true})
+}
+
+// shellStreamFrames renders a completed client command as the live event
+// sequence the streaming shell exec expects: start, output, exit. Answering it
+// with a one-shot ShellResult instead is silently discarded by the server and
+// the model never sees the output.
+func shellStreamFrames(args *agentv1.ShellArgs, res ToolResult) []*agentv1.ShellStream {
+	frames := []*agentv1.ShellStream{
+		{Event: &agentv1.ShellStream_Start{Start: &agentv1.ShellStreamStart{}}},
+	}
+	exitCode := uint32(0)
+	if res.IsError {
+		exitCode = 1
+		if match := exitCodePattern.FindStringSubmatch(res.Content); len(match) == 2 {
+			if parsed, err := strconv.Atoi(match[1]); err == nil && parsed > 0 {
+				exitCode = uint32(parsed)
+			}
+		}
+		if res.Content != "" {
+			frames = append(frames, &agentv1.ShellStream{
+				Event: &agentv1.ShellStream_Stderr{Stderr: &agentv1.ShellStreamStderr{Data: res.Content}},
+			})
+		}
+	} else if res.Content != "" {
+		frames = append(frames, &agentv1.ShellStream{
+			Event: &agentv1.ShellStream_Stdout{Stdout: &agentv1.ShellStreamStdout{Data: res.Content}},
+		})
+	}
+	frames = append(frames, &agentv1.ShellStream{
+		Event: &agentv1.ShellStream_Exit{Exit: &agentv1.ShellStreamExit{
+			Code: exitCode,
+			Cwd:  args.GetWorkingDirectory(),
+		}},
+	})
+	return frames
 }
 
 var exitCodePattern = regexp.MustCompile(`(?i)exit(?: code|ed with)[: ]+(-?\d+)`)
@@ -441,6 +576,48 @@ func buildFetchResult(args *agentv1.FetchArgs, res ToolResult) *agentv1.FetchRes
 			StatusCode:  200,
 			ContentType: "text/markdown",
 		}},
+	}
+}
+
+func buildSubagentResult(args *agentv1.SubagentArgs, res ToolResult) *agentv1.SubagentResult {
+	if res.IsError {
+		return &agentv1.SubagentResult{
+			Result: &agentv1.SubagentResult_Error{Error: &agentv1.SubagentError{Error: res.Content}},
+		}
+	}
+	final := res.Content
+	agentID := strings.TrimSpace(args.GetToolCallId())
+	if agentID == "" {
+		agentID = "client-subagent"
+	}
+	return &agentv1.SubagentResult{
+		Result: &agentv1.SubagentResult_Success{Success: &agentv1.SubagentSuccess{
+			AgentId:      agentID,
+			FinalMessage: &final,
+		}},
+	}
+}
+
+func buildListMcpResourcesResult(res ToolResult) *agentv1.ListMcpResourcesExecResult {
+	if res.IsError {
+		return &agentv1.ListMcpResourcesExecResult{
+			Result: &agentv1.ListMcpResourcesExecResult_Error{Error: &agentv1.ListMcpResourcesError{Error: res.Content}},
+		}
+	}
+	success := &agentv1.ListMcpResourcesSuccess{}
+	for _, line := range strings.Split(res.Content, "\n") {
+		trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- "))
+		if trimmed == "" || !strings.Contains(trimmed, "://") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		success.Resources = append(success.Resources, &agentv1.ListMcpResourcesExecResult_McpResource{
+			Uri:    fields[0],
+			Server: "client",
+		})
+	}
+	return &agentv1.ListMcpResourcesExecResult{
+		Result: &agentv1.ListMcpResourcesExecResult_Success{Success: success},
 	}
 }
 

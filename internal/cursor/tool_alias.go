@@ -24,21 +24,37 @@ var reservedCursorToolNames = map[string]struct{}{
 	"shell":            {},
 }
 
-// nativeBridgedToolNames are reserved names whose calls are served natively:
-// the client tool is not declared to Cursor at all, the model uses the
-// built-in of the same name, and the exec bridge routes the execution back to
-// the client's tool. The remaining reserved names (task, glob, todowrite,
-// listmcpresources) have no usable exec channel, so they keep the rename.
-var nativeBridgedToolNames = map[string]struct{}{
-	"shell": {},
-	"read":  {},
-	"write": {},
-	"grep":  {},
+// nativeServedToolNames are client tool names whose function is served by a
+// Cursor built-in: the client tool is not declared to Cursor at all, the model
+// uses the built-in, and the exec bridge routes execution back to the client's
+// tool. This covers every reserved name — Task rides subagent exec, Glob rides
+// the glob-shaped grep exec, ListMcpResources has its own exec arm, and
+// TodoWrite is handled entirely server-side — plus the non-colliding aliases
+// of the same capabilities (Bash, WebFetch, LS).
+var nativeServedToolNames = map[string]struct{}{
+	"shell":            {},
+	"read":             {},
+	"write":            {},
+	"grep":             {},
+	"glob":             {},
+	"task":             {},
+	"todowrite":        {},
+	"listmcpresources": {},
+	"bash":             {},
+	"webfetch":         {},
+	"ls":               {},
 }
 
-func isNativeBridgedToolName(name string) bool {
-	_, ok := nativeBridgedToolNames[strings.ToLower(strings.TrimSpace(name))]
+func isNativeServedToolName(name string) bool {
+	_, ok := nativeServedToolNames[strings.ToLower(strings.TrimSpace(name))]
 	return ok
+}
+
+// editServedNatively reports whether the client's Edit tool can be left
+// undeclared: the built-in edit lands as a full-content write exec, which
+// needs a write-capable client tool to bridge onto.
+func editServedNatively(tools []ToolDefinition) bool {
+	return findNativeClientTool("write", tools) != nil
 }
 
 // cursorToolAliasPrefix keeps aliased names short so model instructions that
@@ -92,16 +108,22 @@ func AliasToolsForCursor(tools []ToolDefinition, forceAll bool) ([]ToolDefinitio
 	}
 	out := make([]ToolDefinition, 0, len(tools))
 	used := make(map[string]struct{}, len(tools))
+	editNative := editServedNatively(tools)
 	for _, tool := range tools {
 		client := strings.TrimSpace(tool.Name)
 		if client == "" {
 			continue
 		}
-		// Natively bridged names are not declared at all: the model uses the
-		// built-in tool of the same name, and the exec bridge routes the
-		// execution back to the client's tool. Declaring a renamed MCP copy
-		// alongside it only made models choose between two identical tools.
-		if !forceAll && isNativeBridgedToolName(client) {
+		// Natively served names are not declared at all: the model uses the
+		// built-in tool, and the exec bridge routes the execution back to the
+		// client's tool. Declaring an MCP copy alongside it only made models
+		// choose between two identical tools.
+		if !forceAll && isNativeServedToolName(client) {
+			continue
+		}
+		// The built-in edit lands as a full-content write exec, so Edit can
+		// stay undeclared whenever a write-capable tool exists to receive it.
+		if !forceAll && editNative && strings.EqualFold(client, "edit") {
 			continue
 		}
 		upstream := client

@@ -312,6 +312,32 @@ message ShellResult {
   }
 }
 
+message ShellStreamStdout {
+  string data = 1;
+}
+
+message ShellStreamStderr {
+  string data = 1;
+}
+
+message ShellStreamExit {
+  uint32 code = 1;
+  string cwd = 2;
+  bool aborted = 4;
+}
+
+message ShellStreamStart {}
+
+message ShellStream {
+  oneof event {
+    ShellStreamStdout stdout = 1;
+    ShellStreamStderr stderr = 2;
+    ShellStreamExit exit = 3;
+    ShellStreamStart start = 4;
+    ShellRejected rejected = 5;
+  }
+}
+
 message ReadArgs {
   string path = 1;
   string tool_call_id = 2;
@@ -507,6 +533,60 @@ message FetchArgs {
   string tool_call_id = 2;
 }
 
+message ListMcpResourcesExecArgs {
+  optional string server = 1;
+}
+
+message ListMcpResourcesExecResult {
+  message McpResource {
+    string uri = 1;
+    optional string name = 2;
+    optional string description = 3;
+    optional string mime_type = 4;
+    string server = 5;
+  }
+
+  oneof result {
+    ListMcpResourcesSuccess success = 1;
+    ListMcpResourcesError error = 2;
+  }
+}
+
+message ListMcpResourcesSuccess {
+  repeated ListMcpResourcesExecResult.McpResource resources = 1;
+}
+
+message ListMcpResourcesError {
+  string error = 1;
+}
+
+message SubagentArgs {
+  string tool_call_id = 1;
+  string subagent_type = 2;
+  string model_id = 3;
+  string prompt = 4;
+  bool readonly = 5;
+  optional bool run_in_background = 7;
+}
+
+message SubagentSuccess {
+  string agent_id = 1;
+  optional string final_message = 2;
+  int32 tool_call_count = 3;
+}
+
+message SubagentError {
+  optional string agent_id = 1;
+  string error = 2;
+}
+
+message SubagentResult {
+  oneof result {
+    SubagentSuccess success = 1;
+    SubagentError error = 2;
+  }
+}
+
 message FetchSuccess {
   string url = 1;
   string content = 2;
@@ -568,7 +648,9 @@ message ExecServerMessage {
     RequestContextArgs request_context_args = 10;
     McpArgs mcp_args = 11;
     ShellArgs shell_stream_args = 14;
+    ListMcpResourcesExecArgs list_mcp_resources_exec_args = 17;
     FetchArgs fetch_args = 20;
+    SubagentArgs subagent_args = 28;
     ReadArgs redacted_read_args = 29;
   }
 }
@@ -585,7 +667,10 @@ message ExecClientMessage {
     LsResult ls_result = 8;
     RequestContextResult request_context_result = 10;
     McpResult mcp_result = 11;
+    ShellStream shell_stream = 14;
+    ListMcpResourcesExecResult list_mcp_resources_exec_result = 17;
     FetchResult fetch_result = 20;
+    SubagentResult subagent_result = 28;
     ReadResult redacted_read_result = 29;
   }
 }

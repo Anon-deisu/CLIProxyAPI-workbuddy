@@ -842,8 +842,21 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 }
 
 // sendToolResult answers a pending exec with the reply shape its request used:
-// typed native results for bridged built-in tools, McpResult for MCP tools.
+// live stream frames for the streaming shell, typed native results for the
+// other bridged built-in tools, McpResult for MCP tools.
 func (s *Session) sendToolResult(req *agentv1.ExecServerMessage, result ToolResult) error {
+	if m, isStream := req.Message.(*agentv1.ExecServerMessage_ShellStreamArgs); isStream {
+		for _, frame := range shellStreamFrames(m.ShellStreamArgs, result) {
+			if err := s.sendExecClient(&agentv1.ExecClientMessage{
+				Id:      req.Id,
+				ExecId:  req.ExecId,
+				Message: &agentv1.ExecClientMessage_ShellStream{ShellStream: frame},
+			}); err != nil {
+				return err
+			}
+		}
+		return sendExecStreamClose(s.stream, req.Id)
+	}
 	if reply := nativeResultReply(req, result); reply != nil {
 		if err := s.sendExecClient(reply); err != nil {
 			return err
@@ -1520,14 +1533,19 @@ func (s *Session) handleNativeExec(req *agentv1.ExecServerMessage) (bool, error)
 	kind, nativeID, call, ok := nativeBridge(req, s.clientTools)
 	if !ok {
 		log.Warnf("cursor: built-in %s call but the client declared no matching tool; answering with a typed error", kind)
-		reply := nativeUnsupportedReply(req, "the connected client provides no "+kind+" capability; use another approach")
-		if reply == nil {
-			return false, rejectUnsupportedExec(s.stream, req)
+		// Having no MCP resources is a legitimate answer, not a failure.
+		if reply := nativeUnsupportedReply(req, ""); reply != nil {
+			if _, isList := req.Message.(*agentv1.ExecServerMessage_ListMcpResourcesExecArgs); isList {
+				if err := s.sendExecClient(reply); err != nil {
+					return false, err
+				}
+				return false, sendExecStreamClose(s.stream, req.Id)
+			}
 		}
-		if err := s.sendExecClient(reply); err != nil {
-			return false, err
-		}
-		return false, sendExecStreamClose(s.stream, req.Id)
+		return false, s.sendToolResult(req, ToolResult{
+			Content: "the connected client provides no " + kind + " capability; use another approach",
+			IsError: true,
+		})
 	}
 	log.Debugf("cursor: bridging built-in %s call to client tool %q", kind, call.Name)
 	s.pendToolCall(req, nativeID, call)
@@ -1932,6 +1950,12 @@ func (s *Session) requestContext() *agentv1.RequestContext {
 	ctx := headlessRequestContext()
 	if len(s.tools) > 0 {
 		ctx.Tools = buildMcpToolDefinitions(s.tools)
+	}
+	// The client's WebFetch is no longer declared as MCP; advertise the
+	// built-in instead, whose fetch exec the bridge routes back to it.
+	if findNativeClientTool("fetch", s.clientTools) != nil {
+		trueVal := true
+		ctx.WebFetchEnabled = &trueVal
 	}
 	return ctx
 }
