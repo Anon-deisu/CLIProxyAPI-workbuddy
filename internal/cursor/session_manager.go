@@ -115,6 +115,35 @@ func (m *SessionManager) lookupPendingLocked(toolCallID string) *Session {
 	return m.pending[toolCallID]
 }
 
+// scanSessionsForPendingLocked returns a compact "sessionID:key|callID" summary
+// for every live session that still indexes the given tool_call_id by key or by
+// item.call.ID, or "<none>" when nobody does. Caller must hold m.mu; this
+// acquires each session's own mutex, which is the existing (manager->session)
+// lock order used by syncManagerBindings.
+func (m *SessionManager) scanSessionsForPendingLocked(toolCallID string) string {
+	if toolCallID == "" {
+		return "<none>"
+	}
+	live := false
+	summary := ""
+	for _, session := range m.sessions {
+		if session == nil {
+			continue
+		}
+		if session.PendingCallIDAlive(toolCallID) {
+			live = true
+			if summary != "" {
+				summary += ","
+			}
+			summary += session.ID
+		}
+	}
+	if !live {
+		return "<none>"
+	}
+	return summary
+}
+
 // ResolveForToolResults finds the single live session that owns all results.
 func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, error) {
 	if len(results) == 0 {
@@ -131,7 +160,8 @@ func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, 
 		if session == nil {
 			// Clients that retry a long-dead turn land here forever, so keep
 			// this quiet; the caller already logs the rebuild it falls back to.
-			log.Debugf("cursor: no live session for tool_call_id %q (%d bound)", result.ToolCallID, len(m.pending))
+			found := m.scanSessionsForPendingLocked(result.ToolCallID)
+			log.Debugf("cursor: no live session for tool_call_id %q (%d bound; scan=%s)", result.ToolCallID, len(m.pending), found)
 			return nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
 		}
 		if owner == nil {

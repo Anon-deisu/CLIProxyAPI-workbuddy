@@ -466,7 +466,6 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 	results := trailingToolResults(messages)
 	if len(results) > 0 {
 		session, err := cursorlib.DefaultSessionManager().ResolveForToolResults(results)
-		hadLiveRun := err == nil
 		if err == nil {
 			if err = session.SubmitToolResults(results); err == nil {
 				return session, nil
@@ -483,12 +482,24 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 		// The structured assistant tool calls and tool result messages already
 		// carry the complete continuation. Do not add a synthetic user message:
 		// it changes role ordering and can make the provider reject the request.
-		// Rotate only if a live run actually died while owning this result. A
-		// missing in-memory session (restart/cross-instance routing) must keep
-		// the explicit conversation id or every agent step rewrites the cache.
-		if hadLiveRun {
-			opts = append(opts, cursorlib.WithConversationID(uuid.NewString()))
-		}
+		//
+		// Do NOT rotate the conversation id here. The rebuild is a same-turn
+		// continuation of the tool resume under the deterministic id resolved by
+		// resolveCursorConversationID/scopeCursorConversationID (a SHA1 of
+		// authID+sessionKey). Swapping in a fresh uuid.NewString() would:
+		//   - orphan Cursor's server-side conversation state (including the
+		//     pending tool call we are resuming) that still lives under the
+		//     stable id,
+		//   - defeat the continuation-snapshot lookup (takeContinuation is keyed
+		//     by the same stable id, remembered on the responseEnded Close), so
+		//     every agent step forces a full-history rewrite and a cache rewrite,
+		//   - re-enter the exact cost we are removing: full re-render at 789K
+		//     input with zero terminal output.
+		// A missing in-memory session (restart/cross-instance routing) must ALSO
+		// keep the explicit conversation id — Cursor's server conversation under
+		// that id is the only durable handle we have for the pending tool state.
+		// hadLiveRun no longer gates anything here; keep the id stable in every
+		// rebuild path.
 	}
 	return cursorlib.StartSession(ctx, creds, model, messages, tools, opts...)
 }

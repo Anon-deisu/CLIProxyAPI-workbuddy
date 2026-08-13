@@ -159,6 +159,14 @@ func snapshotAssistantMessages(snapshot checkpointSnapshot) []checkpointAssistan
 // The check is deliberately strict — on any doubt the caller falls back to a
 // full rebuild, which is always correct.
 func continuationMatchesHistory(snapshot checkpointSnapshot, messages []ChatMessage) bool {
+	logFail := func(reason string) {
+		total := len(messages)
+		last := "none"
+		if total > 0 {
+			last = messages[total-1].Role + ":" + fmt.Sprintf("%d", len(messages[total-1].ToolCalls))
+		}
+		log.Debugf("cursor: continuation reject [%s] last=%s n=%d", reason, last, total)
+	}
 	// Only the clean text-turn shape continues natively: a fresh user ask on
 	// top of a completed assistant turn. Trailing tool results ride the live
 	// session resume instead, and if that session is gone the pending exec
@@ -171,7 +179,12 @@ func continuationMatchesHistory(snapshot checkpointSnapshot, messages []ChatMess
 		last = i
 		break
 	}
-	if last < 0 || messages[last].Role != "user" || strings.TrimSpace(messages[last].Content) == "" {
+	if last < 0 {
+		logFail("no-non-system")
+		return false
+	}
+	if messages[last].Role != "user" || strings.TrimSpace(messages[last].Content) == "" {
+		logFail("last-not-user-text")
 		return false
 	}
 	var lastAssistant string
@@ -184,22 +197,39 @@ scan:
 			// An assistant still holding tool calls means the turn the
 			// checkpoint recorded did not finish as plain text; rebuild.
 			if len(messages[i].ToolCalls) > 0 {
+				logFail("last-assistant-has-toolcalls")
 				return false
 			}
 			lastAssistant = strings.TrimSpace(messages[i].Content)
 			break scan
 		default: // "tool" or anything unexpected
+			logFail("non-assistant-between-" + messages[i].Role)
 			return false
 		}
 	}
 	if lastAssistant == "" {
+		logFail("no-last-assistant-text")
 		return false
 	}
 	recorded := snapshotAssistantMessages(snapshot)
 	if len(recorded) == 0 {
+		logFail("snapshot-no-assistant-messages")
 		return false
 	}
-	return strings.TrimSpace(recorded[len(recorded)-1].text) == lastAssistant
+	recordedText := strings.TrimSpace(recorded[len(recorded)-1].text)
+	if recordedText == lastAssistant {
+		return true
+	}
+	log.Debugf("cursor: continuation reject [text-mismatch] recorded=%q client=%q recordedN=%d",
+		truncateForLog(recordedText, 80), truncateForLog(lastAssistant, 80), len(recorded))
+	return false
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // buildContinuationRunRequest sends the server's own conversation state back

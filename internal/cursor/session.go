@@ -2823,10 +2823,13 @@ func (s *Session) rebindPendingLocked(item *pendingExec, authoritativeID string)
 	if s.pending == nil {
 		s.pending = map[string]*pendingExec{}
 	}
+	wasEmitted := item.emitted
+	oldIDs := make([]string, 0, len(items))
 	for _, member := range items {
 		for id, pending := range s.pending {
 			if pending == member {
 				delete(s.pending, id)
+				oldIDs = append(oldIDs, id)
 			}
 		}
 	}
@@ -2838,6 +2841,11 @@ func (s *Session) rebindPendingLocked(item *pendingExec, authoritativeID string)
 		member.call.ID = id
 		member.provisional = false
 		s.pending[id] = member
+	}
+	if wasEmitted {
+		log.Debugf("cursor: rebind-EMITTED %q -> %q (old=%v)", item.call.ID, authoritativeID, oldIDs)
+	} else {
+		log.Debugf("cursor: rebind pre-emit %q -> %q (old=%v)", item.call.ID, authoritativeID, oldIDs)
 	}
 }
 
@@ -3709,6 +3717,7 @@ func (s *Session) emitPendingToolBatch(force bool) bool {
 		item.emitted = true
 		call := item.call
 		s.mu.Unlock()
+		log.Debugf("cursor: emit tool_call id=%q kind=%s name=%s pendingKeys=%d", call.ID, call.Kind, call.Name, len(s.pending))
 		s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
 	}
 	if batch != nil {
@@ -3752,6 +3761,7 @@ func (s *Session) emitNextPendingTool() bool {
 		return false
 	}
 	call := next.call
+	log.Debugf("cursor: emit-next tool_call id=%q kind=%s name=%s", call.ID, call.Kind, call.Name)
 	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
 	return true
 }
@@ -3967,6 +3977,27 @@ func (s *Session) lookupPendingTool(toolCallID string) (*pendingExec, string) {
 		}
 	}
 	return nil, ""
+}
+
+// PendingCallIDAlive reports whether any pending exec in this session still
+// indexes the given tool_call_id (either by key or by item.call.ID). Used by
+// the manager to explain id-space divergences across a rebuild boundary.
+func (s *Session) PendingCallIDAlive(toolCallID string) bool {
+	if s == nil || toolCallID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.lookupPendingTool(toolCallID)
+	if s.pending[toolCallID] != nil {
+		return true
+	}
+	for _, item := range s.pending {
+		if item != nil && item.call.ID == toolCallID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) clearPendingTool(keys ...string) {
