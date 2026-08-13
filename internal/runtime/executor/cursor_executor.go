@@ -1297,11 +1297,23 @@ func cursorUsageDetail(input, output, cacheRead, cacheWrite, reasoning int64) us
 	}
 }
 
+// cursorUsagePayload renders usage for OpenAI-shaped responses.
+//
+// prompt_tokens carries only the uncached remainder, with the cache in its own
+// details. The OpenAI spec defines prompt_tokens as inclusive of cached_tokens,
+// but downstream gateways read prompt_tokens as the billable input and show the
+// cache separately: reporting the inclusive figure made every request look like
+// tens of thousands of fresh input tokens with no cache hit, and priced it that
+// way. The Anthropic surface already reports the split; this matches it.
 func cursorUsagePayload(input, output, cacheRead, cacheWrite, reasoning int64) map[string]any {
+	uncached := input - cacheRead - cacheWrite
+	if uncached < 0 {
+		uncached = 0
+	}
 	usagePayload := map[string]any{
-		"prompt_tokens":     input,
+		"prompt_tokens":     uncached,
 		"completion_tokens": output,
-		"total_tokens":      input + output,
+		"total_tokens":      uncached + output + cacheRead + cacheWrite,
 	}
 	details := map[string]any{}
 	if cacheRead > 0 {
