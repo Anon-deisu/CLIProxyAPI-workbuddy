@@ -128,6 +128,11 @@ message McpTools {
   repeated McpToolDefinition mcp_tools = 1;
 }
 
+message PreFetchedBlob {
+  bytes id = 1;
+  bytes value = 2;
+}
+
 message AgentRunRequest {
   ConversationStateStructure conversation_state = 1;
   ConversationAction action = 2;
@@ -136,6 +141,7 @@ message AgentRunRequest {
   optional string conversation_id = 5;
   optional RequestedModel requested_model = 9;
   optional bool exclude_workspace_context = 12;
+  repeated PreFetchedBlob pre_fetched_blobs = 17;
   optional bool client_supports_inline_images = 19;
 }
 

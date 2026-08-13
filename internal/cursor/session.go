@@ -62,6 +62,7 @@ type ToolResult struct {
 // StreamEvent is one Cursor→OpenAI segment event.
 type StreamEvent struct {
 	Type             string
+	SegmentID        uint64
 	Text             string
 	ToolCall         *ToolCall
 	Reason           string
@@ -142,11 +143,18 @@ type Session struct {
 	lastActivity  time.Time
 	manager       *SessionManager
 	parallelTools bool
-	// usageSeen carries TurnEnded counters that land after the caller already
-	// stopped reading the segment, which is the normal ordering when a turn
-	// pauses for client tools.
-	usageSeen   *StreamEvent
-	usageSignal chan struct{}
+	// Cursor can send TurnEnded after the public tool boundary. Keep counters
+	// keyed by the Agent segment they belong to so a late previous-turn update
+	// can never be charged to the next HTTP continuation.
+	segmentID    uint64
+	usageByID    map[uint64]StreamEvent
+	usageSignals map[uint64]chan struct{}
+	usageRecorded map[uint64]struct{}
+	// usageConsumed marks segments whose authoritative usage was already handed
+	// out via the event channel (emitTerminalUsage) or TakeUsageForSegment. A
+	// consumed segment must never be re-emitted or re-served.
+	usageConsumed map[uint64]struct{}
+	usagePending  []uint64
 
 	// Checkpoint / text recovery (cursor2api): Cursor wire text_deltas often
 	// miss a leading token; the authoritative assistant text lands in a later
@@ -157,6 +165,10 @@ type Session struct {
 	visibleThinking     strings.Builder // reasoning seen from deltas
 	emittedThinking     strings.Builder // reasoning already sent to the client
 	seenAssistantMsgIDs map[string]struct{}
+	// The server may rewrite blob/message ids while preserving the ordered
+	// assistant history. Content at the same history position is therefore the
+	// stable identity used to suppress checkpoint replay.
+	seenAssistantHistory []checkpointAssistantMessage
 	turnEndedSeen       bool
 	terminalUsage       StreamEvent
 	terminalUsageReady  bool
@@ -166,6 +178,13 @@ type Session struct {
 	textStreamLive      bool
 	holdTimer           *time.Timer
 	resumed             bool
+	// usedContinuation marks a run opened from a server checkpoint. If that
+	// run fails, the stale checkpoint is dropped and the retry rebuilds from
+	// the caller's complete history.
+	usedContinuation bool
+	// failed prevents a broken or rejected run from replacing a known-good
+	// continuation checkpoint during Close.
+	failed bool
 	// lastFrame is the last time anything arrived from Cursor. Thinking and
 	// text deltas are buffered rather than emitted, so consumer-side idle
 	// detection must not rely on client-visible events alone.
@@ -237,11 +256,28 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	}
 	tools = SanitizeToolDefinitions(tools)
 	selection := ResolveRequestedModel(model)
-	clientMsg, blobStore, conversationID, err := buildRunRequestForConversation(model, messages, tools, cfg.conversationID)
-	if err != nil {
-		return nil, err
+	var clientMsg *agentv1.AgentClientMessage
+	var blobStore map[string][]byte
+	conversationID := strings.TrimSpace(cfg.conversationID)
+	usedContinuation := false
+	if snapshot, ok := takeContinuation(conversationID); ok {
+		if continuationMatchesHistory(snapshot, messages) {
+			clientMsg, blobStore = buildContinuationRunRequest(model, messages, tools, conversationID, snapshot)
+			usedContinuation = true
+		} else {
+			log.Debugf("cursor: stored checkpoint does not match client history; rebuilding conversation %s", conversationID)
+		}
 	}
-	first, err := proto.Marshal(clientMsg)
+	if clientMsg == nil {
+		var err error
+		clientMsg, blobStore, conversationID, err = buildRunRequestForConversation(model, messages, tools, cfg.conversationID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Tool schemas are backed by protobuf maps. Deterministic encoding keeps an
+	// unchanged cached prefix byte-identical across requests.
+	first, err := (proto.MarshalOptions{Deterministic: true}).Marshal(clientMsg)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +324,13 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		lastActivity:        time.Now(),
 		manager:             DefaultSessionManager(),
 		parallelTools:       cfg.parallelTools,
+		segmentID:           1,
+		usageByID:           map[uint64]StreamEvent{},
+		usageSignals:        map[uint64]chan struct{}{},
+		usageRecorded:       map[uint64]struct{}{},
+		usageConsumed:       map[uint64]struct{}{},
 		seenAssistantMsgIDs: map[string]struct{}{},
+		usedContinuation:    usedContinuation,
 		batches:             map[string]*pendingToolBatch{},
 		batchOrder:          make([]*pendingToolBatch, 0),
 		lifecyclesByID:      map[string]*nativeLifecycle{},
@@ -449,7 +491,7 @@ func (s *Session) readLoop(ctx context.Context) {
 			if endForTools {
 				s.flushAssistantText(true)
 				if s.emitPendingToolBatch(false) {
-					s.emitTerminalUsage()
+					s.emitTerminalUsage(s.SegmentID())
 					s.beginWaitingTools()
 					s.mu.Lock()
 					s.segmentEnded = true
@@ -460,7 +502,7 @@ func (s *Session) readLoop(ctx context.Context) {
 			if sawEndStream {
 				s.markPendingBatchesTerminal()
 				if s.emitPendingToolBatch(true) {
-					s.emitTerminalUsage()
+					s.emitTerminalUsage(s.SegmentID())
 					s.beginWaitingTools()
 					s.mu.Lock()
 					alreadyEnded := s.segmentEnded
@@ -483,7 +525,7 @@ func (s *Session) readLoop(ctx context.Context) {
 					continue
 				}
 				s.flushAssistantText(true)
-				s.emitTerminalUsage()
+				s.emitTerminalUsage(s.SegmentID())
 				s.mu.Lock()
 				alreadyEnded := s.segmentEnded
 				s.segmentEnded = true
@@ -498,7 +540,7 @@ func (s *Session) readLoop(ctx context.Context) {
 		if errRead == io.EOF {
 			s.markPendingBatchesTerminal()
 			if s.emitPendingToolBatch(true) {
-				s.emitTerminalUsage()
+				s.emitTerminalUsage(s.SegmentID())
 				s.beginWaitingTools()
 				s.mu.Lock()
 				alreadyEnded := s.segmentEnded
@@ -517,7 +559,7 @@ func (s *Session) readLoop(ctx context.Context) {
 				continue
 			}
 			s.flushAssistantText(true)
-			s.emitTerminalUsage()
+			s.emitTerminalUsage(s.SegmentID())
 			s.mu.Lock()
 			alreadyEnded := s.segmentEnded
 			s.segmentEnded = true
@@ -548,22 +590,56 @@ func (s *Session) beginWaitingTools() {
 	s.pauseCh = make(chan struct{})
 }
 
-func (s *Session) recordUsage(ev StreamEvent) {
+func (s *Session) recordUsage(ev StreamEvent) StreamEvent {
 	if s == nil {
-		return
+		return ev
 	}
 	s.mu.Lock()
-	copied := ev
-	s.usageSeen = &copied
-	signal := s.usageSignal
-	s.usageSignal = nil
+	if s.segmentID == 0 {
+		s.segmentID = 1
+	}
+	if s.usageByID == nil {
+		s.usageByID = map[uint64]StreamEvent{}
+	}
+	if s.usageSignals == nil {
+		s.usageSignals = map[uint64]chan struct{}{}
+	}
+	if s.usageRecorded == nil {
+		s.usageRecorded = map[uint64]struct{}{}
+	}
+	if len(s.usagePending) > 0 {
+		ev.SegmentID = s.usagePending[0]
+		s.usagePending = s.usagePending[1:]
+	} else {
+		ev.SegmentID = s.segmentID
+	}
+	s.usageByID[ev.SegmentID] = ev
+	s.usageRecorded[ev.SegmentID] = struct{}{}
+	signal := s.usageSignals[ev.SegmentID]
+	delete(s.usageSignals, ev.SegmentID)
 	s.mu.Unlock()
 	if signal != nil {
 		close(signal)
 	}
+	return ev
 }
 
-// TakeUsage returns the counters for the turn, waiting up to d for them.
+// SegmentID returns the current public Agent segment identity.
+func (s *Session) SegmentID() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.segmentID == 0 {
+		s.segmentID = 1
+	}
+	return s.segmentID
+}
+
+// TakeUsage returns the counters for the current turn, waiting up to d for
+// them. New code should capture SegmentID before consuming a segment and call
+// TakeUsageForSegment so a later continuation cannot observe older counters.
 //
 // Cursor reports TurnEnded after it has already asked the client to run a tool,
 // so a caller that stops at the tool call sees nothing unless it waits a moment
@@ -572,10 +648,27 @@ func (s *Session) TakeUsage(d time.Duration) (StreamEvent, bool) {
 	if s == nil {
 		return StreamEvent{}, false
 	}
+	return s.TakeUsageForSegment(s.SegmentID(), d)
+}
+
+// TakeUsageForSegment returns exactly one authoritative TurnEnded update for
+// segmentID. It never falls through to counters from another segment, and it
+// never returns counters already handed out through the event channel for the
+// same segment (emitTerminalUsage).
+func (s *Session) TakeUsageForSegment(segmentID uint64, d time.Duration) (StreamEvent, bool) {
+	if s == nil || segmentID == 0 {
+		return StreamEvent{}, false
+	}
 	s.mu.Lock()
-	if s.usageSeen != nil {
-		ev := *s.usageSeen
-		s.usageSeen = nil
+	if s.usageConsumed != nil {
+		if _, consumed := s.usageConsumed[segmentID]; consumed {
+			s.mu.Unlock()
+			return StreamEvent{}, false
+		}
+	}
+	if ev, ok := s.usageByID[segmentID]; ok {
+		delete(s.usageByID, segmentID)
+		s.markConsumed(segmentID)
 		s.mu.Unlock()
 		return ev, true
 	}
@@ -583,24 +676,46 @@ func (s *Session) TakeUsage(d time.Duration) (StreamEvent, bool) {
 		s.mu.Unlock()
 		return StreamEvent{}, false
 	}
-	if s.usageSignal == nil {
-		s.usageSignal = make(chan struct{})
+	if s.usageSignals == nil {
+		s.usageSignals = map[uint64]chan struct{}{}
 	}
-	signal := s.usageSignal
+	signal := s.usageSignals[segmentID]
+	if signal == nil {
+		signal = make(chan struct{})
+		s.usageSignals[segmentID] = signal
+	}
 	s.mu.Unlock()
 
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
 	case <-signal:
-	case <-time.After(d):
+	case <-timer.C:
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.usageSeen == nil {
+	if s.usageConsumed != nil {
+		if _, consumed := s.usageConsumed[segmentID]; consumed {
+			return StreamEvent{}, false
+		}
+	}
+	ev, ok := s.usageByID[segmentID]
+	if !ok {
 		return StreamEvent{}, false
 	}
-	ev := *s.usageSeen
-	s.usageSeen = nil
+	delete(s.usageByID, segmentID)
+	s.markConsumed(segmentID)
 	return ev, true
+}
+
+// markConsumed records that a segment's authoritative usage has been handed out
+// exactly once. A nil map is tolerated so bare &Session{} unit instances and
+// legacy call paths never panic.
+func (s *Session) markConsumed(segmentID uint64) {
+	if s.usageConsumed == nil {
+		s.usageConsumed = map[uint64]struct{}{}
+	}
+	s.usageConsumed[segmentID] = struct{}{}
 }
 
 // awaitingClientTools reports whether the Agent turn is paused for mcp_result.
@@ -654,15 +769,37 @@ func (s *Session) emit(ev StreamEvent) {
 	}
 }
 
-func (s *Session) emitTerminalUsage() {
+// emitTerminalUsage publishes the authoritative TurnEnded counters for the
+// segment currently being ended (segmentID). Cursor may deliver a previous
+// turn's TurnEnded after the public tool boundary, so the pending single slot
+// is only surfaced when it actually belongs to this segment. Once delivered,
+// the segment is marked consumed: a later TakeUsageForSegment can never return
+// the same counters, and a later segment cannot inherit them.
+func (s *Session) emitTerminalUsage(segmentID uint64) {
 	s.mu.Lock()
 	if !s.terminalUsageReady {
 		s.mu.Unlock()
 		return
 	}
 	ev := s.terminalUsage
+	// Guard against cross-segment leakage: if the pending slot belongs to a
+	// different (older) segment than the one being ended now, leave it for that
+	// segment's own boundary or its TailSegment wait, never this one.
+	if ev.SegmentID != 0 && segmentID != 0 && ev.SegmentID != segmentID {
+		s.mu.Unlock()
+		return
+	}
 	s.terminalUsageReady = false
 	s.terminalUsage = StreamEvent{}
+	// The event channel now owns delivery for this segment; remove the
+	// out-of-band fallback copy so it cannot leak into a continuation.
+	if ev.SegmentID != 0 {
+		delete(s.usageByID, ev.SegmentID)
+		if s.usageConsumed == nil {
+			s.usageConsumed = map[uint64]struct{}{}
+		}
+		s.usageConsumed[ev.SegmentID] = struct{}{}
+	}
 	s.mu.Unlock()
 	s.emit(ev)
 }
@@ -670,6 +807,13 @@ func (s *Session) emitTerminalUsage() {
 func (s *Session) fail(err error) {
 	if err == nil {
 		return
+	}
+	s.mu.Lock()
+	s.failed = true
+	usedContinuation := s.usedContinuation
+	s.mu.Unlock()
+	if usedContinuation {
+		dropContinuation(s.ConversationID)
 	}
 	select {
 	case s.errCh <- err:
@@ -914,7 +1058,25 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	s.turnEndedSeen = false
 	s.terminalUsageReady = false
 	s.terminalUsage = StreamEvent{}
-	s.usageSeen = nil
+	if s.segmentID == 0 {
+		s.segmentID = 1
+	}
+	if s.usageRecorded == nil {
+		s.usageRecorded = map[uint64]struct{}{}
+	}
+	if _, recorded := s.usageRecorded[s.segmentID]; !recorded {
+		alreadyPending := false
+		for _, pendingID := range s.usagePending {
+			if pendingID == s.segmentID {
+				alreadyPending = true
+				break
+			}
+		}
+		if !alreadyPending {
+			s.usagePending = append(s.usagePending, s.segmentID)
+		}
+	}
+	s.segmentID++
 	s.thinkingFlushed = false
 	s.textStreamLive = false
 	if s.holdTimer != nil {
@@ -1184,11 +1346,12 @@ func (s *Session) sendNativeResult(req *agentv1.ExecServerMessage, variant strin
 	case "subagent_args":
 		args := req.GetSubagentArgs()
 		value := &agentv1.SubagentResult{}
+		agentID := firstNonEmpty(args.GetResumeAgentId(), args.GetToolCallId(), req.GetExecId(), fmt.Sprintf("subagent-%d", req.GetId()))
 		if result.IsError {
-			value.Result = &agentv1.SubagentResult_Error{Error: &agentv1.SubagentError{Error: content}}
+			value.Result = &agentv1.SubagentResult_Error{Error: &agentv1.SubagentError{AgentId: &agentID, Error: content}}
 		} else {
-			final := content
-			value.Result = &agentv1.SubagentResult_Success{Success: &agentv1.SubagentSuccess{AgentId: args.GetResumeAgentId(), FinalMessage: &final}}
+			final := nativeFinalMessage(content)
+			value.Result = &agentv1.SubagentResult_Success{Success: &agentv1.SubagentSuccess{AgentId: agentID, FinalMessage: &final}}
 		}
 		execClient.Message = &agentv1.ExecClientMessage_SubagentResult{SubagentResult: value}
 	default:
@@ -1203,6 +1366,55 @@ func (s *Session) sendNativeResult(req *agentv1.ExecServerMessage, variant strin
 		return err
 	}
 	return sendExecStreamClose(s.stream, req.Id)
+}
+
+// nativeFinalMessage accepts the structured result shapes emitted by Codex,
+// Claude Code and common Task tools. It prefers a real final payload over
+// status/progress text while preserving arbitrary plain-text results.
+func nativeFinalMessage(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	var value any
+	if json.Unmarshal([]byte(trimmed), &value) != nil {
+		return content
+	}
+	if final := findNativeFinalMessage(value); final != "" {
+		return final
+	}
+	return content
+}
+
+func findNativeFinalMessage(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []any:
+		var parts []string
+		for _, item := range typed {
+			if text := findNativeFinalMessage(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		for _, key := range []string{"final_message", "finalMessage", "result", "output", "content", "message", "summary"} {
+			if candidate, ok := typed[key]; ok {
+				if text := findNativeFinalMessage(candidate); text != "" {
+					return text
+				}
+			}
+		}
+		for _, key := range []string{"data", "response", "success"} {
+			if candidate, ok := typed[key]; ok {
+				if text := findNativeFinalMessage(candidate); text != "" {
+					return text
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func buildDiagnosticsSuccess(path, content string) *agentv1.DiagnosticsSuccess {
@@ -1727,7 +1939,11 @@ func (s *Session) Close() error {
 	}
 	stream := s.stream
 	cancel := s.cancel
+	failed := s.failed
 	s.mu.Unlock()
+	if !failed {
+		rememberContinuation(s.ConversationID, s.checkpointSnapshot())
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -1772,7 +1988,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			// Keep an out-of-band copy for callers whose formal tool boundary
 			// was reached in the same read batch. It is still only a candidate:
 			// public usage is emitted at that boundary or at clean END_STREAM.
-			s.recordUsage(ev)
+			ev = s.recordUsage(ev)
 			// TurnEnded is a candidate terminal update. Cursor can still deliver
 			// the authoritative checkpoint or terminate this attempt with an
 			// error, so usage is published only at a formal tool boundary or a
@@ -1838,7 +2054,9 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 }
 
 func (s *Session) seedSeenAssistantMessages() {
-	for _, msg := range s.checkpointAssistantMessages() {
+	messages := s.checkpointAssistantMessages()
+	s.seenAssistantHistory = append([]checkpointAssistantMessage(nil), messages...)
+	for _, msg := range messages {
 		s.seenAssistantMsgIDs[msg.identity] = struct{}{}
 	}
 }
@@ -1852,6 +2070,71 @@ type checkpointAssistantMessage struct {
 type checkpointSnapshot struct {
 	state *agentv1.ConversationStateStructure
 	blobs map[string][]byte
+}
+
+// unseenCheckpointAssistantMessages compares the checkpoint as an ordered
+// history. Cursor is allowed to rewrite content-addressed blob ids, so identity
+// alone is insufficient: every matching historical position is marked seen
+// under both its old and new ids, and only the appended suffix is returned.
+func (s *Session) unseenCheckpointAssistantMessages() []checkpointAssistantMessage {
+	messages := s.checkpointAssistantMessages()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seenAssistantMsgIDs == nil {
+		s.seenAssistantMsgIDs = map[string]struct{}{}
+	}
+	prefix := 0
+	for prefix < len(messages) && prefix < len(s.seenAssistantHistory) {
+		current := messages[prefix]
+		seen := s.seenAssistantHistory[prefix]
+		if current.text != seen.text || current.thinking != seen.thinking {
+			break
+		}
+		s.seenAssistantMsgIDs[current.identity] = struct{}{}
+		prefix++
+	}
+	if prefix == len(messages) {
+		return nil
+	}
+	out := make([]checkpointAssistantMessage, 0, len(messages)-prefix)
+	for index := prefix; index < len(messages); index++ {
+		msg := messages[index]
+		if _, seen := s.seenAssistantMsgIDs[msg.identity]; seen {
+			continue
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+func (s *Session) markCheckpointAssistantMessages(messages []checkpointAssistantMessage) {
+	if len(messages) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seenAssistantMsgIDs == nil {
+		s.seenAssistantMsgIDs = map[string]struct{}{}
+	}
+	for _, msg := range messages {
+		s.seenAssistantMsgIDs[msg.identity] = struct{}{}
+	}
+	latest := s.checkpointAssistantMessagesLocked()
+	if len(latest) > 0 {
+		s.seenAssistantHistory = append([]checkpointAssistantMessage(nil), latest...)
+	}
+}
+
+func (s *Session) checkpointAssistantMessagesLocked() []checkpointAssistantMessage {
+	var state *agentv1.ConversationStateStructure
+	if s.conversationState != nil {
+		state = proto.Clone(s.conversationState).(*agentv1.ConversationStateStructure)
+	}
+	blobs := make(map[string][]byte, len(s.blobStore))
+	for key, raw := range s.blobStore {
+		blobs[key] = append([]byte(nil), raw...)
+	}
+	return snapshotAssistantMessages(checkpointSnapshot{state: state, blobs: blobs})
 }
 
 func (s *Session) checkpointSnapshot() checkpointSnapshot {
@@ -1912,35 +2195,7 @@ func checkpointBlobIDs(snapshot checkpointSnapshot) [][]byte {
 }
 
 func (s *Session) checkpointAssistantMessages() []checkpointAssistantMessage {
-	snapshot := s.checkpointSnapshot()
-	ids := checkpointBlobIDs(snapshot)
-	if len(ids) == 0 {
-		// Fall back to initial prompt blobs when no checkpoint has arrived yet.
-		keys := make([]string, 0, len(snapshot.blobs))
-		for key := range snapshot.blobs {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		out := make([]checkpointAssistantMessage, 0)
-		for _, key := range keys {
-			if msg, ok := parseAssistantBlob(key, snapshot.blobs[key]); ok {
-				out = append(out, msg)
-			}
-		}
-		return out
-	}
-	out := make([]checkpointAssistantMessage, 0)
-	for _, id := range ids {
-		key := fmt.Sprintf("%x", id)
-		raw := snapshot.blobs[key]
-		if len(raw) == 0 {
-			continue
-		}
-		if msg, ok := parseAssistantBlob(key, raw); ok {
-			out = append(out, msg)
-		}
-	}
-	return out
+	return snapshotAssistantMessages(s.checkpointSnapshot())
 }
 
 func parseAssistantBlob(key string, raw []byte) (checkpointAssistantMessage, bool) {
@@ -2077,15 +2332,8 @@ func (s *Session) releaseTextStream() {
 	s.mu.Unlock()
 
 	final := visible
-	var newIDs []string
-	for _, msg := range s.checkpointAssistantMessages() {
-		s.mu.Lock()
-		_, seen := s.seenAssistantMsgIDs[msg.identity]
-		s.mu.Unlock()
-		if seen {
-			continue
-		}
-		newIDs = append(newIDs, msg.identity)
+	newMessages := s.unseenCheckpointAssistantMessages()
+	for _, msg := range newMessages {
 		final = reconcileAssistantText(final, msg.text)
 	}
 	out := final
@@ -2098,9 +2346,6 @@ func (s *Session) releaseTextStream() {
 		s.mu.Unlock()
 		return
 	}
-	for _, id := range newIDs {
-		s.seenAssistantMsgIDs[id] = struct{}{}
-	}
 	s.textStreamLive = true
 	s.holdTimer = nil
 	s.emittedText.Reset()
@@ -2108,6 +2353,7 @@ func (s *Session) releaseTextStream() {
 	s.visibleText.Reset()
 	s.visibleText.WriteString(final)
 	s.mu.Unlock()
+	s.markCheckpointAssistantMessages(newMessages)
 
 	for _, part := range splitTextForSSE(out, sseChunkBytes) {
 		s.emit(StreamEvent{Type: "text_delta", Text: part})
@@ -2135,17 +2381,11 @@ func (s *Session) flushAssistantText(force bool) {
 
 	final := visible
 	finalThink := visibleThink
-	var newIDs []string
+	var newMessages []checkpointAssistantMessage
 	haveCheckpoint := false
-	for _, msg := range s.checkpointAssistantMessages() {
-		s.mu.Lock()
-		_, seen := s.seenAssistantMsgIDs[msg.identity]
-		s.mu.Unlock()
-		if seen {
-			continue
-		}
+	newMessages = s.unseenCheckpointAssistantMessages()
+	for _, msg := range newMessages {
 		haveCheckpoint = true
-		newIDs = append(newIDs, msg.identity)
 		final = reconcileAssistantText(final, msg.text)
 		if msg.thinking != "" {
 			finalThink = reconcileAssistantText(finalThink, msg.thinking)
@@ -2198,9 +2438,6 @@ func (s *Session) flushAssistantText(force bool) {
 	}
 
 	s.mu.Lock()
-	for _, id := range newIDs {
-		s.seenAssistantMsgIDs[id] = struct{}{}
-	}
 	if out != "" {
 		s.emittedText.Reset()
 		s.emittedText.WriteString(final)
@@ -2209,6 +2446,7 @@ func (s *Session) flushAssistantText(force bool) {
 	}
 	s.textFlushed = true
 	s.mu.Unlock()
+	s.markCheckpointAssistantMessages(newMessages)
 
 	if out == "" {
 		return

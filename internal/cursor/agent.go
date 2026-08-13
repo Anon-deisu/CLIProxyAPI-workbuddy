@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -283,35 +284,7 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 	// forcing it true is rejected for many accounts ("Workspace context
 	// exclusion is not allowed…").
 	supportsImages := true
-	publicID := selection.PublicID
-	if publicID == "" {
-		publicID = model
-	}
-	modelID := selection.ModelID
-	if modelID == "" {
-		modelID = publicID
-	}
-	displayID := publicID
-	displayName := publicID
-	if entry, ok := catalogEntry(publicID); ok {
-		if entry.DisplayModel != "" {
-			displayID = entry.DisplayModel
-		}
-		if entry.DisplayName != "" {
-			displayName = entry.DisplayName
-		}
-		if !selection.VariantStringRepr && len(selection.Parameters) == 0 && len(entry.Parameters) > 0 {
-			selection.Parameters = append([]ModelParameter(nil), entry.Parameters...)
-		}
-		if selection.VariantStringRepr && strings.TrimSpace(selection.ModelID) != "" {
-			modelID = selection.ModelID
-		}
-	}
-	details := &agentv1.ModelDetails{ModelId: modelID, DisplayModelId: displayID, DisplayName: displayName}
-	if selection.MaxMode {
-		maxMode := true
-		details.MaxMode = &maxMode
-	}
+	details, selection := resolveModelDetails(model, selection)
 	run := &agentv1.AgentRunRequest{
 		ConversationId:             &conversationID,
 		ConversationState:          &agentv1.ConversationStateStructure{RootPromptMessagesJson: rootIDs},
@@ -332,10 +305,69 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 	if defs := buildMcpToolDefinitions(customMcpTools(tools)); len(defs) > 0 {
 		run.McpTools = &agentv1.McpTools{McpTools: defs}
 	}
+	run.PreFetchedBlobs = preFetchedBlobs(blobStore)
 	client := &agentv1.AgentClientMessage{
 		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
 	}
 	return client, blobStore, conversationID, nil
+}
+
+func preFetchedBlobs(store map[string][]byte) []*agentv1.PreFetchedBlob {
+	if len(store) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(store))
+	for key := range store {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]*agentv1.PreFetchedBlob, 0, len(keys))
+	for _, key := range keys {
+		id, err := hex.DecodeString(key)
+		if err != nil {
+			continue
+		}
+		out = append(out, &agentv1.PreFetchedBlob{Id: id, Value: store[key]})
+	}
+	return out
+}
+
+func resolveModelDetails(model string, selection ModelSelection) (*agentv1.ModelDetails, ModelSelection) {
+	publicID := selection.PublicID
+	if publicID == "" {
+		publicID = model
+	}
+	modelID := selection.ModelID
+	if modelID == "" {
+		modelID = publicID
+	}
+	displayID := publicID
+	displayName := publicID
+	if entry, ok := catalogEntry(publicID); ok {
+		if entry.DisplayModel != "" {
+			displayID = entry.DisplayModel
+		}
+		if entry.DisplayName != "" {
+			displayName = entry.DisplayName
+		}
+		// Do NOT promote entry.MaxMode here. ResolveRequestedModel already sets
+		// selection.MaxMode from the catalog for bare ids (and from the matched
+		// variant for explicit variant requests). Re-ORing entry.MaxMode would
+		// promote an explicitly requested non-max variant (e.g. "-thinking"
+		// without max) back up to max mode.
+		if !selection.VariantStringRepr && len(selection.Parameters) == 0 && len(entry.Parameters) > 0 {
+			selection.Parameters = append([]ModelParameter(nil), entry.Parameters...)
+		}
+		if selection.VariantStringRepr && strings.TrimSpace(selection.ModelID) != "" {
+			modelID = selection.ModelID
+		}
+	}
+	details := &agentv1.ModelDetails{ModelId: modelID, DisplayModelId: displayID, DisplayName: displayName}
+	if selection.MaxMode {
+		maxMode := true
+		details.MaxMode = &maxMode
+	}
+	return details, selection
 }
 
 func cursorHistoryToolKind(kind string) string {

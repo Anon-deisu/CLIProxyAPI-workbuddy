@@ -211,11 +211,14 @@ func buildContinuationRunRequest(model string, messages []ChatMessage, tools []T
 	var newest *ChatMessage
 	newestIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+		if messages[i].Role == "user" && (strings.TrimSpace(messages[i].Content) != "" || len(messages[i].Images) > 0) {
 			newest = &messages[i]
 			newestIdx = i
 			break
 		}
+	}
+	if newest == nil {
+		return nil, snapshot.blobs
 	}
 	text := clampMessageContent(newest.Content)
 	if injected, ask := splitInjectedContext(text); ask != "" && injected != "" {

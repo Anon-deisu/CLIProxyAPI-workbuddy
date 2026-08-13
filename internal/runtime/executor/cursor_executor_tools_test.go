@@ -36,6 +36,70 @@ func TestApplyCursorToolChoicePreservesExactSemantics(t *testing.T) {
 	}
 }
 
+func TestCursorToolChoiceConstraintNeverTurnsCompletedResponseIntoError(t *testing.T) {
+	constraint := cursorToolConstraint{required: true, name: "Read"}
+	if constraint.Satisfied(nil) {
+		t.Fatal("a response without Read does not satisfy the advisory constraint")
+	}
+	if !constraint.Satisfied([]cursor.ToolCall{{Name: "read"}}) {
+		t.Fatal("tool names should match case-insensitively")
+	}
+	// The executor intentionally only observes Satisfied and logs a miss. It no
+	// longer exposes a Validate method that could convert a completed turn into
+	// `cursor: tool_choice required tool Read`.
+}
+
+func TestToolChoiceUndeclaredNamedToolIsAdvisoryNotError(t *testing.T) {
+	// `tool_choice` asks for a Cursor-native tool (`Read`) that was not in the
+	// declared set of this request. Cursor's wire has no exact named-tool
+	// equivalent, so the request must proceed with the declared tools and no
+	// local 400 — this is the exact `cursor: tool_choice required tool Read`
+	// production symptom.
+	tools := []cursor.ToolDefinition{{Name: "Bash"}}
+	messages := []cursor.ChatMessage{{Role: "user", Content: "go"}}
+	out, filtered, constraint, err := applyCursorToolChoice(
+		[]byte(`{"tool_choice":{"type":"function","name":"Read"}}`), messages, tools)
+	if err != nil {
+		t.Fatalf("undeclared named tool_choice must not error: %v", err)
+	}
+	if len(out) != len(messages) {
+		t.Fatalf("messages should be untouched: got %d", len(out))
+	}
+	if len(filtered) != len(tools) {
+		t.Fatalf("tools should be untouched: got %d", len(filtered))
+	}
+	if constraint.required {
+		t.Fatal("no advisory constraint may be installed for an undeclared tool")
+	}
+}
+
+func TestToolChoiceUnsupportedShapeIsAdvisoryNotError(t *testing.T) {
+	tools := []cursor.ToolDefinition{{Name: "Bash"}}
+	messages := []cursor.ChatMessage{{Role: "user", Content: "go"}}
+	out, filtered, constraint, err := applyCursorToolChoice(
+		[]byte(`{"tool_choice":{"type":"something_unknown"}}`), messages, tools)
+	if err != nil {
+		t.Fatalf("unknown tool_choice shape must degrade, not error: %v", err)
+	}
+	if len(out) != len(messages) || len(filtered) != len(tools) || constraint.required {
+		t.Fatalf("unknown shape should pass through untouched: out=%d tools=%d constraint=%+v", len(out), len(filtered), constraint)
+	}
+}
+
+func TestToolChoiceAllowedToolsUndeclaredIsAdvisoryNotError(t *testing.T) {
+	tools := []cursor.ToolDefinition{{Name: "Bash"}}
+	messages := []cursor.ChatMessage{{Role: "user", Content: "go"}}
+	out, filtered, constraint, err := applyCursorToolChoice([]byte(
+		`{"tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"Read"}]}}`),
+		messages, tools)
+	if err != nil {
+		t.Fatalf("allowed_tools with undeclared tool must not error: %v", err)
+	}
+	if len(out) != len(messages) || len(filtered) != len(tools) || constraint.required {
+		t.Fatalf("allowed_tools should fall back to declared tools: out=%d tools=%d constraint=%+v", len(out), len(filtered), constraint)
+	}
+}
+
 func TestResolveCursorConversationIDIsAccountScoped(t *testing.T) {
 	request := cliproxyexecutor.Request{Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "session-1"}}
 	opts := cliproxyexecutor.Options{SourceFormat: translator.FormatOpenAI, Headers: make(http.Header)}

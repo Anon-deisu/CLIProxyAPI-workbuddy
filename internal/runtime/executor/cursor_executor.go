@@ -33,10 +33,10 @@ type CursorExecutor struct {
 }
 
 // Cursor normally sends TurnEnded immediately behind the formal tool batch.
-// A small bounded wait captures its authoritative cache counters without
-// imposing the multi-second delay that a full turn timeout would add to every
-// client-side tool step.
-const cursorTrailingUsageWait = 150 * time.Millisecond
+// Missing TurnEnded is expensive: downstream billing then reports cache_read=0
+// and locally recounts the entire prompt. The wait applies only when the
+// authoritative frame was absent from the segment, never to normal turns.
+const cursorTrailingUsageWait = 2 * time.Second
 
 // NewCursorExecutor creates a Cursor executor.
 func NewCursorExecutor(cfg *config.Config) *CursorExecutor {
@@ -104,8 +104,11 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if err != nil {
 		return resp, humanizeCursorError(err)
 	}
-	if err = toolConstraint.Validate(result.ToolCalls); err != nil {
-		return resp, err
+	if !toolConstraint.Satisfied(result.ToolCalls) {
+		// Cursor Agent has no named-tool-choice field on AgentRunRequest. The
+		// constraint is therefore best-effort steering, not a reason to discard a
+		// valid model response after the upstream turn already completed.
+		log.Warnf("cursor: upstream completed without satisfying advisory tool_choice %q; returning the successful response", toolConstraint.name)
 	}
 
 	outPayload := buildOpenAIChatCompletion(req.Model, result)
@@ -377,14 +380,11 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			_ = session.Close()
 			return
 		}
-		if constraintErr := toolConstraint.Validate(observedToolCalls); constraintErr != nil {
-			reporter.PublishFailure(ctx, constraintErr)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: constraintErr}:
-			case <-ctx.Done():
-			}
-			_ = session.Close()
-			return
+		if !toolConstraint.Satisfied(observedToolCalls) {
+			// Do not append an artificial stream error after text was already
+			// delivered. Cursor has no exact wire equivalent for a named
+			// tool_choice, so the request remains a best-effort constraint.
+			log.Warnf("cursor: upstream stream completed without satisfying advisory tool_choice %q; preserving the completed stream", toolConstraint.name)
 		}
 
 		// TurnEnded can land after the segment loop has already stopped
@@ -392,9 +392,13 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// they are there. A bounded 150 ms wait is long enough for the adjacent
 		// frame while keeping tool latency effectively unchanged when a Cursor
 		// version emits no TurnEnded at a pause.
+		segmentID := session.SegmentID()
+		if usageFinal.SegmentID > 0 {
+			segmentID = usageFinal.SegmentID
+		}
 		if usageFinal.InputTokens == 0 && usageFinal.OutputTokens == 0 &&
 			usageFinal.CacheReadTokens == 0 && usageFinal.CacheWriteTokens == 0 {
-			if late, ok := session.TakeUsage(cursorTrailingUsageWait); ok {
+			if late, ok := session.TakeUsageForSegment(segmentID, cursorTrailingUsageWait); ok {
 				usageFinal = late
 			}
 		}
@@ -508,22 +512,19 @@ type cursorToolConstraint struct {
 	name     string
 }
 
-func (c cursorToolConstraint) Validate(calls []cursorlib.ToolCall) error {
+func (c cursorToolConstraint) Satisfied(calls []cursorlib.ToolCall) bool {
 	if !c.required {
-		return nil
+		return true
 	}
 	if c.name == "" {
-		if len(calls) == 0 {
-			return fmt.Errorf("cursor: tool_choice required at least one declared tool call")
-		}
-		return nil
+		return len(calls) > 0
 	}
 	for _, call := range calls {
 		if strings.EqualFold(strings.TrimSpace(call.Name), c.name) {
-			return nil
+			return true
 		}
 	}
-	return fmt.Errorf("cursor: tool_choice required tool %s", c.name)
+	return false
 }
 
 func applyCursorToolChoice(body []byte, messages []cursorlib.ChatMessage, tools []cursorlib.ToolDefinition) ([]cursorlib.ChatMessage, []cursorlib.ToolDefinition, cursorToolConstraint, error) {
@@ -539,7 +540,8 @@ func applyCursorToolChoice(body []byte, messages []cursorlib.ChatMessage, tools 
 			return messages, nil, cursorToolConstraint{}, nil
 		case "required", "any":
 			if len(tools) == 0 {
-				return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: tool_choice=%s requires tools", choice.String())
+				log.Warnf("cursor: ignoring tool_choice=%s because the request declares no tools", choice.String())
+				return messages, tools, cursorToolConstraint{}, nil
 			}
 			return appendCursorToolInstruction(messages, "At least one declared tool must be called before answering the user."), tools, cursorToolConstraint{required: true}, nil
 		default:
@@ -556,22 +558,30 @@ func applyCursorToolChoice(body []byte, messages []cursorlib.ChatMessage, tools 
 	}
 	if typ == "required" || typ == "any" {
 		if len(tools) == 0 {
-			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: tool_choice=%s requires tools", typ)
+			log.Warnf("cursor: ignoring tool_choice=%s because the request declares no tools", typ)
+			return messages, tools, cursorToolConstraint{}, nil
 		}
 		return appendCursorToolInstruction(messages, "At least one declared tool must be called before answering the user."), tools, cursorToolConstraint{required: true}, nil
 	}
 	if typ == "allowed_tools" {
 		selectors := choice.Get("tools")
 		if !selectors.IsArray() || len(selectors.Array()) == 0 {
-			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: allowed_tools requires a non-empty tools array")
+			// No exact Cursor wire equivalent for an empty allowed_tools. Keep
+			// the request advisory instead of rejecting a normal request.
+			log.Warnf("cursor: ignoring allowed_tools with an empty tools array")
+			return messages, tools, cursorToolConstraint{}, nil
 		}
 		selected := make(map[string]struct{})
 		for _, selector := range selectors.Array() {
 			name := cursorToolChoiceName(selector)
 			if name == "" {
-				return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: allowed_tools selector is missing a tool name")
+				log.Warnf("cursor: ignoring allowed_tools selector without a tool name")
+				continue
 			}
 			selected[strings.ToLower(name)] = struct{}{}
+		}
+		if len(selected) == 0 {
+			return messages, nil, cursorToolConstraint{}, nil
 		}
 		filtered := make([]cursorlib.ToolDefinition, 0, len(selected))
 		for _, tool := range tools {
@@ -579,22 +589,31 @@ func applyCursorToolChoice(body []byte, messages []cursorlib.ChatMessage, tools 
 				filtered = append(filtered, tool)
 			}
 		}
+		// Some selected tools are not in the declared set (e.g. a Cursor native
+		// tool name the client assumed was available). Cursor cannot faithfully
+		// enforce an exact named tool, so fall back to the declared tools rather
+		// than rejecting the request.
 		if len(filtered) != len(selected) {
-			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: allowed_tools selected an unknown tool")
+			log.Warnf("cursor: allowed_tools selected undeclared tools; keeping the request advisory with declared tools")
+			return messages, tools, cursorToolConstraint{}, nil
 		}
 		mode := strings.ToLower(strings.TrimSpace(choice.Get("mode").String()))
 		if mode == "" || mode == "auto" {
 			return messages, filtered, cursorToolConstraint{}, nil
 		}
 		if mode != "required" {
-			return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: unsupported allowed_tools mode %q", mode)
+			log.Warnf("cursor: ignoring unsupported allowed_tools mode %q (advisory)", mode)
+			return messages, tools, cursorToolConstraint{}, nil
 		}
 		return appendCursorToolInstruction(messages, "At least one declared tool must be called before answering the user."), filtered, cursorToolConstraint{required: true}, nil
 	}
 
 	name := cursorToolChoiceName(choice)
 	if name == "" {
-		return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: named tool_choice is missing a tool name")
+		// Unknown tool_choice shape. Cursor has no exact equivalent, so degrade
+		// to an advisory no-op instead of turning a normal request into a 400.
+		log.Warnf("cursor: ignoring unrecognized tool_choice shape")
+		return messages, tools, cursorToolConstraint{}, nil
 	}
 	matched := make([]cursorlib.ToolDefinition, 0, 1)
 	for _, tool := range tools {
@@ -605,7 +624,12 @@ func applyCursorToolChoice(body []byte, messages []cursorlib.ChatMessage, tools 
 		}
 	}
 	if len(matched) == 0 {
-		return nil, nil, cursorToolConstraint{}, fmt.Errorf("cursor: tool_choice selected unknown tool %s", name)
+		// Named tool_choice for a tool Cursor owns but that was not declared in
+		// this request (e.g. `Read`) or that the client named differently. Keep
+		// the request running; the constraint is advisory and cannot be honored
+		// exactly on the Cursor wire anyway.
+		log.Warnf("cursor: tool_choice requested undeclared tool %q; keeping the request advisory", name)
+		return messages, tools, cursorToolConstraint{}, nil
 	}
 	instruction := fmt.Sprintf("Call the declared tool %s before producing a final answer.", name)
 	return appendCursorToolInstruction(messages, instruction), matched, cursorToolConstraint{required: true, name: name}, nil
@@ -851,7 +875,7 @@ func extractChatMessages(body []byte) ([]cursorlib.ChatMessage, error) {
 		if content.IsArray() {
 			var parts []string
 			for _, part := range content.Array() {
-				if part.Get("type").String() == "text" || part.Get("text").Exists() {
+				if part.Get("type").String() == "text" || part.Get("type").String() == "input_text" || part.Get("text").Exists() {
 					parts = append(parts, part.Get("text").String())
 					continue
 				}
@@ -965,22 +989,50 @@ func responseHistoryToolDescriptors(body []byte) map[string]cursorHistoryToolDes
 	return out
 }
 
-// extractInlineImage reads both content-block shapes clients send: Anthropic
-// `image` blocks and OpenAI `image_url` data URLs.
+// extractInlineImage reads the image block shapes that reach this boundary
+// from Anthropic, Chat Completions and Responses translators. Cursor needs the
+// bytes, so URL/file-id references remain non-inline instead of being silently
+// mislabeled as image data.
 func extractInlineImage(part gjson.Result) (cursorlib.ChatImage, bool) {
-	switch part.Get("type").String() {
+	typ := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+	switch typ {
 	case "image":
 		source := part.Get("source")
 		if !source.Exists() {
-			return cursorlib.ChatImage{}, false
+			return decodeInlineImageFields(part)
 		}
-		// Remote URLs cannot be inlined; Cursor needs the bytes.
-		return cursorlib.DecodeInlineImage(source.Get("media_type").String(), source.Get("data").String())
-	case "image_url":
-		return cursorlib.DecodeInlineImage("", part.Get("image_url.url").String())
+		return cursorlib.DecodeInlineImage(firstNonEmptyString(source.Get("media_type"), source.Get("mime_type")), firstNonEmptyString(source.Get("data"), source.Get("file_data"), source.Get("url")))
+	case "image_url", "input_image":
+		return decodeInlineImageFields(part)
 	default:
-		return cursorlib.ChatImage{}, false
+		// Some gateways strip the type but preserve image_url/file_data.
+		return decodeInlineImageFields(part)
 	}
+}
+
+func decodeInlineImageFields(part gjson.Result) (cursorlib.ChatImage, bool) {
+	mediaType := firstNonEmptyString(part.Get("media_type"), part.Get("mime_type"), part.Get("image_url.media_type"), part.Get("image_url.mime_type"))
+	data := firstNonEmptyString(
+		part.Get("image_url.url"),
+		part.Get("image_url.data"),
+		part.Get("image_url.file_data"),
+		part.Get("image_url"),
+		part.Get("file_data"),
+		part.Get("data"),
+		part.Get("url"),
+	)
+	return cursorlib.DecodeInlineImage(mediaType, data)
+}
+
+func firstNonEmptyString(values ...gjson.Result) string {
+	for _, value := range values {
+		if value.Type == gjson.String {
+			if text := strings.TrimSpace(value.String()); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 func extractCursorTools(body, original []byte, from sdktranslator.Format) []cursorlib.ToolDefinition {
