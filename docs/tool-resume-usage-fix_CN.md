@@ -105,3 +105,48 @@ rm -f /usr/local/bin/cli-proxy-api.bak-latest /usr/local/bin/cli-proxy-api.bak-p
 ## 七、遗留
 
 - 工具续接失败时协议固有的一次全量重定价（789K 类）无法在本 proto 下消除；这是协议约束，不是缺陷。若未来 proto 增加工具结果 action 变体，即可实现真正的 Phase 2（最小 trailer 续接）。
+
+---
+
+# 追加修复：子代理 `model` 参数校验失败（InputValidationError）
+
+- **编写日期**：2026-08-13
+- **涉及提交**：待提交（当前工作区）
+- **涉及模块**：[session.go](internal/cursor/session.go)（`mapNativeExecArgs` 的 `subagent_args` 分支 + 新增 `claudeCodeModelName`）/ `claude_code_model_test.go`（新增单测）
+- **影响范围**：Cursor 协议下模型调用 `Agent`/`Task`/`Subagent` 子代理工具时
+
+## 一、症状
+
+`tool_use_error` 报 `InputValidationError: Invalid option: expected one of "sonnet"|"opus"|"haiku"|"fable"`，出错点在子代理工具的 `model` 参数路径上。
+
+## 二、根因
+
+- Claude Code 的 `Agent`/`Task`/`Subagent` 工具，其 `model` 参数**只接受家族缩写**：`sonnet`、`opus`、`haiku`、`fable`。
+- Cursor 的 `SubagentArgs.ModelId`（proto [agent_mvp.pb.go:7203](internal/cursor/proto/agent/v1/agent_mvp.pb.go)，wire 字段 3）携带的是 **Cursor 内部 wire id**（例如 `cursor-claude-4.6-sonnet`）。
+- 修复前 [session.go:3529-3531](internal/cursor/session.go) 直接写 `out["model"] = args.GetModelId()`，把 Cursor 内部 id 原样透传给 Claude Code → 校验失败 → 整个子代理工具调用被拒。
+
+## 三、修复
+
+新增 `claudeCodeModelName` 映射函数：把 Cursor wire id 小写化、按非字母数字边界切分词元，命中 `sonnet`/`opus`/`haiku`/`fable` 中任一家族 token 即返回对应缩写（`cursor-claude-opus-5-fast` → `opus`）。**未命中任何家族时返回空串**，调用方随之**省略 `model` 字段**，让 Claude Code 走默认模型，而不是让整个工具调用失败。
+
+```go
+// session.go:subagent_args 分支
+if model := claudeCodeModelName(args.GetModelId()); model != "" {
+    out["model"] = model
+}
+```
+
+边界处理：
+
+- 非 Claude 模型（`gpt-5.4`）、未知家族 → 省略 `model`（降级为默认），绝不传非法值；
+- 嵌入式假阳性（`sonsonnet`、`myopus-v3`）→ 因要求独立 token 而正确不匹配；
+- case-insensitive（`Cursor-Claude-4.6-Sonnet` → `sonnet`）。
+
+单测：`TestClaudeCodeModelName`（[claude_code_model_test.go](internal/cursor/claude_code_model_test.go)）覆盖以上 13 个用例，全部通过；`go vet ./internal/cursor/` 无告警。
+
+## 四、部署记录（追加）
+
+- 沿用同一 atomic systemd 替换流程到 `root@ovh.xem8k5.top`，分支 `modeb-relay`，生产 config `debug: false`。
+- 本地静态交叉编译：`CGO_ENABLED=0 GOOS=linux GOARCH=amd64`（OVH VPS 无 Go 工具链）。
+
+> 备份（`.bak-latest` / `.bak-prev` / `config.yaml.bak-debug`）同样遵循"确认新二进制持续接收流量后清除"原则；未确认前绝不删除。

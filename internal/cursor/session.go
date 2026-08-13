@@ -3526,8 +3526,14 @@ func nativeToolArguments(variant string, raw proto.Message, def *ToolDefinition)
 		if args.GetSubagentType() != "" {
 			out[nativeArgumentName(def, "subagent_type", "subagent_type_name")] = args.GetSubagentType()
 		}
-		if args.GetModelId() != "" {
-			out["model"] = args.GetModelId()
+		// Claude Code's Agent/Task/Subagent tools only accept the abbreviated
+		// model family name ("sonnet"|"opus"|"haiku"|"fable"); Cursor passes its
+		// internal wire id (e.g. "cursor-claude-4.6-sonnet") here. Map it down to
+		// the family token so the relayed tool_use validates, and drop the field
+		// entirely when the family is unrecognized so Claude Code falls back to
+		// its default instead of failing the whole tool call.
+		if model := claudeCodeModelName(args.GetModelId()); model != "" {
+			out["model"] = model
 		}
 		if args.GetResumeAgentId() != "" {
 			out["resume"] = args.GetResumeAgentId()
@@ -3564,6 +3570,44 @@ func subagentDescription(prompt, subagentType string) string {
 		summary = string(runes[:maxLen]) + "…"
 	}
 	return summary
+}
+
+// claudeCodeModelName maps a Cursor wire model id onto the abbreviated family
+// name that Claude Code's Agent/Task/Subagent tools accept ("sonnet"|"opus"|
+// "haiku"|"fable"). Cursor passes internal ids like "cursor-claude-4.6-sonnet"
+// or "cursor-claude-opus-5", which fail Claude Code's InputValidationError.
+// The family token, when present, is matched on the lower-cased id; "fable" is
+// the current flagship family but we map any of the four to keep parity. An
+// empty result means the family is unrecognized and the caller omits the field.
+func claudeCodeModelName(modelID string) string {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	switch {
+	case containsModelFamily(modelID, "sonnet"):
+		return "sonnet"
+	case containsModelFamily(modelID, "opus"):
+		return "opus"
+	case containsModelFamily(modelID, "haiku"):
+		return "haiku"
+	case containsModelFamily(modelID, "fable"):
+		return "fable"
+	default:
+		return ""
+	}
+}
+
+// containsModelFamily reports whether id containsfamily as a standalone token
+// (split on non-alphanumeric boundaries), so a longer id like
+// "cursor-claude-opus-5-fast" still matches but "sonsonnet" or a bare name like
+// "myopus-v3" does not accidentally collide.
+func containsModelFamily(id, family string) bool {
+	for _, part := range strings.FieldsFunc(id, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		if part == family {
+			return true
+		}
+	}
+	return false
 }
 
 func localShellCommand(command string) []string {
