@@ -340,6 +340,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 	session.seedSeenAssistantMessages()
 	session.manager.Register(session)
 	go session.heartbeatLoop(runCtx)
+	go session.stallWatcher(runCtx)
 	go session.readLoop(runCtx)
 	return session, nil
 }
@@ -364,6 +365,65 @@ func (s *Session) touch() {
 	s.mu.Lock()
 	s.lastActivity = time.Now()
 	s.mu.Unlock()
+}
+
+// Upstream stall handling. While Cursor's provider is thinking hard (claude
+// with high reasoning effort is measured at 8-51s first tokens; fable-5 with
+// xhigh has stalled past five minutes) the Agent H2 stream can legitimately
+// deliver no bytes for a long stretch. readLoop blocks on stream.Read with no
+// deadline, so without a downstream signal the client sees a frozen SSE and
+// cannot tell "still thinking" from "dead wire".
+const (
+	// cursorIdleHeartbeatInterval bounds how long the downstream can see total
+	// silence before the executor forwards a keep-alive ping. Chosen to be
+	// comfortably shorter than typical client-side request timeouts while still
+	// longer than the hold window and reasoning batching pauses.
+	cursorIdleHeartbeatInterval = 30 * time.Second
+	// cursorStallTimeout is the hard ceiling for a single stretch of upstream
+	// silence. Failing past this converts a genuinely hung H2 stream (observed
+	// holding a request open for 31m46s) into a bounded error instead of an
+	// indefinite block. Generous enough that legitimate long thinking survives,
+	// short enough that a dead connection is surfaced in reasonable time.
+	cursorStallTimeout = 15 * time.Minute
+)
+
+// stallWatcher surfaces progress while the upstream delivers nothing. Every
+// cursorIdleHeartbeatInterval of silence it emits a heartbeat event (the
+// executor forwards it as a downstream ping), and past cursorStallTimeout it
+// fails the session so a dead H2 stream cannot hold the request open forever.
+// s.closed is the sole exit condition: frame arrival resets the counters and a
+// legitimate close (tool boundary, END_STREAM, EOF) stops the watcher.
+func (s *Session) stallWatcher(ctx context.Context) {
+	ticker := time.NewTicker(cursorIdleHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			closed := s.closed
+			last := s.lastFrame
+			s.mu.Unlock()
+			if closed || last.IsZero() {
+				return
+			}
+			idle := time.Since(last)
+			if idle >= cursorStallTimeout {
+				log.Warnf("cursor: upstream stalled for %s with no bytes; failing session %s", idle.Round(time.Second), s.ID)
+				s.fail(fmt.Errorf("cursor: upstream stalled for %s with no bytes (provider thinking longer than configured stall timeout)", idle.Round(time.Second)))
+				return
+			}
+			if idle >= cursorIdleHeartbeatInterval {
+				// Emit as a distinct event; the executor maps it to a downstream
+				// keep-alive so the client does not read the silence as a hang.
+				log.Debugf("cursor: upstream idle %s; sending downstream heartbeat", idle.Round(time.Second))
+				s.emit(StreamEvent{Type: "heartbeat"})
+			}
+		}
+	}
 }
 
 func (s *Session) heartbeatLoop(ctx context.Context) {

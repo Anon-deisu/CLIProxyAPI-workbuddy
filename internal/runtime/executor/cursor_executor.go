@@ -201,6 +201,17 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			}
 			return true
 		}
+		// emitRaw forwards a pre-translated SSE frame verbatim, bypassing the
+		// translator. Used for keep-alive pings (already in the target wire
+		// format) that a chunk translator would silently drop.
+		emitRaw := func(line []byte) bool {
+			select {
+			case out <- cliproxyexecutor.StreamChunk{Payload: line}:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 
 		roleChunk, _ := json.Marshal(map[string]any{
 			"id":      completionID,
@@ -301,6 +312,16 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					flush = true
 				case "usage_final":
 					usageFinal = ev
+					return nil
+				case "heartbeat":
+					// Forward upstream liveness as an SSE comment line: ignored by
+					// every SSE parser (Claude Code and OpenAI-compatible clients
+					// alike) yet it resets idle timeouts, so a long upstream think
+					// does not read as a frozen stream. Must bypass the translator,
+					// which would drop unrecognized frames.
+					if !emitRaw([]byte(": keep-alive (cursor upstream thinking)\n\n")) {
+						return context.Canceled
+					}
 					return nil
 				case "error":
 					return fmt.Errorf("%s", ev.Message)
