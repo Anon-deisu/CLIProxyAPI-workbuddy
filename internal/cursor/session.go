@@ -127,11 +127,6 @@ type Session struct {
 	// usedContinuation marks a run opened from a stored checkpoint; if it
 	// fails, the checkpoint is dropped so retries rebuild from history.
 	usedContinuation bool
-	// holdWindow overrides textHoldWindow. Continuation runs get a longer one:
-	// they receive no early checkpoint to release the hold, their answers are
-	// typically short, and a short answer that outruns the hold cannot have a
-	// dropped opening repaired once it has streamed.
-	holdWindow time.Duration
 	// failed suppresses checkpoint persistence on Close after a stream error.
 	failed bool
 	// lastFrame is the last time anything arrived from Cursor. Thinking and
@@ -274,9 +269,6 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		parallelTools:       cfg.parallelTools,
 		seenAssistantMsgIDs: map[string]struct{}{},
 		usedContinuation:    usedContinuation,
-	}
-	if usedContinuation {
-		session.holdWindow = continuationTextHoldWindow
 	}
 	session.seedSeenAssistantMessages()
 	session.manager.Register(session)
@@ -1260,11 +1252,7 @@ func (s *Session) handleTextDelta(text string) {
 	if live {
 		s.emittedText.WriteString(text)
 	} else if s.holdTimer == nil {
-		window := s.holdWindow
-		if window <= 0 {
-			window = textHoldWindow
-		}
-		s.holdTimer = time.AfterFunc(window, s.releaseTextStream)
+		s.holdTimer = time.AfterFunc(textHoldWindow, s.releaseTextStream)
 	}
 	s.mu.Unlock()
 	if live {

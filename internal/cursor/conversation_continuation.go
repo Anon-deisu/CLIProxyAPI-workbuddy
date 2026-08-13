@@ -34,11 +34,6 @@ import (
 const (
 	continuationTTL  = 2 * time.Hour
 	maxContinuations = 64
-	// continuationTextHoldWindow replaces textHoldWindow on continuation runs:
-	// they receive no early checkpoint that could release the hold sooner, and
-	// their short answers must still be inside the hold when the turn ends for
-	// a dropped opening to be repairable.
-	continuationTextHoldWindow = 2500 * time.Millisecond
 )
 
 type continuationEntry struct {
