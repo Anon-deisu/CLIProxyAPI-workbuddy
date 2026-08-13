@@ -332,51 +332,6 @@ const cursorAPIKeyManagerScript = `
       }
     }
 
-    list.addEventListener('click', async function (event) {
-      var button = event.target.closest('button[data-action]');
-      if (!button) return;
-      var index = Number(button.getAttribute('data-index'));
-      var action = button.getAttribute('data-action');
-      var entry = entries.find(function (item) { return item.index === index; });
-      if (!entry) return;
-      if (action === 'edit') {
-        resetForm(entry);
-        return;
-      }
-      if (action === 'delete') {
-        if (!window.confirm('确定删除 ' + entry['api-key'] + ' 吗？此操作不可撤销。')) return;
-        setStatus('正在删除…');
-        try {
-          await request('DELETE', '/v0/management/cursor-api-key?index=' + encodeURIComponent(index));
-          closeForm();
-          await load();
-          setStatus('删除成功', 'ok');
-        } catch (error) {
-          setStatus(error.message || String(error), 'error');
-        }
-        return;
-      }
-      if (action === 'toggle') {
-        setStatus(entry.disabled ? '正在启用…' : '正在停用…');
-        try {
-          await request('PATCH', '/v0/management/cursor-api-key', {
-            index: index,
-            value: { disabled: !entry.disabled }
-          });
-          await load();
-          setStatus(entry.disabled ? '已启用' : '已停用', 'ok');
-        } catch (error) {
-          setStatus(error.message || String(error), 'error');
-        }
-      }
-    });
-
-    form.addEventListener('submit', save);
-    host.getElementsByClassName('cpa-form-cancel')[0].addEventListener('click', closeForm);
-    host.getElementsByClassName('cpa-form-save')[0].addEventListener('click', function () {
-      form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
-    });
-
     // 构造原生 DOM，复用 OAuth 页设计系统类名
     var panel = document.createElement('div');
     panel.className = 'OAuthPage-module__container';
@@ -454,6 +409,52 @@ const cursorAPIKeyManagerScript = `
     apiKeyInput = panel.querySelector('#cpa-api-key');
     apiKeyHint = panel.querySelector('#cpa-api-key-hint');
     managementKeyInput = panel.querySelector('#cpa-management-key');
+
+    // DOM 全部就绪后再挂事件监听（此前版本在 DOM 构造前执行触发空指针）
+    list.addEventListener('click', async function (event) {
+      var button = event.target.closest('button[data-action]');
+      if (!button) return;
+      var index = Number(button.getAttribute('data-index'));
+      var action = button.getAttribute('data-action');
+      var entry = entries.find(function (item) { return item.index === index; });
+      if (!entry) return;
+      if (action === 'edit') {
+        resetForm(entry);
+        return;
+      }
+      if (action === 'delete') {
+        if (!window.confirm('确定删除 ' + entry['api-key'] + ' 吗？此操作不可撤销。')) return;
+        setStatus('正在删除…');
+        try {
+          await request('DELETE', '/v0/management/cursor-api-key?index=' + encodeURIComponent(index));
+          closeForm();
+          await load();
+          setStatus('删除成功', 'ok');
+        } catch (error) {
+          setStatus(error.message || String(error), 'error');
+        }
+        return;
+      }
+      if (action === 'toggle') {
+        setStatus(entry.disabled ? '正在启用…' : '正在停用…');
+        try {
+          await request('PATCH', '/v0/management/cursor-api-key', {
+            index: index,
+            value: { disabled: !entry.disabled }
+          });
+          await load();
+          setStatus(entry.disabled ? '已启用' : '已停用', 'ok');
+        } catch (error) {
+          setStatus(error.message || String(error), 'error');
+        }
+      }
+    });
+
+    form.addEventListener('submit', save);
+    host.getElementsByClassName('cpa-form-cancel')[0].addEventListener('click', closeForm);
+    host.getElementsByClassName('cpa-form-save')[0].addEventListener('click', function () {
+      form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    });
 
     panel.querySelector('#cpa-refresh').addEventListener('click', load);
     panel.querySelector('#cpa-add').addEventListener('click', function () { resetForm(null); });

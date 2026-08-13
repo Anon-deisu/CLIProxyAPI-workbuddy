@@ -48,6 +48,28 @@ func TestAddCursorAPIKeyManagerToManagementHTML(t *testing.T) {
 		}
 	}
 
+	// 监听器必须在 DOM 构造之后挂载，否则 list/form 为 null 触发空指针
+	// （曾把 list.addEventListener 放在 panel 构造之前，导致页面空白）
+	orderChecks := []struct {
+		before, after []byte
+	}{
+		{[]byte("list = panel.querySelector('#cpa-key-list')"), []byte("list.addEventListener")},
+		{[]byte("form = panel.querySelector('#cpa-form')"), []byte("form.addEventListener('submit'")},
+	}
+	for _, oc := range orderChecks {
+		bi := bytes.Index(got, oc.before)
+		ai := bytes.Index(got, oc.after)
+		if bi < 0 {
+			t.Fatalf("patched html missing %q (DOM 赋值)", oc.before)
+		}
+		if ai < 0 {
+			t.Fatalf("patched html missing %q (监听器)", oc.after)
+		}
+		if bi > ai {
+			t.Fatalf("顺序错误：%q 出现在 %q 之后", oc.before, oc.after)
+		}
+	}
+
 	// 必须不再存在旧版紫色悬浮按钮的痕迹
 	for _, gone := range [][]byte{
 		[]byte(":host{position:fixed;inset:0;z-index:2147482999"),
