@@ -81,6 +81,18 @@ func TestAddCursorAPIKeyManagerToManagementHTML(t *testing.T) {
 		}
 	}
 
+	// 管理密钥完全复用已登录面板会话，页面不得再出现手动凭据输入框（避免割裂感）
+	for _, gone := range [][]byte{
+		[]byte("cpa-management-key"),
+		[]byte("管理密钥（通常自动获取）"),
+		[]byte("managementKeyInput"),
+		[]byte("在下方的管理密钥框中临时填写"),
+	} {
+		if bytes.Contains(got, gone) {
+			t.Fatalf("patched management html still exposes a manual management-key widget %q", gone)
+		}
+	}
+
 	// 脚本注入点在 </body> 之前
 	if bytes.Index(got, []byte(cursorAPIKeyManagerMarker)) > bytes.Index(got, []byte("</body>")) {
 		t.Fatal("Cursor API key manager was not injected inside body")

@@ -148,10 +148,11 @@ const cursorAPIKeyManagerScript = `
     var formTitle = null;
     var apiKeyInput = null;
     var apiKeyHint = null;
-    var managementKeyInput = null;
 
+    // 管理密钥完全来自当前已登录面板会话（自动捕获 Authorization 头或读取 cli-proxy-auth），
+    // 页面不提供任何手动填写入口——用户已经登录，不该再出现凭据输入框。
     function currentManagementKey() {
-      return managementKeyInput.value.trim() || capturedManagementKey || rememberedManagementKey();
+      return capturedManagementKey || rememberedManagementKey();
     }
 
     function setStatus(message, kind) {
@@ -171,7 +172,7 @@ const cursorAPIKeyManagerScript = `
     async function request(method, path, body) {
       var managementKey = currentManagementKey();
       if (!managementKey) {
-        throw new Error('未获取到管理密钥。请先登录管理面板，或在下方的管理密钥框中临时填写。');
+        throw new Error('尚未获取到管理密钥。请确认已登录管理面板，然后刷新页面重试。');
       }
       var options = {
         method: method,
@@ -250,8 +251,16 @@ const cursorAPIKeyManagerScript = `
       }).join('');
     }
 
+    var keyRetried = false;
     async function load() {
       setStatus('正在读取 Cursor API Key…');
+      // 若刚进入该路由、面板自身的认证请求还没来得及发出，密钥暂缺；
+      // 稍后重试一次（面板初始化会在几百毫秒内以 Authorization 头发起管理请求，从而被自动捕获）。
+      if (!currentManagementKey() && !keyRetried) {
+        keyRetried = true;
+        setTimeout(load, 600);
+        return;
+      }
       try {
         var payload = await request('GET', '/v0/management/cursor-api-key');
         entries = Array.isArray(payload['cursor-api-key']) ? payload['cursor-api-key'] : [];
@@ -259,7 +268,7 @@ const cursorAPIKeyManagerScript = `
         setStatus('已加载 ' + entries.length + ' 个 Key', 'ok');
       } catch (error) {
         setStatus(error.message || String(error), 'error');
-        list.innerHTML = '<div class="cpa-empty">读取失败，请检查管理密钥（见下方“管理密钥”框）</div>';
+        list.innerHTML = '<div class="cpa-empty">读取失败：' + escapeHTML(error.message || String(error)) + '</div>';
       }
     }
 
@@ -339,13 +348,6 @@ const cursorAPIKeyManagerScript = `
       '<h1 class="OAuthPage-module__pageTitle">Cursor API Key</h1>' +
       '<div class="OAuthPage-module__content" style="width:100%">' +
       '<section class="OAuthPage-module__providerSection">' +
-      '<h2 class="OAuthPage-module__sectionTitle">管理凭据</h2>' +
-      '<div class="card">' +
-      '<div class="form-group"><label for="cpa-management-key" style="color:var(--text-primary);font-weight:600">管理密钥（通常自动获取）</label>' +
-      '<input id="cpa-management-key" class="form-control" type="password" autocomplete="off" placeholder="仅在自动获取失败时填写">' +
-      '<p class="cpa-hint">不会写入配置或浏览器永久存储；刷新页面后清空。</p></div></div>' +
-      '</section>' +
-      '<section class="OAuthPage-module__providerSection">' +
       '<h2 class="OAuthPage-module__sectionTitle">API Key 列表</h2>' +
       '<div class="cpa-toolbar"><span class="cpa-status" role="status">等待加载</span>' +
       '<button type="button" class="btn" id="cpa-refresh">刷新</button>' +
@@ -408,7 +410,6 @@ const cursorAPIKeyManagerScript = `
     formTitle = panel.querySelector('#cpa-form-title');
     apiKeyInput = panel.querySelector('#cpa-api-key');
     apiKeyHint = panel.querySelector('#cpa-api-key-hint');
-    managementKeyInput = panel.querySelector('#cpa-management-key');
 
     // DOM 全部就绪后再挂事件监听（此前版本在 DOM 构造前执行触发空指针）
     list.addEventListener('click', async function (event) {
