@@ -1,10 +1,13 @@
 package cursor
 
 import (
+	"encoding/binary"
+	"io"
 	"runtime"
 	"testing"
 
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -234,6 +237,255 @@ func TestNativeReadExecRoundTripUsesDeclaredToolName(t *testing.T) {
 	}
 	if args["file_path"] != "a.txt" || args["offset"] != int32(4) || args["limit"] != uint32(20) {
 		t.Fatalf("arguments = %#v", args)
+	}
+}
+
+func TestExecServerMessageDecodesEnvelopeMetadata(t *testing.T) {
+	span := protowire.AppendTag(nil, 1, protowire.BytesType)
+	span = protowire.AppendString(span, "0123456789abcdef0123456789abcdef")
+	span = protowire.AppendTag(span, 2, protowire.BytesType)
+	span = protowire.AppendString(span, "0123456789abcdef")
+	span = protowire.AppendTag(span, 3, protowire.VarintType)
+	span = protowire.AppendVarint(span, 1)
+	span = protowire.AppendTag(span, 4, protowire.BytesType)
+	span = protowire.AppendString(span, "vendor=cursor")
+
+	readArgs, err := proto.Marshal(&agentv1.ReadArgs{Path: "metadata.txt", ToolCallId: "call-metadata"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := protowire.AppendTag(nil, 1, protowire.VarintType)
+	raw = protowire.AppendVarint(raw, 91)
+	raw = protowire.AppendTag(raw, 15, protowire.BytesType)
+	raw = protowire.AppendString(raw, "exec-metadata")
+	raw = protowire.AppendTag(raw, 19, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, span)
+	raw = protowire.AppendTag(raw, 7, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, readArgs)
+	raw = protowire.AppendTag(raw, 55, protowire.VarintType)
+	raw = protowire.AppendVarint(raw, 1)
+
+	decoded := &agentv1.ExecServerMessage{}
+	if err = proto.Unmarshal(raw, decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.GetId() != 91 || decoded.GetExecId() != "exec-metadata" {
+		t.Fatalf("exec envelope id=%d exec_id=%q", decoded.GetId(), decoded.GetExecId())
+	}
+	gotSpan := decoded.GetSpanContext()
+	if gotSpan == nil || gotSpan.GetTraceId() != "0123456789abcdef0123456789abcdef" || gotSpan.GetSpanId() != "0123456789abcdef" || gotSpan.GetTraceFlags() != 1 || gotSpan.GetTraceState() != "vendor=cursor" {
+		t.Fatalf("span_context=%#v", gotSpan)
+	}
+	if !decoded.GetAcceptHookAdditionalContexts() {
+		t.Fatal("accept_hook_additional_contexts was not decoded")
+	}
+	if decoded.GetReadArgs().GetPath() != "metadata.txt" || decoded.GetReadArgs().GetToolCallId() != "call-metadata" {
+		t.Fatalf("read_args=%#v", decoded.GetReadArgs())
+	}
+	if fields := unknownExecFieldNumbers(decoded); len(fields) != 0 {
+		t.Fatalf("known Exec envelope metadata remained unknown: %v", fields)
+	}
+	s := newProtocolSession([]ToolDefinition{{Name: "Read", Kind: "function", Parameters: map[string]any{"type": "object"}}})
+	if _, err = s.handleExec(decoded); err != nil {
+		t.Fatal(err)
+	}
+	if pending := s.pending["call-metadata"]; pending == nil || pending.variant != "read_args" {
+		t.Fatalf("metadata-bearing native Exec was not dispatched: %#v", pending)
+	}
+}
+
+func TestExecEnvelopeMetadataOnlyClosesNormally(t *testing.T) {
+	traceFlags := uint32(1)
+	acceptContexts := true
+	req := &agentv1.ExecServerMessage{
+		Id: 92,
+		SpanContext: &agentv1.SpanContext{
+			TraceId:    "0123456789abcdef0123456789abcdef",
+			SpanId:     "0123456789abcdef",
+			TraceFlags: &traceFlags,
+		},
+		AcceptHookAdditionalContexts: &acceptContexts,
+	}
+	reader, writer := io.Pipe()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	payloadCh := make(chan []byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			errCh <- err
+			return
+		}
+		payload := make([]byte, int(binary.BigEndian.Uint32(header[1:])))
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			errCh <- err
+			return
+		}
+		payloadCh <- payload
+	}()
+
+	s := &Session{stream: &BidiStream{writer: writer}}
+	handled, err := s.handleExec(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled {
+		t.Fatal("metadata-only Exec unexpectedly entered tool handling")
+	}
+
+	var payload []byte
+	select {
+	case err = <-errCh:
+		t.Fatal(err)
+	case payload = <-payloadCh:
+	}
+	client := &agentv1.AgentClientMessage{}
+	if err = proto.Unmarshal(payload, client); err != nil {
+		t.Fatal(err)
+	}
+	control := client.GetExecClientControlMessage()
+	if control == nil || control.GetStreamClose().GetId() != req.GetId() {
+		t.Fatalf("metadata-only response=%#v", control)
+	}
+	if control.GetThrow() != nil {
+		t.Fatalf("metadata-only Exec was refused: %#v", control.GetThrow())
+	}
+}
+
+func TestKnownNativeExecWithoutClientToolReturnsTypedError(t *testing.T) {
+	traceFlags := uint32(1)
+	acceptContexts := true
+	req := &agentv1.ExecServerMessage{
+		Id:     93,
+		ExecId: "exec-unavailable-read",
+		SpanContext: &agentv1.SpanContext{
+			TraceId:    "0123456789abcdef0123456789abcdef",
+			SpanId:     "0123456789abcdef",
+			TraceFlags: &traceFlags,
+		},
+		AcceptHookAdditionalContexts: &acceptContexts,
+		Message: &agentv1.ExecServerMessage_ReadArgs{ReadArgs: &agentv1.ReadArgs{
+			Path: "unavailable.txt",
+		}},
+	}
+	reader, writer := io.Pipe()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	payloadCh := make(chan [][]byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		payloads := make([][]byte, 0, 2)
+		for range 2 {
+			header := make([]byte, 5)
+			if _, err := io.ReadFull(reader, header); err != nil {
+				errCh <- err
+				return
+			}
+			payload := make([]byte, int(binary.BigEndian.Uint32(header[1:])))
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				errCh <- err
+				return
+			}
+			payloads = append(payloads, payload)
+		}
+		payloadCh <- payloads
+	}()
+
+	s := newProtocolSession(nil)
+	s.stream = &BidiStream{writer: writer}
+	handled, err := s.handleExec(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled {
+		t.Fatal("unavailable native Exec unexpectedly entered client tool handling")
+	}
+
+	var payloads [][]byte
+	select {
+	case err = <-errCh:
+		t.Fatal(err)
+	case payloads = <-payloadCh:
+	}
+	resultEnvelope := &agentv1.AgentClientMessage{}
+	if err = proto.Unmarshal(payloads[0], resultEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	execResult := resultEnvelope.GetExecClientMessage()
+	readError := execResult.GetReadResult().GetError()
+	if execResult.GetId() != req.GetId() || execResult.GetExecId() != req.GetExecId() || readError.GetPath() != "unavailable.txt" || readError.GetError() == "" {
+		t.Fatalf("typed unavailable result=%#v", execResult)
+	}
+	closeEnvelope := &agentv1.AgentClientMessage{}
+	if err = proto.Unmarshal(payloads[1], closeEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	control := closeEnvelope.GetExecClientControlMessage()
+	if control == nil || control.GetStreamClose().GetId() != req.GetId() || control.GetThrow() != nil {
+		t.Fatalf("unavailable native close=%#v", control)
+	}
+}
+
+func TestUnknownExecVariantRemainsVisible(t *testing.T) {
+	raw := protowire.AppendTag(nil, 99, protowire.BytesType)
+	raw = protowire.AppendBytes(raw, nil)
+	decoded := &agentv1.ExecServerMessage{}
+	if err := proto.Unmarshal(raw, decoded); err != nil {
+		t.Fatal(err)
+	}
+	fields := unknownExecFieldNumbers(decoded)
+	if len(fields) != 1 || fields[0] != 99 {
+		t.Fatalf("unknown Exec fields=%v, want [99]", fields)
+	}
+
+	reader, writer := io.Pipe()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	payloadCh := make(chan [][]byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		payloads := make([][]byte, 0, 2)
+		for range 2 {
+			header := make([]byte, 5)
+			if _, err := io.ReadFull(reader, header); err != nil {
+				errCh <- err
+				return
+			}
+			payload := make([]byte, int(binary.BigEndian.Uint32(header[1:])))
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				errCh <- err
+				return
+			}
+			payloads = append(payloads, payload)
+		}
+		payloadCh <- payloads
+	}()
+	s := newProtocolSession(nil)
+	s.stream = &BidiStream{writer: writer}
+	if _, err := s.handleExec(decoded); err != nil {
+		t.Fatal(err)
+	}
+	var payloads [][]byte
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	case payloads = <-payloadCh:
+	}
+	throwEnvelope := &agentv1.AgentClientMessage{}
+	if err := proto.Unmarshal(payloads[0], throwEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	throw := throwEnvelope.GetExecClientControlMessage().GetThrow()
+	if throw == nil || throw.GetErrorCode() != "exec_variant_unsupported" {
+		t.Fatalf("unknown Exec response=%#v", throwEnvelope.GetExecClientControlMessage())
+	}
+	closeEnvelope := &agentv1.AgentClientMessage{}
+	if err := proto.Unmarshal(payloads[1], closeEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if closeEnvelope.GetExecClientControlMessage().GetStreamClose() == nil {
+		t.Fatalf("unknown Exec close=%#v", closeEnvelope.GetExecClientControlMessage())
 	}
 }
 

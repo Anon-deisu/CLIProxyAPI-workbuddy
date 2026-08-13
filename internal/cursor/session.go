@@ -2707,6 +2707,9 @@ func checkpointGroupDigest(calls []checkpointToolCall) string {
 func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
 	switch m := req.Message.(type) {
 	case nil:
+		if len(unknownExecFieldNumbers(req)) > 0 {
+			return false, rejectUnsupportedExec(s.stream, req)
+		}
 		return false, sendExecStreamClose(s.stream, req.Id)
 	case *agentv1.ExecServerMessage_RequestContextArgs:
 		result := &agentv1.RequestContextResult{
@@ -2800,7 +2803,15 @@ var nativeExecToolNames = map[string][]string{
 func (s *Session) handleNativeArgs(req *agentv1.ExecServerMessage, variant string, args proto.Message) (bool, error) {
 	def := s.lookupNativeTool(variant)
 	if def == nil {
-		return false, rejectUnsupportedExec(s.stream, req)
+		toolName := variant
+		if names := nativeExecToolNames[variant]; len(names) > 0 {
+			toolName = names[0]
+		}
+		return false, s.sendNativeResult(req, variant, ToolResult{
+			Name:    toolName,
+			Content: fmt.Sprintf("%s is not available in this client request", toolName),
+			IsError: true,
+		})
 	}
 	arguments, err := nativeToolArgumentBags(variant, args, def)
 	if err != nil {
@@ -3730,10 +3741,9 @@ func (s *Session) requestContext() *agentv1.RequestContext {
 }
 
 func rejectUnsupportedExec(stream *BidiStream, req *agentv1.ExecServerMessage) error {
-	// Cursor asks the client to run one of its own built-in tools. The MVP
-	// schema only decodes request_context and mcp_args, so log which field the
-	// server used: that is exactly the variant a model reached for instead of
-	// the forwarded MCP tools.
+	// Preserve an explicit refusal for genuinely unknown future oneof variants.
+	// Known native variants use their typed result schema, including when the
+	// current downstream request did not expose a compatible tool.
 	log.Warnf("cursor: unsupported exec variant, refusing (unknown proto fields=%v)", unknownExecFieldNumbers(req))
 	code := "exec_variant_unsupported"
 	control := &agentv1.ExecClientControlMessage{

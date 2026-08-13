@@ -837,9 +837,17 @@ message RequestContextResult {
   }
 }
 
+message SpanContext {
+  string trace_id = 1;
+  string span_id = 2;
+  optional uint32 trace_flags = 3;
+  optional string trace_state = 4;
+}
+
 message ExecServerMessage {
   uint32 id = 1;
   string exec_id = 15;
+  optional SpanContext span_context = 19;
   oneof message {
     ShellArgs shell_args = 2;
     WriteArgs write_args = 3;
@@ -862,6 +870,7 @@ message ExecServerMessage {
     PiLsExecArgs pi_ls_args = 51;
     ShellArgs mini_swe_agent_bash_args = 52;
   }
+  optional bool accept_hook_additional_contexts = 55;
 }
 
 message ExecClientMessage {
