@@ -259,6 +259,273 @@ message KvClientMessage {
   }
 }
 
+// ===== Native built-in tool exec surface =====
+//
+// Cursor's Agent always exposes its built-in tools (Shell/Read/Write/Grep/…)
+// to the model; when the model uses one, the server asks the connected client
+// to execute it over the exec channel. Field numbers below are copied from the
+// full agent.proto. Args messages are lean decode-side subsets (proto3 ignores
+// unknown fields); result messages are encode-side and complete for what we
+// set.
+
+message ShellArgs {
+  string command = 1;
+  string working_directory = 2;
+  int32 timeout = 3;
+  string tool_call_id = 4;
+  bool is_background = 11;
+  optional string description = 15;
+}
+
+message ShellSuccess {
+  string command = 1;
+  string working_directory = 2;
+  int32 exit_code = 3;
+  string stdout = 5;
+  string stderr = 6;
+  int32 execution_time = 7;
+}
+
+message ShellFailure {
+  string command = 1;
+  string working_directory = 2;
+  int32 exit_code = 3;
+  string stdout = 5;
+  string stderr = 6;
+  int32 execution_time = 7;
+  bool aborted = 11;
+}
+
+message ShellRejected {
+  string command = 1;
+  string working_directory = 2;
+  string reason = 3;
+  bool is_readonly = 4;
+}
+
+message ShellResult {
+  optional bool is_background = 102;
+  oneof result {
+    ShellSuccess success = 1;
+    ShellFailure failure = 2;
+    ShellRejected rejected = 4;
+  }
+}
+
+message ReadArgs {
+  string path = 1;
+  string tool_call_id = 2;
+  optional int32 offset = 4;
+  optional uint32 limit = 5;
+}
+
+message ReadSuccess {
+  string path = 1;
+  int32 total_lines = 3;
+  int64 file_size = 4;
+  bool truncated = 6;
+  oneof output {
+    string content = 2;
+  }
+  bool range_applied = 8;
+}
+
+message ReadError {
+  string path = 1;
+  string error = 2;
+}
+
+message ReadFileNotFound {
+  string path = 1;
+}
+
+message ReadResult {
+  oneof result {
+    ReadSuccess success = 1;
+    ReadError error = 2;
+    ReadFileNotFound file_not_found = 4;
+  }
+}
+
+message WriteArgs {
+  string path = 1;
+  string file_text = 2;
+  string tool_call_id = 3;
+  bool return_file_content_after_write = 4;
+}
+
+message WriteSuccess {
+  string path = 1;
+  int32 lines_created = 2;
+  int32 file_size = 3;
+  optional string file_content_after_write = 4;
+}
+
+message WriteError {
+  string path = 1;
+  string error = 2;
+}
+
+message WriteResult {
+  oneof result {
+    WriteSuccess success = 1;
+    WriteError error = 5;
+  }
+}
+
+message DeleteArgs {
+  string path = 1;
+  string tool_call_id = 2;
+}
+
+message DeleteSuccess {
+  string path = 1;
+}
+
+message DeleteError {
+  string path = 1;
+  string error = 2;
+}
+
+message DeleteResult {
+  oneof result {
+    DeleteSuccess success = 1;
+    DeleteError error = 7;
+  }
+}
+
+message GrepArgs {
+  string pattern = 1;
+  optional string path = 2;
+  optional string glob = 3;
+  optional string output_mode = 4;
+  optional int32 context_before = 5;
+  optional int32 context_after = 6;
+  optional int32 context = 7;
+  optional bool case_insensitive = 8;
+  optional string type = 9;
+  optional int32 head_limit = 10;
+  optional bool multiline = 11;
+  string tool_call_id = 14;
+}
+
+message GrepFileCount {
+  string file = 1;
+  int32 count = 2;
+}
+
+message GrepCountResult {
+  repeated GrepFileCount counts = 1;
+  int32 total_files = 2;
+  int32 total_matches = 3;
+}
+
+message GrepFilesResult {
+  repeated string files = 1;
+  int32 total_files = 2;
+}
+
+message GrepContentMatch {
+  int32 line_number = 1;
+  string content = 2;
+  bool is_context_line = 4;
+}
+
+message GrepFileMatch {
+  string file = 1;
+  repeated GrepContentMatch matches = 2;
+}
+
+message GrepContentResult {
+  repeated GrepFileMatch matches = 1;
+  int32 total_lines = 2;
+  int32 total_matched_lines = 3;
+}
+
+message GrepUnionResult {
+  oneof result {
+    GrepCountResult count = 1;
+    GrepFilesResult files = 2;
+    GrepContentResult content = 3;
+  }
+}
+
+message GrepSuccess {
+  string pattern = 1;
+  string path = 2;
+  string output_mode = 3;
+  map<string, GrepUnionResult> workspace_results = 4;
+}
+
+message GrepError {
+  string error = 1;
+}
+
+message GrepResult {
+  oneof result {
+    GrepSuccess success = 1;
+    GrepError error = 2;
+  }
+}
+
+message LsArgs {
+  string path = 1;
+  repeated string ignore = 2;
+  string tool_call_id = 3;
+}
+
+message LsDirectoryTreeNode {
+  message File {
+    string name = 1;
+  }
+
+  string abs_path = 1;
+  repeated LsDirectoryTreeNode children_dirs = 2;
+  repeated File children_files = 3;
+  bool children_were_processed = 4;
+  int32 num_files = 6;
+}
+
+message LsSuccess {
+  LsDirectoryTreeNode directory_tree_root = 1;
+}
+
+message LsError {
+  string path = 1;
+  string error = 2;
+}
+
+message LsResult {
+  oneof result {
+    LsSuccess success = 1;
+    LsError error = 2;
+  }
+}
+
+message FetchArgs {
+  string url = 1;
+  string tool_call_id = 2;
+}
+
+message FetchSuccess {
+  string url = 1;
+  string content = 2;
+  int32 status_code = 3;
+  string content_type = 4;
+}
+
+message FetchError {
+  string url = 1;
+  string error = 2;
+}
+
+message FetchResult {
+  oneof result {
+    FetchSuccess success = 1;
+    FetchError error = 2;
+  }
+}
+
 message RequestContextArgs {}
 
 message RequestContext {
@@ -292,8 +559,17 @@ message ExecServerMessage {
   uint32 id = 1;
   string exec_id = 15;
   oneof message {
+    ShellArgs shell_args = 2;
+    WriteArgs write_args = 3;
+    DeleteArgs delete_args = 4;
+    GrepArgs grep_args = 5;
+    ReadArgs read_args = 7;
+    LsArgs ls_args = 8;
     RequestContextArgs request_context_args = 10;
     McpArgs mcp_args = 11;
+    ShellArgs shell_stream_args = 14;
+    FetchArgs fetch_args = 20;
+    ReadArgs redacted_read_args = 29;
   }
 }
 
@@ -301,8 +577,16 @@ message ExecClientMessage {
   uint32 id = 1;
   string exec_id = 15;
   oneof message {
+    ShellResult shell_result = 2;
+    WriteResult write_result = 3;
+    DeleteResult delete_result = 4;
+    GrepResult grep_result = 5;
+    ReadResult read_result = 7;
+    LsResult ls_result = 8;
     RequestContextResult request_context_result = 10;
     McpResult mcp_result = 11;
+    FetchResult fetch_result = 20;
+    ReadResult redacted_read_result = 29;
   }
 }
 

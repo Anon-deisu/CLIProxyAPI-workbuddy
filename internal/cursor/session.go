@@ -63,6 +63,10 @@ type pendingExec struct {
 	request *agentv1.ExecServerMessage
 	call    ToolCall
 	emitted bool
+	// native marks a bridged built-in tool call. Those never appear in the
+	// checkpoint's pending tool-call JSON (that only carries MCP parts), so
+	// batch readiness must not wait on checkpoint confirmation for them.
+	native bool
 }
 
 // Session is a live Agent Connect run that can pause for client tools.
@@ -71,12 +75,16 @@ type Session struct {
 	ConversationID string
 	Model          string
 
-	mu           sync.Mutex
-	stream       *BidiStream
-	blobStore    map[string][]byte
-	tools        []ToolDefinition
-	toolIndex    map[string]*ToolDefinition
-	toolAlias    *ToolAliasMap
+	mu        sync.Mutex
+	stream    *BidiStream
+	blobStore map[string][]byte
+	tools     []ToolDefinition
+	// clientTools is the sanitized tool list exactly as the downstream client
+	// declared it, before collision handling dropped or renamed anything. The
+	// native bridge resolves built-in exec requests against these names.
+	clientTools []ToolDefinition
+	toolIndex   map[string]*ToolDefinition
+	toolAlias   *ToolAliasMap
 	pending      map[string]*pendingExec
 	pendingOrder []*pendingExec
 	events       chan StreamEvent
@@ -177,8 +185,8 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 			opt(&cfg)
 		}
 	}
-	tools = SanitizeToolDefinitions(tools)
-	tools, toolAlias := AliasToolsForCursor(tools, cfg.forceToolAlias)
+	clientTools := SanitizeToolDefinitions(tools)
+	tools, toolAlias := AliasToolsForCursor(clientTools, cfg.forceToolAlias)
 	if !toolAlias.Empty() {
 		messages = ApplyToolAliasToMessages(messages, toolAlias)
 		log.Debugf("cursor: renamed %d tool(s) that collide with Cursor built-ins", len(toolAlias.toClient))
@@ -224,6 +232,7 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		stream:              stream,
 		blobStore:           blobStore,
 		tools:               append([]ToolDefinition(nil), tools...),
+		clientTools:         clientTools,
 		toolIndex:           indexTools(tools),
 		toolAlias:           toolAlias,
 		pending:             map[string]*pendingExec{},
@@ -777,7 +786,7 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 		// to Read on an END_STREAM response stalls the client indefinitely.
 		for i, result := range results {
 			if pending[i].request != nil && s.stream != nil {
-				_ = s.sendMcpResult(pending[i].request, result)
+				_ = s.sendToolResult(pending[i].request, result)
 			}
 			s.releasePendingExec(pending[i], ids[i], results[i].ToolCallID)
 		}
@@ -787,7 +796,7 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 
 	for i, result := range results {
 		item := pending[i]
-		if err := s.sendMcpResult(item.request, result); err != nil {
+		if err := s.sendToolResult(item.request, result); err != nil {
 			// Release remaining pending indexes so a rebuild does not keep
 			// stale multi-tool bindings that block later ResolveForToolResults.
 			for j := i; j < len(pending); j++ {
@@ -832,6 +841,18 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	return nil
 }
 
+// sendToolResult answers a pending exec with the reply shape its request used:
+// typed native results for bridged built-in tools, McpResult for MCP tools.
+func (s *Session) sendToolResult(req *agentv1.ExecServerMessage, result ToolResult) error {
+	if reply := nativeResultReply(req, result); reply != nil {
+		if err := s.sendExecClient(reply); err != nil {
+			return err
+		}
+		return sendExecStreamClose(s.stream, req.Id)
+	}
+	return s.sendMcpResult(req, result)
+}
+
 func (s *Session) sendMcpResult(req *agentv1.ExecServerMessage, result ToolResult) error {
 	mcp := &agentv1.McpResult{
 		Result: &agentv1.McpResult_Success{
@@ -854,6 +875,14 @@ func (s *Session) sendMcpResult(req *agentv1.ExecServerMessage, result ToolResul
 			McpResult: mcp,
 		},
 	}
+	if err := s.sendExecClient(execClient); err != nil {
+		return err
+	}
+	return sendExecStreamClose(s.stream, req.Id)
+}
+
+// sendExecClient marshals and writes one ExecClientMessage envelope.
+func (s *Session) sendExecClient(execClient *agentv1.ExecClientMessage) error {
 	client := &agentv1.AgentClientMessage{
 		Message: &agentv1.AgentClientMessage_ExecClientMessage{ExecClientMessage: execClient},
 	}
@@ -861,10 +890,7 @@ func (s *Session) sendMcpResult(req *agentv1.ExecServerMessage, result ToolResul
 	if err != nil {
 		return err
 	}
-	if err = s.stream.WriteEnvelope(payload, false); err != nil {
-		return err
-	}
-	return sendExecStreamClose(s.stream, req.Id)
+	return s.stream.WriteEnvelope(payload, false)
 }
 
 // Close tears down the Agent stream.
@@ -1481,7 +1507,61 @@ func (s *Session) handleExec(req *agentv1.ExecServerMessage) (bool, error) {
 	case *agentv1.ExecServerMessage_McpArgs:
 		return s.handleMcpArgs(req, m.McpArgs)
 	}
+	if isNativeExec(req) {
+		return s.handleNativeExec(req)
+	}
 	return false, rejectUnsupportedExec(s.stream, req)
+}
+
+// handleNativeExec bridges a built-in tool execution request onto whichever
+// tool the downstream client declared for it. The pend/emit/submit lifecycle is
+// exactly the MCP one; only the wire representation of the reply differs.
+func (s *Session) handleNativeExec(req *agentv1.ExecServerMessage) (bool, error) {
+	kind, nativeID, call, ok := nativeBridge(req, s.clientTools)
+	if !ok {
+		log.Warnf("cursor: built-in %s call but the client declared no matching tool; answering with a typed error", kind)
+		reply := nativeUnsupportedReply(req, "the connected client provides no "+kind+" capability; use another approach")
+		if reply == nil {
+			return false, rejectUnsupportedExec(s.stream, req)
+		}
+		if err := s.sendExecClient(reply); err != nil {
+			return false, err
+		}
+		return false, sendExecStreamClose(s.stream, req.Id)
+	}
+	log.Debugf("cursor: bridging built-in %s call to client tool %q", kind, call.Name)
+	s.pendToolCall(req, nativeID, call)
+	// Native calls have no checkpoint boundary to wait for: pause the segment
+	// now so the client receives the tool_use and can answer the exec.
+	return true, nil
+}
+
+// pendToolCall registers a server-initiated tool execution so the batch
+// emitter can surface it and a later SubmitToolResults can answer it.
+func (s *Session) pendToolCall(req *agentv1.ExecServerMessage, nativeID string, call ToolCall) {
+	if strings.TrimSpace(nativeID) == "" {
+		nativeID = uuid.NewString()
+	}
+	clientID := util.SanitizeClaudeToolID(nativeID)
+	if clientID == "" {
+		clientID = nativeID
+	}
+	call.ID = clientID
+	copyReq := proto.Clone(req).(*agentv1.ExecServerMessage)
+	pending := &pendingExec{request: copyReq, call: call, native: isNativeExec(req)}
+	s.mu.Lock()
+	s.pending[clientID] = pending
+	if nativeID != clientID {
+		s.pending[nativeID] = pending
+	}
+	s.pendingOrder = append(s.pendingOrder, pending)
+	s.mu.Unlock()
+	if s.manager != nil {
+		s.manager.BindPending(clientID, s)
+		if nativeID != clientID {
+			s.manager.BindPending(nativeID, s)
+		}
+	}
 }
 
 func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.McpArgs) (bool, error) {
@@ -1505,37 +1585,13 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
 		}
 		return false, s.replyMcp(req, result)
 	}
-	nativeID := strings.TrimSpace(args.GetToolCallId())
-	if nativeID == "" {
-		nativeID = uuid.NewString()
-	}
-	// Emit the Claude-safe id to clients so /v1/messages round-trips match BindPending.
-	clientID := util.SanitizeClaudeToolID(nativeID)
-	if clientID == "" {
-		clientID = nativeID
-	}
 	call := ToolCall{
-		ID: clientID,
 		// Cursor sees the (possibly renamed) upstream name; clients must get
 		// back the tool name they declared.
 		Name:      s.toolAlias.ClientName(def.Name),
 		Arguments: decodeMcpArguments(args, def),
 	}
-	copyReq := proto.Clone(req).(*agentv1.ExecServerMessage)
-	pending := &pendingExec{request: copyReq, call: call}
-	s.mu.Lock()
-	s.pending[clientID] = pending
-	if nativeID != clientID {
-		s.pending[nativeID] = pending
-	}
-	s.pendingOrder = append(s.pendingOrder, pending)
-	s.mu.Unlock()
-	if s.manager != nil {
-		s.manager.BindPending(clientID, s)
-		if nativeID != clientID {
-			s.manager.BindPending(nativeID, s)
-		}
-	}
+	s.pendToolCall(req, strings.TrimSpace(args.GetToolCallId()), call)
 	// Exec frames can arrive before Cursor's checkpoint proves the complete
 	// provider tool batch. Keep reading until that boundary is available.
 	return false, nil
@@ -1595,9 +1651,13 @@ func (s *Session) pendingToolBatchReady() bool {
 func (s *Session) orderedPendingToolBatch(force bool) ([]*pendingExec, bool) {
 	s.mu.Lock()
 	pending := make([]*pendingExec, 0, len(s.pendingOrder))
+	mcpPending := make([]*pendingExec, 0, len(s.pendingOrder))
 	for _, item := range s.pendingOrder {
 		if item != nil && !item.emitted {
 			pending = append(pending, item)
+			if !item.native {
+				mcpPending = append(mcpPending, item)
+			}
 		}
 	}
 	state := s.conversationState
@@ -1605,32 +1665,60 @@ func (s *Session) orderedPendingToolBatch(force bool) ([]*pendingExec, bool) {
 	if len(pending) == 0 {
 		return nil, false
 	}
+	// Bridged built-in calls never show up in the checkpoint's pending
+	// tool-call JSON, so a batch of only native calls is ready as it arrived.
+	if len(mcpPending) == 0 {
+		return pending, true
+	}
 
+	// The checkpoint gate confirms and orders the MCP part of the batch.
 	checkpointCalls, checkpointPresent := checkpointToolCalls(state)
 	if checkpointPresent {
-		byID := make(map[string]*pendingExec, len(pending))
-		for _, item := range pending {
+		byID := make(map[string]*pendingExec, len(mcpPending))
+		for _, item := range mcpPending {
 			byID[item.call.ID] = item
 		}
 		ordered := make([]*pendingExec, 0, len(checkpointCalls))
+		matched := true
 		for _, call := range checkpointCalls {
 			item := byID[util.SanitizeClaudeToolID(call.id)]
 			if item == nil {
 				item = byID[call.id]
 			}
 			if item == nil || !s.toolCallNameMatches(item.call.Name, call.name) {
-				return nil, false
+				matched = false
+				break
 			}
 			ordered = append(ordered, item)
 		}
-		if len(ordered) != len(pending) {
+		if matched && len(ordered) == len(mcpPending) {
+			if len(ordered) == len(pending) {
+				pending = ordered
+			} else {
+				// Mixed batch: checkpoint-confirmed MCP calls first, bridged
+				// native calls after them in arrival order.
+				combined := make([]*pendingExec, 0, len(pending))
+				combined = append(combined, ordered...)
+				for _, item := range pending {
+					if item.native {
+						combined = append(combined, item)
+					}
+				}
+				pending = combined
+			}
+			s.mu.Lock()
+			s.pendingOrder = append([]*pendingExec(nil), pending...)
+			s.mu.Unlock()
+			return pending, true
+		}
+		// A checkpoint that does not line up must not wedge a forced boundary
+		// (END_STREAM/EOF): fall back to arrival order there.
+		if !force {
 			return nil, false
 		}
-		pending = ordered
-		s.mu.Lock()
-		s.pendingOrder = append([]*pendingExec(nil), ordered...)
-		s.mu.Unlock()
-	} else if !force {
+		return pending, true
+	}
+	if !force {
 		return nil, false
 	}
 	return pending, true
