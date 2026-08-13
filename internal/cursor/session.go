@@ -2384,12 +2384,21 @@ func (s *Session) releaseTextStream() {
 	final := reconcileAssistantText(s.visibleText.String(), checkpointFinal)
 	out := final
 	if emitted != "" {
+		begin := strings.Index(final, emitted)
 		switch {
 		case strings.HasPrefix(final, emitted):
 			out = final[len(emitted):]
+		case begin > 0:
+			// Checkpoint recovered a leading token the wire deltas dropped.
+			// Emit just the recovered prefix, not the whole final, so the
+			// already-streamed text is never duplicated.
+			log.Debugf("cursor: release recovered %d leading char(s) (streamed=%d checkpoint=%d)",
+				begin, len(emitted), len(final))
+			out = final[:begin]
 		case strings.HasSuffix(final, emitted):
 			// Same live text, possibly prefixed by a recovered opening token.
-			out = final
+			// Emit only the recovered prefix; the emitted suffix is already owned.
+			out = final[:len(final)-len(emitted)]
 		default:
 			// Once text is live the downstream already owns the emitted prefix.
 			// Replaying a diverging checkpoint would duplicate the answer.
@@ -2482,6 +2491,7 @@ func (s *Session) flushAssistantText(force bool) {
 	}
 
 	var out string
+	begin := strings.Index(final, emitted)
 	switch {
 	case final == emitted:
 		out = ""
@@ -2489,6 +2499,16 @@ func (s *Session) flushAssistantText(force bool) {
 		out = final
 	case strings.HasPrefix(final, emitted):
 		out = final[len(emitted):]
+	case begin > 0:
+		// The checkpoint recovered a leading token that the wire deltas
+		// dropped (the "每次" → "次" case). final is the whole repaired text,
+		// but the downstream already owns all of emitted, and a clean prefix
+		// match was excluded above. Emit only the recovered prefix that sits
+		// BEFORE emitted, never the whole final, so nothing already streamed
+		// is duplicated.
+		log.Debugf("cursor: checkpoint recovered %d leading char(s) (streamed=%d checkpoint=%d)",
+			begin, len(emitted), len(final))
+		out = final[:begin]
 	default:
 		// Once text is live the downstream already owns the emitted prefix.
 		// Replaying a diverging checkpoint would duplicate the answer.
@@ -2499,6 +2519,9 @@ func (s *Session) flushAssistantText(force bool) {
 
 	s.mu.Lock()
 	if out != "" {
+		// emittedText/visibleText absorb the WHOLE repaired final (not just the
+		// emitted prefix), so a later reconcile treats the recovered opening as
+		// already sent and never re-emits it.
 		s.emittedText.Reset()
 		s.emittedText.WriteString(final)
 		s.visibleText.Reset()
@@ -3485,6 +3508,13 @@ func nativeToolArguments(variant string, raw proto.Message, def *ToolDefinition)
 	case "subagent_args":
 		args := raw.(*agentv1.SubagentArgs)
 		out := map[string]any{"prompt": args.GetPrompt()}
+		// Claude Code's client-side Task/Agent/Subagent tools declare
+		// "description" as a required argument. Cursor's SubagentArgs proto has
+		// no description field, so when the model invokes the subagent tool the
+		// relayed tool_use would arrive without it and Claude Code rejects it
+		// with InputValidationError. Synthesize one from the prompt instead, so
+		// the relayed tool call is always valid.
+		out["description"] = subagentDescription(args.GetPrompt(), args.GetSubagentType())
 		if args.GetSubagentType() != "" {
 			out[nativeArgumentName(def, "subagent_type", "subagent_type_name")] = args.GetSubagentType()
 		}
@@ -3501,6 +3531,31 @@ func nativeToolArguments(variant string, raw proto.Message, def *ToolDefinition)
 	default:
 		return nil, fmt.Errorf("cursor: unsupported native exec mapping %s", variant)
 	}
+}
+
+// subagentDescription synthesizes the "description" argument that Claude Code's
+// client-side Task/Agent/Subagent tools require. Cursor's SubagentArgs carries
+// no description, so we derive a short human-readable one from the prompt's
+// first non-blank line. This keeps the relayed tool_use valid even when the
+// model omits the context that would make a better summary.
+func subagentDescription(prompt, subagentType string) string {
+	const maxLen = 120
+	summary := strings.TrimSpace(prompt)
+	if index := strings.IndexAny(summary, "\n\r"); index >= 0 {
+		summary = strings.TrimSpace(summary[:index])
+	}
+	if summary == "" {
+		if subagentType != "" {
+			summary = "Delegate this task to a " + subagentType + " subagent."
+		} else {
+			summary = "Delegate this task to a subagent."
+		}
+	}
+	runes := []rune(summary)
+	if len(runes) > maxLen {
+		summary = string(runes[:maxLen]) + "…"
+	}
+	return summary
 }
 
 func localShellCommand(command string) []string {
