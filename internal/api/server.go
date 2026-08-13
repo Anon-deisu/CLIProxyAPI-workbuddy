@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/access"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
@@ -354,6 +355,21 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+
+	// One-time first-boot migration: the old standalone-page manager persisted
+	// Cursor API keys inside config.yaml ("cursor-api-key" block). The current
+	// design stores them as JSON files in the auth dir. If any legacy keys are
+	// still present, carry them over to the JSON store (idempotent) and strip
+	// the now-dead block from config.yaml. Safe to run on every boot.
+	if strings.TrimSpace(cfg.AuthDir) != "" && strings.TrimSpace(configFilePath) != "" {
+		store := cursor.NewAPIKeyStore(cfg.AuthDir)
+		if n, errMigrate := cursor.MigrateLegacyCursorAPIKeys(store, configFilePath); errMigrate != nil {
+			log.Warnf("cursor API key legacy migration skipped: %v", errMigrate)
+		} else if n > 0 {
+			log.Infof("migrated %d legacy cursor API key(s) into the JSON store", n)
+		}
+	}
+
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {

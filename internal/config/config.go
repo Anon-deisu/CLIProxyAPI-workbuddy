@@ -1967,6 +1967,8 @@ func removeRemovedIntegrationKeys(root *yaml.Node) {
 	removeMapKey(root, "amp-upstream-api-key")
 	removeMapKey(root, "amp-restrict-management-to-localhost")
 	removeMapKey(root, "amp-model-mappings")
+	// Cursor API keys moved out of config.yaml into the JSON store (auth dir).
+	removeMapKey(root, "cursor-api-key")
 }
 
 func removeLegacyGenerativeLanguageKeys(root *yaml.Node) {

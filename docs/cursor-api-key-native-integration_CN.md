@@ -53,13 +53,20 @@ auth/<email>_cursor-api-key.json
 - `cursorKeyStore()`（`config_cursor_keys.go`）= `cursor.NewAPIKeyStore(cfg.AuthDir)`，根目录即配置的 auth 目录。
 - watcher 的 `synthesizeCursorAPIKey`（`internal/watcher/synthesizer/file.go`）把 JSON 文件实时合成为 Auth 对象，与既有 `#/auth-files` 走同一套发现机制。
 
-### 迁移结论（Task #8）
+### 迁移：初次启动自动导入旧配置的 key 并删除旧字段（Task #8）
 
-**无需迁移**。旧独立页面把凭据写进 `config.yaml` 的 `cursor-api-key`（`h.cfg.CursorKey = ...; h.persistLocked(c)`），从未写过 auth 目录下的 JSON 文件。因此：
+旧独立页面把凭据持久化到 **config.yaml 的 `cursor-api-key` 块**（`h.cfg.CursorKey = ...; h.persistLocked(c)`），从未写 auth 目录 JSON。生产服务器 `/etc/cli-proxy-api/config.yaml` 上**实际遗留了 3 个在用 key**（`crsr_9df03fee…` 等）。新二进制删除了 `config.CursorKey` 字段、对该块直接忽略，因此若不迁移，这些 key 将彻底不可达——**这是一个真实的、必须做的迁移**。
 
-- auth 目录中**不存在旧方案遗留的** `*_cursor-api-key.json` 需要导入；
-- `config.CursorKey` 字段连同 `cursor-api-key` 配置污染已完全删除，新二进制对旧配置中的该块**直接忽略**；
-- 任何已通过新方案保存的 JSON 文件都会被新 store 原样读取，零转换。
+`internal/auth/cursor/legacy_migrate.go` 实现了幂等的一次性迁移，由 `NewServer` 在每次启动时调用（`server.go`）：
+
+1. 读取 config.yaml 顶层 `cursor-api-key:` 节点（用 `yaml.Node` 判定**块是否存在**——含空块 `cursor-api-key: []`，区别于块缺失）。
+2. 对每个旧 key：若其 `base_url+api_key` 已存在于 JSON store（防重复），跳过；否则用 store 的 `Create` 落成标准 JSON 文件（`<…>_cursor-api-key.json`）——走同一套原子写 + fsnotify，watcher 立即重新分发。
+3. 迁移完成后 `stripLegacyCursorAPIKeyBlock` 以 **yaml.Node 编辑 + 原子写** 删除 config.yaml 中的 `cursor-api-key` 块，**保留其余注释与节**。
+4. 幂等：块缺失则完全不改写 config.yaml；重复 key 去重；出错（无法读/写/单条失败）只记日志、绝不阻塞启动，留待下次启动重试。
+
+- **不再写 config.yaml 的 `cursor-api-key`**：`config.CursorKey` 字段连同该块已完全删除（`removeRemovedIntegrationKeys` 也会在后续管理保存时顺带剔除残留块）。
+- 迁移成功后，仅从 **auth 目录 JSON 文件**加载；任何已通过新方案保存的 JSON 都会被原样读取，零转换。
+- 安全性：迁移在服务端日志中只记文件名与数量，**绝不输出 key 明文**。
 
 ## 三、管理界面
 
