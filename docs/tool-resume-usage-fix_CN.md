@@ -144,9 +144,13 @@ if model := claudeCodeModelName(args.GetModelId()); model != "" {
 
 单测：`TestClaudeCodeModelName`（[claude_code_model_test.go](internal/cursor/claude_code_model_test.go)）覆盖以上 13 个用例，全部通过；`go vet ./internal/cursor/` 无告警。
 
-## 四、部署记录（追加）
+## 四、部署记录（追加，2026-08-13 15:53 UTC）
 
-- 沿用同一 atomic systemd 替换流程到 `root@ovh.xem8k5.top`，分支 `modeb-relay`，生产 config `debug: false`。
+- 沿同一 atomic systemd 替换流程部署到 `root@ovh.xem8k5.top`，分支 `modeb-relay`，生产 config `debug: false`。
 - 本地静态交叉编译：`CGO_ENABLED=0 GOOS=linux GOARCH=amd64`（OVH VPS 无 Go 工具链）。
+- 提交：`52eb5b44`（`fix(cursor): 子代理工具 model 参数映射为 Claude Code 家族缩写`），已推送。
+- 新二进制 md5 `84ad66aefc30bdece420d344c1885109`（57995426 字节），`systemctl is-active` = `active`，`NRestarts=0`，`MainPID=1054674`。
+- 新程序自启动后即持续收到 `200 POST /v1/messages` 请求（来源 IP `95.169.7.75`、`10.200.2.128` 等），**流量确认无误**。
+- 清除本轮部署产生的服务器端备份：`/usr/local/bin/cli-proxy-api.bak-latest` 已删除；`.bak-prev`、`config.yaml.bak-debug` 本轮未产生，无需处理。服务器现仅存运行中的新二进制与 `config.yaml`。
 
-> 备份（`.bak-latest` / `.bak-prev` / `config.yaml.bak-debug`）同样遵循"确认新二进制持续接收流量后清除"原则；未确认前绝不删除。
+> 备份（`.bak-latest` / `.bak-prev` / `config.yaml.bak-debug`）同样遵循"确认新二进制持续接收流量后清除"原则；未确认前绝不删除。未触碰的备份绝不删除。
