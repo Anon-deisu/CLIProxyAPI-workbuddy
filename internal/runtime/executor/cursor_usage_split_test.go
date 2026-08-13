@@ -23,14 +23,21 @@ func TestCursorInputExcludesTheCacheBuckets(t *testing.T) {
 	}
 }
 
-func TestCursorUsageNeverGoesNegative(t *testing.T) {
-	// Cursor occasionally reports cache figures that exceed its own input.
+func TestCursorUsageParallelCacheBuckets(t *testing.T) {
+	// Anthropic-official and some cross-account upstreams report input_tokens as
+	// the fresh portion only, with the cache read/write buckets parallel to it.
+	// The cache can then legitimately exceed the fresh input (a request reuses a
+	// big cached prefix against a small new tail). Clamping the overflow to zero
+	// dropped the real fresh input from the statistics — the "cache missing /
+	// input went to zero" reports. The fresh input is the input itself; only the
+	// inclusive shape (buckets inside input) gets the subtraction.
 	got := cursorUsageDetail(100, 5, 400, 50, 0)
-	if got.InputTokens != 0 {
-		t.Fatalf("input = %d, want 0", got.InputTokens)
+	if got.InputTokens != 100 {
+		t.Fatalf("input = %d, want the 100 fresh tokens kept", got.InputTokens)
 	}
-	if got.TotalTokens != 455 {
-		t.Fatalf("total = %d, want 455", got.TotalTokens)
+	// Every bucket counted once: 100 fresh + 400 read + 50 written + 5 out.
+	if got.TotalTokens != 555 {
+		t.Fatalf("total = %d, want 555 (fresh input must not be dropped)", got.TotalTokens)
 	}
 }
 
@@ -70,5 +77,26 @@ func TestSplitPayloadSurvivesTheClaudeTranslator(t *testing.T) {
 	cached := details["cached_tokens"].(int64) + details["cache_creation_tokens"].(int64)
 	if prompt >= cached {
 		t.Fatalf("prompt %d >= cache %d would be subtracted again downstream", prompt, cached)
+	}
+}
+
+func TestSplitCursorInputBothShapes(t *testing.T) {
+	cases := []struct {
+		name                string
+		input, read, write  int64
+		wantUncached        int64
+	}{
+		{"inclusive input, buckets inside it", 25249, 25117, 130, 2},
+		{"inclusive, exactly equal buckets", 250, 200, 50, 0},
+		{"parallel buckets exceed fresh input", 100, 400, 50, 100},
+		{"parallel, no cache at all", 300, 0, 0, 300},
+		{"parallel, read only exceeds", 50, 500, 0, 50},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := splitCursorInput(c.input, c.read, c.write); got != c.wantUncached {
+				t.Fatalf("splitCursorInput(%d,%d,%d) = %d, want %d", c.input, c.read, c.write, got, c.wantUncached)
+			}
+		})
 	}
 }
