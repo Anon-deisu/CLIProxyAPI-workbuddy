@@ -6,124 +6,101 @@ import (
 	"testing"
 )
 
-// fixtureManagementHTML 是一个逼近上游 bundle 关键结构的输入：拥有网关分类的
-// nav 项（icon:K9.oauth）、/oauth 路由（(0,H.jsx)(VM,{})）、以及两条 locale 锚点
-// （oauth:`OAuth Login`,quota_management: 与 oauth:`OAuth authorization`,quota_management:），
-// 足以触发本函数的四处修补。反引号用 \x60 转义。
+// fixtureManagementHTML 是一个逼近上游 bundle 结构的输入：拥有闭合的 </body>
+// 注入点，足以触发 AddCursorAPIKeyInlineToManagementHTML 的注入。具体 OAuth
+// 卡片结构由运行时的 findCursorCards 依据文案匹配，无需在此构造。
 func fixtureManagementHTML() []byte {
-	t := "\x60"
 	return []byte("<!doctype html>\n" +
 		"<html>\n<head><title>management</title></head>\n<body>\n" +
-		"<nav>{gateway:[{path:" + t + "/oauth" + t + ",labelKey:" + t + "nav.oauth" + t + ",metaKey:" + t + "nav_meta.oauth" + t + ",icon:K9.oauth}]}</nav>\n" +
-		"<v>{path:" + t + "/oauth" + t + ",element:(0,H.jsx)(VM,{})}</v>\n" +
-		"<z>{oauth:" + t + "OAuth Login" + t + ",quota_management:" + t + "Quota" + t + "}</z>\n" +
-		"<z>{oauth:" + t + "OAuth authorization" + t + ",quota_management:" + t + "Quota" + t + "}</z>\n" +
+		"<div id=\"root\"><section class=\"OAuthPage-module__oauthCard\">Cursor OAuth</section></div>\n" +
 		"</body>\n</html>")
 }
 
-func TestAddCursorAPIKeyManagerToManagementHTML(t *testing.T) {
+func TestAddCursorAPIKeyInlineToManagementHTML(t *testing.T) {
 	t.Parallel()
 
-	got, errPatch := AddCursorAPIKeyManagerToManagementHTML(fixtureManagementHTML())
+	input := fixtureManagementHTML()
+	got, errPatch := AddCursorAPIKeyInlineToManagementHTML(input)
 	if errPatch != nil {
-		t.Fatalf("AddCursorAPIKeyManagerToManagementHTML() error = %v", errPatch)
+		t.Fatalf("AddCursorAPIKeyInlineToManagementHTML() error = %v", errPatch)
 	}
+
+	// 注入点必须在 </body> 之前，且幂等标记必须出现。
+	markerIdx := bytes.Index(got, []byte(cursorAPIKeyInlineMarker))
+	if markerIdx < 0 {
+		t.Fatalf("patched management html missing idempotency marker %q", cursorAPIKeyInlineMarker)
+	}
+	if bodyIdx := bytes.Index(got, []byte("</body>")); markerIdx > bodyIdx {
+		t.Fatalf("inline script (%d) injected after </body> (%d)", markerIdx, bodyIdx)
+	}
+
+	// 不再注入独立页导航/路由痕迹（旧版 AddCursorAPIKeyManagerToManagementHTML 已删除）。
+	for _, gone := range [][]byte{
+		[]byte(`path:` + "\x60/cursor-api-key\x60"),
+		[]byte("cpa-native-route-host"),
+		[]byte("nav.cursor_api_key"),
+	} {
+		if bytes.Contains(got, gone) {
+			t.Fatalf("patched management html still carries legacy standalone-page marker %q", gone)
+		}
+	}
+
+	// 内联管理脚本的 CRUD 后端与关键 UI 文案必须存在。
 	for _, want := range [][]byte{
-		// 幂等标记
-		[]byte(cursorAPIKeyManagerMarker),
-		// 导航项 + 导航文案（nav 与 nav_meta）
-		[]byte(",{path:`/cursor-api-key`,labelKey:`nav.cursor_api_key`,metaKey:`nav_meta.cursor_api_key`,icon:K9.oauth}"),
-		[]byte("cursor_api_key:`Cursor API Key`,"),
-		// 原生路由挂载点（非外挂按钮）
-		[]byte(",{path:`/cursor-api-key`,element:(0,H.jsx)(\"div\",{id:\"cpa-native-route-host\"})}"),
-		[]byte(`id:"cpa-native-route-host"`),
-		// 管理脚本的关键后端逻辑
-		[]byte("/v0/management/cursor-api-key"),
-		[]byte("留空表示不更换现有 Key"),
-		[]byte("entry.last_error"),
+		[]byte("cpa-key-inline-script"),
+		[]byte("managementPath = '/v0/management/'"),
+		[]byte("managementPath + 'cursor-api-key'"),
 		[]byte("MutationObserver"),
+		[]byte("Cursor API Key"),
 	} {
 		if !bytes.Contains(got, want) {
 			t.Fatalf("patched management html missing %q", want)
 		}
 	}
 
-	// 监听器必须在 DOM 构造之后挂载，否则 list/form 为 null 触发空指针
-	// （曾把 list.addEventListener 放在 panel 构造之前，导致页面空白）
-	orderChecks := []struct {
-		before, after []byte
-	}{
-		{[]byte("list = panel.querySelector('#cpa-key-list')"), []byte("list.addEventListener")},
-		{[]byte("form = panel.querySelector('#cpa-form')"), []byte("form.addEventListener('submit'")},
-	}
-	for _, oc := range orderChecks {
-		bi := bytes.Index(got, oc.before)
-		ai := bytes.Index(got, oc.after)
-		if bi < 0 {
-			t.Fatalf("patched html missing %q (DOM 赋值)", oc.before)
-		}
-		if ai < 0 {
-			t.Fatalf("patched html missing %q (监听器)", oc.after)
-		}
-		if bi > ai {
-			t.Fatalf("顺序错误：%q 出现在 %q 之后", oc.before, oc.after)
-		}
-	}
-
-	// 必须不再存在旧版紫色悬浮按钮的痕迹
-	for _, gone := range [][]byte{
-		[]byte(":host{position:fixed;inset:0;z-index:2147482999"),
-		[]byte("#open"),
-		[]byte("openButton.classList.toggle('hidden'"),
-	} {
-		if bytes.Contains(got, gone) {
-			t.Fatalf("patched management html still carries legacy floating-button marker %q", gone)
-		}
-	}
-
-	// 管理密钥完全复用已登录面板会话，页面不得再出现手动凭据输入框（避免割裂感）
-	for _, gone := range [][]byte{
-		[]byte("cpa-management-key"),
-		[]byte("管理密钥（通常自动获取）"),
-		[]byte("managementKeyInput"),
-		[]byte("在下方的管理密钥框中临时填写"),
-	} {
-		if bytes.Contains(got, gone) {
-			t.Fatalf("patched management html still exposes a manual management-key widget %q", gone)
-		}
-	}
-
-	// 脚本注入点在 </body> 之前
-	if bytes.Index(got, []byte(cursorAPIKeyManagerMarker)) > bytes.Index(got, []byte("</body>")) {
-		t.Fatal("Cursor API key manager was not injected inside body")
-	}
-
-	// 再次修补必须无副作用（幂等）
-	again, errAgain := AddCursorAPIKeyManagerToManagementHTML(got)
+	// 再次修补必须无副作用（幂等）。
+	again, errAgain := AddCursorAPIKeyInlineToManagementHTML(got)
 	if errAgain != nil {
-		t.Fatalf("second AddCursorAPIKeyManagerToManagementHTML() error = %v", errAgain)
+		t.Fatalf("second AddCursorAPIKeyInlineToManagementHTML() error = %v", errAgain)
 	}
 	if !bytes.Equal(again, got) {
-		t.Fatal("Cursor API key management patch is not idempotent")
+		t.Fatal("Cursor API key inline patch is not idempotent")
+	}
+	// 幂等命中时输入缓冲被原样返回（不拷贝、不追加）。
+	if !sameBacking(got, again) {
+		t.Fatal("idempotent pass should return the already-patched buffer unchanged")
 	}
 }
 
-func TestAddCursorAPIKeyManagerNoAnchorsReturnsError(t *testing.T) {
+func TestAddCursorAPIKeyInlineEmptyInput(t *testing.T) {
 	t.Parallel()
 
-	_, errPatch := AddCursorAPIKeyManagerToManagementHTML([]byte("<html>management</html>"))
+	_, errPatch := AddCursorAPIKeyInlineToManagementHTML(nil)
 	if errPatch == nil {
-		t.Fatal("expected error when nav/route/locale anchors are absent, got nil")
+		t.Fatal("expected error for empty input, got nil")
 	}
-	if !strings.Contains(errPatch.Error(), "anchor not found") {
+	if !strings.Contains(errPatch.Error(), "empty") {
 		t.Fatalf("unexpected error text: %v", errPatch)
 	}
 }
 
-func TestAddCursorAPIKeyManagerEmptyInput(t *testing.T) {
+func TestAddCursorAPIKeyInlineNoBodyFallsBackToEnd(t *testing.T) {
 	t.Parallel()
 
-	if _, errPatch := AddCursorAPIKeyManagerToManagementHTML(nil); errPatch == nil {
-		t.Fatal("expected error for empty input, got nil")
+	in := []byte("<html>management only, no body tag</html>")
+	got, errPatch := AddCursorAPIKeyInlineToManagementHTML(in)
+	if errPatch != nil {
+		t.Fatalf("AddCursorAPIKeyInlineToManagementHTML() error = %v", errPatch)
 	}
+	if bytes.Index(got, []byte(cursorAPIKeyInlineMarker)) < 0 {
+		t.Fatal("expected inline marker even without a </body> anchor")
+	}
+}
+
+// sameBacking 报告 b 是否为 a 的零拷贝切片（同一底层数组头地址）。
+func sameBacking(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b)
+	}
+	return &a[0] == &b[0]
 }

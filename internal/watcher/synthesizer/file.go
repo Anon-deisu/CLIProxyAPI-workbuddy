@@ -19,6 +19,12 @@ import (
 // It handles file-based authentication.
 type FileSynthesizer struct{}
 
+// cursorAPIKeyProvider is the auth.Provider value used for Cursor API key
+// JSON credentials. It must match the "type" discriminator written by
+// APIKeyStorage (internal/auth/cursor). The watcher maps it to a dedicated
+// management category and routes it through the cursor executor.
+const cursorAPIKeyProvider = "cursor-api-key"
+
 // NewFileSynthesizer creates a new FileSynthesizer instance.
 func NewFileSynthesizer() *FileSynthesizer {
 	return &FileSynthesizer{}
@@ -125,6 +131,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			return auths
 		}
 	}
+	// Cursor API key credentials are stored in dedicated JSON files (see
+	// internal/auth/cursor/api_key_storage.go). They ride the same file-based
+	// synthesizer as OAuth files but must surface as their own provider
+	// category and promote the API key / base URL into Attributes so the
+	// cursor executor can read them without an OAuth token exchange.
+	if provider == "cursor-api-key" {
+		return []*coreauth.Auth{synthesizeCursorAPIKey(ctx, fullPath, metadata)}
+	}
 	if provider == "" || provider == "gemini-cli" {
 		return nil
 	}
@@ -218,6 +232,125 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+// synthesizeCursorAPIKey turns a Cursor API key JSON file into a single Auth
+// record. The API key and base URL are promoted into Attributes so the cursor
+// executor (which reads AttributeAPIKey / "base_url" and never touches OAuth
+// tokens) can exchange them directly. Provider is set to a dedicated value so
+// the management UI shows a distinct Cursor API Key category.
+func synthesizeCursorAPIKey(ctx *SynthesisContext, fullPath string, metadata map[string]any) *coreauth.Auth {
+	now := ctx.Now
+	cfg := ctx.Config
+
+	label := "cursor-api-key"
+	if email, _ := metadata["email"].(string); strings.TrimSpace(email) != "" {
+		label = strings.TrimSpace(email)
+	}
+
+	// Use relative path under authDir as ID to stay consistent with the
+	// file-based token store (mirrors synthesizeFileAuths).
+	id := fullPath
+	if strings.TrimSpace(ctx.AuthDir) != "" {
+		if rel, errRel := filepath.Rel(ctx.AuthDir, fullPath); errRel == nil && rel != "" {
+			id = rel
+		}
+	}
+	if runtime.GOOS == "windows" {
+		id = strings.ToLower(id)
+	}
+
+	apiKey := strings.TrimSpace(metadataString(metadata, "api_key"))
+	if apiKey == "" {
+		return nil
+	}
+
+	disabled, _ := metadata["disabled"].(bool)
+	status := coreauth.StatusActive
+	if disabled {
+		status = coreauth.StatusDisabled
+	}
+
+	prefix := ""
+	if rawPrefix, ok := metadata["prefix"].(string); ok {
+		trimmed := strings.TrimSpace(rawPrefix)
+		trimmed = strings.Trim(trimmed, "/")
+		if trimmed != "" && !strings.Contains(trimmed, "/") {
+			prefix = trimmed
+		}
+	}
+
+	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
+
+	attributes := map[string]string{
+		coreauth.AttributeSource:        fullPath,
+		coreauth.AttributePath:          fullPath,
+		coreauth.AttributeSourceBackend: coreauth.AuthSourceFile,
+		coreauth.AttributeAPIKey:        apiKey,
+		coreauth.AttributeAuthKind:      coreauth.AuthKindAPIKey,
+		// The executor routes on this provider attribute; cursor api-key
+		// credentials must act as a cursor account, not a generic config file.
+		"provider": "cursor",
+	}
+	if baseURL := strings.TrimSpace(metadataString(metadata, "base_url")); baseURL != "" {
+		attributes["base_url"] = baseURL
+	}
+	// Promote priority so the dispatcher / management UI can read it.
+	if rawPriority, ok := metadata["priority"]; ok {
+		switch v := rawPriority.(type) {
+		case float64:
+			attributes["priority"] = strconv.Itoa(int(v))
+		case string:
+			priority := strings.TrimSpace(v)
+			if _, errAtoi := strconv.Atoi(priority); errAtoi == nil {
+				attributes["priority"] = priority
+			}
+		}
+	}
+	// Promote a stable email if the credential carries one.
+	if email := strings.TrimSpace(metadataString(metadata, "email")); email != "" {
+		attributes["email"] = email
+	}
+	if rawNote, ok := metadata["note"].(string); ok {
+		if trimmed := strings.TrimSpace(rawNote); trimmed != "" {
+			attributes["note"] = trimmed
+		}
+	}
+	if coolingDisabled, _ := metadata["disable_cooling"].(bool); coolingDisabled {
+		attributes["disable_cooling"] = "true"
+	}
+
+	a := &coreauth.Auth{
+		ID:         id,
+		Provider:   cursorAPIKeyProvider,
+		Label:      label,
+		Prefix:     prefix,
+		Status:     status,
+		Disabled:   disabled,
+		Attributes: attributes,
+		Metadata:   metadata,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	coreauth.ApplyCustomHeadersFromMetadata(a)
+	coreauth.SetOAuthModelAliasesAttribute(a, extractOAuthModelAliasesFromMetadata(metadata))
+	// Pass AuthKindAPIKey so the helper re-affirms the api-key kind rather than
+	// overwriting the attribute with an "oauth" kind (which would misroute the
+	// executor to the OAuth token branch).
+	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, coreauth.AuthKindAPIKey)
+	return a
+}
+
+// metadataString reads a string metadata key, falling back to "" when absent
+// or of a non-string type.
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	if v, ok := metadata[key].(string); ok {
+		return v
+	}
+	return ""
 }
 
 func parsePluginFileAuths(parser PluginAuthParser, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {

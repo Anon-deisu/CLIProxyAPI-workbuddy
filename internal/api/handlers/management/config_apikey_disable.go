@@ -73,15 +73,6 @@ func toggleConfigAPIKeyExcludedAll(cfg *config.Config, auth *coreauth.Auth, disa
 			return true, nil
 		}
 	}
-	for i := range cfg.CursorKey {
-		entry := &cfg.CursorKey[i]
-		baseURL := config.NormalizeCursorBaseURL(entry.BaseURL)
-		id, _ := idGen.Next("cursor:apikey", entry.APIKey, baseURL)
-		if id == authID {
-			entry.ExcludedModels = setConfigAPIKeyExcludedAll(entry.ExcludedModels, disable)
-			return true, nil
-		}
-	}
 	for i := range cfg.VertexCompatAPIKey {
 		entry := &cfg.VertexCompatAPIKey[i]
 		id, _ := idGen.Next("vertex:apikey", entry.APIKey, entry.BaseURL, entry.ProxyURL)

@@ -54,39 +54,3 @@ func TestToggleConfigAPIKeyExcludedAll_Codex(t *testing.T) {
 		t.Fatalf("expected excluded-models cleared, got %#v", cfg.CodexKey[0].ExcludedModels)
 	}
 }
-
-func TestToggleConfigAPIKeyExcludedAll_Cursor(t *testing.T) {
-	cfg := &config.Config{
-		CursorKey: []config.CursorKey{{
-			APIKey:  "crsr_test",
-			BaseURL: config.DefaultCursorBaseURL,
-		}},
-	}
-	idGen := synthesizer.NewStableIDGenerator()
-	authID, _ := idGen.Next("cursor:apikey", "crsr_test", "")
-	auth := &coreauth.Auth{
-		ID:       authID,
-		Provider: "cursor",
-		Label:    "cursor-apikey",
-		Attributes: map[string]string{
-			"api_key": "crsr_test",
-			"source":  "config:cursor[abc]",
-		},
-	}
-
-	handled, err := toggleConfigAPIKeyExcludedAll(cfg, auth, true)
-	if err != nil || !handled {
-		t.Fatalf("toggle disable: handled=%v err=%v", handled, err)
-	}
-	if !cursorKeyDisabled(cfg.CursorKey[0].ExcludedModels) {
-		t.Fatalf("expected disabled marker, got %#v", cfg.CursorKey[0].ExcludedModels)
-	}
-
-	handled, err = toggleConfigAPIKeyExcludedAll(cfg, auth, false)
-	if err != nil || !handled {
-		t.Fatalf("toggle enable: handled=%v err=%v", handled, err)
-	}
-	if cursorKeyDisabled(cfg.CursorKey[0].ExcludedModels) {
-		t.Fatalf("expected disabled marker removed, got %#v", cfg.CursorKey[0].ExcludedModels)
-	}
-}

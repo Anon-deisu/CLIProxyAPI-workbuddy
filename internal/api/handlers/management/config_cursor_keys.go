@@ -3,46 +3,53 @@ package management
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 type cursorKeyInput struct {
 	APIKey         string   `json:"api-key"`
+	Email          string   `json:"email,omitempty"`
 	Priority       int      `json:"priority,omitempty"`
 	Prefix         string   `json:"prefix,omitempty"`
 	BaseURL        string   `json:"base-url,omitempty"`
 	ExcludedModels []string `json:"excluded-models,omitempty"`
 	DisableCooling bool     `json:"disable-cooling,omitempty"`
 	Disabled       bool     `json:"disabled,omitempty"`
+	Note           string   `json:"note,omitempty"`
 }
 
 type cursorKeyPatch struct {
 	APIKey         *string   `json:"api-key"`
+	Email          *string   `json:"email"`
 	Priority       *int      `json:"priority"`
 	Prefix         *string   `json:"prefix"`
 	BaseURL        *string   `json:"base-url"`
 	ExcludedModels *[]string `json:"excluded-models"`
 	DisableCooling *bool     `json:"disable-cooling"`
 	Disabled       *bool     `json:"disabled"`
+	Note           *string   `json:"note"`
 }
 
 type cursorKeyView struct {
 	Index          int                            `json:"index"`
 	APIKey         string                         `json:"api-key"`
 	APIKeySet      bool                           `json:"api-key-set"`
+	Email          string                         `json:"email,omitempty"`
 	Priority       int                            `json:"priority,omitempty"`
 	Prefix         string                         `json:"prefix,omitempty"`
 	BaseURL        string                         `json:"base-url,omitempty"`
 	ExcludedModels []string                       `json:"excluded-models,omitempty"`
 	DisableCooling bool                           `json:"disable-cooling,omitempty"`
 	Disabled       bool                           `json:"disabled"`
+	Note           string                         `json:"note,omitempty"`
 	AuthIndex      string                         `json:"auth-index,omitempty"`
 	Success        int64                          `json:"success"`
 	Failed         int64                          `json:"failed"`
@@ -55,39 +62,47 @@ type cursorKeyView struct {
 	RecentRequests []coreauth.RecentRequestBucket `json:"recent_requests,omitempty"`
 }
 
+// cursorKeyStore returns a file-backed store rooted at the configured auth
+// directory. It is built on demand so a fresh view of the directory is always
+// reflected, and it stays nil-safe (callers treat it as unavailable).
+func (h *Handler) cursorKeyStore() *cursor.APIKeyStore {
+	if h == nil || h.cfg == nil {
+		return nil
+	}
+	return cursor.NewAPIKeyStore(h.cfg.AuthDir)
+}
+
 // GetCursorKeys returns Cursor API key settings without exposing credential
 // material. Mutations use stable list indexes, so clients never need the raw key.
 func (h *Handler) GetCursorKeys(c *gin.Context) {
-	if h == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+	store := h.cursorKeyStore()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return
 	}
 	runtimeByID := h.liveCursorKeyRuntimeByID()
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+	list, err := store.List()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list cursor API keys"})
 		return
 	}
-
-	idGen := synthesizer.NewStableIDGenerator()
-	out := make([]cursorKeyView, 0, len(h.cfg.CursorKey))
-	for i := range h.cfg.CursorKey {
-		entry := h.cfg.CursorKey[i]
-		baseURL := config.NormalizeCursorBaseURL(entry.BaseURL)
-		id, _ := idGen.Next("cursor:apikey", strings.TrimSpace(entry.APIKey), baseURL)
-		runtime := runtimeByID[id]
+	out := make([]cursorKeyView, 0, len(list))
+	for i, rec := range list {
+		baseURL := rec.ResolvedBaseURL()
+		runtime := runtimeByID[filepath.Base(rec.FileName())]
 		out = append(out, cursorKeyView{
 			Index:          i,
-			APIKey:         maskCursorAPIKey(entry.APIKey),
-			APIKeySet:      strings.TrimSpace(entry.APIKey) != "",
-			Priority:       entry.Priority,
-			Prefix:         entry.Prefix,
+			APIKey:         maskCursorAPIKey(rec.APIKey),
+			APIKeySet:      strings.TrimSpace(rec.APIKey) != "",
+			Email:          rec.Email,
+			Priority:       rec.Priority,
+			Prefix:         rec.Prefix,
 			BaseURL:        baseURL,
-			ExcludedModels: cursorVisibleExcludedModels(entry.ExcludedModels),
-			DisableCooling: entry.DisableCooling,
-			Disabled:       cursorKeyDisabled(entry.ExcludedModels),
+			ExcludedModels: cursorVisibleExcludedModels(rec.ExcludedModels),
+			DisableCooling: rec.DisableCooling,
+			Disabled:       rec.Disabled,
+			Note:           rec.Note,
 			AuthIndex:      runtime.AuthIndex,
 			Success:        runtime.Success,
 			Failed:         runtime.Failed,
@@ -166,9 +181,35 @@ func (h *Handler) liveCursorKeyRuntimeByID() map[string]cursorKeyRuntimeView {
 	return out
 }
 
+// cursorKeyFromInput converts an API key input into the on-disk JSON record.
+// A blank API key is rejected here so the store's "api key required" contract
+// is enforced at the HTTP boundary with a readable message.
+func cursorKeyFromInput(input cursorKeyInput) (*cursor.APIKeyStorage, bool) {
+	rec := &cursor.APIKeyStorage{
+		APIKey:         input.APIKey,
+		Email:          input.Email,
+		Priority:       input.Priority,
+		Prefix:         input.Prefix,
+		BaseURL:        input.BaseURL,
+		ExcludedModels: append([]string(nil), input.ExcludedModels...),
+		DisableCooling: input.DisableCooling,
+		Disabled:       input.Disabled,
+		Note:           input.Note,
+	}
+	if strings.TrimSpace(rec.APIKey) == "" {
+		return nil, false
+	}
+	return rec, true
+}
+
 // PutCursorKeys replaces the complete Cursor API key list. The management UI
 // uses POST/PATCH so a masked GET response can never accidentally overwrite keys.
 func (h *Handler) PutCursorKeys(c *gin.Context) {
+	store := h.cursorKeyStore()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	data, errRead := c.GetRawData()
 	if errRead != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
@@ -186,64 +227,70 @@ func (h *Handler) PutCursorKeys(c *gin.Context) {
 		inputs = *wrapper.Items
 	}
 
-	entries := make([]config.CursorKey, 0, len(inputs))
+	records := make([]*cursor.APIKeyStorage, 0, len(inputs))
 	for i := range inputs {
-		entry, ok := cursorKeyFromInput(inputs[i])
+		rec, ok := cursorKeyFromInput(inputs[i])
 		if !ok {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "api-key is required"})
 			return
 		}
-		entries = append(entries, entry)
-	}
-	normalized, duplicate := normalizeCursorKeyEntries(entries)
-	if duplicate {
-		c.JSON(http.StatusConflict, gin.H{"error": "duplicate cursor API key and base URL"})
-		return
+		records = append(records, rec)
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+	// Remove every existing credential first so the list is a true replace.
+	list, errList := store.List()
+	if errList != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list cursor API keys"})
 		return
 	}
-	h.cfg.CursorKey = normalized
-	h.persistLocked(c)
+	for i := len(list) - 1; i >= 0; i-- {
+		if err := store.Delete(i); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to replace cursor API keys"})
+			return
+		}
+	}
+	for _, rec := range records {
+		if _, err := store.Create(rec); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save cursor API key"})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"cursor-api-key": "ok"})
 }
 
 // PostCursorKey appends one Cursor API key without requiring clients to resend
 // the existing (masked) credentials.
 func (h *Handler) PostCursorKey(c *gin.Context) {
+	store := h.cursorKeyStore()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	var input cursorKeyInput
 	if errBind := c.ShouldBindJSON(&input); errBind != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
-	entry, ok := cursorKeyFromInput(input)
+	rec, ok := cursorKeyFromInput(input)
 	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "api-key is required"})
 		return
 	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+	if _, err := store.Create(rec); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save cursor API key"})
 		return
 	}
-	entries := append(append([]config.CursorKey(nil), h.cfg.CursorKey...), entry)
-	normalized, duplicate := normalizeCursorKeyEntries(entries)
-	if duplicate {
-		c.JSON(http.StatusConflict, gin.H{"error": "duplicate cursor API key and base URL"})
-		return
-	}
-	h.cfg.CursorKey = normalized
-	h.persistLocked(c)
+	c.JSON(http.StatusOK, gin.H{"cursor-api-key": "ok"})
 }
 
 // PatchCursorKey updates one entry by index. An omitted or blank api-key keeps
 // the stored secret unchanged, which makes password-style edit forms safe.
 func (h *Handler) PatchCursorKey(c *gin.Context) {
+	store := h.cursorKeyStore()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	var body struct {
 		Index *int            `json:"index"`
 		Value *cursorKeyPatch `json:"value"`
@@ -253,74 +300,72 @@ func (h *Handler) PatchCursorKey(c *gin.Context) {
 		return
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+	rec, errGet := store.Get(*body.Index)
+	if errGet != nil {
+		if cursor.IsIndexOutOfRange(errGet) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load cursor API key"})
 		return
 	}
-	index := *body.Index
-	if index < 0 || index >= len(h.cfg.CursorKey) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
-		return
-	}
-
-	entry := h.cfg.CursorKey[index]
 	patch := body.Value
 	if patch.APIKey != nil {
 		if value := strings.TrimSpace(*patch.APIKey); value != "" {
-			entry.APIKey = value
+			rec.APIKey = value
 		}
 	}
+	if patch.Email != nil {
+		rec.Email = *patch.Email
+	}
 	if patch.Priority != nil {
-		entry.Priority = *patch.Priority
+		rec.Priority = *patch.Priority
 	}
 	if patch.Prefix != nil {
-		entry.Prefix = *patch.Prefix
+		rec.Prefix = *patch.Prefix
 	}
 	if patch.BaseURL != nil {
-		entry.BaseURL = *patch.BaseURL
+		rec.BaseURL = *patch.BaseURL
 	}
 	if patch.ExcludedModels != nil {
-		entry.ExcludedModels = append([]string(nil), (*patch.ExcludedModels)...)
+		rec.ExcludedModels = append([]string(nil), (*patch.ExcludedModels)...)
 	}
 	if patch.DisableCooling != nil {
-		entry.DisableCooling = *patch.DisableCooling
+		rec.DisableCooling = *patch.DisableCooling
 	}
 	if patch.Disabled != nil {
-		entry.ExcludedModels = setConfigAPIKeyExcludedAll(entry.ExcludedModels, *patch.Disabled)
+		rec.Disabled = *patch.Disabled
+	}
+	if patch.Note != nil {
+		rec.Note = *patch.Note
 	}
 
-	entries := append([]config.CursorKey(nil), h.cfg.CursorKey...)
-	entries[index] = entry
-	normalized, duplicate := normalizeCursorKeyEntries(entries)
-	if duplicate {
-		c.JSON(http.StatusConflict, gin.H{"error": "duplicate cursor API key and base URL"})
+	if err := store.Update(*body.Index, rec); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update cursor API key"})
 		return
 	}
-	h.cfg.CursorKey = normalized
-	h.persistLocked(c)
+	c.JSON(http.StatusOK, gin.H{"cursor-api-key": "ok"})
 }
 
 func (h *Handler) DeleteCursorKey(c *gin.Context) {
+	store := h.cursorKeyStore()
+	if store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
 	index, ok := cursorQueryIndex(c)
 	if !ok {
 		return
 	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.cfg == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+	if err := store.Delete(index); err != nil {
+		if cursor.IsIndexOutOfRange(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete cursor API key"})
 		return
 	}
-	if index < 0 || index >= len(h.cfg.CursorKey) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
-		return
-	}
-	h.cfg.CursorKey = append(h.cfg.CursorKey[:index], h.cfg.CursorKey[index+1:]...)
-	h.cfg.SanitizeCursorKeys()
-	h.persistLocked(c)
+	c.JSON(http.StatusOK, gin.H{"cursor-api-key": "ok"})
 }
 
 func cursorQueryIndex(c *gin.Context) (int, bool) {
@@ -339,45 +384,13 @@ func cursorQueryIndex(c *gin.Context) (int, bool) {
 	return index, true
 }
 
-func cursorKeyFromInput(input cursorKeyInput) (config.CursorKey, bool) {
-	entry := config.CursorKey{
-		APIKey:         input.APIKey,
-		Priority:       input.Priority,
-		Prefix:         input.Prefix,
-		BaseURL:        input.BaseURL,
-		ExcludedModels: append([]string(nil), input.ExcludedModels...),
-		DisableCooling: input.DisableCooling,
-	}
-	if input.Disabled {
-		entry.ExcludedModels = setConfigAPIKeyExcludedAll(entry.ExcludedModels, true)
-	}
-	normalized, _ := normalizeCursorKeyEntries([]config.CursorKey{entry})
-	if len(normalized) != 1 {
-		return config.CursorKey{}, false
-	}
-	return normalized[0], true
-}
-
-func normalizeCursorKeyEntries(entries []config.CursorKey) ([]config.CursorKey, bool) {
-	if len(entries) == 0 {
-		return nil, false
-	}
-	normalized := append([]config.CursorKey(nil), entries...)
-	cfg := config.Config{CursorKey: normalized}
-	cfg.SanitizeCursorKeys()
-	return cfg.CursorKey, len(cfg.CursorKey) != len(entries)
-}
-
-func cursorKeyDisabled(models []string) bool {
-	for _, model := range models {
-		if strings.TrimSpace(model) == configAPIKeyDisablePattern {
-			return true
-		}
-	}
-	return false
-}
-
+// cursorVisibleExcludedModels hides the "*" disable sentinel from the API view
+// (a disabled credential is surfaced through the Disabled bool instead), while
+// preserving any real model-level exclusions.
 func cursorVisibleExcludedModels(models []string) []string {
+	if len(models) == 0 {
+		return nil
+	}
 	out := make([]string, 0, len(models))
 	for _, model := range models {
 		if strings.TrimSpace(model) != configAPIKeyDisablePattern {

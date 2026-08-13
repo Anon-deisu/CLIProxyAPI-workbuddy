@@ -8,16 +8,23 @@ import (
 	"strings"
 	"testing"
 
-	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cursorstore "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
 )
 
 func TestCursorAPIKeyManagementRouteMasksSecret(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
 	server := newTestServer(t)
-	server.cfg.CursorKey = []proxyconfig.CursorKey{{
+
+	// API key 凭据改为从 JSON 存储加载（config.yaml 已彻底废弃 cursor-api-key 污染），
+	// 这里通过 store 写入一条记录来模拟已保存的凭据。
+	store := cursorstore.NewAPIKeyStore(server.cfg.AuthDir)
+	if _, err := store.Create(&cursorstore.APIKeyStorage{
+		Type:   cursorstore.StoredAPIKeyType,
 		APIKey: "crsr_server-route-secret",
 		Prefix: "team",
-	}}
+	}); err != nil {
+		t.Fatalf("seed cursor api key: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodGet, "/v0/management/cursor-api-key", nil)
 	req.Header.Set("Authorization", "Bearer test-management-key")
@@ -36,8 +43,9 @@ func TestCursorAPIKeyManagementRouteMasksSecret(t *testing.T) {
 }
 
 // 管理面板的 Cursor API Key 管理界面已按需求从「漂浮按钮」重构为
-// 「原生集成到 #/oauth 设计系统」：只有当上游面板存在 /oauth 导航与路由锚点时，
-// 服务端才会注入原生路由挂载点；同时管理页关闭缓存，避免刷新时拿到旧版本。
+// 「卡片内嵌输入框」：服务端在 #/oauth 的 Cursor OAuth 卡片内注入内联 API
+// Key 输入框与管理脚本（幂等），不再注入独立导航/路由；同时管理页关闭缓存，
+// 避免刷新时拿到旧版本。
 func TestManagementPageIntegratesCursorEntryAndDisablesCaching(t *testing.T) {
 	staticDir := t.TempDir()
 	t.Setenv("MANAGEMENT_STATIC_PATH", staticDir)
@@ -65,13 +73,15 @@ func TestManagementPageIntegratesCursorEntryAndDisablesCaching(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	for _, want := range []string{
-		// 原生路由挂载点（非漂浮按钮）
-		`cursor-api-key`,
-		`id:"cpa-native-route-host"`,
-		// 原生导航文案
-		`cursor_api_key:` + backtick + `Cursor API Key` + backtick,
-		// 管理脚本
-		`/v0/management/cursor-api-key`,
+		// 内联管理脚本（非漂浮按钮）
+		`id="cpa-key-inline-script"`,
+		// 卡片内嵌输入框文案
+		`Cursor API Key`,
+		// 管理脚本（GET/POST/PATCH/DELETE 复用同一端点）
+		`managementPath + 'cursor-api-key'`,
+
+		// 运行时事件捕获
+		`MutationObserver`,
 	} {
 		if !strings.Contains(rec.Body.String(), want) {
 			t.Fatalf("management page missing native Cursor integration %q", want)
@@ -83,8 +93,8 @@ func TestManagementPageIntegratesCursorEntryAndDisablesCaching(t *testing.T) {
 	// 幂等：重复请求不应重复注入导航/路由/脚本。
 	rec2 := httptest.NewRecorder()
 	server.engine.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/management.html", nil))
-	if count := strings.Count(rec2.Body.String(), `id:"cpa-native-route-host"`); count != 1 {
-		t.Fatalf("native route host injected %d times, want 1 (idempotency broken)", count)
+	if count := strings.Count(rec2.Body.String(), `id="cpa-key-inline-script"`); count != 1 {
+		t.Fatalf("inline script injected %d times, want 1 (idempotency broken)", count)
 	}
 
 	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {

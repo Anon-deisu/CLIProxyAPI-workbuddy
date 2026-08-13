@@ -969,9 +969,9 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	} else {
 		data = patchedData
 	}
-	patchedData, errPatch = managementasset.AddCursorAPIKeyManagerToManagementHTML(data)
+	patchedData, errPatch = managementasset.AddCursorAPIKeyInlineToManagementHTML(data)
 	if errPatch != nil {
-		log.WithError(errPatch).Warn("management control panel does not support Cursor API key manager injection")
+		log.WithError(errPatch).Warn("management control panel does not support Cursor API key inline injection")
 	} else {
 		data = patchedData
 	}
