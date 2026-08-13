@@ -442,12 +442,18 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		// they are there. A bounded 150 ms wait is long enough for the adjacent
 		// frame while keeping tool latency effectively unchanged when a Cursor
 		// version emits no TurnEnded at a pause.
+		//
+		// A usage_final seen on the event stream is the same record that
+		// TakeUsageForSegment would return, so it is authoritative on its own.
+		// Re-home only when the segment produced no usage_final event at all, or
+		// when its counter set is empty despite a segment having run — both mean
+		// the trailing frame never crossed the event channel.
 		segmentID := session.SegmentID()
 		if usageFinal.SegmentID > 0 {
 			segmentID = usageFinal.SegmentID
 		}
-		if usageFinal.InputTokens == 0 && usageFinal.OutputTokens == 0 &&
-			usageFinal.CacheReadTokens == 0 && usageFinal.CacheWriteTokens == 0 {
+		if usageFinal.SegmentID == 0 && usageFinal.InputTokens == 0 && usageFinal.OutputTokens == 0 &&
+			usageFinal.CacheReadTokens == 0 && usageFinal.CacheWriteTokens == 0 && usageFinal.ReasoningTokens == 0 {
 			if late, ok := session.TakeUsageForSegment(segmentID, cursorTrailingUsageWait); ok {
 				usageFinal = late
 			}
@@ -1564,8 +1570,32 @@ func deltaIsReasoningOnly(delta map[string]any) bool {
 	return ok
 }
 
+// splitCursorInput decides how much of a reported input figure is genuinely
+// uncached (fresh) input. Cursor's counters follow two different shapes that
+// share the same TurnEnded fields:
+//
+//   - Own-account Cursor: input_tokens already contains the cache buckets
+//     (measured: prompt_tokens 25249 = cached 25117 + written 130 + 2 fresh).
+//     Subtracting the buckets leaves the true fresh remainder.
+//   - Anthropic-official / some cross-account and third-party upstreams:
+//     input_tokens is the fresh portion only, with cache read/write reported
+//     as separate buckets parallel to it.
+//
+// The shape is distinguishable locally: if the cache buckets fit inside the
+// reported input, the input is inclusive; if they exceed it (or the input is
+// smaller than their sum), they are separate and the input is already fresh.
+// This removes the hard-coded assumption that cost the updated statistics:
+// subtracting parallel buckets when they do not live inside the input drove the
+// uncached figure to zero on the inclusive path's opposite.
+func splitCursorInput(input, cacheRead, cacheWrite int64) int64 {
+	if cacheRead+cacheWrite <= input {
+		return input - cacheRead - cacheWrite
+	}
+	return input
+}
+
 func cursorUsageDetail(input, output, cacheRead, cacheWrite, reasoning int64) usage.Detail {
-	uncached := input - cacheRead - cacheWrite
+	uncached := splitCursorInput(input, cacheRead, cacheWrite)
 	if uncached < 0 {
 		uncached = 0
 	}
@@ -1589,7 +1619,7 @@ func cursorUsageDetail(input, output, cacheRead, cacheWrite, reasoning int64) us
 // tens of thousands of fresh input tokens with no cache hit, and priced it that
 // way. The Anthropic surface already reports the split; this matches it.
 func cursorUsagePayload(input, output, cacheRead, cacheWrite, reasoning int64) map[string]any {
-	uncached := input - cacheRead - cacheWrite
+	uncached := splitCursorInput(input, cacheRead, cacheWrite)
 	if uncached < 0 {
 		uncached = 0
 	}

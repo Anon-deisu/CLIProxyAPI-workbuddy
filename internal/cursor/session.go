@@ -2438,8 +2438,6 @@ func (s *Session) releaseTextStream() {
 			out = ""
 		}
 	}
-	// Still under the lock taken above — re-locking here deadlocked every
-	// streaming turn's first text release.
 	s.textStreamLive = true
 	s.holdTimer = nil
 	s.emittedText.Reset()

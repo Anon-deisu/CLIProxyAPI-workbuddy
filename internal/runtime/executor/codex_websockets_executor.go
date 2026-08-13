@@ -38,6 +38,10 @@ const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
+	// How often the reader re-checks a stalled consumer channel before giving up
+	// waiting for it to drain. Small enough to detect consumer/session changes
+	// quickly, large enough to avoid a hot spin when the consumer is merely slow.
+	codexResponsesWebsocketStallPoll = 200 * time.Millisecond
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -1443,6 +1447,7 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 	if e == nil || sess == nil || conn == nil {
 		return
 	}
+readLoop:
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(codexResponsesWebsocketIdleTimeout))
 		msgType, payload, errRead := conn.ReadMessage()
@@ -1493,9 +1498,47 @@ func (e *CodexWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, 
 		if ch == nil {
 			continue
 		}
-		select {
-		case ch <- codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}:
-		case <-done:
+		pending := codexWebsocketRead{conn: conn, msgType: msgType, payload: payload}
+	deliver:
+		for {
+			select {
+			case ch <- pending:
+			case <-done:
+				// The current consumer's turn ended (clearActive cancelled done).
+				// Do not return: the reader keeps the shared upstream conn alive for
+				// the session's next turn; the conn-close / teardown path terminates
+				// the loop via a ReadMessage error below.
+				continue readLoop
+			default:
+				// The consumer channel (buffered 4096) is full and the consumer is
+				// actively draining. Do not block forever here: a wedged consumer that
+				// never cancels `done` would otherwise stall the reader and freeze the
+				// whole session. Poll periodically so we stay responsive to consumer
+				// progress and to the session being re-pinned/torn down while we wait,
+				// without ever dropping the pending message.
+				select {
+				case ch <- pending:
+				case <-done:
+					continue readLoop
+				case <-time.After(codexResponsesWebsocketStallPoll):
+					sess.activeMu.Lock()
+					curCh := sess.activeCh
+					curDone := sess.activeDone
+					sess.activeMu.Unlock()
+					if curCh == nil {
+						return
+					}
+					if curCh == ch && curDone == done {
+						continue deliver
+					}
+					// The session was re-pinned to a new consumer while we waited.
+					// Re-target the pending message at the fresh channel.
+					ch = curCh
+					done = curDone
+					continue deliver
+				}
+			}
+			break deliver
 		}
 	}
 }

@@ -822,13 +822,22 @@ func extractOpenAIUsage(usage gjson.Result) (int64, int64, int64) {
 		cacheWriteTokens = usage.Get("input_tokens_details.cache_write_tokens").Int()
 	}
 
+	// The reported prompt_tokens may take one of two shapes:
+	//   - OpenAI-style: prompt_tokens already contains the cache buckets, so
+	//     stripping them exposes the genuinely fresh input.
+	//   - Split-style (this proxy's Cursor path): prompt_tokens is the fresh
+	//     portion only, cache read/write reported as parallel buckets. The
+	//     cache can then legitimately exceed the fresh input.
+	//
+	// Both are distinguishable locally the same way splitCursorInput uses
+	// upstream: if the cache buckets fit within prompt_tokens, subtract; if
+	// they exceed it, prompt_tokens is already fresh and must be kept. Without
+	// this, a split-style prompt (e.g. 2 fresh vs 25117 cached) was stripped
+	// again, driving the reported input_tokens to zero — the "uncached input
+	// went from a few tokens to 0" reports.
 	cachedInput := cachedTokens + cacheWriteTokens
-	if cachedInput > 0 {
-		if inputTokens >= cachedInput {
-			inputTokens -= cachedInput
-		} else {
-			inputTokens = 0
-		}
+	if cachedInput > 0 && inputTokens >= cachedInput {
+		inputTokens -= cachedInput
 	}
 
 	return inputTokens, outputTokens, cachedTokens
