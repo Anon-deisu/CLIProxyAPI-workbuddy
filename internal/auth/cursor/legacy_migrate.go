@@ -175,21 +175,23 @@ func stripLegacyCursorAPIKeyBlock(configFile string, data []byte) error {
 	if err := enc.Close(); err != nil {
 		return err
 	}
-	return atomicWriteFile(configFile, buf.Bytes())
+	return writeInlineConfigFile(configFile, buf.Bytes())
 }
 
-// atomicWriteFile writes payload to path via a temp file + rename so a crash
-// mid-write can never leave a truncated config file.
-func atomicWriteFile(path string, payload []byte) error {
-	tmp := path + ".cursor-migrate.tmp"
-	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
+// writeInlineConfigFile writes payload back to path in place, truncating the
+// existing file. This mirrors SaveConfigPreserveComments (os.Create) exactly:
+// it must work when the config directory is not writable by the service user
+// but the config file itself is (its owner), which is the deployment layout
+// for /etc/cli-proxy-api/config.yaml. A temp-file+rename would require create
+// permission on the directory and fails there (permission denied).
+func writeInlineConfigFile(path string, payload []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	defer func() { _ = f.Close() }()
+	_, werr := f.Write(payload)
+	return werr
 }
 
 // containsStoredKey reports whether key already lives in list.
