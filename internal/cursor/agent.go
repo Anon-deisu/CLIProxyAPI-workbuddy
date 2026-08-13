@@ -273,6 +273,36 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 	// forcing it true is rejected for many accounts ("Workspace context
 	// exclusion is not allowed…").
 	supportsImages := true
+	details, selection := resolveModelDetails(model, selection)
+	run := &agentv1.AgentRunRequest{
+		ConversationId:             &conversationID,
+		ConversationState:          &agentv1.ConversationStateStructure{RootPromptMessagesJson: rootIDs},
+		ModelDetails:               details,
+		RequestedModel:             toRequestedModelProto(selection),
+		ClientSupportsInlineImages: &supportsImages,
+		Action:                     &agentv1.ConversationAction{},
+	}
+	if activeUserMessage != nil {
+		run.Action.Action = &agentv1.ConversationAction_UserMessageAction{
+			UserMessageAction: &agentv1.UserMessageAction{UserMessage: activeUserMessage},
+		}
+	} else {
+		run.Action.Action = &agentv1.ConversationAction_ResumeAction{
+			ResumeAction: &agentv1.ResumeAction{},
+		}
+	}
+	if defs := buildMcpToolDefinitions(tools); len(defs) > 0 {
+		run.McpTools = &agentv1.McpTools{McpTools: defs}
+	}
+	client := &agentv1.AgentClientMessage{
+		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
+	}
+	return client, blobStore, conversationID, nil
+}
+
+// resolveModelDetails derives the wire ModelDetails for a public model id and
+// returns the (possibly enriched) selection for toRequestedModelProto.
+func resolveModelDetails(model string, selection ModelSelection) (*agentv1.ModelDetails, ModelSelection) {
 	publicID := selection.PublicID
 	if publicID == "" {
 		publicID = model
@@ -303,30 +333,7 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 		maxMode := true
 		details.MaxMode = &maxMode
 	}
-	run := &agentv1.AgentRunRequest{
-		ConversationId:             &conversationID,
-		ConversationState:          &agentv1.ConversationStateStructure{RootPromptMessagesJson: rootIDs},
-		ModelDetails:               details,
-		RequestedModel:             toRequestedModelProto(selection),
-		ClientSupportsInlineImages: &supportsImages,
-		Action:                     &agentv1.ConversationAction{},
-	}
-	if activeUserMessage != nil {
-		run.Action.Action = &agentv1.ConversationAction_UserMessageAction{
-			UserMessageAction: &agentv1.UserMessageAction{UserMessage: activeUserMessage},
-		}
-	} else {
-		run.Action.Action = &agentv1.ConversationAction_ResumeAction{
-			ResumeAction: &agentv1.ResumeAction{},
-		}
-	}
-	if defs := buildMcpToolDefinitions(tools); len(defs) > 0 {
-		run.McpTools = &agentv1.McpTools{McpTools: defs}
-	}
-	client := &agentv1.AgentClientMessage{
-		Message: &agentv1.AgentClientMessage_RunRequest{RunRequest: run},
-	}
-	return client, blobStore, conversationID, nil
+	return details, selection
 }
 
 const (

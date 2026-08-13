@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -125,6 +124,16 @@ type Session struct {
 	textStreamLive      bool
 	holdTimer           *time.Timer
 	resumed             bool
+	// usedContinuation marks a run opened from a stored checkpoint; if it
+	// fails, the checkpoint is dropped so retries rebuild from history.
+	usedContinuation bool
+	// holdWindow overrides textHoldWindow. Continuation runs get a longer one:
+	// they receive no early checkpoint to release the hold, their answers are
+	// typically short, and a short answer that outruns the hold cannot have a
+	// dropped opening repaired once it has streamed.
+	holdWindow time.Duration
+	// failed suppresses checkpoint persistence on Close after a stream error.
+	failed bool
 	// lastFrame is the last time anything arrived from Cursor. Thinking and
 	// text deltas are buffered rather than emitted, so consumer-side idle
 	// detection must not rely on client-visible events alone.
@@ -192,9 +201,27 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		log.Debugf("cursor: renamed %d tool(s) that collide with Cursor built-ins", len(toolAlias.toClient))
 	}
 	selection := ResolveRequestedModel(model)
-	clientMsg, blobStore, conversationID, err := buildRunRequestForConversation(model, messages, tools, cfg.conversationID)
-	if err != nil {
-		return nil, err
+	var clientMsg *agentv1.AgentClientMessage
+	var blobStore map[string][]byte
+	conversationID := strings.TrimSpace(cfg.conversationID)
+	usedContinuation := false
+	// The native path for a follow-up turn: send the server's own checkpoint
+	// state back with just the new user message, instead of re-flattening the
+	// client's whole history into fresh prompt blobs.
+	if snapshot, ok := takeContinuation(conversationID); ok {
+		if continuationMatchesHistory(snapshot, messages) {
+			clientMsg, blobStore = buildContinuationRunRequest(model, messages, tools, conversationID, snapshot)
+			usedContinuation = true
+		} else {
+			log.Debugf("cursor: stored checkpoint does not match client history; rebuilding conversation %s", conversationID)
+		}
+	}
+	if clientMsg == nil {
+		var err error
+		clientMsg, blobStore, conversationID, err = buildRunRequestForConversation(model, messages, tools, cfg.conversationID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	first, err := proto.Marshal(clientMsg)
 	if err != nil {
@@ -246,6 +273,10 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		manager:             DefaultSessionManager(),
 		parallelTools:       cfg.parallelTools,
 		seenAssistantMsgIDs: map[string]struct{}{},
+		usedContinuation:    usedContinuation,
+	}
+	if usedContinuation {
+		session.holdWindow = continuationTextHoldWindow
 	}
 	session.seedSeenAssistantMessages()
 	session.manager.Register(session)
@@ -614,6 +645,15 @@ func (s *Session) fail(err error) {
 	if err == nil {
 		return
 	}
+	s.mu.Lock()
+	s.failed = true
+	usedContinuation := s.usedContinuation
+	s.mu.Unlock()
+	if usedContinuation {
+		// The server would not run on the stored state; retries must rebuild
+		// from client history instead of replaying the same rejection.
+		dropContinuation(s.ConversationID)
+	}
 	select {
 	case s.errCh <- err:
 	default:
@@ -920,7 +960,13 @@ func (s *Session) Close() error {
 	}
 	stream := s.stream
 	cancel := s.cancel
+	failed := s.failed
 	s.mu.Unlock()
+	if !failed {
+		// Keep the server's latest checkpoint so the conversation's next turn
+		// can continue natively instead of rebuilding from client history.
+		rememberContinuation(s.ConversationID, s.checkpointSnapshot())
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -1102,35 +1148,7 @@ func checkpointBlobIDs(snapshot checkpointSnapshot) [][]byte {
 }
 
 func (s *Session) checkpointAssistantMessages() []checkpointAssistantMessage {
-	snapshot := s.checkpointSnapshot()
-	ids := checkpointBlobIDs(snapshot)
-	if len(ids) == 0 {
-		// Fall back to initial prompt blobs when no checkpoint has arrived yet.
-		keys := make([]string, 0, len(snapshot.blobs))
-		for key := range snapshot.blobs {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		out := make([]checkpointAssistantMessage, 0)
-		for _, key := range keys {
-			if msg, ok := parseAssistantBlob(key, snapshot.blobs[key]); ok {
-				out = append(out, msg)
-			}
-		}
-		return out
-	}
-	out := make([]checkpointAssistantMessage, 0)
-	for _, id := range ids {
-		key := fmt.Sprintf("%x", id)
-		raw := snapshot.blobs[key]
-		if len(raw) == 0 {
-			continue
-		}
-		if msg, ok := parseAssistantBlob(key, raw); ok {
-			out = append(out, msg)
-		}
-	}
-	return out
+	return snapshotAssistantMessages(s.checkpointSnapshot())
 }
 
 func parseAssistantBlob(key string, raw []byte) (checkpointAssistantMessage, bool) {
@@ -1242,7 +1260,11 @@ func (s *Session) handleTextDelta(text string) {
 	if live {
 		s.emittedText.WriteString(text)
 	} else if s.holdTimer == nil {
-		s.holdTimer = time.AfterFunc(textHoldWindow, s.releaseTextStream)
+		window := s.holdWindow
+		if window <= 0 {
+			window = textHoldWindow
+		}
+		s.holdTimer = time.AfterFunc(window, s.releaseTextStream)
 	}
 	s.mu.Unlock()
 	if live {
