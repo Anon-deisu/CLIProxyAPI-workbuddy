@@ -284,6 +284,27 @@ func TestExtractOpenAIUsageSeparatesCacheReadAndWrite(t *testing.T) {
 	}
 }
 
+// split-style usage (this proxy's Cursor path): prompt_tokens is the fresh
+// portion only, cache read/write reported as parallel buckets that exceed it.
+// It must NOT be stripped again, or the genuinely-fresh input is lost and the
+// reported input_tokens collapses to 0.
+func TestExtractOpenAIUsageKeepsSplitStyleFreshInput(t *testing.T) {
+	usage := gjson.Parse(`{"prompt_tokens":2,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":25117}}`)
+	input, output, cached := extractOpenAIUsage(usage)
+	if input != 2 || output != 50 || cached != 25117 {
+		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
+	}
+}
+
+// Cache is absent entirely: nothing to strip, fresh input passes through.
+func TestExtractOpenAIUsageNoCache(t *testing.T) {
+	usage := gjson.Parse(`{"prompt_tokens":300,"completion_tokens":50,"prompt_tokens_details":{}}`)
+	input, output, cached := extractOpenAIUsage(usage)
+	if input != 300 || output != 50 || cached != 0 {
+		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
+	}
+}
+
 func TestStreamingTool_MissingIDGetsFallbackWithoutRewritingRealIDs(t *testing.T) {
 	events := runStream(t, streamReq,
 		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"function":{"name":"do_it","arguments":""}}]}}]}`,
