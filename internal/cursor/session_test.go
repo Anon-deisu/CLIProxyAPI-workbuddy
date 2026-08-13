@@ -3,6 +3,7 @@ package cursor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -505,8 +506,37 @@ func TestParallelToolBatchRejectsPartialNativeResumeForHistoryRebuild(t *testing
 	if err != ErrToolResumeRebuild {
 		t.Fatalf("partial parallel batch error=%v", err)
 	}
-	if !s.closed {
-		t.Fatal("partial native batch must close before structured history rebuild")
+	// Closing here used to kill the whole session including the events
+	// channel of any sibling request still streaming from it, which surfaced
+	// downstream as "stream closed before a terminal boundary". The session
+	// stays alive (parked for rebuild) and the sweep tears it down.
+	if s.closed {
+		t.Fatal("partial batch must not close the session under a live sibling consumer")
+	}
+	if !s.parkedForRebuild() {
+		t.Fatal("partial batch must park the session for rebuild")
+	}
+}
+
+// An externally closed session under an active collector routes to the
+// rebuild path while tools are pending, never to a client-facing error.
+func TestCollectorTreatsExternalCloseAsRebuildWhileToolsPending(t *testing.T) {
+	s := &Session{
+		waitingTools: true,
+		pending:      map[string]*pendingExec{"call_1": {}},
+		events:       make(chan StreamEvent, 1),
+		errCh:        make(chan error, 1),
+	}
+	close(s.events)
+
+	if _, err := s.CollectSegment(context.Background()); !errors.Is(err, ErrToolResumeRebuild) {
+		t.Fatalf("collect: want rebuild signal, got %v", err)
+	}
+
+	s2 := &Session{events: make(chan StreamEvent, 1), errCh: make(chan error, 1)}
+	close(s2.events)
+	if _, err := s2.CollectSegment(context.Background()); !errors.Is(err, ErrEmptyTerminal) {
+		t.Fatalf("collect without pending tools: want empty terminal, got %v", err)
 	}
 }
 

@@ -24,6 +24,7 @@ const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 	DefaultAuthDir               = "~/.cli-proxy-api"
+	DefaultCursorBaseURL         = "https://api2.cursor.sh"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -124,6 +125,10 @@ type Config struct {
 
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
+
+	// CursorKey defines Cursor user or service-account API keys.
+	// Keys are exchanged for short-lived Agent Connect credentials at runtime.
+	CursorKey []CursorKey `yaml:"cursor-api-key" json:"cursor-api-key"`
 
 	// Codex configures provider-wide Codex request behavior.
 	Codex CodexConfig `yaml:"codex" json:"codex"`
@@ -487,6 +492,32 @@ type ClaudeKey struct {
 func (k ClaudeKey) GetAPIKey() string  { return k.APIKey }
 func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
 
+// CursorKey represents a Cursor API key that is exchanged for short-lived
+// Agent Connect credentials without an interactive OAuth login.
+type CursorKey struct {
+	// APIKey is a Cursor user or service-account key.
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Priority controls selection preference when multiple credentials match.
+	// Higher values are preferred; defaults to 0.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Prefix optionally namespaces models for this credential.
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
+	// BaseURL optionally overrides the Cursor API endpoint.
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+
+	// ExcludedModels lists model IDs that should be excluded for this credential.
+	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
+
+	// DisableCooling disables auth/model cooldown scheduling for this credential.
+	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+}
+
+func (k CursorKey) GetAPIKey() string  { return k.APIKey }
+func (k CursorKey) GetBaseURL() string { return k.BaseURL }
+
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
 	// Name is the upstream model identifier used when issuing requests.
@@ -798,6 +829,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize native Interactions API key configuration.
 	cfg.SanitizeInteractionsKeys()
 
+	// Sanitize Cursor API key configuration.
+	cfg.SanitizeCursorKeys()
+
 	// Sanitize Vertex-compatible API keys.
 	cfg.SanitizeVertexCompatKeys()
 
@@ -1027,6 +1061,42 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}
+}
+
+// SanitizeCursorKeys trims, deduplicates, and normalizes Cursor API keys.
+func (cfg *Config) SanitizeCursorKeys() {
+	if cfg == nil || len(cfg.CursorKey) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(cfg.CursorKey))
+	out := cfg.CursorKey[:0]
+	for i := range cfg.CursorKey {
+		entry := cfg.CursorKey[i]
+		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		if entry.APIKey == "" {
+			continue
+		}
+		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+		entry.BaseURL = NormalizeCursorBaseURL(entry.BaseURL)
+		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		uniqueKey := entry.APIKey + "|" + entry.BaseURL
+		if _, exists := seen[uniqueKey]; exists {
+			continue
+		}
+		seen[uniqueKey] = struct{}{}
+		out = append(out, entry)
+	}
+	cfg.CursorKey = out
+}
+
+// NormalizeCursorBaseURL canonicalizes the default endpoint to an empty
+// override so omitted and explicitly configured defaults produce one auth ID.
+func NormalizeCursorBaseURL(raw string) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if strings.EqualFold(baseURL, DefaultCursorBaseURL) {
+		return ""
+	}
+	return baseURL
 }
 
 func sanitizeGeminiKeyEntries(entries []GeminiKey) []GeminiKey {

@@ -106,6 +106,41 @@ func drainEvents(s *Session) {
 	}
 }
 
+// Once the opening has reached an append-only SSE client, a later checkpoint
+// cannot repair it by emitting the missing prefix as another delta: that would
+// move the prefix to the end ("次它…" + "每"). The longer hold window handles
+// the normal recovery path; this guard prevents a late checkpoint from
+// corrupting the already-streamed order.
+func TestFlushAssistantTextNeverAppendsLateOpeningAtTail(t *testing.T) {
+	blobID := []byte{0xab, 0xcd, 0xef, 0x0a}
+	full := "每次它返回的都有变化"
+	payload, _ := json.Marshal(map[string]any{
+		"id":      "msg-late-open",
+		"role":    "assistant",
+		"content": []map[string]string{{"type": "text", "text": full}},
+	})
+	s := &Session{
+		blobStore:           map[string][]byte{},
+		events:              make(chan StreamEvent, 16),
+		seenAssistantMsgIDs: map[string]struct{}{},
+	}
+	s.handleTextDelta(strings.TrimPrefix(full, "每"))
+	s.releaseTextStream()
+	drainEvents(s)
+
+	s.conversationState = &agentv1.ConversationStateStructure{
+		RootPromptMessagesJson: [][]byte{blobID},
+	}
+	s.blobStore[sprintfHex(blobID)] = payload
+	s.flushAssistantText(false)
+
+	select {
+	case ev := <-s.events:
+		t.Fatalf("late recovered prefix must not be appended out of order, got %#v", ev)
+	default:
+	}
+}
+
 func TestFlushAssistantTextAppendsCheckpointSuffix(t *testing.T) {
 	blobID := []byte{0xab, 0xcd, 0xef, 0x02}
 	payload, _ := json.Marshal(map[string]any{

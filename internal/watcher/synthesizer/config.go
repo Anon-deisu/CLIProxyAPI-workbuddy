@@ -13,7 +13,7 @@ import (
 )
 
 // ConfigSynthesizer generates Auth entries from configuration API keys.
-// It handles Gemini, Interactions, Claude, Codex, OpenAI-compat, and Vertex-compat providers.
+// It handles Gemini, Interactions, Claude, Codex, Cursor, OpenAI-compat, and Vertex-compat providers.
 type ConfigSynthesizer struct{}
 
 // NewConfigSynthesizer creates a new ConfigSynthesizer instance.
@@ -36,6 +36,8 @@ func (s *ConfigSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth,
 	out = append(out, s.synthesizeClaudeKeys(ctx)...)
 	// Codex API Keys
 	out = append(out, s.synthesizeCodexKeys(ctx)...)
+	// Cursor API Keys
+	out = append(out, s.synthesizeCursorKeys(ctx)...)
 	// OpenAI-compat
 	out = append(out, s.synthesizeOpenAICompat(ctx)...)
 	// Vertex-compat
@@ -218,6 +220,62 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// synthesizeCursorKeys creates auth entries whose API keys are exchanged for
+// short-lived Agent Connect credentials by the Cursor provider.
+func (s *ConfigSynthesizer) synthesizeCursorKeys(ctx *SynthesisContext) []*coreauth.Auth {
+	cfg := ctx.Config
+	now := ctx.Now
+	idGen := ctx.IDGenerator
+
+	out := make([]*coreauth.Auth, 0, len(cfg.CursorKey))
+	seen := make(map[string]struct{}, len(cfg.CursorKey))
+	for i := range cfg.CursorKey {
+		entry := cfg.CursorKey[i]
+		key := strings.TrimSpace(entry.APIKey)
+		if key == "" {
+			continue
+		}
+		baseURL := config.NormalizeCursorBaseURL(entry.BaseURL)
+		identity := key + "\x00" + baseURL
+		if _, exists := seen[identity]; exists {
+			continue
+		}
+		seen[identity] = struct{}{}
+		id, token := idGen.Next("cursor:apikey", key, baseURL)
+		attrs := map[string]string{
+			"source":  fmt.Sprintf("config:cursor[%s]", token),
+			"api_key": key,
+		}
+		if entry.Priority != 0 {
+			attrs["priority"] = strconv.Itoa(entry.Priority)
+		}
+		if baseURL != "" {
+			attrs["base_url"] = baseURL
+		}
+		metadata := map[string]any{}
+		if entry.DisableCooling {
+			metadata["disable_cooling"] = true
+		}
+		a := &coreauth.Auth{
+			ID:         id,
+			Provider:   "cursor",
+			Label:      "cursor-apikey",
+			Prefix:     strings.TrimSpace(entry.Prefix),
+			Status:     coreauth.StatusActive,
+			Attributes: attrs,
+			Metadata:   metadata,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		}
+		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
 		if len(a.Metadata) == 0 {
 			a.Metadata = nil
 		}

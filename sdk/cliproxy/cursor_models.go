@@ -20,7 +20,21 @@ func (s *Service) fetchCursorModelsForAuth(ctx context.Context, auth *coreauth.A
 	if auth == nil {
 		return nil
 	}
-	creds := cursorlib.CredentialsFromMetadata(auth.Metadata)
+	var (
+		creds cursorlib.AccountCredentials
+		err   error
+	)
+	if auth.AuthKind() == coreauth.AuthKindAPIKey {
+		apiKey := strings.TrimSpace(auth.Attributes[coreauth.AttributeAPIKey])
+		baseURL := strings.TrimSpace(auth.Attributes["base_url"])
+		creds, err = cursorlib.CredentialsFromAPIKey(ctx, apiKey, baseURL, auth.Metadata)
+		if err != nil {
+			log.WithError(err).Warnf("cursor: API key exchange failed for auth %s", auth.ID)
+			return nil
+		}
+	} else {
+		creds = cursorlib.CredentialsFromMetadata(auth.Metadata)
+	}
 	if strings.TrimSpace(creds.AccessToken) == "" {
 		return nil
 	}

@@ -1,4 +1,4 @@
-﻿package cursor
+package cursor
 
 import (
 	"context"
@@ -890,6 +890,13 @@ func (s *Session) CollectSegment(ctx context.Context) (*ChatResult, error) {
 			}
 		case ev, ok := <-s.events:
 			if !ok {
+				// The session died under the collector without a boundary
+				// (external close: sweep, sibling teardown). While tools are
+				// pending this is exactly the resume-rebuild situation, not a
+				// client-facing failure.
+				if s.awaitingClientTools() {
+					return nil, ErrToolResumeRebuild
+				}
 				return nil, fmt.Errorf("%w: stream closed before a terminal boundary", ErrEmptyTerminal)
 			}
 			switch ev.Type {
@@ -952,6 +959,12 @@ func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) e
 			}
 		case ev, ok := <-s.events:
 			if !ok {
+				// See CollectSegment: an external close while tools are
+				// pending routes to the rebuild path instead of failing the
+				// client's request.
+				if s.awaitingClientTools() {
+					return ErrToolResumeRebuild
+				}
 				return fmt.Errorf("%w: stream closed before a terminal boundary", ErrEmptyTerminal)
 			}
 			if ev.Type == "tool_call" && ev.ToolCall != nil {
@@ -1025,8 +1038,16 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 				}
 			}
 			if _, ok := selected[item]; !ok {
+				// A partial batch: the client answered a subset and will (or
+				// already did) carry the rest in other requests. Closing here
+				// used to kill the whole session — including the events
+				// channel of any sibling request still streaming from it,
+				// which surfaced downstream as "stream closed before a
+				// terminal boundary". Mark the response ended so the eventual
+				// full submission rebuilds, and leave teardown to the parked
+				// sweep.
+				s.responseEnded = true
 				s.mu.Unlock()
-				_ = s.Close()
 				return ErrToolResumeRebuild
 			}
 		}
@@ -2363,9 +2384,12 @@ func (s *Session) handleThinkingDelta(text string) {
 // The checkpoint is the only thing that can restore a dropped opening, so this
 // is the deadline for waiting on one. Shortening it to 400ms to save latency
 // cost claude-fable-5 the first nine characters of a reply in one run out of
-// three. The checkpoint now releases the hold as soon as it lands, so a fast
-// turn no longer pays the full window anyway.
-const textHoldWindow = 1200 * time.Millisecond
+// three, and 1200ms still allowed a late checkpoint to miss the window. A
+// recovered prefix cannot be appended after streamed text without moving it to
+// the end of the answer, so wait longer for the authoritative opening instead.
+// The checkpoint releases the hold as soon as it lands, so fast turns do not
+// pay the full window.
+const textHoldWindow = 3 * time.Second
 
 func (s *Session) handleTextDelta(text string) {
 	if text == "" {
@@ -3520,22 +3544,58 @@ func nativeToolArguments(variant string, raw proto.Message, def *ToolDefinition)
 	case "subagent_args":
 		args := raw.(*agentv1.SubagentArgs)
 		out := map[string]any{"prompt": args.GetPrompt()}
-		if args.GetSubagentType() != "" {
-			out[nativeArgumentName(def, "subagent_type", "subagent_type_name")] = args.GetSubagentType()
+		// Cursor's SubagentArgs has no description field, while Claude Code's
+		// Task/Agent/Subagent schemas require one. Only synthesize it when the
+		// downstream declaration accepts the field so strict custom tools do
+		// not receive an undeclared argument.
+		if nativeToolHasProperty(def, "description") {
+			out["description"] = subagentDescription(args.GetPrompt(), args.GetSubagentType())
 		}
-		if args.GetModelId() != "" {
-			out["model"] = args.GetModelId()
+		if args.GetSubagentType() != "" {
+			if name, ok := nativeDeclaredArgumentName(def, "subagent_type", "subagent_type_name"); ok {
+				out[name] = args.GetSubagentType()
+			}
+		}
+		if model, ok := nativeSubagentModelArgument(def, args.GetModelId()); ok {
+			out["model"] = model
 		}
 		if args.GetResumeAgentId() != "" {
-			out["resume"] = args.GetResumeAgentId()
+			if name, ok := nativeDeclaredArgumentName(def, "resume", "resume_agent_id"); ok {
+				out[name] = args.GetResumeAgentId()
+			}
 		}
 		if args.RunInBackground != nil {
-			out["run_in_background"] = args.GetRunInBackground()
+			if name, ok := nativeDeclaredArgumentName(def, "run_in_background", "runInBackground"); ok {
+				out[name] = args.GetRunInBackground()
+			}
 		}
 		return out, nil
 	default:
 		return nil, fmt.Errorf("cursor: unsupported native exec mapping %s", variant)
 	}
+}
+
+// subagentDescription derives the required downstream description from the
+// first non-empty prompt line and keeps it within Claude Code's short summary
+// convention.
+func subagentDescription(prompt, subagentType string) string {
+	const maxRunes = 120
+	summary := strings.TrimSpace(prompt)
+	if index := strings.IndexAny(summary, "\n\r"); index >= 0 {
+		summary = strings.TrimSpace(summary[:index])
+	}
+	if summary == "" {
+		if subagentType != "" {
+			summary = "Delegate this task to the " + subagentType + " subagent."
+		} else {
+			summary = "Delegate this task to a subagent."
+		}
+	}
+	runes := []rune(summary)
+	if len(runes) > maxRunes {
+		summary = string(runes[:maxRunes-1]) + "…"
+	}
+	return summary
 }
 
 func localShellCommand(command string) []string {
@@ -3617,6 +3677,95 @@ func nativeToolHasProperty(def *ToolDefinition, name string) bool {
 	}
 	_, ok = properties[name]
 	return ok
+}
+
+func nativeDeclaredArgumentName(def *ToolDefinition, candidates ...string) (string, bool) {
+	if def == nil {
+		return "", false
+	}
+	properties, ok := def.Parameters["properties"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	for _, candidate := range candidates {
+		if _, exists := properties[candidate]; exists {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// nativeSubagentModelArgument projects Cursor's concrete model ID onto the
+// downstream Task/Agent schema. Claude Code accepts short families such as
+// "sonnet" or "opus", while Cursor emits IDs such as "claude-opus-5" and
+// "composer-2.5-fast". An unrepresentable optional value must be omitted:
+// forwarding it verbatim makes the client reject the entire tool call before
+// it can run.
+func nativeSubagentModelArgument(def *ToolDefinition, modelID string) (string, bool) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" || !nativeToolHasProperty(def, "model") {
+		return "", false
+	}
+	properties, _ := def.Parameters["properties"].(map[string]any)
+	allowed := nativeStringEnum(properties["model"])
+	if len(allowed) == 0 {
+		return modelID, true
+	}
+	for _, value := range allowed {
+		if strings.EqualFold(value, modelID) {
+			return value, true
+		}
+	}
+	for _, family := range []string{"sonnet", "opus", "haiku", "fable"} {
+		if !nativeModelHasFamilyToken(modelID, family) {
+			continue
+		}
+		for _, value := range allowed {
+			if strings.EqualFold(value, family) {
+				return value, true
+			}
+		}
+	}
+	return "", false
+}
+
+func nativeModelHasFamilyToken(modelID, family string) bool {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	family = strings.ToLower(strings.TrimSpace(family))
+	if modelID == "" || family == "" {
+		return false
+	}
+	for _, token := range strings.FieldsFunc(modelID, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		if token == family {
+			return true
+		}
+	}
+	return false
+}
+
+func nativeStringEnum(schema any) []string {
+	node, ok := schema.(map[string]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	switch values := node["enum"].(type) {
+	case []any:
+		for _, value := range values {
+			if text, okText := value.(string); okText && strings.TrimSpace(text) != "" {
+				out = append(out, strings.TrimSpace(text))
+			}
+		}
+	case []string:
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				out = append(out, value)
+			}
+		}
+	}
+	return out
 }
 
 func putNativeOptional[T comparable](out map[string]any, key string, value *T) {

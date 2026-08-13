@@ -740,6 +740,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/interactions-api-key", s.mgmt.PatchInteractionsKey)
 		mgmt.DELETE("/interactions-api-key", s.mgmt.DeleteInteractionsKey)
 
+		mgmt.GET("/cursor-api-key", s.mgmt.GetCursorKeys)
+		mgmt.POST("/cursor-api-key", s.mgmt.PostCursorKey)
+		mgmt.PUT("/cursor-api-key", s.mgmt.PutCursorKeys)
+		mgmt.PATCH("/cursor-api-key", s.mgmt.PatchCursorKey)
+		mgmt.DELETE("/cursor-api-key", s.mgmt.DeleteCursorKey)
+
 		mgmt.GET("/logs", s.mgmt.GetLogs)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
@@ -963,6 +969,15 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	} else {
 		data = patchedData
 	}
+	patchedData, errPatch = managementasset.AddCursorAPIKeyManagerToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support Cursor API key manager injection")
+	} else {
+		data = patchedData
+	}
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }
 

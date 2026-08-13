@@ -523,7 +523,6 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 	results := trailingToolResults(messages)
 	if len(results) > 0 {
 		session, err := cursorlib.DefaultSessionManager().ResolveForToolResults(results)
-		hadLiveRun := err == nil
 		if err == nil {
 			if err = session.SubmitToolResults(results); err == nil {
 				return session, nil
@@ -533,21 +532,34 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 			} else {
 				log.Warnf("cursor: stream submit tool results failed (%v); rebuilding turn from history", err)
 			}
-			_ = session.Close()
+			// ErrToolResumeRebuild can mean this request supplied only part of
+			// a parallel batch. SubmitToolResults deliberately parks that
+			// shared session so sibling requests can submit the remaining
+			// results; closing it here would undo that protection and close the
+			// sibling's event channel. Other submit failures still tear down the
+			// unusable live run before rebuilding.
+			if shouldCloseCursorSessionAfterToolSubmit(err) {
+				_ = session.Close()
+			}
 		} else {
 			log.Warnf("cursor: stream resume tool session failed (%v); rebuilding turn from history", err)
 		}
 		// The structured assistant tool calls and tool result messages already
 		// carry the complete continuation. Do not add a synthetic user message:
 		// it changes role ordering and can make the provider reject the request.
-		// Rotate only if a live run actually died while owning this result. A
-		// missing in-memory session (restart/cross-instance routing) must keep
-		// the explicit conversation id or every agent step rewrites the cache.
-		if hadLiveRun {
-			opts = append(opts, cursorlib.WithConversationID(uuid.NewString()))
-		}
+		//
+		// Keep the deterministic conversation ID on every rebuild. Rotating it
+		// here orphans Cursor's server-side pending tool state and prevents the
+		// checkpoint continuation cache from matching, forcing every subsequent
+		// tool step to rewrite the full history (large input with zero terminal
+		// output). A restart or cross-instance resume needs the stable ID for the
+		// same reason.
 	}
 	return cursorlib.StartSession(ctx, creds, model, messages, tools, opts...)
+}
+
+func shouldCloseCursorSessionAfterToolSubmit(err error) bool {
+	return err != nil && !errors.Is(err, cursorlib.ErrToolResumeRebuild)
 }
 
 // translateCursorRequest gives the Responses entrypoint a deterministic
@@ -885,6 +897,16 @@ func (e *CursorExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 }
 
 func (e *CursorExecutor) ensureCredentials(ctx context.Context, auth *cliproxyauth.Auth) (cursorlib.AccountCredentials, error) {
+	if auth != nil && auth.AuthKind() == cliproxyauth.AuthKindAPIKey {
+		apiKey := ""
+		baseURL := ""
+		if auth.Attributes != nil {
+			apiKey = strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeAPIKey])
+			baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+		}
+		return cursorlib.CredentialsFromAPIKey(ctx, apiKey, baseURL, auth.Metadata)
+	}
+
 	creds := cursorlib.CredentialsFromMetadata(authMetadata(auth))
 	if creds.AccessToken == "" {
 		return creds, fmt.Errorf("cursor: auth missing access_token")

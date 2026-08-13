@@ -211,6 +211,188 @@ func TestLocalShellMappingUsesInterpreterArgv(t *testing.T) {
 	}
 }
 
+func TestNativeSubagentSynthesizesDeclaredDescription(t *testing.T) {
+	def := &ToolDefinition{Name: "Task", Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"prompt":        map[string]any{"type": "string"},
+			"description":   map[string]any{"type": "string"},
+			"subagent_type": map[string]any{"type": "string"},
+		},
+	}}
+	args, err := nativeToolArguments("subagent_args", &agentv1.SubagentArgs{
+		Prompt:       "Inspect the authentication flow.\nReturn only concrete findings.",
+		SubagentType: "explore",
+	}, def)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := args["description"]; got != "Inspect the authentication flow." {
+		t.Fatalf("description = %#v", got)
+	}
+	if got := args["subagent_type"]; got != "explore" {
+		t.Fatalf("subagent_type = %#v", got)
+	}
+}
+
+func TestNativeSubagentDescriptionIsSchemaSafeAndRuneBounded(t *testing.T) {
+	withoutDescription := &ToolDefinition{Name: "custom_subagent", Parameters: map[string]any{
+		"properties": map[string]any{"prompt": map[string]any{"type": "string"}},
+	}}
+	args, err := nativeToolArguments("subagent_args", &agentv1.SubagentArgs{Prompt: "Do the work"}, withoutDescription)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := args["description"]; exists {
+		t.Fatal("description must not be injected into a schema that does not declare it")
+	}
+
+	longPrompt := ""
+	for i := 0; i < 130; i++ {
+		longPrompt += "界"
+	}
+	description := subagentDescription(longPrompt, "")
+	if got := len([]rune(description)); got != 120 {
+		t.Fatalf("description rune length = %d, want 120", got)
+	}
+	if description[len(description)-len("…"):] != "…" {
+		t.Fatalf("truncated description = %q", description)
+	}
+	if fallback := subagentDescription(" \n ", "explore"); fallback != "Delegate this task to the explore subagent." {
+		t.Fatalf("fallback description = %q", fallback)
+	}
+}
+
+func TestNativeSubagentModelRespectsDeclaredEnum(t *testing.T) {
+	enumDef := &ToolDefinition{Name: "Task", Parameters: map[string]any{
+		"properties": map[string]any{
+			"prompt": map[string]any{"type": "string"},
+			"model": map[string]any{
+				"type": "string",
+				"enum": []any{"sonnet", "opus", "haiku", "fable"},
+			},
+		},
+	}}
+	tests := []struct {
+		name    string
+		modelID string
+		want    string
+		present bool
+	}{
+		{name: "empty", modelID: "", present: false},
+		{name: "sonnet wire id", modelID: "cursor-claude-4.6-sonnet", want: "sonnet", present: true},
+		{name: "opus wire id", modelID: "cursor-claude-opus-5", want: "opus", present: true},
+		{name: "haiku wire id", modelID: "cursor-claude-haiku-4.5", want: "haiku", present: true},
+		{name: "fable wire id", modelID: "cursor-claude-fable-5", want: "fable", present: true},
+		{name: "family with suffix", modelID: "cursor-claude-opus-5-fast", want: "opus", present: true},
+		{name: "family with thinking variant", modelID: "claude-sonnet-4.5-thinking", want: "sonnet", present: true},
+		{name: "exact enum", modelID: "fable", want: "fable", present: true},
+		{name: "mixed case", modelID: "Cursor-Claude-4.6-Sonnet", want: "sonnet", present: true},
+		{name: "unrepresentable cursor model", modelID: "composer-2.5-fast", present: false},
+		{name: "non claude model", modelID: "gpt-5.4", present: false},
+		{name: "embedded token", modelID: "sonsonnet", present: false},
+		{name: "embedded token with prefix", modelID: "myopus-v3", present: false},
+		{name: "unknown family", modelID: "cursor-claude-4.6-turbo", present: false},
+		{name: "standalone family without claude", modelID: "fast-opus-x", want: "opus", present: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			args, err := nativeToolArguments("subagent_args", &agentv1.SubagentArgs{
+				Prompt:  "Inspect authentication",
+				ModelId: test.modelID,
+			}, enumDef)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, present := args["model"]
+			if present != test.present || (present && got != test.want) {
+				t.Fatalf("model = %#v, present=%v; want %q, present=%v", got, present, test.want, test.present)
+			}
+		})
+	}
+}
+
+func TestNativeSubagentModelIsSchemaSafe(t *testing.T) {
+	withoutModel := &ToolDefinition{Name: "Task", Parameters: map[string]any{
+		"properties": map[string]any{"prompt": map[string]any{"type": "string"}},
+	}}
+	args, err := nativeToolArguments("subagent_args", &agentv1.SubagentArgs{
+		Prompt: "Inspect authentication", ModelId: "composer-2.5-fast",
+	}, withoutModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := args["model"]; present {
+		t.Fatal("model must not be injected into a schema that does not declare it")
+	}
+
+	unrestricted := &ToolDefinition{Name: "Task", Parameters: map[string]any{
+		"properties": map[string]any{
+			"prompt": map[string]any{"type": "string"},
+			"model":  map[string]any{"type": "string"},
+		},
+	}}
+	args, err = nativeToolArguments("subagent_args", &agentv1.SubagentArgs{
+		Prompt: "Inspect authentication", ModelId: "composer-2.5-fast",
+	}, unrestricted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := args["model"]; got != "composer-2.5-fast" {
+		t.Fatalf("unrestricted model = %#v", got)
+	}
+}
+
+func TestNativeSubagentOptionalFieldsRespectSchema(t *testing.T) {
+	resume := "agent-123"
+	background := false
+	args, err := nativeToolArguments("subagent_args", &agentv1.SubagentArgs{
+		Prompt:          "Inspect authentication",
+		SubagentType:    "explore",
+		ModelId:         "composer-2.5-fast",
+		ResumeAgentId:   &resume,
+		RunInBackground: &background,
+	}, &ToolDefinition{Name: "strict_task", Parameters: map[string]any{
+		"properties": map[string]any{
+			"prompt":      map[string]any{"type": "string"},
+			"description": map[string]any{"type": "string"},
+			"model": map[string]any{
+				"type": "string",
+				"enum": []any{"sonnet", "opus", "haiku", "fable"},
+			},
+		},
+		"additionalProperties": false,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(args) != 2 || args["prompt"] == nil || args["description"] == nil {
+		t.Fatalf("strict arguments contain undeclared fields: %#v", args)
+	}
+
+	args, err = nativeToolArguments("subagent_args", &agentv1.SubagentArgs{
+		Prompt:          "Inspect authentication",
+		SubagentType:    "explore",
+		ResumeAgentId:   &resume,
+		RunInBackground: &background,
+	}, &ToolDefinition{Name: "Task", Parameters: map[string]any{
+		"properties": map[string]any{
+			"prompt":             map[string]any{"type": "string"},
+			"subagent_type_name": map[string]any{"type": "string"},
+			"resume_agent_id":    map[string]any{"type": "string"},
+			"runInBackground":    map[string]any{"type": "boolean"},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args["subagent_type_name"] != "explore" ||
+		args["resume_agent_id"] != resume ||
+		args["runInBackground"] != false {
+		t.Fatalf("declared aliases were not mapped: %#v", args)
+	}
+}
+
 func TestNativeReadExecRoundTripUsesDeclaredToolName(t *testing.T) {
 	offset := int32(4)
 	limit := uint32(20)
