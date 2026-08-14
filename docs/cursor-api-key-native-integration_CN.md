@@ -74,9 +74,11 @@ auth/<email>_cursor-api-key.json
 
 `internal/managementasset/cursor_api_key.go` 在 serve `management.html` 时注入一段 IIFE 脚本（`<script id="cpa-key-inline-script">`）：
 
-- 用 `MutationObserver` **扫描文档中的 Cursor OAuth provider 卡片**，在卡片内嵌入一个列表 + 内联输入框（填 Key → 「添加」）;
-- 通过 `managementPath = '/v0/management/'` + `cursor-api-key` 拼接端点（**连续字面量 `/v0/management/cursor-api-key` 不会出现在脚本里**）；
-- 状态提示：「共 N 个 Key；完整编辑请前往「Auth Files → Cursor API Key」」；
+- 用 `MutationObserver` **扫描文档中的单个 Cursor OAuth provider 卡片**（`findCursorContainer` 只挂载首个匹配容器，杜绝重复注入），在卡片内嵌入**极简内联输入框**；
+- OAuth 页面**只允许出现三个元素**：API Key 输入框、提交按钮（「添加」）、以及原有的 OAuth 登录按钮——**不出现标题、标签文字、提示、列表、刷新按钮、邮箱/标识输入框等任何其它字样或元素**；
+- 输入框 `placeholder` 为 `'Cursor API Key'`，提交即 `POST /v0/management/cursor-api-key`（端点由 `managementPath = '/v0/management/'` + `cursor-api-key` 拼接，**连续字面量 `/v0/management/cursor-api-key` 不会出现在脚本里**）；
+- 提交成功即清空输入框；失败仅将输入框边框变红，**不输出任何文字**；
+- **刻意不做 GET 读回、不渲染管理列表**——列表只归属 `#/auth-files → Cursor API Key`，绝不回贴到 OAuth 页；
 - 认证复用已登录面板自动捕获的 `Authorization: Bearer`，无手工填表入口。
 
 ### 幂等性（关键，生产 bug 修复）
