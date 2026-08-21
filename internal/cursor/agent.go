@@ -130,15 +130,7 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 	// Pull client system prompts out so we don't bury them behind a dummy
 	// "You are a helpful assistant." blob (that was a major context-loss source).
 	systemPrompt, conversation := splitSystemMessages(messages)
-	if strings.TrimSpace(systemPrompt) == "" {
-		systemPrompt = "You are a helpful assistant."
-	}
-	systemBlob := storeBlob(blobStore, mustJSON(map[string]any{
-		"role": "system",
-		"content": []map[string]string{
-			{"type": "text", "text": systemPrompt},
-		},
-	}))
+	systemBlob := storeBlob(blobStore, systemPromptBlob(systemPrompt))
 
 	var activeUser *ChatMessage
 	historyEnd := len(conversation)
@@ -245,6 +237,13 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 		}
 	}
 
+	if activeUser != nil && isResumeUserText(activeUser.Content) &&
+		(conversationEndsWithToolResults(conversation[:historyEnd]) || repeatedReadWithoutWrite(conversation[:historyEnd])) {
+		// "继续" is not a new task. Treating it as the whole action dropped
+		// the tool-result nudge and the model just repeated Read for 20+ minutes.
+		activeUser = nil
+	}
+
 	// Keep the Agent's user message as the user's actual instruction; client
 	// injected context rides along as a preceding history blob instead.
 	var activeUserMessage *agentv1.UserMessage
@@ -257,8 +256,12 @@ func buildRunRequestForConversation(model string, messages []ChatMessage, tools 
 		// themselves already sit in the history blobs; this only gives the
 		// turn an action to execute. Constant wording keeps the prompt prefix
 		// cache-stable.
+		nudge := toolContinuationNudge
+		if repeatedReadWithoutWrite(conversation) {
+			nudge = writeLoopBreakerNudge
+		}
 		activeUserMessage = &agentv1.UserMessage{
-			Text:      toolContinuationNudge,
+			Text:      nudge,
 			MessageId: uuid.NewString(),
 		}
 	}
@@ -422,10 +425,177 @@ const toolContinuationNudge = "The tool results above have been delivered. " +
 	"Continue the turn using them and finish the pending request. " +
 	"Do not re-run tool calls that already have results."
 
+// writeLoopBreakerNudge is used when the rebuilt history is a Read-only
+// spin (the model promised to Write, only Read arrived, the local file
+// never appeared). A bare "continue" made that loop last tens of minutes.
+const writeLoopBreakerNudge = "The file was never written. Previous turns only called Read. " +
+	"Call Write now with the complete file contents. Do not Read that file again."
+
 // assistantContinuationNudge drives the client prefill / "continue" pattern,
 // where the newest message is a partial assistant turn to extend.
 const assistantContinuationNudge = "Continue exactly from where the assistant " +
 	"message above stopped. Do not repeat any text that was already written."
+
+func isResumeUserText(text string) bool {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "继续", "繼續", "continue", "go on", "keep going", "please continue", "go ahead", "cont":
+		return true
+	default:
+		return false
+	}
+}
+
+func repeatedReadWithoutWrite(messages []ChatMessage) bool {
+	return repeatedReadCount(messages, "") >= 3
+}
+
+func isReadToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "read", "read_file", "readfile":
+		return true
+	default:
+		return false
+	}
+}
+
+func isReadExecVariant(variant string) bool {
+	return variant == "read_args" || variant == "pi_read_args"
+}
+
+func isMutatingToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "write", "edit", "multiedit", "apply_patch":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeToolPath(path string) string {
+	path = strings.TrimSpace(path)
+	path = strings.ReplaceAll(path, "\\", "/")
+	return strings.ToLower(path)
+}
+
+func toolCallPath(args map[string]any) string {
+	if args == nil {
+		return ""
+	}
+	for _, key := range []string{"path", "file_path", "filePath", "filename"} {
+		if value, ok := args[key].(string); ok {
+			if path := normalizeToolPath(value); path != "" {
+				return path
+			}
+		}
+	}
+	return ""
+}
+
+func repeatedReadCount(messages []ChatMessage, path string) int {
+	path = normalizeToolPath(path)
+	reads := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role == "user" && !isResumeUserText(msg.Content) && strings.TrimSpace(msg.Content) != "" {
+			break
+		}
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, call := range msg.ToolCalls {
+			if isMutatingToolName(call.Name) {
+				return reads
+			}
+			if !isReadToolName(call.Name) {
+				continue
+			}
+			if path != "" && toolCallPath(call.Arguments) != path {
+				continue
+			}
+			reads++
+		}
+	}
+	return reads
+}
+
+func lastReadResultForPath(messages []ChatMessage, path string) string {
+	path = normalizeToolPath(path)
+	if path == "" {
+		return ""
+	}
+	ids := map[string]struct{}{}
+	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, call := range msg.ToolCalls {
+			if isReadToolName(call.Name) && toolCallPath(call.Arguments) == path && strings.TrimSpace(call.ID) != "" {
+				ids[call.ID] = struct{}{}
+			}
+		}
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != "tool" {
+			continue
+		}
+		if _, ok := ids[msg.ToolCallID]; ok {
+			return msg.Content
+		}
+	}
+	return ""
+}
+
+const duplicateReadReplyPrefix = "This file was already read in this turn. Do not Read it again. Call Write now with the complete file contents.\n"
+
+func duplicateReadReplyText(messages []ChatMessage, path string) string {
+	return duplicateReadReplyTextFrom(lastReadResultForPath(messages, path))
+}
+
+func duplicateReadReplyTextFrom(prev string) string {
+	if strings.TrimSpace(prev) != "" {
+		return duplicateReadReplyPrefix + "Previous Read result:\n" + clampMessageContent(prev)
+	}
+	return strings.TrimSpace(duplicateReadReplyPrefix)
+}
+
+func seedTurnReadState(messages []ChatMessage) (map[string]int, map[string]string) {
+	counts := map[string]int{}
+	last := map[string]string{}
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role == "user" && !isResumeUserText(msg.Content) && strings.TrimSpace(msg.Content) != "" {
+			break
+		}
+		if msg.Role != "assistant" {
+			continue
+		}
+		hitMut := false
+		for _, call := range msg.ToolCalls {
+			if isMutatingToolName(call.Name) {
+				hitMut = true
+				break
+			}
+			if !isReadToolName(call.Name) {
+				continue
+			}
+			path := toolCallPath(call.Arguments)
+			if path == "" {
+				continue
+			}
+			counts[path]++
+		}
+		if hitMut {
+			break
+		}
+	}
+	for path := range counts {
+		if text := lastReadResultForPath(messages, path); text != "" {
+			last[path] = text
+		}
+	}
+	return counts, last
+}
 
 // conversationEndsWithToolResults reports whether the newest substantive
 // message is a tool result, i.e. the request is a tool continuation.
@@ -435,7 +605,12 @@ func conversationEndsWithToolResults(conversation []ChatMessage) bool {
 		switch conversation[i].Role {
 		case "tool":
 			sawTool = true
-		case "user", "assistant":
+		case "user":
+			if isResumeUserText(conversation[i].Content) {
+				continue
+			}
+			return sawTool
+		case "assistant":
 			return sawTool
 		}
 	}
@@ -518,6 +693,38 @@ func splitSystemMessages(messages []ChatMessage) (systemPrompt string, conversat
 		conversation = append(conversation, msg)
 	}
 	return truncateRunes(strings.Join(parts, "\n\n"), maxSystemPromptRunes), conversation
+}
+
+// systemInstructionLabel introduces a relayed system prompt. Wording is
+// constant so the prompt prefix stays byte-stable and the provider cache keeps
+// hitting across turns.
+const systemInstructionLabel = "The following are system instructions for this conversation. " +
+	"Follow them for every subsequent reply.\n\n"
+
+// systemPromptBlob renders the client's system prompt as a root-prompt message.
+//
+// Cursor's Agent owns the system prompt: it accepts a blob with role "system"
+// and then discards it, so a client system message reached the model as nothing
+// at all — the same text scored identical prompt_tokens whether it was sent or
+// omitted, and instructions in it were never followed. A user-role blob does
+// arrive, so the prompt travels as one, labelled to be read as standing
+// instruction rather than a question to answer. With no client prompt the
+// historical placeholder shape is kept so the root prompt is never empty.
+func systemPromptBlob(systemPrompt string) []byte {
+	if strings.TrimSpace(systemPrompt) == "" {
+		return mustJSON(map[string]any{
+			"role": "system",
+			"content": []map[string]string{
+				{"type": "text", "text": "You are a helpful assistant."},
+			},
+		})
+	}
+	return mustJSON(map[string]any{
+		"role": "user",
+		"content": []map[string]string{
+			{"type": "text", "text": systemInstructionLabel + systemPrompt},
+		},
+	})
 }
 
 func mustJSON(v any) []byte {

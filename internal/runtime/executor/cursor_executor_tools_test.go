@@ -49,6 +49,27 @@ func TestCursorToolChoiceConstraintNeverTurnsCompletedResponseIntoError(t *testi
 	// `cursor: tool_choice required tool Read`.
 }
 
+func TestShouldRetryToolTailWithoutContinuation(t *testing.T) {
+	hard := fmt.Errorf(`cursor connect end-stream error: {"code":"resource_exhausted","details":[{"debug":{"error":"ERROR_PROVIDER_ERROR","details":{"additionalInfo":{"providerStatusCode":"400"}}}}]}`)
+	policy := fmt.Errorf(`cursor connect end-stream error: {"code":"invalid_argument","details":[{"debug":{"error":"ERROR_OPENAI","details":{"title":"Request blocked by Anthropic","detail":"blocked under [Anthropic's Usage Policy]","analyticsMetadata":{"actionRequired":"cyber_policy_review"}}}}]}`)
+	messages := []cursor.ChatMessage{
+		{Role: "assistant", ToolCalls: []cursor.ToolCall{{ID: "c1", Name: "Bash"}}},
+		{Role: "tool", ToolCallID: "c1", Content: "ok"},
+	}
+	if !shouldRetryToolTailWithoutContinuation(true, messages, hard) {
+		t.Fatal("rejected continuation tool rebuild must retry from history")
+	}
+	if shouldRetryToolTailWithoutContinuation(false, messages, hard) {
+		t.Fatal("full-history runs must not loop")
+	}
+	if shouldRetryToolTailWithoutContinuation(true, []cursor.ChatMessage{{Role: "user", Content: "hi"}}, hard) {
+		t.Fatal("plain asks are not tool-tail rebuilds")
+	}
+	if shouldRetryToolTailWithoutContinuation(true, messages, policy) {
+		t.Fatal("policy blocks must not be retried")
+	}
+}
+
 func TestToolResumeRebuildKeepsSharedSessionAlive(t *testing.T) {
 	if shouldCloseCursorSessionAfterToolSubmit(cursor.ErrToolResumeRebuild) {
 		t.Fatal("rebuild signal must not close a session shared by parallel tool-result requests")
@@ -195,6 +216,18 @@ func TestHumanizeLeavesOtherErrorsAlone(t *testing.T) {
 	}
 }
 
+func TestCursorTransportResetIncludesResponseBodyClosed(t *testing.T) {
+	closed := fmt.Errorf("cursor: stream error while awaiting client tool results: http2: response body closed")
+	if !isCursorTransportReset(closed) || !isCursorTransientProviderError(closed) {
+		t.Fatal("response body closed must retry like other H2 resets")
+	}
+	humanized := humanizeCursorError(closed)
+	var gateway statusErr
+	if !errors.As(humanized, &gateway) || gateway.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("response body closed must surface as 502, got %T %v", humanized, humanized)
+	}
+}
+
 func TestCursorErrorClassification(t *testing.T) {
 	transient := fmt.Errorf(`cursor connect end-stream error: {"code":"unavailable","message":"Error","details":[{"debug":{"error":"ERROR_OPENAI","details":{"title":"Unable to reach the model provider"}}}]}`)
 	if !isCursorTransientProviderError(transient) {
@@ -242,5 +275,16 @@ func TestApplyCursorReasoningEffort(t *testing.T) {
 	}
 	if !strings.HasSuffix(applyCursorReasoningEffort("m", []byte(`{"reasoning_effort":"auto"}`)), "-thinking-high") {
 		t.Fatalf("auto mapping failed")
+	}
+}
+
+func TestCursorDownstreamPing(t *testing.T) {
+	claude := string(cursorDownstreamPing(translator.FormatClaude))
+	if !strings.Contains(claude, "event: ping") || !strings.Contains(claude, `"type":"ping"`) {
+		t.Fatalf("claude ping = %q", claude)
+	}
+	openai := string(cursorDownstreamPing(translator.FormatOpenAI))
+	if !strings.HasPrefix(openai, ": keep-alive") {
+		t.Fatalf("openai ping = %q", openai)
 	}
 }

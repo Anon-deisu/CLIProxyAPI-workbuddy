@@ -2,6 +2,7 @@ package cursor
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,19 +22,23 @@ const (
 	// account — requests then queued until the gateway's 15-minute 504.
 	pendingIdleTTL = 20 * time.Minute
 	// parkedRebuildTTL bounds sessions whose upstream response already ended
-	// while tools were pending. Resuming those always rebuilds (the checkpoint
-	// is remembered at Close, and the tool-tail continuation serves the
-	// results), so the parked object only exists to route the rebuild — yet
+	// while tools were pending. Resuming those always rebuilds from client
+	// history, so the parked object only exists to route that rebuild — yet
 	// each one pins the conversation's blob store. Under upstream reset storms
 	// they accumulated gigabytes within the hour and OOM-killed the process.
 	parkedRebuildTTL = 3 * time.Minute
+	// toolTombstoneTTL keeps tool_call_id indexes after a parked session is
+	// closed so a client retry a few seconds later still takes the rebuild
+	// path instead of "unknown or expired tool_call_id".
+	toolTombstoneTTL = 20 * time.Minute
 )
 
 // SessionManager tracks live Agent sessions waiting on client tool results.
 type SessionManager struct {
-	mu       sync.Mutex
-	sessions map[string]*Session // session id
-	pending  map[string]*Session // tool_call_id -> session
+	mu         sync.Mutex
+	sessions   map[string]*Session // session id
+	pending    map[string]*Session // tool_call_id -> session
+	tombstones map[string]time.Time
 }
 
 var defaultSessionManager = NewSessionManager()
@@ -44,8 +49,9 @@ func DefaultSessionManager() *SessionManager { return defaultSessionManager }
 // NewSessionManager creates an empty manager.
 func NewSessionManager() *SessionManager {
 	m := &SessionManager{
-		sessions: map[string]*Session{},
-		pending:  map[string]*Session{},
+		sessions:   map[string]*Session{},
+		pending:    map[string]*Session{},
+		tombstones: map[string]time.Time{},
 	}
 	go m.reaper()
 	return m
@@ -79,8 +85,10 @@ func (m *SessionManager) BindPending(toolCallID string, session *Session) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.clearTombstoneLocked(toolCallID)
 	m.pending[toolCallID] = session
 	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
+		m.clearTombstoneLocked(safe)
 		m.pending[safe] = session
 	}
 	session.touch()
@@ -117,8 +125,10 @@ func (m *SessionManager) RebindSessionPending(session *Session, toolCallIDs []st
 		if id == "" {
 			continue
 		}
+		m.clearTombstoneLocked(id)
 		m.pending[id] = session
 		if safe := util.SanitizeClaudeToolID(id); safe != "" && safe != id {
+			m.clearTombstoneLocked(safe)
 			m.pending[safe] = session
 		}
 	}
@@ -191,11 +201,13 @@ func (m *SessionManager) ResolveForToolResults(results []ToolResult) (*Session, 
 		}
 		session := m.lookupPendingLocked(result.ToolCallID)
 		if session == nil {
-			// Clients that retry a long-dead turn land here forever, so keep
-			// this quiet; the caller already logs the rebuild it falls back to.
 			found := m.scanSessionsForPendingLocked(result.ToolCallID)
 			log.Debugf("cursor: no live session for tool_call_id %q (%d bound; scan=%s)", result.ToolCallID, len(m.pending), found)
-			return nil, fmt.Errorf("cursor: unknown or expired tool_call_id %s", result.ToolCallID)
+			// Missing ids are a rebuild, not a client-facing failure. The
+			// structured tool history on the next StartSession is complete;
+			// returning "unknown or expired" only produced 500s after a
+			// stream reset.
+			return nil, ErrToolResumeRebuild
 		}
 		if owner == nil {
 			owner = session
@@ -216,11 +228,19 @@ func (m *SessionManager) Remove(session *Session) {
 	if m == nil || session == nil {
 		return
 	}
+	parked := session.parkedForRebuild()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sessions, session.ID)
+	if m.tombstones == nil {
+		m.tombstones = map[string]time.Time{}
+	}
+	expires := time.Now().Add(toolTombstoneTTL)
 	for id, owner := range m.pending {
 		if owner != nil && owner.ID == session.ID {
+			if parked {
+				m.tombstones[id] = expires
+			}
 			delete(m.pending, id)
 		}
 	}
@@ -260,9 +280,69 @@ func (m *SessionManager) Sweep(ttl time.Duration) {
 			stale = append(stale, session)
 		}
 	}
+	m.expireTombstonesLocked(time.Now())
 	m.mu.Unlock()
 	for _, session := range stale {
 		_ = session.Close()
 		m.Remove(session)
+	}
+}
+
+// RememberToolTombstones keeps tool_call_id indexes after the live session is
+// gone so the next client POST still rebuilds instead of treating the ids as
+// unknown.
+func (m *SessionManager) RememberToolTombstones(ids []string) {
+	if m == nil || len(ids) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tombstones == nil {
+		m.tombstones = map[string]time.Time{}
+	}
+	expires := time.Now().Add(toolTombstoneTTL)
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		m.tombstones[id] = expires
+		if safe := util.SanitizeClaudeToolID(id); safe != "" && safe != id {
+			m.tombstones[safe] = expires
+		}
+	}
+}
+
+func (m *SessionManager) hasTombstoneLocked(toolCallID string) bool {
+	if m == nil || m.tombstones == nil || toolCallID == "" {
+		return false
+	}
+	now := time.Now()
+	if expires, ok := m.tombstones[toolCallID]; ok && now.Before(expires) {
+		return true
+	}
+	if safe := util.SanitizeClaudeToolID(toolCallID); safe != "" && safe != toolCallID {
+		if expires, ok := m.tombstones[safe]; ok && now.Before(expires) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *SessionManager) clearTombstoneLocked(toolCallID string) {
+	if m == nil || m.tombstones == nil || toolCallID == "" {
+		return
+	}
+	delete(m.tombstones, toolCallID)
+}
+
+func (m *SessionManager) expireTombstonesLocked(now time.Time) {
+	if m == nil || m.tombstones == nil {
+		return
+	}
+	for id, expires := range m.tombstones {
+		if !expires.After(now) {
+			delete(m.tombstones, id)
+		}
 	}
 }

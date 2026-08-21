@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
@@ -138,11 +139,21 @@ type Session struct {
 	// for client tools. The request side may still accept mcp_result writes,
 	// but no further InteractionUpdates will arrive — resume must rebuild.
 	responseEnded bool
-	cancel        context.CancelFunc
-	done          <-chan struct{}
-	lastActivity  time.Time
-	manager       *SessionManager
-	parallelTools bool
+	// publishedToolIDs are tool_call ids already shown to the downstream
+	// client. Rebinds must not drop them: Claude Code comes back with exactly
+	// these ids, and losing them produced "unknown or expired tool_call_id".
+	publishedToolIDs map[string]struct{}
+	// history is the client transcript for this run. Used to stop a Read-only
+	// spin: after the same file has already been read, another Read is
+	// answered here instead of being shown to Claude Code again.
+	history        []ChatMessage
+	turnReadCounts map[string]int
+	lastReadByPath map[string]string
+	cancel         context.CancelFunc
+	done           <-chan struct{}
+	lastActivity   time.Time
+	manager        *SessionManager
+	parallelTools  bool
 	// Cursor can send TurnEnded after the public tool boundary. Keep counters
 	// keyed by the Agent segment they belong to so a late previous-turn update
 	// can never be charged to the next HTTP continuation.
@@ -189,6 +200,10 @@ type Session struct {
 	// text deltas are buffered rather than emitted, so consumer-side idle
 	// detection must not rely on client-visible events alone.
 	lastFrame time.Time
+	// lastEmit is the last time a client-visible token or tool_call left
+	// this session. Downstream pings used to keep Claude Code "Composing"
+	// for 20+ minutes after the model had already gone silent.
+	lastEmit time.Time
 	// InteractionUpdate is the authoritative lifecycle envelope for native
 	// tool ids and provider batch identity. Exec may arrive before or after it.
 	lifecyclesByID   map[string]*nativeLifecycle
@@ -241,6 +256,18 @@ func WithConversationID(conversationID string) StartOption {
 // exposed to the downstream client at once or one call per continuation.
 func WithParallelToolCalls(enabled bool) StartOption {
 	return func(c *startConfig) { c.parallelTools = enabled }
+}
+
+// ConversationIDFromStartOptions returns the conversation id pinned by
+// WithConversationID, if any.
+func ConversationIDFromStartOptions(opts []StartOption) string {
+	cfg := startConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	return strings.TrimSpace(cfg.conversationID)
 }
 
 // StartSession opens a new Agent run for the given messages/tools.
@@ -336,7 +363,14 @@ func StartSession(ctx context.Context, creds AccountCredentials, model string, m
 		lifecyclesByID:      map[string]*nativeLifecycle{},
 		lifecycleOrder:      make([]*nativeLifecycle, 0),
 		serverOwnedTodos:    map[string]*nativeLifecycle{},
+		// Seed lastFrame so stallWatcher can emit downstream pings during the
+		// initial think, before Cursor has sent any bytes. Leaving it zero
+		// made the first tick exit the watcher permanently.
+		lastFrame: time.Now(),
+		lastEmit:  time.Now(),
+		history:   append([]ChatMessage(nil), messages...),
 	}
+	session.turnReadCounts, session.lastReadByPath = seedTurnReadState(messages)
 	session.seedSeenAssistantMessages()
 	session.manager.Register(session)
 	go session.heartbeatLoop(runCtx)
@@ -375,17 +409,56 @@ func (s *Session) touch() {
 // cannot tell "still thinking" from "dead wire".
 const (
 	// cursorIdleHeartbeatInterval bounds how long the downstream can see total
-	// silence before the executor forwards a keep-alive ping. Chosen to be
-	// comfortably shorter than typical client-side request timeouts while still
-	// longer than the hold window and reasoning batching pauses.
-	cursorIdleHeartbeatInterval = 30 * time.Second
+	// silence before the executor forwards a keep-alive ping. Claude Code's
+	// default stream idle / stainless timeout is 600s; 15s keeps nginx, the
+	// outbound proxy, and the client from treating a long think as a dead wire.
+	cursorIdleHeartbeatInterval = 15 * time.Second
 	// cursorStallTimeout is the hard ceiling for a single stretch of upstream
 	// silence. Failing past this converts a genuinely hung H2 stream (observed
 	// holding a request open for 31m46s) into a bounded error instead of an
 	// indefinite block. Generous enough that legitimate long thinking survives,
 	// short enough that a dead connection is surfaced in reasonable time.
 	cursorStallTimeout = 15 * time.Minute
+	// cursorTokenStallTimeout is the ceiling for "bytes are arriving but the
+	// client has seen no new token". Heartbeats alone used to hold Claude
+	// Code in Composing for 20+ minutes after a 100-token stall.
+	cursorTokenStallTimeout = 8 * time.Minute
 )
+
+// stallAction decides whether a silent upstream stretch should ping the
+// downstream client or fail the session. last==zero is treated as "just
+// started" so the watcher cannot disable itself before the first Cursor frame.
+// tokenStallShouldFail is the "bytes arriving, no new client tokens" ceiling.
+// Tool-wait and a quiet Write generation must survive: the 8-minute token
+// stall used to RST those sessions and the model then only emitted Read.
+func tokenStallShouldFail(awaiting bool, lastEmit, lastFrame, now time.Time) bool {
+	if awaiting {
+		return false
+	}
+	if lastEmit.IsZero() || now.Sub(lastEmit) < cursorTokenStallTimeout {
+		return false
+	}
+	if !lastFrame.IsZero() && now.Sub(lastFrame) < cursorTokenStallTimeout {
+		return false
+	}
+	return true
+}
+
+func stallAction(last, now time.Time) (heartbeat, fail bool) {
+	if last.IsZero() {
+		// No start mark: keep the downstream alive, do not fail. Failing
+		// would require a measured idle stretch we do not have.
+		return true, false
+	}
+	idle := now.Sub(last)
+	if idle >= cursorStallTimeout {
+		return false, true
+	}
+	if idle >= cursorIdleHeartbeatInterval {
+		return true, false
+	}
+	return false, false
+}
 
 // stallWatcher surfaces progress while the upstream delivers nothing. Every
 // cursorIdleHeartbeatInterval of silence it emits a heartbeat event (the
@@ -405,20 +478,42 @@ func (s *Session) stallWatcher(ctx context.Context) {
 		case <-ticker.C:
 			s.mu.Lock()
 			closed := s.closed
+			ended := s.responseEnded
+			awaiting := s.waitingTools || len(s.pending) > 0
 			last := s.lastFrame
+			lastEmit := s.lastEmit
 			s.mu.Unlock()
-			if closed || last.IsZero() {
+			if closed || ended {
 				return
 			}
-			idle := time.Since(last)
-			if idle >= cursorStallTimeout {
+			now := time.Now()
+			// Do not kill a run that is waiting for client tools or still
+			// receiving upstream bytes (a large Write can take minutes after
+			// the last visible sentence). Those used to look like a 24-minute
+			// Read loop because the Write never reached the client.
+			if tokenStallShouldFail(awaiting, lastEmit, last, now) {
+				idle := now.Sub(lastEmit).Round(time.Second)
+				log.Warnf("cursor: no client tokens for %s; failing session %s", idle, s.ID)
+				s.fail(fmt.Errorf("cursor: no tokens for %s (upstream stayed open but produced no new output)", idle))
+				return
+			}
+			heartbeat, fail := stallAction(last, now)
+			if fail {
+				idle := time.Since(last)
+				if last.IsZero() {
+					idle = cursorStallTimeout
+				}
 				log.Warnf("cursor: upstream stalled for %s with no bytes; failing session %s", idle.Round(time.Second), s.ID)
 				s.fail(fmt.Errorf("cursor: upstream stalled for %s with no bytes (provider thinking longer than configured stall timeout)", idle.Round(time.Second)))
 				return
 			}
-			if idle >= cursorIdleHeartbeatInterval {
+			if heartbeat {
 				// Emit as a distinct event; the executor maps it to a downstream
 				// keep-alive so the client does not read the silence as a hang.
+				idle := time.Since(last)
+				if last.IsZero() {
+					idle = cursorIdleHeartbeatInterval
+				}
 				log.Debugf("cursor: upstream idle %s; sending downstream heartbeat", idle.Round(time.Second))
 				s.emit(StreamEvent{Type: "heartbeat"})
 			}
@@ -436,9 +531,10 @@ func (s *Session) heartbeatLoop(ctx context.Context) {
 		case <-ticker.C:
 			s.mu.Lock()
 			closed := s.closed
+			ended := s.responseEnded
 			stream := s.stream
 			s.mu.Unlock()
-			if closed || stream == nil {
+			if closed || ended || stream == nil {
 				return
 			}
 			hb := &agentv1.AgentClientMessage{
@@ -466,11 +562,9 @@ func (s *Session) readLoop(ctx context.Context) {
 	readBuf := make([]byte, 32*1024)
 	for {
 		s.mu.Lock()
-		waiting := s.waitingTools
 		responseEnded := s.responseEnded
 		closed := s.closed
 		stream := s.stream
-		pauseCh := s.pauseCh
 		s.mu.Unlock()
 		if closed {
 			return
@@ -479,8 +573,13 @@ func (s *Session) readLoop(ctx context.Context) {
 		case <-ctx.Done():
 			s.mu.Lock()
 			alreadyClosed := s.closed
+			ended := s.responseEnded
+			awaiting := s.waitingTools || len(s.pending) > 0
 			s.mu.Unlock()
-			if !alreadyClosed {
+			// Client SSE disconnect after tool_use is normal. Emitting an
+			// error here raced the tool_calls boundary and turned a clean
+			// pause into a 500.
+			if !alreadyClosed && !ended && !awaiting {
 				s.emit(StreamEvent{Type: "error", Message: ctx.Err().Error()})
 				s.emit(StreamEvent{Type: "segment_end", Reason: "error"})
 			}
@@ -490,13 +589,15 @@ func (s *Session) readLoop(ctx context.Context) {
 		// Keep reading while a live run is waiting for client tools. Cursor may
 		// send a trailing TurnEnded after the formal tool boundary; pausing here
 		// discarded those authoritative cache counters. Once the response has
-		// actually ended, wait for SubmitToolResults to rebuild or resume.
-		if waiting && responseEnded {
+		// actually ended, never Read again — a closed body returns the same
+		// error every wake (sweep / pauseCh) and used to spam rebuild warnings
+		// every minute until the client timed out with a 500.
+		if responseEnded {
 			select {
 			case <-ctx.Done():
 				return
-			case <-pauseCh:
-				continue
+			case <-s.done:
+				return
 			}
 		}
 
@@ -578,10 +679,7 @@ func (s *Session) readLoop(ctx context.Context) {
 				// SubmitToolResults refuses same-stream resume (reading after
 				// END_STREAM blocks forever → Claude Code "Cascading…").
 				if s.awaitingClientTools() {
-					s.mu.Lock()
-					s.responseEnded = true
-					s.mu.Unlock()
-					log.Warnf("cursor: response END_STREAM while awaiting tools (pending=%d); will rebuild after tool results", s.pendingToolCount())
+					s.parkForRebuild("response END_STREAM while awaiting tools")
 					continue
 				}
 				s.flushAssistantText(true)
@@ -611,10 +709,7 @@ func (s *Session) readLoop(ctx context.Context) {
 				}
 			}
 			if s.awaitingClientTools() {
-				s.mu.Lock()
-				s.responseEnded = true
-				s.mu.Unlock()
-				log.Warnf("cursor: EOF while awaiting client tool results (pending=%d); will rebuild after tool results", s.pendingToolCount())
+				s.parkForRebuild("EOF while awaiting client tool results")
 				s.beginWaitingTools()
 				continue
 			}
@@ -651,11 +746,7 @@ func (s *Session) readLoop(ctx context.Context) {
 				}
 			}
 			if s.awaitingClientTools() {
-				s.mu.Lock()
-				s.responseEnded = true
-				s.mu.Unlock()
-				log.Warnf("cursor: stream error while awaiting client tool results (pending=%d): %v; will rebuild after tool results",
-					s.pendingToolCount(), errRead)
+				s.parkForRebuild(fmt.Sprintf("stream error while awaiting client tool results: %v", errRead))
 				s.beginWaitingTools()
 				continue
 			}
@@ -832,6 +923,159 @@ func (s *Session) parkedForRebuild() bool {
 	return (s.waitingTools || len(s.pending) > 0) && s.responseEnded
 }
 
+// parkForRebuild marks the upstream run dead, keeps tool_call_id indexes as
+// tombstones, and drops any tool-pause checkpoint so the next client POST
+// rebuilds from history instead of dying on an expired id or a 400 replay.
+func (s *Session) parkForRebuild(reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	already := s.responseEnded
+	s.responseEnded = true
+	conversationID := s.ConversationID
+	s.mu.Unlock()
+	if s.manager != nil {
+		s.manager.RememberToolTombstones(s.pendingIDs())
+	}
+	dropContinuation(conversationID)
+	if already {
+		return
+	}
+	log.Warnf("cursor: %s (pending=%d); will rebuild after tool results", reason, s.pendingToolCount())
+}
+
+func (s *Session) duplicateReadReply(toolName string, args map[string]any) (string, bool) {
+	return s.duplicateReadDecision(toolName, args, false)
+}
+
+func (s *Session) takeDuplicateReadReply(toolName string, args map[string]any) (string, bool) {
+	return s.duplicateReadDecision(toolName, args, true)
+}
+
+func (s *Session) duplicateReadDecision(toolName string, args map[string]any, reserve bool) (string, bool) {
+	if s == nil || !isReadToolName(toolName) {
+		return "", false
+	}
+	path := toolCallPath(args)
+	if path == "" {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	if s.turnReadCounts != nil {
+		n = s.turnReadCounts[path]
+	}
+	if n == 0 {
+		n = repeatedReadCount(s.history, path)
+	}
+	if n >= 1 {
+		s.lastFrame = time.Now()
+		prev := ""
+		if s.lastReadByPath != nil {
+			prev = s.lastReadByPath[path]
+		}
+		if strings.TrimSpace(prev) == "" {
+			prev = lastReadResultForPath(s.history, path)
+		}
+		return duplicateReadReplyTextFrom(prev), true
+	}
+	if reserve {
+		if s.turnReadCounts == nil {
+			s.turnReadCounts = map[string]int{}
+		}
+		s.turnReadCounts[path] = n + 1
+	}
+	return "", false
+}
+
+func (s *Session) clearTurnRead(path string) {
+	path = normalizeToolPath(path)
+	if s == nil || path == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.turnReadCounts, path)
+	delete(s.lastReadByPath, path)
+	s.mu.Unlock()
+}
+
+func (s *Session) noteToolResult(call ToolCall, content string) {
+	path := toolCallPath(call.Arguments)
+	if s == nil || path == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if isReadToolName(call.Name) {
+		if s.lastReadByPath == nil {
+			s.lastReadByPath = map[string]string{}
+		}
+		s.lastReadByPath[path] = content
+	}
+	if isMutatingToolName(call.Name) {
+		delete(s.turnReadCounts, path)
+		delete(s.lastReadByPath, path)
+	}
+}
+
+func (s *Session) rememberPublishedToolID(id string) {
+	id = strings.TrimSpace(id)
+	if s == nil || id == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.publishedToolIDs == nil {
+		s.publishedToolIDs = map[string]struct{}{}
+	}
+	s.publishedToolIDs[id] = struct{}{}
+	if safe := util.SanitizeClaudeToolID(id); safe != "" && safe != id {
+		s.publishedToolIDs[safe] = struct{}{}
+	}
+	s.mu.Unlock()
+	if s.manager != nil {
+		s.manager.BindPending(id, s)
+	}
+}
+
+// aliasPendingID indexes one more key for a pending exec. Unlike
+// bindPendingExec it does not re-append to pendingOrder, so an already
+// registered exec keeps its single place in the batch order.
+func (s *Session) aliasPendingID(pending *pendingExec, id string) {
+	if s == nil || pending == nil || id == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.pending == nil {
+		s.pending = map[string]*pendingExec{}
+	}
+	s.pending[id] = pending
+	s.mu.Unlock()
+	if s.manager != nil {
+		s.manager.BindPending(id, s)
+	}
+}
+
+// publishToolCall hands a pending call to the client under an id both the
+// OpenAI and Claude surfaces accept.
+//
+// A Cursor MCP exec can carry the provider call id and the model's
+// function-call id in a single toolCallId separated by a newline. Published
+// verbatim that newline lands inside tool_call.id, which clients validating
+// against ^[a-zA-Z0-9_-]+$ reject outright. Only the published copy is
+// rewritten: the raw id stays indexed here and in the manager, so a result
+// posted against either form still resolves to this exec.
+func (s *Session) publishToolCall(item *pendingExec, call ToolCall) {
+	s.rememberPublishedToolID(call.ID)
+	if safe := util.SanitizeClaudeToolID(call.ID); safe != "" && safe != call.ID {
+		s.aliasPendingID(item, safe)
+		s.rememberPublishedToolID(safe)
+		call.ID = safe
+	}
+	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
+}
+
 func (s *Session) pendingToolCount() int {
 	if s == nil {
 		return 0
@@ -861,6 +1105,12 @@ func (s *Session) resumeReading() {
 
 func (s *Session) emit(ev StreamEvent) {
 	s.touch()
+	switch ev.Type {
+	case "text_delta", "thinking_delta", "tool_call":
+		s.mu.Lock()
+		s.lastEmit = time.Now()
+		s.mu.Unlock()
+	}
 	// Event order is part of the downstream streaming protocol. Never discard a
 	// delta or terminal event merely because the consumer is temporarily slow.
 	select {
@@ -1001,6 +1251,17 @@ func (s *Session) wasResumed() bool {
 	return s.resumed
 }
 
+// UsedContinuation reports whether this run was opened from a stored server
+// checkpoint rather than a full client-history rebuild.
+func (s *Session) UsedContinuation() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.usedContinuation
+}
+
 // IterSegment invokes fn for each event until segment_end (inclusive).
 func (s *Session) IterSegment(ctx context.Context, fn func(StreamEvent) error) error {
 	toolCalls := 0
@@ -1075,7 +1336,7 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 		item, id := s.lookupPendingTool(result.ToolCallID)
 		if item == nil {
 			s.mu.Unlock()
-			return fmt.Errorf("cursor: no pending tool call %s", result.ToolCallID)
+			return ErrToolResumeRebuild
 		}
 		pending = append(pending, item)
 		ids = append(ids, id)
@@ -1117,6 +1378,11 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 	if responseEnded {
 		// Best-effort deliver results, then force history rebuild. Continuing
 		// to Read on an END_STREAM response stalls the client indefinitely.
+		// Tombstone every known id first: releasePendingExec unbinds them, and
+		// a client retry a second later must still take the rebuild path.
+		if s.manager != nil {
+			s.manager.RememberToolTombstones(append(s.pendingIDs(), ids...))
+		}
 		for i, result := range results {
 			if pending[i].request != nil && s.stream != nil {
 				if pending[i].variant == "mcp_args" {
@@ -1133,6 +1399,9 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 
 	for i, result := range results {
 		item := pending[i]
+		if item != nil {
+			s.noteToolResult(item.call, result.Content)
+		}
 		var err error
 		completed := true
 		if item.variant == "mcp_args" {
@@ -1141,10 +1410,13 @@ func (s *Session) SubmitToolResults(results []ToolResult) error {
 			completed, err = s.submitNativeGroupResult(item, result)
 		}
 		if err != nil {
-			// The Cursor request stream may fail transiently after the client has
-			// already executed the tool. Keep every pending binding intact so the
-			// exact structured result can be retried or rebuilt from history.
-			return fmt.Errorf("cursor: submit tool result %s: %w", ids[i], err)
+			// The request stream is already dead (typical: tool results arrive
+			// in the same second as H2 RST). A write error used to Close without
+			// tombstones and persist a tool-pause checkpoint — the next POST
+			// then expired the id and 400'd on continuation replay.
+			s.parkForRebuild(fmt.Sprintf("submit tool result %s failed: %v", ids[i], err))
+			_ = s.Close()
+			return ErrToolResumeRebuild
 		}
 		if completed {
 			s.releaseNativeGroup(item, ids[i], result.ToolCallID)
@@ -1278,6 +1550,9 @@ func (s *Session) releaseNativeGroup(item *pendingExec, keys ...string) {
 }
 
 func (s *Session) sendMcpResult(req *agentv1.ExecServerMessage, result ToolResult) error {
+	if s == nil || s.stream == nil || req == nil {
+		return fmt.Errorf("cursor: no exec stream")
+	}
 	mcp := &agentv1.McpResult{
 		Result: &agentv1.McpResult_Success{
 			Success: &agentv1.McpSuccess{
@@ -1313,6 +1588,9 @@ func (s *Session) sendMcpResult(req *agentv1.ExecServerMessage, result ToolResul
 }
 
 func (s *Session) sendNativeResult(req *agentv1.ExecServerMessage, variant string, result ToolResult) error {
+	if s == nil || s.stream == nil || req == nil {
+		return fmt.Errorf("cursor: no exec stream")
+	}
 	execClient := &agentv1.ExecClientMessage{Id: req.Id, ExecId: req.ExecId}
 	content := result.Content
 	switch variant {
@@ -2061,9 +2339,20 @@ func (s *Session) Close() error {
 	stream := s.stream
 	cancel := s.cancel
 	failed := s.failed
+	responseEnded := s.responseEnded
+	awaitingTools := s.waitingTools || len(s.pending) > 0
+	conversationID := s.ConversationID
 	s.mu.Unlock()
-	if !failed {
-		rememberContinuation(s.ConversationID, s.checkpointSnapshot())
+	if responseEnded || awaitingTools {
+		// Dead or tool-paused runs are not continuable. Persisting that
+		// checkpoint made the next StartSession replay tool outputs as a
+		// user message, which Cursor rejected with provider 400.
+		dropContinuation(conversationID)
+		if s.manager != nil {
+			s.manager.RememberToolTombstones(s.pendingIDs())
+		}
+	} else if !failed {
+		rememberContinuation(conversationID, s.checkpointSnapshot())
 	}
 	if cancel != nil {
 		cancel()
@@ -2138,6 +2427,10 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 		s.mu.Lock()
 		turnEnded := s.turnEndedSeen
 		s.mu.Unlock()
+		// Blobs are what make a checkpoint readable. Retry the opening
+		// repair even before TurnEnded: releasing on the empty envelope
+		// used to emit the truncated first token permanently.
+		s.releaseTextStream(false)
 		if turnEnded {
 			s.flushAssistantText(false)
 		}
@@ -2155,10 +2448,10 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			if turnEnded {
 				s.flushAssistantText(false)
 			} else {
-				// The checkpoint is the authoritative copy of the opening, so
-				// there is nothing left to wait for: release the held text now
-				// instead of sitting out the rest of the hold window.
-				s.releaseTextStream()
+				// Only release when the checkpoint actually has assistant
+				// text. The envelope often lands before its blobs; forcing
+				// a release here was the live "丢首字" path.
+				s.releaseTextStream(false)
 			}
 			if s.pendingToolBatchReady() {
 				return true, nil
@@ -2437,19 +2730,12 @@ func (s *Session) handleThinkingDelta(text string) {
 	s.emit(StreamEvent{Type: "thinking_delta", Text: text})
 }
 
-// textHoldWindow gives the checkpoint a short chance to repair Cursor's
-// occasionally missing leading token. After this opening window, deltas stream
-// immediately instead of buffering the whole response.
-//
-// The checkpoint is the only thing that can restore a dropped opening, so this
-// is the deadline for waiting on one. Shortening it to 400ms to save latency
-// cost claude-fable-5 the first nine characters of a reply in one run out of
-// three, and 1200ms still allowed a late checkpoint to miss the window. A
-// recovered prefix cannot be appended after streamed text without moving it to
-// the end of the answer, so wait longer for the authoritative opening instead.
-// The checkpoint releases the hold as soon as it lands, so fast turns do not
-// pay the full window.
-const textHoldWindow = 3 * time.Second
+// textHoldWindow is only a last-resort cap. A readable checkpoint releases
+// the opening immediately; we must not sit on the first token for seconds or
+// the client looks frozen. 8s made every turn whose blobs arrive at TurnEnded
+// feel like non-streaming. 500ms is enough for blobs that actually follow the
+// envelope, then subsequent deltas go out live.
+const textHoldWindow = 500 * time.Millisecond
 
 func (s *Session) handleTextDelta(text string) {
 	if text == "" {
@@ -2465,7 +2751,7 @@ func (s *Session) handleTextDelta(text string) {
 	if live {
 		s.emittedText.WriteString(text)
 	} else if s.holdTimer == nil {
-		s.holdTimer = time.AfterFunc(textHoldWindow, s.releaseTextStream)
+		s.holdTimer = time.AfterFunc(textHoldWindow, func() { s.releaseTextStream(true) })
 	}
 	s.mu.Unlock()
 	if live {
@@ -2475,8 +2761,9 @@ func (s *Session) handleTextDelta(text string) {
 
 // releaseTextStream emits the withheld opening, using an already available
 // checkpoint as the authoritative copy, then switches subsequent deltas to
-// live streaming.
-func (s *Session) releaseTextStream() {
+// live streaming. force=false keeps holding when the checkpoint envelope
+// arrived without readable assistant text (blobs still in flight).
+func (s *Session) releaseTextStream(force bool) {
 	s.mu.Lock()
 	if s.textStreamLive || s.textFlushed {
 		s.mu.Unlock()
@@ -2492,6 +2779,9 @@ func (s *Session) releaseTextStream() {
 	newMessages := s.unseenCheckpointAssistantMessages()
 	for _, msg := range newMessages {
 		checkpointFinal = reconcileAssistantText(checkpointFinal, msg.text)
+	}
+	if !force && checkpointFinal == "" {
+		return
 	}
 
 	s.mu.Lock()
@@ -2523,7 +2813,10 @@ func (s *Session) releaseTextStream() {
 		}
 	}
 	s.textStreamLive = true
-	s.holdTimer = nil
+	if s.holdTimer != nil {
+		s.holdTimer.Stop()
+		s.holdTimer = nil
+	}
 	s.emittedText.Reset()
 	s.emittedText.WriteString(final)
 	s.visibleText.Reset()
@@ -2699,11 +2992,8 @@ func reconcileAssistantText(streamed, checkpoint string) string {
 	if streamed == checkpoint {
 		return streamed
 	}
-	if strings.HasPrefix(checkpoint, streamed) || strings.HasSuffix(checkpoint, streamed) {
-		return checkpoint
-	}
-	if strings.Contains(checkpoint, streamed) {
-		return checkpoint
+	if repaired := repairDroppedOpening(streamed, checkpoint); repaired != "" {
+		return repaired
 	}
 	if strings.Contains(streamed, checkpoint) {
 		// The streamed copy already owns the checkpoint text (the checkpoint is
@@ -2715,6 +3005,39 @@ func reconcileAssistantText(streamed, checkpoint string) string {
 	// replayed without duplicating or relocating already-sent text. The live
 	// copy wins, byte for byte.
 	return streamed
+}
+
+// repairDroppedOpening restores Cursor's missing first token when the
+// checkpoint still has it. The live stream may already have continued past
+// the checkpoint snapshot ("件写好了现在用…" vs "文件写好了"), so a plain
+// suffix match is not enough: stitch the recovered opening onto the live tail.
+func repairDroppedOpening(streamed, checkpoint string) string {
+	if strings.HasPrefix(checkpoint, streamed) || strings.HasSuffix(checkpoint, streamed) {
+		return checkpoint
+	}
+	if strings.Contains(checkpoint, streamed) {
+		return checkpoint
+	}
+	if strings.HasPrefix(streamed, checkpoint) {
+		return streamed
+	}
+	offset := 0
+	for offset < len(checkpoint) {
+		_, size := utf8.DecodeRuneInString(checkpoint[offset:])
+		if size <= 0 {
+			break
+		}
+		offset += size
+		rest := checkpoint[offset:]
+		if rest == "" || !strings.HasPrefix(streamed, rest) {
+			continue
+		}
+		if utf8.RuneCountInString(checkpoint[:offset]) > 8 {
+			break
+		}
+		return checkpoint[:offset] + streamed
+	}
+	return ""
 }
 
 func (s *Session) handleToolLifecycle(envelopeID, modelCallID string, toolCall *agentv1.ToolCall, completed bool) {
@@ -2919,13 +3242,10 @@ func (s *Session) rebindPendingLocked(item *pendingExec, authoritativeID string)
 	if s.pending == nil {
 		s.pending = map[string]*pendingExec{}
 	}
-	for _, member := range items {
-		for id, pending := range s.pending {
-			if pending == member {
-				delete(s.pending, id)
-			}
-		}
-	}
+	// Keep every already-published id as an alias. Lifecycle/checkpoint
+	// rebinds used to delete the provisional and Claude-safe keys after the
+	// client had already been shown them; the next POST then died with
+	// "unknown or expired tool_call_id" and rebuilt into a 400.
 	for index, member := range items {
 		id := authoritativeID
 		if index > 0 {
@@ -2947,11 +3267,29 @@ func (s *Session) syncManagerBindings() {
 func (s *Session) pendingIDs() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ids := make([]string, 0, len(s.pending))
-	for id := range s.pending {
-		if strings.TrimSpace(id) != "" {
-			ids = append(ids, id)
+	ids := make([]string, 0, len(s.pending)+len(s.publishedToolIDs))
+	seen := map[string]struct{}{}
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
 		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	for id := range s.pending {
+		add(id)
+	}
+	for _, item := range s.pending {
+		if item != nil {
+			add(item.call.ID)
+		}
+	}
+	for id := range s.publishedToolIDs {
+		add(id)
 	}
 	return ids
 }
@@ -3236,6 +3574,17 @@ func (s *Session) handleNativeArgs(req *agentv1.ExecServerMessage, variant strin
 	arguments, err := nativeToolArgumentBags(variant, args, def)
 	if err != nil {
 		return false, err
+	}
+	if isReadExecVariant(variant) && len(arguments) > 0 {
+		if reply, ok := s.takeDuplicateReadReply(def.Name, arguments[0]); ok {
+			log.Warnf("cursor: suppressing duplicate Read of %s; not showing it to the client", toolCallPath(arguments[0]))
+			return false, s.sendNativeResult(req, variant, ToolResult{Name: def.Name, Content: reply})
+		}
+	}
+	if isMutatingToolName(def.Name) {
+		for _, bag := range arguments {
+			s.clearTurnRead(toolCallPath(bag))
+		}
 	}
 	copyReq := proto.Clone(req).(*agentv1.ExecServerMessage)
 	if variant == "shell_stream_args" {
@@ -3868,6 +4217,14 @@ func (s *Session) handleMcpArgs(req *agentv1.ExecServerMessage, args *agentv1.Mc
 		Kind:      firstNonEmpty(def.Kind, "function"),
 		Namespace: def.Namespace,
 	}
+	if reply, ok := s.takeDuplicateReadReply(call.Name, call.Arguments); ok {
+		log.Warnf("cursor: suppressing duplicate MCP Read of %s; not showing it to the client", toolCallPath(call.Arguments))
+		copyReq := proto.Clone(req).(*agentv1.ExecServerMessage)
+		return false, s.sendMcpResult(copyReq, ToolResult{Name: call.Name, Content: reply})
+	}
+	if isMutatingToolName(call.Name) {
+		s.clearTurnRead(toolCallPath(call.Arguments))
+	}
 	copyReq := proto.Clone(req).(*agentv1.ExecServerMessage)
 	pending := &pendingExec{request: copyReq, call: call, variant: "mcp_args", modelCallID: modelCallID, provisional: provisional}
 	s.bindPendingExec(pending, nativeID)
@@ -3898,7 +4255,7 @@ func (s *Session) emitPendingToolBatch(force bool) bool {
 		item.emitted = true
 		call := item.call
 		s.mu.Unlock()
-		s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
+		s.publishToolCall(item, call)
 	}
 	if batch != nil {
 		s.mu.Lock()
@@ -3941,8 +4298,22 @@ func (s *Session) emitNextPendingTool() bool {
 		return false
 	}
 	call := next.call
-	s.emit(StreamEvent{Type: "tool_call", ToolCall: &call})
+	s.publishToolCall(next, call)
 	return true
+}
+
+func mutatingPending(items []*pendingExec) []*pendingExec {
+	out := make([]*pendingExec, 0, len(items))
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(item.call.Name)) {
+		case "write", "edit", "multiedit", "bash", "shell":
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func (s *Session) pendingToolBatchReady() bool {
@@ -3982,10 +4353,22 @@ func (s *Session) orderedPendingToolBatchWithOwner(force bool) ([]*pendingExec, 
 				}
 				expected++
 			}
-			if expected > 0 && len(pending) < expected {
-				continue
+			complete := expected == 0 || len(pending) >= expected
+			if complete {
+				return pending, batch, true
 			}
-			return pending, batch, true
+			// Stream death / force: emit what we have. Waiting for a sibling
+			// Write that never arrived swallowed the Write and left the
+			// client in a Read-only loop for tens of minutes.
+			if force && len(pending) > 0 {
+				return pending, batch, true
+			}
+			// Live path: a finished Write/Edit/Bash must not sit behind an
+			// incomplete checkpoint. The model already said it would write.
+			if len(mutatingPending(pending)) > 0 {
+				return pending, batch, true
+			}
+			continue
 		}
 		if force && (batch.modelCallID != "" || batch.terminal || strings.HasPrefix(batch.id, "exec:")) {
 			return pending, batch, true
@@ -4028,7 +4411,6 @@ func (s *Session) rebindPendingGroup(items []*pendingExec, checkpointID string) 
 		for id, pending := range s.pending {
 			if pending == item {
 				oldIDs = append(oldIDs, id)
-				delete(s.pending, id)
 			}
 		}
 		id := checkpointID
@@ -4042,7 +4424,7 @@ func (s *Session) rebindPendingGroup(items []*pendingExec, checkpointID string) 
 	s.mu.Unlock()
 	if s.manager != nil {
 		for _, id := range oldIDs {
-			s.manager.UnbindPending(id)
+			s.manager.BindPending(id, s)
 		}
 		for _, id := range newIDs {
 			s.manager.BindPending(id, s)
@@ -4154,6 +4536,9 @@ func (s *Session) PendingCallIDAlive(toolCallID string) bool {
 	defer s.mu.Unlock()
 	_, _ = s.lookupPendingTool(toolCallID)
 	if s.pending[toolCallID] != nil {
+		return true
+	}
+	if _, ok := s.publishedToolIDs[toolCallID]; ok {
 		return true
 	}
 	for _, item := range s.pending {
@@ -4459,7 +4844,9 @@ func RunChat(ctx context.Context, creds AccountCredentials, model string, messag
 		// Session was lost (process restart / TTL / id mismatch) or the resumed
 		// run went silent. Rebuild a new Agent run that keeps the tool history
 		// in conversation state instead of hard-failing the client.
-		log.Warnf("cursor: resume tool session unusable (%v); rebuilding turn from history", err)
+		if err != nil && !errors.Is(err, ErrToolResumeRebuild) {
+			log.Warnf("cursor: resume tool session unusable (%v); rebuilding turn from history", err)
+		}
 		// The structured history is a complete resume input. A synthetic user
 		// message changes the transcript and must not be added.
 	}

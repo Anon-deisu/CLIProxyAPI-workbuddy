@@ -30,6 +30,7 @@ func TestPeerResetIsRetriedAsTransient(t *testing.T) {
 func TestOtherTransportTeardownsAreCovered(t *testing.T) {
 	for _, msg := range []string{
 		"http2: server sent GOAWAY and closed the connection; LastStreamID=5, ErrCode=NO_ERROR",
+		"http2: response body closed",
 		"read tcp 10.0.0.2:44412->104.18.2.1:443: connection reset by peer",
 		"cursor proxy connect read: unexpected EOF",
 	} {

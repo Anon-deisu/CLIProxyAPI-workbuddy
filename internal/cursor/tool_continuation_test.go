@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -45,6 +46,48 @@ func TestPlainQuestionsKeepTheirOwnText(t *testing.T) {
 	action := msg.GetRunRequest().GetAction().GetUserMessageAction()
 	if action == nil || action.GetUserMessage().GetText() != "hello there" {
 		t.Fatalf("plain user text was altered: %+v", action)
+	}
+}
+
+func TestResumeUserAfterToolsUsesNudgeNotBareContinue(t *testing.T) {
+	conversation := append(toolTailConversation(), ChatMessage{Role: "user", Content: "继续"})
+	msg, _, _, err := buildRunRequestForConversation("claude-fable-5", conversation, nil, "conv-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := msg.GetRunRequest().GetAction().GetUserMessageAction()
+	if action == nil {
+		t.Fatal("expected an executable user action")
+	}
+	text := action.GetUserMessage().GetText()
+	if text == "继续" || text == "continue" {
+		t.Fatalf("bare resume text must not be the action: %q", text)
+	}
+	if !strings.Contains(text, "tool results") && !strings.Contains(text, "Write") {
+		t.Fatalf("resume after tools must use a continuation nudge, got %q", text)
+	}
+}
+
+func TestReadLoopAfterContinueUsesWriteBreaker(t *testing.T) {
+	conversation := []ChatMessage{
+		{Role: "user", Content: "把动画写成完整 html 文件"},
+	}
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("toolu_read_%d", i)
+		conversation = append(conversation,
+			ChatMessage{Role: "assistant", Content: "现在真正写入文件。", ToolCalls: []ToolCall{
+				{ID: id, Name: "Read", Arguments: map[string]any{"path": "pelican-ride/v2.html"}}}},
+			ChatMessage{Role: "tool", ToolCallID: id, Name: "Read", Content: "File not found"},
+		)
+	}
+	conversation = append(conversation, ChatMessage{Role: "user", Content: "继续"})
+	msg, _, _, err := buildRunRequestForConversation("claude-fable-5", conversation, nil, "conv-loop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage().GetText()
+	if text != writeLoopBreakerNudge {
+		t.Fatalf("read/write loop must use the write breaker, got %q", text)
 	}
 }
 

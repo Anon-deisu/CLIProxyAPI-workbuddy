@@ -59,7 +59,12 @@ func OpenAgentRun(ctx context.Context, baseURL string, headers map[string]string
 		// reads forever: agent runs are long-lived and detached from the
 		// client's request context, so nothing else cancels them. The ping
 		// pair turns silent death into a read error our retry paths handle.
-		ReadIdleTimeout: 75 * time.Second,
+		// Long thinking stretches (fable / opus) can be silent for minutes.
+		// 75s was short enough that the HTTP/2 PING, after a proxy ate it,
+		// reset the stream mid-think and the client saw a 500. Protocol
+		// ClientHeartbeat writes still keep the request side alive; this
+		// only bounds a truly black-holed response.
+		ReadIdleTimeout: 3 * time.Minute,
 		PingTimeout:     15 * time.Second,
 	}
 	client := &http.Client{Transport: transport}

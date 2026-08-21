@@ -104,6 +104,9 @@ func TestNativeExecBeforeLifecycleRebindsPendingAndManager(t *testing.T) {
 	if manager.LookupPending("toolu_authoritative") != s {
 		t.Fatal("manager did not bind authoritative id")
 	}
+	if s.pending[provisional] == nil || manager.LookupPending(provisional) != s {
+		t.Fatal("provisional id must stay resolvable after the authoritative rebind")
+	}
 }
 
 func TestCheckpointBeforeExecAttachesWhenExecArrives(t *testing.T) {

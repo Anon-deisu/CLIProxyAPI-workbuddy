@@ -321,12 +321,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 					usageFinal = ev
 					return nil
 				case "heartbeat":
-					// Forward upstream liveness as an SSE comment line: ignored by
-					// every SSE parser (Claude Code and OpenAI-compatible clients
-					// alike) yet it resets idle timeouts, so a long upstream think
-					// does not read as a frozen stream. Must bypass the translator,
-					// which would drop unrecognized frames.
-					if !emitRaw([]byte(": keep-alive (cursor upstream thinking)\n\n")) {
+					// Official Claude ping (plus an SSE comment for other
+					// clients) resets idle timers without injecting tokens.
+					// Must bypass the translator, which drops unknown frames.
+					if !emitRaw(cursorDownstreamPing(responseFormat)) {
 						return context.Canceled
 					}
 					return nil
@@ -355,6 +353,18 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errors.Is(errIter, cursorlib.ErrToolResumeRebuild) && !contentEmitted {
 			// The resumed run went silent. Closing it above unbound the tool
 			// ids, so opening again naturally rebuilds from history.
+			_ = session.Close()
+			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
+			if rebuildErr == nil {
+				session = rebuilt
+				errIter = iterate(session)
+			} else {
+				errIter = rebuildErr
+			}
+		}
+		if errIter != nil && !contentEmitted && shouldRetryToolTailWithoutContinuation(session.UsedContinuation(), messages, errIter) {
+			log.Warnf("cursor: continuation tool rebuild rejected; retrying from full history: %v", errIter)
+			cursorlib.DropContinuation(conversationID)
 			_ = session.Close()
 			rebuilt, rebuildErr := openCursorSessionWithRetries(ctx, creds, upstreamModel, messages, tools, startOpts...)
 			if rebuildErr == nil {
@@ -563,6 +573,8 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 			if shouldCloseCursorSessionAfterToolSubmit(err) {
 				_ = session.Close()
 			}
+		} else if errors.Is(err, cursorlib.ErrToolResumeRebuild) {
+			log.Warnf("cursor: tool resume requires rebuild (session already torn down); rebuilding turn from history")
 		} else {
 			log.Warnf("cursor: stream resume tool session failed (%v); rebuilding turn from history", err)
 		}
@@ -582,6 +594,20 @@ func openCursorSession(ctx context.Context, creds cursorlib.AccountCredentials, 
 
 func shouldCloseCursorSessionAfterToolSubmit(err error) bool {
 	return err != nil && !errors.Is(err, cursorlib.ErrToolResumeRebuild)
+}
+
+// shouldRetryToolTailWithoutContinuation is the recovery for a dead Agent run
+// whose stored checkpoint was replayed as a user-message tool continuation and
+// then rejected by the provider (400 / resource_exhausted). Drop the
+// checkpoint and rebuild from the client's full tool history once.
+func shouldRetryToolTailWithoutContinuation(usedContinuation bool, messages []cursorlib.ChatMessage, err error) bool {
+	if !usedContinuation || err == nil {
+		return false
+	}
+	if !isCursorProviderBadRequest(err) || isCursorPolicyBlock(err) {
+		return false
+	}
+	return len(trailingToolResults(messages)) > 0
 }
 
 // translateCursorRequest gives the Responses entrypoint a deterministic
@@ -1429,6 +1455,8 @@ func isCursorTransportReset(err error) bool {
 		return true
 	}
 	return strings.Contains(msg, "http2: server sent goaway") ||
+		strings.Contains(msg, "http2: response body closed") ||
+		strings.Contains(msg, "response body closed") ||
 		strings.Contains(msg, "connection reset by peer") ||
 		strings.Contains(msg, "unexpected eof")
 }
@@ -1497,6 +1525,17 @@ func retryRunCursorChat(ctx context.Context, creds cursorlib.AccountCredentials,
 	// covers isRetryable:false, which the hard-error classifier excludes: the
 	// retry is on a different wire, not a replay of the rejected one.
 	if isCursorProviderBadRequest(err) && !isCursorPolicyBlock(err) && retryBudgetLeft(start) {
+		if len(trailingToolResults(messages)) > 0 {
+			if id := cursorlib.ConversationIDFromStartOptions(opts); id != "" {
+				log.Warnf("cursor: continuation tool rebuild rejected; retrying from full history: %v", err)
+				cursorlib.DropContinuation(id)
+				result, nextErr := cursorlib.RunChat(ctx, creds, model, messages, tools, opts...)
+				if nextErr == nil {
+					return result, nil
+				}
+				err = nextErr
+			}
+		}
 		if alt := cursorlib.AlternateUsableModelID(model); alt != "" && !strings.EqualFold(alt, model) {
 			log.Warnf("cursor: hard 400 persists on %q; serving via sibling wire %q: %v", model, alt, err)
 			result, nextErr := cursorlib.RunChat(ctx, creds, alt, messages, tools, opts...)
@@ -1560,6 +1599,20 @@ func applyCursorSpeed(model string, body []byte) string {
 		return model + "-standard"
 	default:
 		return model
+	}
+}
+
+// cursorDownstreamPing is the keep-alive frame written while Cursor is silent.
+// Claude Code only reliably resets its stream idle timer on an official
+// `event: ping`; SSE comments are still included for OpenAI-compatible clients
+// and for proxies that key off any bytes.
+func cursorDownstreamPing(format sdktranslator.Format) []byte {
+	name := strings.ToLower(strings.TrimSpace(format.String()))
+	switch name {
+	case "claude", "anthropic":
+		return []byte("event: ping\ndata: {\"type\":\"ping\"}\n\n")
+	default:
+		return []byte(": keep-alive (cursor upstream thinking)\n\n")
 	}
 }
 

@@ -1,6 +1,7 @@
 package cursor
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -55,6 +56,10 @@ func TestSweepReapsParkedRebuildSessionsQuickly(t *testing.T) {
 
 	if _, alive := m.sessions["p1"]; alive {
 		t.Fatal("parked-for-rebuild session survived the short sweep")
+	}
+	_, err := m.ResolveForToolResults([]ToolResult{{ToolCallID: "call-p1"}})
+	if !errors.Is(err, ErrToolResumeRebuild) {
+		t.Fatalf("swept parked session must leave a rebuild tombstone, got %v", err)
 	}
 }
 

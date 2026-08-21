@@ -34,7 +34,7 @@ func TestFlushAssistantTextNeverDuplicatesStreamedText(t *testing.T) {
 	// Cursor dropped the leading token, and the opening was already released to
 	// the client, so the checkpoint copy can no longer replace it.
 	s.handleTextDelta("ARKER123")
-	s.releaseTextStream()
+	s.releaseTextStream(true)
 	drainEvents(s)
 
 	s.flushAssistantText(true)
@@ -53,7 +53,7 @@ func TestTextStreamsLiveAfterOpeningIsReleased(t *testing.T) {
 	if len(s.events) != 0 {
 		t.Fatal("opening must be withheld")
 	}
-	s.releaseTextStream()
+	s.releaseTextStream(true)
 	// Everything after the release streams immediately.
 	s.handleTextDelta("lo")
 	s.handleTextDelta(" world")
@@ -86,7 +86,7 @@ func TestReleaseTextStreamRepairsOpeningFromCheckpoint(t *testing.T) {
 		},
 	}
 	s.handleTextDelta("ARKER123") // Cursor dropped the leading token
-	s.releaseTextStream()
+	s.releaseTextStream(false)
 
 	var got strings.Builder
 	for len(s.events) > 0 {
@@ -125,7 +125,7 @@ func TestFlushAssistantTextNeverAppendsLateOpeningAtTail(t *testing.T) {
 		seenAssistantMsgIDs: map[string]struct{}{},
 	}
 	s.handleTextDelta(strings.TrimPrefix(full, "每"))
-	s.releaseTextStream()
+	s.releaseTextStream(true)
 	drainEvents(s)
 
 	s.conversationState = &agentv1.ConversationStateStructure{
@@ -295,6 +295,48 @@ func TestReconcileAssistantText(t *testing.T) {
 	}
 	if got := reconcileAssistantText("abc", ""); got != "abc" {
 		t.Fatalf("empty checkpoint: %q", got)
+	}
+	if got := reconcileAssistantText("件写好了现在用画布", "文件写好了"); got != "文件写好了现在用画布" {
+		t.Fatalf("cjk opening + live tail: %q", got)
+	}
+	if got := reconcileAssistantText("整的鹈鹕骑行", "完整的鹈鹕骑行"); got != "完整的鹈鹕骑行" {
+		t.Fatalf("cjk suffix repair: %q", got)
+	}
+}
+
+func TestReleaseTextStreamHoldsUntilCheckpointTextExists(t *testing.T) {
+	blobID := []byte{0xab, 0xcd, 0xef, 0x0b}
+	payload, _ := json.Marshal(map[string]any{
+		"id":      "msg-late-blob",
+		"role":    "assistant",
+		"content": []map[string]string{{"type": "text", "text": "文件写好了"}},
+	})
+	s := &Session{
+		blobStore:           map[string][]byte{},
+		events:              make(chan StreamEvent, 16),
+		seenAssistantMsgIDs: map[string]struct{}{},
+		conversationState: &agentv1.ConversationStateStructure{
+			RootPromptMessagesJson: [][]byte{blobID},
+		},
+	}
+	s.handleTextDelta("件写好了")
+	s.releaseTextStream(false)
+	if len(s.events) != 0 {
+		t.Fatal("empty checkpoint must not release the truncated opening")
+	}
+
+	s.blobStore[sprintfHex(blobID)] = payload
+	s.releaseTextStream(false)
+
+	var got strings.Builder
+	for len(s.events) > 0 {
+		ev := <-s.events
+		if ev.Type == "text_delta" {
+			got.WriteString(ev.Text)
+		}
+	}
+	if got.String() != "文件写好了" {
+		t.Fatalf("late blob did not repair opening, got %q", got.String())
 	}
 }
 

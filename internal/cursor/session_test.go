@@ -54,41 +54,44 @@ func TestSplitSystemMessagesAndPreserveHistory(t *testing.T) {
 	if msg.GetRunRequest() == nil {
 		t.Fatal("missing run")
 	}
-	var sawClientSystem bool
+	// Cursor discards a root-prompt blob with role "system", so the client's
+	// rules only survive the trip on a user blob.
+	var carrier string
 	for _, data := range blobs {
 		var payload map[string]any
 		if err := json.Unmarshal(data, &payload); err != nil {
 			continue
 		}
-		if payload["role"] == "system" {
-			content := ""
-			switch c := payload["content"].(type) {
-			case string:
-				content = c
-			case []any:
-				for _, part := range c {
-					m, _ := part.(map[string]any)
-					if m == nil {
-						continue
+		content := ""
+		switch c := payload["content"].(type) {
+		case string:
+			content = c
+		case []any:
+			for _, part := range c {
+				m, _ := part.(map[string]any)
+				if m == nil {
+					continue
+				}
+				if t, _ := m["text"].(string); t != "" {
+					if content != "" {
+						content += "\n"
 					}
-					if t, _ := m["text"].(string); t != "" {
-						if content != "" {
-							content += "\n"
-						}
-						content += t
-					}
+					content += t
 				}
 			}
-			if strings.Contains(content, "Client system rules") {
-				sawClientSystem = true
-			}
-			if content == "You are a helpful assistant." {
-				t.Fatalf("dummy system should not replace client system: %q", content)
-			}
+		}
+		if strings.Contains(content, "Client system rules") {
+			carrier, _ = payload["role"].(string)
+		}
+		if payload["role"] == "system" && content == "You are a helpful assistant." {
+			t.Fatalf("dummy system should not replace client system: %q", content)
 		}
 	}
-	if !sawClientSystem {
+	if carrier == "" {
 		t.Fatal("expected client system prompt in blobs")
+	}
+	if carrier != "user" {
+		t.Fatalf("client system prompt rode a %q blob; Cursor only keeps user turns", carrier)
 	}
 	um := msg.GetRunRequest().GetAction().GetUserMessageAction().GetUserMessage()
 	if um == nil || um.GetText() != "hello" {
@@ -289,6 +292,40 @@ func TestAwaitingClientToolsKeepsSessionAlive(t *testing.T) {
 	}
 }
 
+func TestParkForRebuildTombsAndDropsContinuation(t *testing.T) {
+	id := "conv-park-helper"
+	dropContinuation(id)
+	snapshot := snapshotWithAssistant(t, "held")
+	rememberContinuation(id, snapshot)
+	m := &SessionManager{sessions: map[string]*Session{}, pending: map[string]*Session{}}
+	item := &pendingExec{call: ToolCall{ID: "toolu_park", Name: "Bash"}}
+	s := &Session{
+		ID:             "park-s",
+		ConversationID: id,
+		pending:        map[string]*pendingExec{"toolu_park": item},
+		waitingTools:   true,
+		manager:        m,
+	}
+	m.Register(s)
+	m.BindPending("toolu_park", s)
+	s.parkForRebuild("stream error while awaiting client tool results: INTERNAL_ERROR")
+	if !s.parkedForRebuild() {
+		t.Fatal("expected parked for rebuild")
+	}
+	if _, ok := takeContinuation(id); ok {
+		t.Fatal("park must drop the tool-pause checkpoint")
+	}
+	_ = s.Close()
+	_, err := m.ResolveForToolResults([]ToolResult{{ToolCallID: "toolu_park"}})
+	if !errors.Is(err, ErrToolResumeRebuild) {
+		t.Fatalf("got %v want rebuild tombstone", err)
+	}
+	s.parkForRebuild("stream error while awaiting client tool results: http2: response body closed")
+	if !s.responseEnded {
+		t.Fatal("repeat park must keep responseEnded")
+	}
+}
+
 func TestSubmitToolResultsRebuildsWhenResponseEnded(t *testing.T) {
 	s := &Session{
 		pending: map[string]*pendingExec{
@@ -402,11 +439,8 @@ func TestSubmitToolResultsKeepsPendingAfterWriteFailure(t *testing.T) {
 		batches:      map[string]*pendingToolBatch{},
 	}
 	err := s.SubmitToolResults([]ToolResult{{ToolCallID: "tool_raw", Content: "sunny"}})
-	if err == nil {
-		t.Fatal("expected request-stream write failure")
-	}
-	if s.pending["tool_raw"] != item || len(s.pendingOrder) != 1 {
-		t.Fatalf("pending state was lost after write failure: %#v", s.pending)
+	if !errors.Is(err, ErrToolResumeRebuild) {
+		t.Fatalf("dead request stream must rebuild, got %v", err)
 	}
 }
 
@@ -432,6 +466,51 @@ func TestPiEditGroupRollsBackFinalResultAfterWriteFailure(t *testing.T) {
 	}
 	if group.sent || len(group.results) != 1 || group.results[0].Content != "one" {
 		t.Fatalf("group state was not rolled back: sent=%v results=%#v", group.sent, group.results)
+	}
+}
+
+func TestIncompleteCheckpointEmitsWriteOnForceAndEager(t *testing.T) {
+	write := &pendingExec{call: ToolCall{ID: "toolu_write", Name: "Write"}}
+	s := &Session{
+		pending:        map[string]*pendingExec{"toolu_write": write},
+		pendingOrder:   []*pendingExec{write},
+		parallelTools:  true,
+		events:         make(chan StreamEvent, 4),
+		lifecyclesByID: map[string]*nativeLifecycle{},
+	}
+	s.conversationState = &agentv1.ConversationStateStructure{PendingToolCalls: []string{
+		`{"role":"assistant","content":[{"type":"tool-call","toolCallId":"toolu_read","toolName":"Read"},{"type":"tool-call","toolCallId":"toolu_write","toolName":"Write"}]}`,
+	}}
+	s.applyCheckpointToolBatches(s.conversationState)
+	if !s.emitPendingToolBatch(false) {
+		t.Fatal("Write sitting in an incomplete checkpoint must emit eagerly")
+	}
+	if got := (<-s.events).ToolCall.Name; got != "Write" {
+		t.Fatalf("eager tool=%q want Write", got)
+	}
+}
+
+func TestIncompleteCheckpointEmitsWhatItHasOnForce(t *testing.T) {
+	read := &pendingExec{call: ToolCall{ID: "toolu_read", Name: "Read"}}
+	s := &Session{
+		pending:        map[string]*pendingExec{"toolu_read": read},
+		pendingOrder:   []*pendingExec{read},
+		parallelTools:  true,
+		events:         make(chan StreamEvent, 4),
+		lifecyclesByID: map[string]*nativeLifecycle{},
+	}
+	s.conversationState = &agentv1.ConversationStateStructure{PendingToolCalls: []string{
+		`{"role":"assistant","content":[{"type":"tool-call","toolCallId":"toolu_read","toolName":"Read"},{"type":"tool-call","toolCallId":"toolu_write","toolName":"Write"}]}`,
+	}}
+	s.applyCheckpointToolBatches(s.conversationState)
+	if s.emitPendingToolBatch(false) {
+		t.Fatal("Read-only incomplete checkpoint must still wait on the live path")
+	}
+	if !s.emitPendingToolBatch(true) {
+		t.Fatal("force must emit the Read we already have")
+	}
+	if got := (<-s.events).ToolCall.Name; got != "Read" {
+		t.Fatalf("forced tool=%q want Read", got)
 	}
 }
 
@@ -555,5 +634,126 @@ func TestPreferredToolNamesKeepsBash(t *testing.T) {
 	}
 	if !names["Bash"] || !names["Read"] {
 		t.Fatalf("expected Bash/Read in capped set, got %v", out)
+	}
+}
+
+func TestStallActionKeepsAliveBeforeFirstFrame(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	heartbeat, fail := stallAction(time.Time{}, now)
+	if !heartbeat || fail {
+		t.Fatalf("zero lastFrame should ping, not fail (heartbeat=%v fail=%v)", heartbeat, fail)
+	}
+
+	started := now.Add(-10 * time.Second)
+	heartbeat, fail = stallAction(started, now)
+	if heartbeat || fail {
+		t.Fatalf("10s idle should wait (heartbeat=%v fail=%v)", heartbeat, fail)
+	}
+
+	started = now.Add(-cursorIdleHeartbeatInterval)
+	heartbeat, fail = stallAction(started, now)
+	if !heartbeat || fail {
+		t.Fatalf("idle interval should ping (heartbeat=%v fail=%v)", heartbeat, fail)
+	}
+
+	started = now.Add(-cursorStallTimeout)
+	heartbeat, fail = stallAction(started, now)
+	if heartbeat || !fail {
+		t.Fatalf("stall timeout should fail (heartbeat=%v fail=%v)", heartbeat, fail)
+	}
+}
+
+func TestTokenStallDoesNotKillToolWait(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	old := now.Add(-cursorTokenStallTimeout - time.Minute)
+	if tokenStallShouldFail(true, old, old, now) {
+		t.Fatal("token stall must skip while awaiting client tools")
+	}
+}
+
+func TestPublishedToolIDIsBoundAndTombstoned(t *testing.T) {
+	m := &SessionManager{sessions: map[string]*Session{}, pending: map[string]*Session{}}
+	item := &pendingExec{call: ToolCall{ID: "call:raw id", Name: "Bash"}}
+	s := &Session{
+		ID:      "pub-s",
+		pending: map[string]*pendingExec{"call:raw id": item},
+		manager: m,
+	}
+	m.Register(s)
+	s.rememberPublishedToolID("call:raw id")
+	if m.LookupPending("call:raw id") != s {
+		t.Fatal("published id must be bound")
+	}
+	ids := s.pendingIDs()
+	found := false
+	for _, id := range ids {
+		if id == "call:raw id" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pendingIDs missing published id: %v", ids)
+	}
+	if !s.PendingCallIDAlive("call:raw id") {
+		t.Fatal("published id must count as alive")
+	}
+	s.parkForRebuild("test")
+	_ = s.Close()
+	_, err := m.ResolveForToolResults([]ToolResult{{ToolCallID: "call:raw id"}})
+	if !errors.Is(err, ErrToolResumeRebuild) {
+		t.Fatalf("published id must rebuild after park, got %v", err)
+	}
+}
+
+func TestSubmitUnknownPendingRebuilds(t *testing.T) {
+	s := &Session{
+		pending: map[string]*pendingExec{"toolu_known": {call: ToolCall{ID: "toolu_known"}}},
+	}
+	err := s.SubmitToolResults([]ToolResult{{ToolCallID: "toolu_missing", Content: "ok"}})
+	if !errors.Is(err, ErrToolResumeRebuild) {
+		t.Fatalf("unknown pending id must rebuild, got %v", err)
+	}
+}
+
+type countingReadCloser struct {
+	reads int
+}
+
+func (c *countingReadCloser) Read([]byte) (int, error) {
+	c.reads++
+	return 0, io.EOF
+}
+
+func (c *countingReadCloser) Close() error { return nil }
+
+func TestReadLoopDoesNotRereadAfterResponseEnded(t *testing.T) {
+	body := &countingReadCloser{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &Session{
+		stream:        &BidiStream{body: body},
+		events:        make(chan StreamEvent, 4),
+		errCh:         make(chan error, 1),
+		waitingTools:  true,
+		responseEnded: true,
+		pauseCh:       make(chan struct{}),
+		done:          ctx.Done(),
+		cancel:        cancel,
+		lastActivity:  time.Now(),
+	}
+	done := make(chan struct{})
+	go func() {
+		s.readLoop(ctx)
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if body.reads != 0 {
+		t.Fatalf("parked session re-read a dead body %d times", body.reads)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("readLoop did not exit after cancel")
 	}
 }

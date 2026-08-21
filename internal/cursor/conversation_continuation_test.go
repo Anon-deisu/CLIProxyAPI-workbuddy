@@ -162,6 +162,26 @@ func TestClosepersistsAndFailDrops(t *testing.T) {
 	}
 }
 
+func TestCloseParkedDropsContinuation(t *testing.T) {
+	id := "conv-parked-drop"
+	dropContinuation(id)
+	snapshot := snapshotWithAssistant(t, "done")
+	rememberContinuation(id, snapshot)
+	s := &Session{
+		ConversationID:    id,
+		conversationState: snapshot.state,
+		blobStore:         snapshot.blobs,
+		waitingTools:      true,
+		responseEnded:     true,
+		pending:           map[string]*pendingExec{"c1": {}},
+		events:            make(chan StreamEvent, 4),
+	}
+	_ = s.Close()
+	if _, ok := takeContinuation(id); ok {
+		t.Fatal("parked close must not keep a tool-pause checkpoint")
+	}
+}
+
 var errUnavailableForTest = errTest("upstream unavailable")
 
 type errTest string

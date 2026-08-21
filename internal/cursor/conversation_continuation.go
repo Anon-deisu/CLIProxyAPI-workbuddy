@@ -112,6 +112,12 @@ func takeContinuation(conversationID string) (checkpointSnapshot, bool) {
 	return copied, true
 }
 
+// DropContinuation forgets a conversation's stored state, forcing the next
+// turn to rebuild from client history.
+func DropContinuation(conversationID string) {
+	dropContinuation(conversationID)
+}
+
 // dropContinuation forgets a conversation's stored state, forcing the next
 // turn to rebuild from client history.
 func dropContinuation(conversationID string) {
@@ -210,13 +216,12 @@ func continuationMatchesHistory(snapshot checkpointSnapshot, messages []ChatMess
 	// Continuing it keeps the prompt cache and stops the model from replaying
 	// the turn's opening — the full rebuild used to answer twice and pay the
 	// whole prompt again. The results ride inside the user action.
-	if trailing := trailingToolResultMessages(messages); len(trailing) > 0 {
-		for i := range trailing {
-			if !snapshotMentionsToolCall(snapshot, trailing[i].ToolCallID) {
-				return false
-			}
-		}
-		return true
+	if len(trailingToolResultMessages(messages)) > 0 {
+		// Native tool-tail continuation (checkpoint + tool outputs as a user
+		// message) is rejected by Cursor as provider 400 / resource_exhausted
+		// once the Agent run has already ended. Always rebuild from the
+		// client's structured tool history instead.
+		return false
 	}
 	// Otherwise only the clean text-turn shape continues natively: a fresh
 	// user ask on top of a completed assistant turn.

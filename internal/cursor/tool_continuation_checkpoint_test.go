@@ -26,14 +26,13 @@ func toolTail(id string) []ChatMessage {
 	}
 }
 
-// A tool round-trip whose session died (long tool run, stream EOF, restart)
-// must continue from the server checkpoint instead of rebuilding a fresh
-// conversation: the rebuild lost the prompt cache and replayed the turn's
-// opening, which clients saw as answering twice.
+// A tool round-trip whose session died must rebuild from client history.
+// Native checkpoint continuation of tool tails is rejected by Cursor as
+// provider 400 / resource_exhausted once the Agent run has ended.
 func TestToolTailContinuesFromCheckpoint(t *testing.T) {
 	id := "toolu_01KeepCacheAlive"
-	if !continuationMatchesHistory(checkpointWithToolCall(id), toolTail(id)) {
-		t.Fatal("tool tail with a matching checkpoint must continue natively")
+	if continuationMatchesHistory(checkpointWithToolCall(id), toolTail(id)) {
+		t.Fatal("tool tail must rebuild from history, not continue natively")
 	}
 }
 
