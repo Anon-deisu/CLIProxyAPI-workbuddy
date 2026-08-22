@@ -13,7 +13,7 @@ import (
 const (
 	ProviderType            = "cursor"
 	DefaultBaseURL          = "https://api2.cursor.sh"
-	DefaultClientVersion    = "3.17"
+	DefaultClientVersion    = "3.17.8"
 	DefaultAuthClientID     = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
 	AgentRunPath            = "/agent.v1.AgentService/Run"
 	refreshThresholdSeconds = 300

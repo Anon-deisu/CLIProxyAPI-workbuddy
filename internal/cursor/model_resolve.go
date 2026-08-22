@@ -14,7 +14,7 @@ type ModelParameter struct {
 }
 
 // ModelSelection is the wire model id + catalog-style parameters for AgentRun.
-// Matches Cursor 3.17: base model_id + exact advertised parameters
+// Matches Cursor 3.17.8: base model_id + exact advertised parameters
 // (including fast=true). Variant-string wire IDs are not used by default.
 type ModelSelection struct {
 	ModelID           string
