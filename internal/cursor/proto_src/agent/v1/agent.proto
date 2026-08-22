@@ -193,7 +193,7 @@ enum BugbotDeeplinkEventKind {
    BUGBOT_DEEPLINK_EVENT_KIND_HANDLED_FIX_IN_WEB = 5;
 }
 
-// Cursor 3.7.12 desktop enums used by conversation checkpoints/actions.
+// Cursor 3.17.8 desktop enums used by conversation checkpoints/actions.
 enum AgentMode {
    AGENT_MODE_UNSPECIFIED = 0;
    AGENT_MODE_AGENT = 1;
@@ -579,7 +579,7 @@ message ToolCall {
    }
    repeated HookAdditionalContext hook_additional_contexts = 54;
    // Modern Agent builds carry lifecycle metadata on the envelope. These
-   // fields are emitted by the live service even though the Desktop 3.7.12
+   // fields are emitted by the live service even though the Desktop 3.17.8
    // bundle predates them.
    optional string tool_call_id = 57;
    optional int64 started_at_ms = 59;
@@ -1058,7 +1058,7 @@ message AgentRunRequest {
    optional SkillOptions skill_options = 7;
    // Custom system prompt override. Allowlisted for specific teams only.
    optional string custom_system_prompt = 8;
-   // Cursor 3.7.12 desktop descriptor extensions. Fields whose dependent
+   // Cursor 3.17.8 desktop descriptor extensions. Fields whose dependent
    // messages are not present in the pinned CLI schema remain unknown-field
    // compatible and are documented in the protocol audit report.
    optional bool suggest_next_prompt = 10;
@@ -1613,23 +1613,9 @@ message AskQuestionArgs {
    string async_original_tool_call_id = 6;
 }
 
-message AskQuestionArgs_Question {
-   // unique, model-provided
-   string id = 1;
-   // the question text
-   string prompt = 2;
-   // choices
-   repeated AskQuestionArgs_Option options = 3;
-   // multi-select vs single-select
-   bool allow_multiple = 4;
-}
 
-message AskQuestionArgs_Option {
-   // stable option id
-   string id = 1;
-   // display text
-   string label = 2;
-}
+
+
 
 // Marker indicating that questions have been sent asynchronously Answers will arrive later as a separate ask_question tool call
 message AskQuestionAsync {
@@ -1654,11 +1640,7 @@ message AskQuestionSuccess {
    repeated Answer answers = 1;
 }
 
-message AskQuestionSuccess_Answer {
-   string question_id = 1;
-   // empty if unanswered
-   repeated string selected_option_ids = 2;
-}
+
 
 message AskQuestionError {
    string error_message = 1;
@@ -2158,17 +2140,21 @@ message ExaFetchRequestQuery {
 
 message ExaFetchRequestResponse {
    oneof result {
-      ExaFetchRequestResponse_Approved approved = 1;
-      ExaFetchRequestResponse_Rejected rejected = 2;
+      Approved approved = 1;
+      Rejected rejected = 2;
+   }
+
+   message Rejected {
+   string reason = 1;
+   }
+
+   message Approved {
    }
 }
 
-message ExaFetchRequestResponse_Approved {
-}
 
-message ExaFetchRequestResponse_Rejected {
-   string reason = 1;
-}
+
+
 
 message ExaSearchArgs {
    string query = 1;
@@ -2216,17 +2202,21 @@ message ExaSearchRequestQuery {
 
 message ExaSearchRequestResponse {
    oneof result {
-      ExaSearchRequestResponse_Approved approved = 1;
-      ExaSearchRequestResponse_Rejected rejected = 2;
+      Approved approved = 1;
+      Rejected rejected = 2;
+   }
+
+   message Rejected {
+   string reason = 1;
+   }
+
+   message Approved {
    }
 }
 
-message ExaSearchRequestResponse_Approved {
-}
 
-message ExaSearchRequestResponse_Rejected {
-   string reason = 1;
-}
+
+
 
 message ExecClientStreamClose {
    uint32 id = 1;
@@ -2621,10 +2611,7 @@ message LsDirectoryTreeNode {
    int32 num_files = 6;
 }
 
-message LsDirectoryTreeNode_File {
-   string name = 1;
-   optional TerminalMetadata terminal_metadata = 2;
-}
+
 
 message LsError {
    string path = 1;
@@ -2655,12 +2642,7 @@ message TerminalMetadata {
    optional Command current_command = 4;
 }
 
-message TerminalMetadata_Command {
-   string command = 1;
-   optional int32 exit_code = 2;
-   optional int64 timestamp_ms = 3;
-   optional int64 duration_ms = 4;
-}
+
 
 message LsToolCall {
    LsArgs args = 1;
@@ -2764,16 +2746,7 @@ message ListMcpResourcesExecResult {
    }
 }
 
-message ListMcpResourcesExecResult_McpResource {
-   string uri = 1;
-   optional string name = 2;
-   optional string description = 3;
-   optional string mime_type = 4;
-   // Server name that provides this resource
-   string server = 5;
-   // Additional metadata
-   map<string, string> annotations = 6;
-}
+
 
 message ListMcpResourcesSuccess {
    repeated ListMcpResourcesExecResult.McpResource resources = 1;
@@ -3110,10 +3083,7 @@ message ImageProto {
    string mime_type = 7;
 }
 
-message ImageProto_Dimension {
-   int32 width = 1;
-   int32 height = 2;
-}
+
 
 // Git repository information for a workspace
 message GitRepoInfo {
@@ -3207,10 +3177,7 @@ message PrecomputedHumanChange {
    bool is_deleted_file = 4;
 }
 
-message RecentlyAddedPlugin_CapabilityDescriptor {
-   string name = 1;
-   string description = 2;
-}
+
 
 message RecentlyAddedPlugin {
    message CapabilityDescriptor {
@@ -3273,7 +3240,7 @@ message RequestContext {
    repeated CustomSubagent custom_subagents = 22;
    // MCP file system options for agent MCP tool descriptor access
    optional McpFileSystemOptions mcp_file_system_options = 23;
-   // Cursor 3.7.12 completeness/capability flags. A headless compatibility
+   // Cursor 3.17.8 completeness/capability flags. A headless compatibility
    // client sets these explicitly so the server does not infer missing IDE
    // context as an unfinished RequestContext response.
    optional bool web_fetch_enabled = 24;
@@ -3349,15 +3316,9 @@ message SelectedImage {
 }
 
 // Contains both blob_id and data together, for when the client has both and wants to populate the server-side cache without re-uploading
-message SelectedImage_BlobIdWithData {
-   bytes blob_id = 1;
-   bytes data = 2;
-}
 
-message SelectedImage_Dimension {
-   int32 width = 1;
-   int32 height = 2;
-}
+
+
 
 // Extra context entry that can be stored inline or as a blob reference
 message ExtraContextEntry {
@@ -3754,63 +3715,20 @@ message InvocationContext {
    }
 }
 
-message InvocationContext_MicrosoftTeamsThread {
-   string thread = 1;
-   optional string channel_name = 2;
-   optional string team_name = 3;
-   optional string channel_description = 4;
-   optional string team_description = 5;
-}
 
-message InvocationContext_SlackThread {
-   string thread = 1;
-   optional string channel_name = 2;
-   optional string channel_purpose = 3;
-   optional string channel_topic = 4;
-}
 
-message InvocationContext_GithubPR {
-   string title = 1;
-   string description = 2;
-   string comments = 3;
-   optional string ci_failures = 4;
-}
 
-message InvocationContext_IdeState {
-   repeated InvocationContext_IdeState_File visible_files = 1;
-   repeated InvocationContext_IdeState_File recently_viewed_files = 2;
-   // PRs currently being viewed in the review editor (if any)
-   repeated InvocationContext_IdeState_ViewedPullRequest currently_viewed_prs = 3;
-}
 
-message InvocationContext_IdeState_File {
-   // This is the full path
-   string path = 1;
-   optional string relative_path = 2;
-   // Present if file is currently focused
-   optional InvocationContext_IdeState_File_CursorPosition cursor_position = 3;
-   int32 total_lines = 4;
-   // Present for terminal files
-   optional string active_command = 5;
-}
 
-message InvocationContext_IdeState_File_CursorPosition {
-   int32 line = 1;
-   string text = 2;
-}
+
+
+
+
+
+
 
 // Information about a PR currently being viewed in a review editor
-message InvocationContext_IdeState_ViewedPullRequest {
-   int32 number = 1;
-   string url = 2;
-   optional string title = 3;
-   // Path to the folder containing PR details (diffs, metadata, etc.)
-   optional string folder_path = 4;
-   // Summary JSON containing file list and diff sizes (contents of summary.json)
-   optional string summary_json = 5;
-   // PR description/body
-   optional string description = 6;
-}
+
 
 message SetupVmEnvironmentArgs {
    // Command to install runtime dependencies (e.g., "npm install")
@@ -3865,16 +3783,9 @@ message ShellCommandParsingResult {
    repeated Redirect redirects = 6;
 }
 
-message ShellCommandParsingResult_ExecutableCommandArg {
-   string type = 1;
-   string value = 2;
-}
 
-message ShellCommandParsingResult_ExecutableCommand {
-   string name = 1;
-   repeated ShellCommandParsingResult_ExecutableCommandArg args = 2;
-   string full_text = 3;
-}
+
+
 
 message ShellArgs {
    string command = 1;
@@ -4190,12 +4101,9 @@ message SwitchModeRequestResponse {
    }
 }
 
-message SwitchModeRequestResponse_Approved {
-}
 
-message SwitchModeRequestResponse_Rejected {
-   string reason = 1;
-}
+
+
 
 message TodoItem {
    string id = 1;
@@ -4333,12 +4241,9 @@ message WebSearchRequestResponse {
    }
 }
 
-message WebSearchRequestResponse_Approved {
-}
 
-message WebSearchRequestResponse_Rejected {
-   string reason = 1;
-}
+
+
 
 message WriteArgs {
    string path = 1;
@@ -5380,12 +5285,7 @@ message McpStateExecResult {
 
 // ===== Allowlist prechecks =====
 
-message CommandClassifierResult_ClassifiedCommand {
-   string name = 1;
-   repeated string arguments = 2;
-   optional string suggested_allowlist_entry = 3;
-   repeated string subcommand_tokens = 4;
-}
+
 
 message CommandClassifierResult {
    message ClassifiedCommand {
@@ -5407,12 +5307,7 @@ message CommandClassifierResult {
    bool classification_failed = 3;
 }
 
-message ShellCommandParsingResult_Redirect {
-   string operator = 1;
-   repeated uint32 destination_fds = 2;
-   string target_node_type = 3;
-   optional string target_text = 4;
-}
+
 
 message ShellAllowlistPrecheckArgs {
    string command = 1;
@@ -5514,7 +5409,7 @@ enum ForceBackgroundSubagentStatus {
    FORCE_BACKGROUND_SUBAGENT_STATUS_NOT_FOUND = 2;
 }
 
-// Full desktop 3.7.12 subagent invocation shape recovered from the static descriptor.
+// Full desktop 3.17.8 subagent invocation shape recovered from the static descriptor.
 message SubagentArgs {
    string tool_call_id = 1;
    string subagent_type = 2;
