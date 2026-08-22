@@ -1165,6 +1165,33 @@ func (s *Session) emitTerminalUsage(segmentID uint64) {
 	s.emit(ev)
 }
 
+func (s *Session) abort(reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.failed = true
+	s.responseEnded = true
+	cancel := s.cancel
+	stream := s.stream
+	conversationID := s.ConversationID
+	s.mu.Unlock()
+	if conversationID != "" {
+		dropContinuation(conversationID)
+	}
+	if cancel != nil {
+		cancel()
+	}
+	if stream != nil {
+		_ = stream.Close()
+	}
+	log.Debugf("cursor: native session aborted reason=%s", reason)
+}
+
 func (s *Session) fail(err error) {
 	if err == nil {
 		return
@@ -2484,7 +2511,7 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 		s.touchFrame()
 		if control := m.ExecServerControlMessage; control != nil {
 			if abort := control.GetAbort(); abort != nil {
-				log.Debugf("cursor: native exec abort id=%d", abort.GetId())
+				s.abort(fmt.Sprintf("exec id=%d", abort.GetId()))
 			}
 		}
 	case *agentv1.AgentServerMessage_InteractionQuery:
