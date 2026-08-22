@@ -2515,12 +2515,15 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			}
 		}
 	case *agentv1.AgentServerMessage_InteractionQuery:
-		// InteractionQuery is an official native approval/query boundary. Keep
-		// it observable and alive without fabricating an InteractionResponse.
+		// InteractionQuery is an official native approval/query boundary. This
+		// gateway has no downstream approval callback to produce the matching
+		// InteractionResponse, so fail explicitly instead of leaving the Agent
+		// stream parked forever or fabricating an answer.
 		s.touchFrame()
 		if query := m.InteractionQuery; query != nil {
-			log.Debugf("cursor: native interaction query id=%d type=%T", query.GetId(), query.GetQuery())
+			return false, fmt.Errorf("cursor: unsupported native interaction query id=%d type=%T", query.GetId(), query.GetQuery())
 		}
+		return false, fmt.Errorf("cursor: empty native interaction query")
 	case *agentv1.AgentServerMessage_ConversationCheckpointUpdate:
 		if m.ConversationCheckpointUpdate != nil {
 			state := proto.Clone(m.ConversationCheckpointUpdate).(*agentv1.ConversationStateStructure)
