@@ -2459,6 +2459,20 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 		return false, nil
 	case *agentv1.AgentServerMessage_ExecServerMessage:
 		return s.handleExec(m.ExecServerMessage)
+	case *agentv1.AgentServerMessage_ExecServerControlMessage:
+		s.touchFrame()
+		if control := m.ExecServerControlMessage; control != nil {
+			if abort := control.GetAbort(); abort != nil {
+				log.Debugf("cursor: native exec abort id=%d", abort.GetId())
+			}
+		}
+	case *agentv1.AgentServerMessage_InteractionQuery:
+		// InteractionQuery is an official native approval/query boundary. Keep
+		// it observable and alive without fabricating an InteractionResponse.
+		s.touchFrame()
+		if query := m.InteractionQuery; query != nil {
+			log.Debugf("cursor: native interaction query id=%d type=%T", query.GetId(), query.GetQuery())
+		}
 	case *agentv1.AgentServerMessage_ConversationCheckpointUpdate:
 		if m.ConversationCheckpointUpdate != nil {
 			state := proto.Clone(m.ConversationCheckpointUpdate).(*agentv1.ConversationStateStructure)
