@@ -34,7 +34,7 @@
 
 ### 3. 为什么工具结果只能重渲染（Proto 限制，决定性）
 
-独立重读编译后 proto：[agent_mvp.pb.go:333-347](internal/cursor/proto/agent/v1/agent_mvp.pb.go)。
+独立重读编译后官方 proto：[agent.pb.go](internal/cursor/proto/agent/v1/agent.pb.go)。
 
 - `isConversationAction_Action` 接口只有**两个** oneof 实现：
   - `ConversationAction_UserMessageAction`（含 `UserMessage`）；
@@ -122,7 +122,7 @@ rm -f /usr/local/bin/cli-proxy-api.bak-latest /usr/local/bin/cli-proxy-api.bak-p
 ## 二、根因
 
 - Claude Code 的 `Agent`/`Task`/`Subagent` 工具，其 `model` 参数**只接受家族缩写**：`sonnet`、`opus`、`haiku`、`fable`。
-- Cursor 的 `SubagentArgs.ModelId`（proto [agent_mvp.pb.go:7203](internal/cursor/proto/agent/v1/agent_mvp.pb.go)，wire 字段 3）携带的是 **Cursor 内部 wire id**（例如 `cursor-claude-4.6-sonnet`）。
+- Cursor 的 `SubagentArgs.ModelId`（官方 proto `agent.pb.go`，wire 字段 3）携带的是 **Cursor 内部 wire id**（例如 `cursor-claude-4.6-sonnet`）。
 - 修复前 [session.go:3529-3531](internal/cursor/session.go) 直接写 `out["model"] = args.GetModelId()`，把 Cursor 内部 id 原样透传给 Claude Code → 校验失败 → 整个子代理工具调用被拒。
 
 ## 三、修复
