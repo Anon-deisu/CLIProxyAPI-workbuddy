@@ -2400,6 +2400,27 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			}
 		case *agentv1.InteractionUpdate_Heartbeat:
 			s.touchFrame()
+		case *agentv1.InteractionUpdate_ThinkingCompleted:
+			s.touchFrame()
+			log.Debugf("cursor: thinking completed duration_ms=%d", u.ThinkingCompleted.GetThinkingDurationMs())
+		case *agentv1.InteractionUpdate_TokenDelta:
+			s.touchFrame()
+			log.Debugf("cursor: native token delta tokens=%d", u.TokenDelta.GetTokens())
+		case *agentv1.InteractionUpdate_Summary,
+			*agentv1.InteractionUpdate_SummaryStarted,
+			*agentv1.InteractionUpdate_SummaryCompleted,
+			*agentv1.InteractionUpdate_ShellOutputDelta,
+			*agentv1.InteractionUpdate_StepStarted,
+			*agentv1.InteractionUpdate_StepCompleted,
+			*agentv1.InteractionUpdate_PromptSuggestion,
+			*agentv1.InteractionUpdate_PostRequestPrompt,
+			*agentv1.InteractionUpdate_ActiveBranchChange,
+			*agentv1.InteractionUpdate_FeedbackRequest,
+			*agentv1.InteractionUpdate_UserMessageAppended:
+			// These official lifecycle frames are progress, not downstream
+			// assistant content. Preserve them as native state without
+			// fabricating an OpenAI/Claude delta.
+			s.touchFrame()
 		case *agentv1.InteractionUpdate_TurnEnded:
 			ev := StreamEvent{Type: "usage_final"}
 			if u.TurnEnded.InputTokens != nil {
