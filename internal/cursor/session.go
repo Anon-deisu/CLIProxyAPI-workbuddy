@@ -401,6 +401,17 @@ func (s *Session) touch() {
 	s.mu.Unlock()
 }
 
+// touchFrame records an official native Agent frame without fabricating a
+// downstream text/tool event. Heartbeats and typed tool deltas are progress,
+// even when they do not yet produce client-visible output.
+func (s *Session) touchFrame() {
+	now := time.Now()
+	s.mu.Lock()
+	s.lastActivity = now
+	s.lastFrame = now
+	s.mu.Unlock()
+}
+
 // Upstream stall handling. While Cursor's provider is thinking hard (claude
 // with high reasoning effort is measured at 8-51s first tokens; fable-5 with
 // xhigh has stalled past five minutes) the Agent H2 stream can legitimately
@@ -2379,6 +2390,16 @@ func (s *Session) handleServerMessage(msg *agentv1.AgentServerMessage) (pauseFor
 			s.handleTextDelta(text)
 		case *agentv1.InteractionUpdate_ThinkingDelta:
 			s.handleThinkingDelta(u.ThinkingDelta.GetText())
+		case *agentv1.InteractionUpdate_ToolCallDelta:
+			// Keep the official native delta visible to the session lifecycle. The
+			// typed delta must not be fabricated into a completed tool call before
+			// Cursor sends its authoritative started/completed update.
+			s.touchFrame()
+			if delta := u.ToolCallDelta; delta != nil {
+				log.Debugf("cursor: native tool_call_delta call=%s model_call=%s type=%T", delta.GetCallId(), delta.GetModelCallId(), delta.GetToolCallDelta().GetDelta())
+			}
+		case *agentv1.InteractionUpdate_Heartbeat:
+			s.touchFrame()
 		case *agentv1.InteractionUpdate_TurnEnded:
 			ev := StreamEvent{Type: "usage_final"}
 			if u.TurnEnded.InputTokens != nil {
