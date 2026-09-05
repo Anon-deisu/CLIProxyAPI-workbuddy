@@ -923,6 +923,13 @@ func trailingToolResults(messages []cursorlib.ChatMessage) []cursorlib.ToolResul
 }
 
 // CountTokens returns a best-effort character-based estimate.
+// Refresh returns the auth unchanged: Cursor credentials are exchanged and
+// renewed inline by ensureCredentials on every run, so there is no separate
+// provider refresh flow.
+func (e *CursorExecutor) Refresh(_ context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	return auth, nil
+}
+
 func (e *CursorExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	_ = ctx
 	_ = auth

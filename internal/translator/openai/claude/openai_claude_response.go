@@ -8,10 +8,10 @@ package claude
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
-	"github.com/google/uuid"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -58,6 +58,11 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	ThinkingContentBlockIndex int
 	// Next available content block index
 	NextContentBlockIndex int
+	// Usage metrics cached from streaming chunks
+	UsageInputTokens      int64
+	UsageOutputTokens     int64
+	UsageCachedTokens     int64
+	UsageCacheWriteTokens int64
 }
 
 // ToolCallAccumulator holds the state for accumulating tool call data
@@ -101,26 +106,26 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			TextContentBlockIndex:       -1,
 			ThinkingContentBlockIndex:   -1,
 			NextContentBlockIndex:       0,
+			UsageInputTokens:            0,
+			UsageOutputTokens:           0,
+			UsageCachedTokens:           0,
+			UsageCacheWriteTokens:       0,
 		}
-	}
-
-	if (*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap == nil {
-		(*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap = util.ToolNameMapFromClaudeRequest(originalRequestRawJSON)
-	}
-
-	// Accept both "data: [DONE]" and bare "[DONE]" (some executors emit either).
-	trimmedDone := bytes.TrimSpace(rawJSON)
-	if bytes.HasPrefix(trimmedDone, dataTag) {
-		trimmedDone = bytes.TrimSpace(trimmedDone[len(dataTag):])
-	}
-	if bytes.Equal(trimmedDone, []byte("[DONE]")) {
-		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
 
 	if !bytes.HasPrefix(rawJSON, dataTag) {
 		return [][]byte{}
 	}
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
+
+	if (*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap == nil {
+		(*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap = util.ToolNameMapFromClaudeRequest(originalRequestRawJSON)
+	}
+
+	// Check if this is the [DONE] marker
+	if bytes.Equal(bytes.TrimSpace(rawJSON), []byte("[DONE]")) {
+		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
+	}
 
 	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
 	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
@@ -138,6 +143,13 @@ func effectiveOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) 
 		return "tool_calls"
 	}
 	return param.FinishReason
+}
+
+func terminalOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) string {
+	if reason := effectiveOpenAIFinishReason(param); reason != "" {
+		return reason
+	}
+	return "stop"
 }
 
 // convertOpenAIStreamingChunkToAnthropic converts OpenAI streaming chunk to Anthropic streaming events
@@ -229,8 +241,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				param.ToolCallsAccumulator = make(map[int]*ToolCallAccumulator)
 			}
 
-			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
+			toolCalls.ForEach(func(arrayIndex, toolCall gjson.Result) bool {
 				index := int(toolCall.Get("index").Int())
+				if !toolCall.Get("index").Exists() {
+					index = int(arrayIndex.Int())
+				}
 
 				// Initialize accumulator if needed
 				if _, exists := param.ToolCallsAccumulator[index]; !exists {
@@ -293,77 +308,28 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			param.FinishReason = reason
 		}
 
-		// Send content_block_stop for thinking content if needed
-		if param.ThinkingContentBlockStarted {
-			contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-			contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
-			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-			param.ThinkingContentBlockStarted = false
-			param.ThinkingContentBlockIndex = -1
-		}
-
-		// Send content_block_stop for text if text content block was started
-		stopTextContentBlock(param, &results)
-
-		// Send content_block_stop for any tool calls
-		if !param.ContentBlocksStopped {
-			for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
-				accumulator := param.ToolCallsAccumulator[index]
-				if !accumulator.StartEmitted {
-					if accumulator.Name == "" {
-						continue
-					}
-					if accumulator.ID == "" {
-						// Preserve every non-empty upstream id byte-for-byte. A
-						// fallback is only for malformed streams that never supplied
-						// any id, so the tool can still complete instead of aborting
-						// the whole response.
-						accumulator.ID = "toolu_" + uuid.NewString()
-					}
-					emitToolUseStart(param, index, accumulator, &results)
-				}
-				blockIndex := param.toolContentBlockIndex(index)
-
-				// Send complete input_json_delta with all accumulated arguments
-				if accumulator.Arguments.Len() > 0 {
-					inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
-					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
-				}
-
-				contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-				contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", blockIndex)
-				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-				delete(param.ToolCallBlockIndexes, index)
-			}
-			param.ContentBlocksStopped = true
-		}
+		finalizeOpenAIAnthropicContentBlocks(param, &results)
 
 		// Don't send message_delta here - wait for usage info or [DONE]
 	}
 
-	// Handle usage information separately (this comes in a later chunk)
-	// Only process if usage has actual values (not null)
-	if param.FinishReason != "" {
-		usage := root.Get("usage")
-		var inputTokens, outputTokens, cachedTokens int64
-		if usage.Exists() && usage.Type != gjson.Null {
-			inputTokens, outputTokens, cachedTokens = extractOpenAIUsage(usage)
-			// Send message_delta with usage
-			messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(effectiveOpenAIFinishReason(param)))
-			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.input_tokens", inputTokens)
-			messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.output_tokens", outputTokens)
-			if cachedTokens > 0 {
-				messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.cache_read_input_tokens", cachedTokens)
-			}
-			messageDeltaJSON = applyOpenAICacheCreation(messageDeltaJSON, usage)
-			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
-			param.MessageDeltaSent = true
+	// Cache usage information whenever present
+	usage := root.Get("usage")
+	hasUsage := usage.Exists() && usage.Type != gjson.Null
+	if hasUsage {
+		param.UsageInputTokens, param.UsageOutputTokens, param.UsageCachedTokens, param.UsageCacheWriteTokens = extractOpenAIUsage(usage)
+	}
 
-			emitMessageStopIfNeeded(param, &results)
-		}
+	// Emit message_delta and message_stop only when generation is finished:
+	// 1. Upstream provided a finish_reason, or
+	// 2. Upstream sent a trailing usage-only chunk (choices array is empty or absent) after content/tools started.
+	isTrailingUsageChunk := hasUsage && !root.Get("choices.0").Exists() &&
+		(param.FinishReason != "" || param.SawToolCall || param.TextContentBlockStarted || param.ThinkingContentBlockStarted || param.ContentAccumulator.Len() > 0)
+
+	if !param.MessageDeltaSent && (param.FinishReason != "" || isTrailingUsageChunk) && hasUsage {
+		finalizeOpenAIAnthropicContentBlocks(param, &results)
+		emitAnthropicMessageDelta(param, &results, param.UsageInputTokens, param.UsageOutputTokens, param.UsageCachedTokens, param.UsageCacheWriteTokens)
+		emitMessageStopIfNeeded(param, &results)
 	}
 
 	return results
@@ -373,51 +339,10 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams) [][]byte {
 	var results [][]byte
 
-	// Ensure all content blocks are stopped before final events
-	if param.ThinkingContentBlockStarted {
-		contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-		contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", param.ThinkingContentBlockIndex)
-		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-		param.ThinkingContentBlockStarted = false
-		param.ThinkingContentBlockIndex = -1
-	}
+	finalizeOpenAIAnthropicContentBlocks(param, &results)
 
-	stopTextContentBlock(param, &results)
-
-	if !param.ContentBlocksStopped {
-		for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
-			accumulator := param.ToolCallsAccumulator[index]
-			if !accumulator.StartEmitted {
-				// Belated emit at [DONE]; same behavior as the finish_reason
-				// path for name-but-no-id streams.
-				if accumulator.Name == "" {
-					continue
-				}
-				emitToolUseStart(param, index, accumulator, &results)
-			}
-			blockIndex := param.toolContentBlockIndex(index)
-
-			if accumulator.Arguments.Len() > 0 {
-				inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
-				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
-			}
-
-			contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
-			contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", blockIndex)
-			results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
-			delete(param.ToolCallBlockIndexes, index)
-		}
-		param.ContentBlocksStopped = true
-	}
-
-	// If we haven't sent message_delta yet (no usage info was received), send it now
-	if param.FinishReason != "" && !param.MessageDeltaSent {
-		messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
-		messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(effectiveOpenAIFinishReason(param)))
-		results = append(results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
-		param.MessageDeltaSent = true
+	if !param.MessageDeltaSent {
+		emitAnthropicMessageDelta(param, &results, param.UsageInputTokens, param.UsageOutputTokens, param.UsageCachedTokens, param.UsageCacheWriteTokens)
 	}
 
 	emitMessageStopIfNeeded(param, &results)
@@ -436,6 +361,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 	// Process message content and tool calls
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0] // Take first choice
+		var contentBlocks [][]byte
 
 		reasoningNode := choice.Get("message.reasoning_content")
 		for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
@@ -444,21 +370,21 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 			}
 			block := []byte(`{"type":"thinking","thinking":""}`)
 			block, _ = sjson.SetBytes(block, "thinking", reasoningText)
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
+			contentBlocks = append(contentBlocks, block)
 		}
 
 		// Handle text content
 		if content := choice.Get("message.content"); content.Exists() && content.String() != "" {
 			block := []byte(`{"type":"text","text":""}`)
 			block, _ = sjson.SetBytes(block, "text", content.String())
-			out, _ = sjson.SetRawBytes(out, "content.-1", block)
+			contentBlocks = append(contentBlocks, block)
 		}
 
 		// Handle tool calls
 		if toolCalls := choice.Get("message.tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 				toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
-				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", openAIToolCallID(toolCall))
+				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolCall.Get("function.name").String())
 
 				argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
@@ -473,9 +399,13 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 					toolUseBlock, _ = sjson.SetRawBytes(toolUseBlock, "input", []byte(`{}`))
 				}
 
-				out, _ = sjson.SetRawBytes(out, "content.-1", toolUseBlock)
+				contentBlocks = append(contentBlocks, toolUseBlock)
 				return true
 			})
+		}
+
+		if len(contentBlocks) > 0 {
+			out = translatorcommon.SetRawArrayItems(out, "content", contentBlocks)
 		}
 
 		// Set stop reason
@@ -486,13 +416,15 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 
 	// Set usage information
 	if usage := root.Get("usage"); usage.Exists() {
-		inputTokens, outputTokens, cachedTokens := extractOpenAIUsage(usage)
+		inputTokens, outputTokens, cachedTokens, cacheWriteTokens := extractOpenAIUsage(usage)
 		out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
 		out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
 		if cachedTokens > 0 {
 			out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
 		}
-		out = applyOpenAICacheCreation(out, usage)
+		if cacheWriteTokens > 0 {
+			out, _ = sjson.SetBytes(out, "usage.cache_creation_input_tokens", cacheWriteTokens)
+		}
 	}
 
 	return [][]byte{out}
@@ -595,11 +527,84 @@ func emitToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolI
 	blockIndex := param.toolContentBlockIndex(openAIToolIndex)
 	contentBlockStartJSON := []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`)
 	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "index", blockIndex)
-	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.id", accumulator.ID)
+	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.id", util.SanitizeClaudeToolID(accumulator.ID))
 	contentBlockStartJSON, _ = sjson.SetBytes(contentBlockStartJSON, "content_block.name", accumulator.Name)
 	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSON, 2))
 	accumulator.StartEmitted = true
 	param.SawToolCall = true
+}
+
+// emitBelatedToolUseStart finalizes a tool_use block that never received a
+// mid-stream start. Some OpenAI-compatible providers leave function.name empty
+// for the whole stream; dropping those calls loses tool_use for Claude Code and
+// can trigger retry loops. When name is still empty but the call has an id
+// and/or arguments, synthesize tool_<index> instead of silently discarding it.
+// Returns false when the accumulator has no usable tool-call signal.
+func emitBelatedToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolIndex int, accumulator *ToolCallAccumulator, results *[][]byte) bool {
+	if accumulator == nil {
+		return false
+	}
+	if accumulator.StartEmitted {
+		return true
+	}
+	if accumulator.Name == "" && accumulator.ID == "" && accumulator.Arguments.Len() == 0 {
+		return false
+	}
+	if accumulator.Name == "" {
+		accumulator.Name = fmt.Sprintf("tool_%d", openAIToolIndex)
+	}
+	emitToolUseStart(param, openAIToolIndex, accumulator, results)
+	return true
+}
+
+func finalizeOpenAIAnthropicContentBlocks(param *ConvertOpenAIResponseToAnthropicParams, results *[][]byte) {
+	if param == nil {
+		return
+	}
+	stopThinkingContentBlock(param, results)
+	stopTextContentBlock(param, results)
+
+	if !param.ContentBlocksStopped {
+		for _, index := range toolCallAccumulatorIndexes(param.ToolCallsAccumulator) {
+			accumulator := param.ToolCallsAccumulator[index]
+			if !emitBelatedToolUseStart(param, index, accumulator, results) {
+				continue
+			}
+			blockIndex := param.toolContentBlockIndex(index)
+
+			// Send complete input_json_delta with all accumulated arguments
+			if accumulator.Arguments.Len() > 0 {
+				inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
+				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
+				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
+				*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
+			}
+
+			contentBlockStopJSON := []byte(`{"type":"content_block_stop","index":0}`)
+			contentBlockStopJSON, _ = sjson.SetBytes(contentBlockStopJSON, "index", blockIndex)
+			*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_stop", contentBlockStopJSON, 2))
+			delete(param.ToolCallBlockIndexes, index)
+		}
+		param.ContentBlocksStopped = true
+	}
+}
+
+func emitAnthropicMessageDelta(param *ConvertOpenAIResponseToAnthropicParams, results *[][]byte, inputTokens, outputTokens, cachedTokens, cacheWriteTokens int64) {
+	if param == nil || param.MessageDeltaSent {
+		return
+	}
+	messageDeltaJSON := []byte(`{"type":"message_delta","delta":{"stop_reason":"","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+	messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "delta.stop_reason", mapOpenAIFinishReasonToAnthropic(terminalOpenAIFinishReason(param)))
+	messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.input_tokens", inputTokens)
+	messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.output_tokens", outputTokens)
+	if cachedTokens > 0 {
+		messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.cache_read_input_tokens", cachedTokens)
+	}
+	if cacheWriteTokens > 0 {
+		messageDeltaJSON, _ = sjson.SetBytes(messageDeltaJSON, "usage.cache_creation_input_tokens", cacheWriteTokens)
+	}
+	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "message_delta", messageDeltaJSON, 2))
+	param.MessageDeltaSent = true
 }
 
 func toolCallAccumulatorIndexes(accumulators map[int]*ToolCallAccumulator) []int {
@@ -632,6 +637,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 	hasToolCall := false
 	stopReasonSet := false
+	var blocks [][]byte
 
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0]
@@ -653,7 +659,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						}
 						block := []byte(`{"type":"text","text":""}`)
 						block, _ = sjson.SetBytes(block, "text", textBuilder.String())
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						blocks = append(blocks, block)
 						textBuilder.Reset()
 					}
 
@@ -663,7 +669,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						}
 						block := []byte(`{"type":"thinking","thinking":""}`)
 						block, _ = sjson.SetBytes(block, "thinking", thinkingBuilder.String())
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						blocks = append(blocks, block)
 						thinkingBuilder.Reset()
 					}
 
@@ -680,7 +686,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 								toolCalls.ForEach(func(_, tc gjson.Result) bool {
 									hasToolCall = true
 									toolUse := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
-									toolUse, _ = sjson.SetBytes(toolUse, "id", openAIToolCallID(tc))
+									toolUse, _ = sjson.SetBytes(toolUse, "id", util.SanitizeClaudeToolID(tc.Get("id").String()))
 									toolUse, _ = sjson.SetBytes(toolUse, "name", util.MapToolName(toolNameMap, tc.Get("function.name").String()))
 
 									argsStr := util.FixJSON(tc.Get("function.arguments").String())
@@ -695,7 +701,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 										toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(`{}`))
 									}
 
-									out, _ = sjson.SetRawBytes(out, "content.-1", toolUse)
+									blocks = append(blocks, toolUse)
 									return true
 								})
 							}
@@ -717,7 +723,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					if textContent != "" {
 						block := []byte(`{"type":"text","text":""}`)
 						block, _ = sjson.SetBytes(block, "text", textContent)
-						out, _ = sjson.SetRawBytes(out, "content.-1", block)
+						blocks = append(blocks, block)
 					}
 				}
 			}
@@ -729,7 +735,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 					}
 					block := []byte(`{"type":"thinking","thinking":""}`)
 					block, _ = sjson.SetBytes(block, "thinking", reasoningText)
-					out, _ = sjson.SetRawBytes(out, "content.-1", block)
+					blocks = append(blocks, block)
 				}
 			}
 
@@ -737,7 +743,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 				toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 					hasToolCall = true
 					toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
-					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", openAIToolCallID(toolCall))
+					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
 					toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", util.MapToolName(toolNameMap, toolCall.Get("function.name").String()))
 
 					argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
@@ -752,21 +758,27 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 						toolUseBlock, _ = sjson.SetRawBytes(toolUseBlock, "input", []byte(`{}`))
 					}
 
-					out, _ = sjson.SetRawBytes(out, "content.-1", toolUseBlock)
+					blocks = append(blocks, toolUseBlock)
 					return true
 				})
 			}
 		}
 	}
 
+	if len(blocks) > 0 {
+		out, _ = sjson.SetRawBytes(out, "content", translatorcommon.JoinRawArray(blocks))
+	}
+
 	if respUsage := root.Get("usage"); respUsage.Exists() {
-		inputTokens, outputTokens, cachedTokens := extractOpenAIUsage(respUsage)
+		inputTokens, outputTokens, cachedTokens, cacheWriteTokens := extractOpenAIUsage(respUsage)
 		out, _ = sjson.SetBytes(out, "usage.input_tokens", inputTokens)
 		out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
 		if cachedTokens > 0 {
 			out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
 		}
-		out = applyOpenAICacheCreation(out, respUsage)
+		if cacheWriteTokens > 0 {
+			out, _ = sjson.SetBytes(out, "usage.cache_creation_input_tokens", cacheWriteTokens)
+		}
 	}
 
 	if !stopReasonSet {
@@ -780,65 +792,30 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 	return out
 }
 
-func openAIToolCallID(toolCall gjson.Result) string {
-	id := toolCall.Get("id")
-	if id.Exists() && id.Type == gjson.String && id.String() != "" {
-		return id.String()
-	}
-	return "toolu_" + uuid.NewString()
-}
-
 func ClaudeTokenCount(ctx context.Context, count int64) []byte {
 	return translatorcommon.ClaudeInputTokensJSON(count)
 }
 
-// applyOpenAICacheCreation surfaces provider-reported cache writes, which some
-// upstreams (Cursor Agent) report alongside cached_tokens.
-func applyOpenAICacheCreation(payload []byte, usage gjson.Result) []byte {
-	created := usage.Get("prompt_tokens_details.cache_creation_tokens").Int()
-	if created <= 0 {
-		created = usage.Get("input_tokens_details.cache_write_tokens").Int()
-	}
-	if created <= 0 {
-		return payload
-	}
-	out, err := sjson.SetBytes(payload, "usage.cache_creation_input_tokens", created)
-	if err != nil {
-		return payload
-	}
-	return out
-}
-
-func extractOpenAIUsage(usage gjson.Result) (int64, int64, int64) {
+func extractOpenAIUsage(usage gjson.Result) (int64, int64, int64, int64) {
 	if !usage.Exists() || usage.Type == gjson.Null {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 
 	inputTokens := usage.Get("prompt_tokens").Int()
 	outputTokens := usage.Get("completion_tokens").Int()
 	cachedTokens := usage.Get("prompt_tokens_details.cached_tokens").Int()
-	cacheWriteTokens := usage.Get("prompt_tokens_details.cache_creation_tokens").Int()
-	if cacheWriteTokens <= 0 {
-		cacheWriteTokens = usage.Get("input_tokens_details.cache_write_tokens").Int()
+	cacheWriteTokens := usage.Get("prompt_tokens_details.cache_write_tokens").Int()
+	if cacheWriteTokens == 0 {
+		cacheWriteTokens = usage.Get("prompt_tokens_details.cache_creation_tokens").Int()
 	}
 
-	// The reported prompt_tokens may take one of two shapes:
-	//   - OpenAI-style: prompt_tokens already contains the cache buckets, so
-	//     stripping them exposes the genuinely fresh input.
-	//   - Split-style (this proxy's Cursor path): prompt_tokens is the fresh
-	//     portion only, cache read/write reported as parallel buckets. The
-	//     cache can then legitimately exceed the fresh input.
-	//
-	// Both are distinguishable locally the same way splitCursorInput uses
-	// upstream: if the cache buckets fit within prompt_tokens, subtract; if
-	// they exceed it, prompt_tokens is already fresh and must be kept. Without
-	// this, a split-style prompt (e.g. 2 fresh vs 25117 cached) was stripped
-	// again, driving the reported input_tokens to zero — the "uncached input
-	// went from a few tokens to 0" reports.
-	cachedInput := cachedTokens + cacheWriteTokens
-	if cachedInput > 0 && inputTokens >= cachedInput {
-		inputTokens -= cachedInput
+	if cachedTokens > 0 {
+		if inputTokens >= cachedTokens {
+			inputTokens -= cachedTokens
+		} else {
+			inputTokens = 0
+		}
 	}
 
-	return inputTokens, outputTokens, cachedTokens
+	return inputTokens, outputTokens, cachedTokens, cacheWriteTokens
 }

@@ -1,151 +1,138 @@
 package responses
 
 import (
-	"encoding/json"
-	"fmt"
 	"strings"
 
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-func convertResponsesToolToOpenAIChatTools(tool gjson.Result) [][]byte {
-	toolType := strings.TrimSpace(tool.Get("type").String())
-	switch toolType {
-	case "", "function":
-		if tJSON, ok := convertResponsesFunctionToolToOpenAIChat(tool, ""); ok {
-			return [][]byte{tJSON}
-		}
-	case "namespace":
-		return convertResponsesNamespaceToolToOpenAIChat(tool)
-	case "custom", "shell", "local_shell", "apply_patch":
-		if tJSON, ok := convertResponsesTypedToolToOpenAIChat(tool, ""); ok {
-			return [][]byte{tJSON}
-		}
-	default:
-		return nil
-	}
-	return nil
+// responsesToolDeclaration is one Responses tool declaration paired with the
+// Chat Completions function name it produces. Namespace children carry both
+// their declared name and the owning namespace, so reverse translation can
+// restore the split identity.
+type responsesToolDeclaration struct {
+	tool      gjson.Result
+	chatName  string
+	localName string
+	namespace string
+	custom    bool
 }
 
-func convertResponsesNamespaceToolToOpenAIChat(tool gjson.Result) [][]byte {
-	namespaceName := strings.TrimSpace(tool.Get("name").String())
-	children := tool.Get("tools")
-	if !children.Exists() || !children.IsArray() {
-		return nil
+// walkResponsesToolDeclarations visits the tool declarations of a Responses
+// request in one canonical order: the top-level "tools" field first, then
+// Codex Desktop (Responses Lite) "additional_tools" input items, namespace
+// children in declaration order. Declarations that produce no Chat Completions
+// tool are skipped. Visiting stops early once visit returns false.
+//
+// Request conversion, reverse name resolution and freeform tool classification
+// all traverse through here, so they cannot disagree about which declaration
+// backs a given Chat Completions tool name.
+func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDeclaration) bool) {
+	proceed := true
+	emit := func(tool gjson.Result, namespaceName string) {
+		if !proceed {
+			return
+		}
+		var custom bool
+		switch strings.TrimSpace(tool.Get("type").String()) {
+		case "", "function":
+		case "custom":
+			custom = true
+		default:
+			return
+		}
+		localName := responsesToolName(tool)
+		if localName == "" {
+			return
+		}
+		proceed = visit(responsesToolDeclaration{
+			tool:      tool,
+			chatName:  qualifyResponsesNamespaceToolName(namespaceName, localName),
+			localName: localName,
+			namespace: namespaceName,
+			custom:    custom,
+		})
+	}
+	scan := func(tools gjson.Result) {
+		if !proceed || !tools.Exists() || !tools.IsArray() {
+			return
+		}
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			if strings.TrimSpace(tool.Get("type").String()) == "namespace" {
+				if children := tool.Get("tools"); children.Exists() && children.IsArray() {
+					namespaceName := strings.TrimSpace(tool.Get("name").String())
+					children.ForEach(func(_, child gjson.Result) bool {
+						emit(child, namespaceName)
+						return proceed
+					})
+				}
+				return proceed
+			}
+			emit(tool, "")
+			return proceed
+		})
 	}
 
-	var out [][]byte
-	children.ForEach(func(_, child gjson.Result) bool {
-		childName := responsesToolName(child)
-		qualifiedName := qualifyResponsesNamespaceToolName(namespaceName, childName)
-		var tJSON []byte
-		var ok bool
-		if strings.TrimSpace(child.Get("type").String()) == "custom" {
-			tJSON, ok = convertResponsesTypedToolToOpenAIChat(child, qualifiedName)
-		} else {
-			tJSON, ok = convertResponsesFunctionToolToOpenAIChat(child, qualifiedName)
+	scan(root.Get("tools"))
+	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			if item.Get("type").String() == "additional_tools" {
+				scan(item.Get("tools"))
+			}
+			return proceed
+		})
+	}
+}
+
+// mergeResponsesRequestChatTools converts every tool declaration in a Responses
+// request into Chat Completions form, merging the top-level "tools" field with
+// Codex Desktop (Responses Lite) "additional_tools" input items.
+//
+// Codex clients may deliver the same tool through both channels, and namespace
+// qualification can collapse distinct declarations onto one Chat Completions
+// name, so entries are deduplicated by function name. The first occurrence
+// wins, which keeps the top-level "tools" definition authoritative over the
+// "additional_tools" copy. Chat Completions requires tool names to be unique;
+// strict upstreams reject the whole request otherwise.
+func mergeResponsesRequestChatTools(root gjson.Result) [][]byte {
+	var merged [][]byte
+	seenToolNames := make(map[string]struct{})
+	walkResponsesToolDeclarations(root, func(declaration responsesToolDeclaration) bool {
+		if _, duplicate := seenToolNames[declaration.chatName]; duplicate {
+			return true
 		}
-		if ok {
-			out = append(out, tJSON)
+		convert := convertResponsesFunctionToolToOpenAIChat
+		if declaration.custom {
+			convert = convertResponsesCustomToolToOpenAIChat
+		}
+		if chatTool, ok := convert(declaration.tool, declaration.chatName); ok {
+			seenToolNames[declaration.chatName] = struct{}{}
+			merged = append(merged, chatTool)
 		}
 		return true
 	})
-	return out
+	return merged
 }
 
-func convertResponsesTypedToolToOpenAIChat(tool gjson.Result, overrideName string) ([]byte, bool) {
-	kind := strings.TrimSpace(tool.Get("type").String())
+// convertResponsesCustomToolToOpenAIChat maps a Responses freeform ("custom")
+// tool onto a Chat Completions function tool with a single freeform "input"
+// string, mirroring the function-based shape Codex uses for apply_patch.
+func convertResponsesCustomToolToOpenAIChat(tool gjson.Result, overrideName string) ([]byte, bool) {
 	name := strings.TrimSpace(overrideName)
 	if name == "" {
-		if kind == "shell" || kind == "local_shell" || kind == "apply_patch" {
-			name = kind
-		} else {
-			name = responsesToolName(tool)
-		}
+		name = responsesToolName(tool)
 	}
 	if name == "" {
 		return nil, false
 	}
-	description := responsesToolDescription(tool)
-	if description == "" {
-		switch kind {
-		case "custom":
-			description = "Accept raw text input for this custom tool."
-		case "shell":
-			description = "Execute one or more shell commands in the client environment."
-		case "local_shell":
-			description = "Execute a command in the client's local shell."
-		case "apply_patch":
-			description = "Create, delete, or update a file using a structured patch operation."
-		}
-	}
-	parameters := responsesTypedToolSchema(kind)
-	if parameters == nil {
-		return nil, false
-	}
-	chatTool := []byte(`{"type":"function","function":{"name":"","description":"","parameters":{}}}`)
+	chatTool := []byte(`{"type":"function","function":{"name":"","description":"","parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}}}`)
 	chatTool, _ = sjson.SetBytes(chatTool, "function.name", name)
-	chatTool, _ = sjson.SetBytes(chatTool, "function.description", description)
-	raw, _ := json.Marshal(parameters)
-	chatTool, _ = sjson.SetRawBytes(chatTool, "function.parameters", raw)
-	return chatTool, true
-}
-
-func responsesTypedToolSchema(kind string) map[string]any {
-	switch kind {
-	case "custom":
-		return map[string]any{
-			"type":                 "object",
-			"properties":           map[string]any{"input": map[string]any{"type": "string"}},
-			"required":             []string{"input"},
-			"additionalProperties": false,
-		}
-	case "shell":
-		return map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"commands":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"max_output_length": map[string]any{"type": "integer", "minimum": 1},
-				"timeout_ms":        map[string]any{"type": "integer", "minimum": 1},
-			},
-			"required":             []string{"commands"},
-			"additionalProperties": false,
-		}
-	case "local_shell":
-		return map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"type":              map[string]any{"type": "string", "const": "exec"},
-				"command":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
-				"env":               map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
-				"timeout_ms":        map[string]any{"type": "integer", "minimum": 1},
-				"user":              map[string]any{"type": "string"},
-				"working_directory": map[string]any{"type": "string"},
-			},
-			"required":             []string{"command", "env", "type"},
-			"additionalProperties": false,
-		}
-	case "apply_patch":
-		return map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"operation": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"type": map[string]any{"type": "string", "enum": []string{"create_file", "delete_file", "update_file"}},
-						"path": map[string]any{"type": "string"},
-						"diff": map[string]any{"type": "string"},
-					},
-					"required": []string{"type", "path"},
-				},
-			},
-			"required":             []string{"operation"},
-			"additionalProperties": false,
-		}
-	default:
-		return nil
+	if description := responsesToolDescription(tool); description != "" {
+		chatTool, _ = sjson.SetBytes(chatTool, "function.description", description)
 	}
+	return chatTool, true
 }
 
 func convertResponsesFunctionToolToOpenAIChat(tool gjson.Result, overrideName string) ([]byte, bool) {
@@ -197,6 +184,87 @@ func responsesToolParameters(tool gjson.Result) gjson.Result {
 	return gjson.Result{}
 }
 
+// responsesToolOutputText flattens a tool output value that may be a plain
+// string or an array of content parts ({"type":"input_text","text":...}) into
+// a single text payload for a Chat Completions tool message.
+func responsesToolOutputText(output gjson.Result) string {
+	if output.Type == gjson.String {
+		return output.String()
+	}
+	if output.IsArray() {
+		var b strings.Builder
+		output.ForEach(func(_, part gjson.Result) bool {
+			if part.Type == gjson.String {
+				b.WriteString(part.String())
+				return true
+			}
+			if text := part.Get("text"); text.Exists() {
+				b.WriteString(text.String())
+			}
+			return true
+		})
+		return b.String()
+	}
+	if output.Exists() {
+		return output.Raw
+	}
+	return ""
+}
+
+// responsesCustomToolNames collects the Chat Completions names of the freeform
+// ("custom") tools that survive the merge, so response translation only unwraps
+// freeform arguments for calls whose winning declaration really was freeform.
+//
+// Declaration types may differ across the two delivery channels: a top-level
+// function and an "additional_tools" custom tool can flatten to the same name.
+// Classification therefore follows the same first-wins rule as the merge —
+// a discarded custom declaration must not turn a surviving ordinary function
+// into a custom_tool_call.
+func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
+	names := make(map[string]struct{})
+	seenToolNames := make(map[string]struct{})
+	walkResponsesToolDeclarations(gjson.ParseBytes(requestRawJSON), func(declaration responsesToolDeclaration) bool {
+		if _, duplicate := seenToolNames[declaration.chatName]; duplicate {
+			return true
+		}
+		seenToolNames[declaration.chatName] = struct{}{}
+		if declaration.custom {
+			names[declaration.chatName] = struct{}{}
+		}
+		return true
+	})
+	return names
+}
+
+func responsesSingleCustomToolName(requestRawJSON []byte) (string, bool) {
+	customToolNames := responsesCustomToolNames(requestRawJSON)
+	if len(customToolNames) != 1 {
+		return "", false
+	}
+
+	// Count the tools actually emitted, which are deduplicated by name, so a
+	// tool delivered through both "tools" and "additional_tools" still counts
+	// once and freeform unwrapping stays enabled.
+	toolCount := len(mergeResponsesRequestChatTools(gjson.ParseBytes(requestRawJSON)))
+	for name := range customToolNames {
+		return name, toolCount == 1
+	}
+	return "", false
+}
+
+// unwrapCustomToolInput extracts the freeform input from the {"input": "..."}
+// function-call arguments produced for a converted custom tool; it falls back
+// to the raw arguments when the wrapper is absent.
+func unwrapCustomToolInput(arguments string) string {
+	if v := gjson.Get(arguments, "input"); v.Exists() {
+		if v.Type == gjson.String {
+			return v.String()
+		}
+		return v.Raw
+	}
+	return arguments
+}
+
 func qualifyResponsesNamespaceToolName(namespaceName, childName string) string {
 	childName = strings.TrimSpace(childName)
 	if childName == "" || namespaceName == "" || strings.HasPrefix(childName, "mcp__") {
@@ -211,49 +279,35 @@ func qualifyResponsesNamespaceToolName(namespaceName, childName string) string {
 	return namespaceName + "__" + childName
 }
 
+// resolveResponsesQualifiedToolIdentity maps an emitted Chat Completions
+// function name back to the Responses declaration that produced it.
+//
+// Declarations are walked in the same order mergeResponsesRequestChatTools
+// uses, and the first one producing the name wins, so reverse translation
+// reports the identity of the declaration that actually survived the merge. A
+// flat top-level tool named "editor__apply_patch" therefore stays flat even
+// when a later namespace declares a child qualifying to the same name.
+func resolveResponsesQualifiedToolIdentity(root gjson.Result, qualifiedName string) (name, namespace string, found bool) {
+	walkResponsesToolDeclarations(root, func(declaration responsesToolDeclaration) bool {
+		if declaration.chatName != qualifiedName {
+			return true
+		}
+		name, namespace, found = declaration.localName, declaration.namespace, true
+		return false
+	})
+	return name, namespace, found
+}
+
 func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, qualifiedName string) (name, namespace string) {
 	qualifiedName = strings.TrimSpace(qualifiedName)
 	if qualifiedName == "" {
 		return "", ""
 	}
 
-	tools := gjson.GetBytes(requestRawJSON, "tools")
-	if !tools.Exists() || !tools.IsArray() {
-		return qualifiedName, ""
+	if resolvedName, resolvedNamespace, ok := resolveResponsesQualifiedToolIdentity(gjson.ParseBytes(requestRawJSON), qualifiedName); ok {
+		return resolvedName, resolvedNamespace
 	}
-
-	var bestNamespace string
-	var bestChild string
-	tools.ForEach(func(_, tool gjson.Result) bool {
-		if strings.TrimSpace(tool.Get("type").String()) != "namespace" {
-			return true
-		}
-		namespaceName := strings.TrimSpace(tool.Get("name").String())
-		if namespaceName == "" {
-			return true
-		}
-		children := tool.Get("tools")
-		if !children.Exists() || !children.IsArray() {
-			return true
-		}
-		children.ForEach(func(_, child gjson.Result) bool {
-			childName := responsesToolName(child)
-			if childName == "" {
-				return true
-			}
-			if qualifyResponsesNamespaceToolName(namespaceName, childName) == qualifiedName {
-				bestNamespace = namespaceName
-				bestChild = childName
-			}
-			return true
-		})
-		return true
-	})
-
-	if bestNamespace == "" || bestChild == "" {
-		return qualifiedName, ""
-	}
-	return bestChild, bestNamespace
+	return qualifiedName, ""
 }
 
 func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
@@ -268,122 +322,5 @@ func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
 
 func applyResponsesFunctionCallNamespaceFields(item []byte, requestRawJSON []byte, qualifiedName string, itemPath string) []byte {
 	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON, qualifiedName)
-	namePath := "name"
-	namespacePath := "namespace"
-	if itemPath != "" {
-		namePath = itemPath + ".name"
-		namespacePath = itemPath + ".namespace"
-	}
-	item, _ = sjson.SetBytes(item, namePath, name)
-	if namespace != "" {
-		item, _ = sjson.SetBytes(item, namespacePath, namespace)
-	} else {
-		item, _ = sjson.DeleteBytes(item, namespacePath)
-	}
-	return item
-}
-
-type responsesToolDescriptor struct {
-	kind      string
-	name      string
-	namespace string
-}
-
-func describeResponsesToolFromRequest(requestRawJSON []byte, qualifiedName string) responsesToolDescriptor {
-	descriptor := responsesToolDescriptor{kind: "function", name: qualifiedName}
-	tools := gjson.GetBytes(requestRawJSON, "tools")
-	if !tools.IsArray() {
-		return descriptor
-	}
-	tools.ForEach(func(_, tool gjson.Result) bool {
-		kind := strings.TrimSpace(tool.Get("type").String())
-		if kind == "namespace" {
-			namespace := strings.TrimSpace(tool.Get("name").String())
-			tool.Get("tools").ForEach(func(_, child gjson.Result) bool {
-				childName := responsesToolName(child)
-				if qualifyResponsesNamespaceToolName(namespace, childName) != qualifiedName {
-					return true
-				}
-				descriptor = responsesToolDescriptor{
-					kind:      strings.TrimSpace(child.Get("type").String()),
-					name:      childName,
-					namespace: namespace,
-				}
-				if descriptor.kind == "" {
-					descriptor.kind = "function"
-				}
-				return false
-			})
-			return descriptor.namespace == ""
-		}
-		name := responsesToolName(tool)
-		if kind == "shell" || kind == "local_shell" || kind == "apply_patch" {
-			name = kind
-		}
-		if name != qualifiedName {
-			return true
-		}
-		descriptor = responsesToolDescriptor{kind: kind, name: name}
-		if descriptor.kind == "" {
-			descriptor.kind = "function"
-		}
-		return false
-	})
-	return descriptor
-}
-
-func responsesToolCallItem(requestRawJSON []byte, qualifiedName, callID, arguments, status string) []byte {
-	descriptor := describeResponsesToolFromRequest(requestRawJSON, qualifiedName)
-	prefix := "fc"
-	switch descriptor.kind {
-	case "custom":
-		prefix = "ctc"
-	case "shell":
-		prefix = "sh"
-	case "local_shell":
-		prefix = "lsh"
-	case "apply_patch":
-		prefix = "ap"
-	}
-	itemID := fmt.Sprintf("%s_%s", prefix, callID)
-	switch descriptor.kind {
-	case "custom":
-		item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","call_id":"","name":"","input":""}`)
-		item, _ = sjson.SetBytes(item, "id", itemID)
-		item, _ = sjson.SetBytes(item, "status", status)
-		item, _ = sjson.SetBytes(item, "call_id", callID)
-		item, _ = sjson.SetBytes(item, "name", descriptor.name)
-		item, _ = sjson.SetBytes(item, "input", gjson.Get(arguments, "input").String())
-		if descriptor.namespace != "" {
-			item, _ = sjson.SetBytes(item, "namespace", descriptor.namespace)
-		}
-		return item
-	case "shell", "local_shell":
-		itemType := descriptor.kind + "_call"
-		item := []byte(`{"id":"","type":"","status":"completed","call_id":"","action":{}}`)
-		item, _ = sjson.SetBytes(item, "id", itemID)
-		item, _ = sjson.SetBytes(item, "type", itemType)
-		item, _ = sjson.SetBytes(item, "status", status)
-		item, _ = sjson.SetBytes(item, "call_id", callID)
-		if gjson.Valid(arguments) {
-			item, _ = sjson.SetRawBytes(item, "action", []byte(arguments))
-		}
-		return item
-	case "apply_patch":
-		item := []byte(`{"id":"","type":"apply_patch_call","status":"completed","call_id":"","operation":{}}`)
-		item, _ = sjson.SetBytes(item, "id", itemID)
-		item, _ = sjson.SetBytes(item, "status", status)
-		item, _ = sjson.SetBytes(item, "call_id", callID)
-		if operation := gjson.Get(arguments, "operation"); operation.Exists() {
-			item, _ = sjson.SetRawBytes(item, "operation", []byte(operation.Raw))
-		}
-		return item
-	default:
-		item := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
-		item, _ = sjson.SetBytes(item, "id", itemID)
-		item, _ = sjson.SetBytes(item, "status", status)
-		item, _ = sjson.SetBytes(item, "arguments", arguments)
-		item, _ = sjson.SetBytes(item, "call_id", callID)
-		return applyResponsesFunctionCallNamespaceFields(item, requestRawJSON, qualifiedName, "")
-	}
+	return translatorcommon.SetResponsesToolCallIdentity(item, name, namespace, itemPath)
 }

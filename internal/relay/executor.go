@@ -93,6 +93,13 @@ func (f *failedAuthority) Snapshot() (map[string]string, map[string]AccountState
 }
 
 // CountTokens is not part of the constrained coding-agent surface.
+// Refresh returns the auth unchanged: in the Mode-B relay design the
+// account's real CC agent owns the OAuth token lifecycle, so the gateway
+// never refreshes Claude credentials itself.
+func (e *Executor) Refresh(_ context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	return auth, nil
+}
+
 func (e *Executor) CountTokens(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, reject(501, "count_tokens is unsupported on the coding-agent surface; use the official API")
 }
