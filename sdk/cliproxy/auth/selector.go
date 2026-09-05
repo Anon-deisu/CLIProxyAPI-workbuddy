@@ -1047,17 +1047,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 			return auth, nil
 		}
-		// The bound account is busy (cooldown, rate limit, lower priority
-		// tier). Reuse whichever stand-in this session already borrowed so a
-		// multi-turn chat stays on one account for the whole outage instead of
-		// rebuilding the upstream prompt cache on every turn.
-		standbyKey := cacheKey + "::standby"
-		if standbyID, okStandby := s.cache.GetAndRefresh(standbyKey); okStandby {
-			if auth := findAuthByID(available, standbyID); auth != nil {
-				entry.Infof("session-affinity: bound auth busy, staying on stand-in | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
-			}
-		}
+		// Cached auth not available, reselect via fallback selector for even distribution
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
@@ -1065,12 +1055,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if auth == nil {
 			return nil, nil
 		}
-		// Record the stand-in but leave the binding alone. Cooldowns end, and
-		// the session should go back to the account that already holds its
-		// cached prompt; if that account never returns, the binding simply
-		// expires and the stand-in keeps serving the chat.
-		s.cache.Set(standbyKey, auth.ID)
-		entry.Infof("session-affinity: bound auth busy, using stand-in | session=%s auth=%s bound=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, cachedAuthID, provider, model)
+		bind(auth.ID)
+		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
 

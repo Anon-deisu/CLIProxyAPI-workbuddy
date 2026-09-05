@@ -13,14 +13,6 @@ const affinityTestModel = "claude-opus-5"
 
 func healthy(id string) *Auth { return &Auth{ID: id, Provider: "cursor", Status: StatusActive} }
 
-func coolingDown(id string) *Auth {
-	a := healthy(id)
-	a.ModelStates = map[string]*ModelState{
-		affinityTestModel: {Unavailable: true, NextRetryAfter: time.Now().Add(10 * time.Minute)},
-	}
-	return a
-}
-
 // orderedSelector mimics a real fallback: it only ever returns an auth that is
 // actually selectable, walking its preference list in order.
 type orderedSelector struct {
@@ -44,84 +36,6 @@ func (o *orderedSelector) Pick(_ context.Context, provider, model string, _ clip
 		}
 	}
 	return available[0], nil
-}
-
-func pickWithSession(t *testing.T, s *SessionAffinitySelector, auths []*Auth) string {
-	t.Helper()
-	headers := http.Header{}
-	headers.Set("X-Session-ID", "chat-1234")
-	got, err := s.Pick(context.Background(), "cursor", affinityTestModel,
-		cliproxyexecutor.Options{Headers: headers}, auths)
-	if err != nil {
-		t.Fatalf("pick: %v", err)
-	}
-	return got.ID
-}
-
-func TestBusyAccountDoesNotStealTheSessionPermanently(t *testing.T) {
-	s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &orderedSelector{prefer: []string{"b"}},
-		TTL:      time.Hour,
-	})
-	defer s.Stop()
-
-	all := []*Auth{healthy("a"), healthy("b")}
-	if got := pickWithSession(t, s, all); got != "b" {
-		t.Fatalf("first pick bound %s, want b", got)
-	}
-
-	// "b" goes into cooldown, so this turn has to run somewhere else.
-	if got := pickWithSession(t, s, []*Auth{healthy("a"), coolingDown("b")}); got != "a" {
-		t.Fatalf("during cooldown got %s, want the stand-in a", got)
-	}
-
-	// Once it recovers the chat must return to the account that still holds
-	// its cached prompt rather than staying on the stand-in.
-	if got := pickWithSession(t, s, all); got != "b" {
-		t.Fatalf("after recovery got %s, want the original binding b", got)
-	}
-}
-
-func TestStandInIsStableForTheWholeOutage(t *testing.T) {
-	s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &orderedSelector{prefer: []string{"a", "c"}},
-		TTL:      time.Hour,
-	})
-	defer s.Stop()
-
-	all := []*Auth{healthy("a"), healthy("b"), healthy("c")}
-	bound := pickWithSession(t, s, all)
-
-	degraded := []*Auth{healthy("a"), coolingDown("b"), healthy("c")}
-	if bound == "b" {
-		first := pickWithSession(t, s, degraded)
-		second := pickWithSession(t, s, degraded)
-		third := pickWithSession(t, s, degraded)
-		if first != second || second != third {
-			t.Fatalf("stand-in moved %s -> %s -> %s mid-outage; every hop rebuilds the prompt cache", first, second, third)
-		}
-	}
-}
-
-func TestSessionKeepsServingWhileItsAccountIsMissing(t *testing.T) {
-	s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
-		Fallback: &orderedSelector{prefer: []string{"b"}},
-		TTL:      time.Hour,
-	})
-	defer s.Stop()
-
-	if got := pickWithSession(t, s, []*Auth{healthy("a"), healthy("b")}); got != "b" {
-		t.Fatalf("first pick bound %s", got)
-	}
-	// "b" disappears entirely (removed, or filtered out before selection).
-	if got := pickWithSession(t, s, []*Auth{healthy("a")}); got != "a" {
-		t.Fatalf("with b missing got %s", got)
-	}
-	// When it comes back the chat returns to it: that is where its cached
-	// prompt still lives.
-	if got := pickWithSession(t, s, []*Auth{healthy("a"), healthy("b")}); got != "b" {
-		t.Fatalf("did not return to the bound account, got %s", got)
-	}
 }
 
 func TestProviderFilteredAffinityOnlyPinsCursor(t *testing.T) {

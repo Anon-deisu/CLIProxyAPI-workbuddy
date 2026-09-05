@@ -16,8 +16,10 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 	if state.strategy != "weighted-round-robin" {
 		t.Fatalf("strategy = %q, want weighted-round-robin", state.strategy)
 	}
-	if _, ok := newRoutingSelector(state).(*coreauth.WeightedRoundRobinSelector); !ok {
-		t.Fatalf("selector type = %T, want *auth.WeightedRoundRobinSelector", newRoutingSelector(state))
+	// This fork always wraps the strategy selector with session affinity so
+	// Cursor conversations stay pinned to one account (see newRoutingSelector).
+	if _, ok := newRoutingSelector(state).(*coreauth.SessionAffinitySelector); !ok {
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", newRoutingSelector(state))
 	}
 }
 

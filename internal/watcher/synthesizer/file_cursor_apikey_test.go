@@ -16,7 +16,7 @@ func TestSynthesizeCursorAPIKeyClassification(t *testing.T) {
 		Config:      &config.Config{},
 		IDGenerator: NewStableIDGenerator(),
 	}
-	auths := synthesizeFileAuths(ctx, path, []byte(`{
+	auths, errSynth := synthesizeFileAuths(ctx, path, []byte(`{
 		"type":"cursor-api-key",
 		"api_key":"sk-test-123",
 		"base_url":"https://api2.cursor.sh",
@@ -24,6 +24,9 @@ func TestSynthesizeCursorAPIKeyClassification(t *testing.T) {
 		"priority":5,
 		"excluded_models":["gpt-4o"]
 	}`))
+	if errSynth != nil {
+		t.Fatalf("synthesizeFileAuths() error = %v", errSynth)
+	}
 	if len(auths) != 1 {
 		t.Fatalf("want 1 auth, got %d", len(auths))
 	}
