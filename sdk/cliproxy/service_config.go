@@ -41,11 +41,17 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		return state
 	}
 
-	switch strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy)) {
+	strategy := cfg.Routing.Strategy
+	if runtimeMode := strings.TrimSpace(cfg.Routing.SchedulerMode); runtimeMode != "" {
+		strategy = runtimeMode
+	}
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
 		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
+	case "remaining-quota", "remaining_quota", "remainingquota", "quota":
+		state.strategy = "remaining-quota"
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -69,6 +75,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.WeightedRoundRobinSelector{}
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
+	case "remaining-quota":
+		selector = &coreauth.RemainingQuotaSelector{}
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}

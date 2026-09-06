@@ -56,6 +56,7 @@ type Handler struct {
 	postAuthPersistHook     coreauth.PostAuthHook
 	pluginHost              *pluginhost.Host
 	configReloadHook        func(context.Context, *config.Config)
+	runtimeConfigHook       func(context.Context, *config.Config)
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginReleaseCacheMu    sync.Mutex
@@ -158,6 +159,48 @@ func (h *Handler) SetConfigReloadHook(hook func(context.Context, *config.Config)
 	h.mu.Lock()
 	h.configReloadHook = hook
 	h.mu.Unlock()
+}
+
+// SetRuntimeConfigHook updates the callback used by runtime-only management settings.
+func (h *Handler) SetRuntimeConfigHook(hook func(context.Context, *config.Config)) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.runtimeConfigHook = hook
+	h.mu.Unlock()
+}
+
+// applyRuntimeConfig applies an in-memory config mutation without writing config.yaml.
+func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config) error) bool {
+	if h == nil || mutate == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "management handler unavailable"})
+		return false
+	}
+
+	h.mu.Lock()
+	if h.cfg == nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return false
+	}
+	if errMutate := mutate(h.cfg); errMutate != nil {
+		h.mu.Unlock()
+		c.JSON(http.StatusBadRequest, gin.H{"error": errMutate.Error()})
+		return false
+	}
+	snapshot := h.cfg.CloneForRuntime()
+	hook := h.runtimeConfigHook
+	manager := h.authManager
+	h.mu.Unlock()
+
+	if hook != nil {
+		hook(c.Request.Context(), snapshot)
+	} else if manager != nil {
+		manager.SetConfig(snapshot)
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "runtime_only": true})
+	return true
 }
 
 // reloadSnapshotConfigLocked clones the runtime config and assigns a reload generation.

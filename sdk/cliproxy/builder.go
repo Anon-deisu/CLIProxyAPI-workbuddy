@@ -288,6 +288,9 @@ func (b *Builder) Build() (*Service, error) {
 		api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
 			service.reloadConfigFromWatcher()
 		}),
+		api.WithRuntimeConfigHook(func(ctx context.Context, cfg *config.Config) {
+			service.applyConfigUpdateWithAuthSynthesis(ctx, cfg, false)
+		}),
 	)
 	return service, nil
 }

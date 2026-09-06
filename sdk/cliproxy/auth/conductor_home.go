@@ -1254,7 +1254,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.IsDispatchDisabled() {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {

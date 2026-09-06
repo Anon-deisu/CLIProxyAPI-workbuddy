@@ -70,6 +70,14 @@ type Auth struct {
 	StatusMessage string `json:"status_message,omitempty"`
 	// Disabled indicates the auth is intentionally disabled by operator.
 	Disabled bool `json:"disabled"`
+	// AutoDisabled indicates that runtime policy temporarily excluded this auth.
+	// It is intentionally kept out of auth-file persistence and is cleared by
+	// the management enable action or an explicit quota reset.
+	AutoDisabled bool `json:"-"`
+	// AutoDisableReason identifies why runtime policy excluded this auth.
+	AutoDisableReason string `json:"-"`
+	// AutoDisabledAt records when runtime policy excluded this auth.
+	AutoDisabledAt time.Time `json:"-"`
 	// Unavailable flags transient provider unavailability (e.g. quota exceeded).
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
@@ -110,7 +118,28 @@ const (
 	AttributePluginVirtual   = "plugin_virtual"
 	AttributeVirtualSource   = "virtual_source"
 	pluginVirtualAttrEnabled = "true"
+
+	// AutoDisableReasonUnauthorized identifies an upstream authentication failure.
+	AutoDisableReasonUnauthorized = "unauthorized"
+	// AutoDisableReasonQuotaExhausted identifies an exhausted upstream quota.
+	AutoDisableReasonQuotaExhausted = "quota_exhausted"
 )
+
+// IsDispatchDisabled reports whether an auth must be excluded from selection.
+// Manual and automatic disable states share the same routing exclusion rule.
+func (a *Auth) IsDispatchDisabled() bool {
+	return a != nil && (a.Disabled || a.AutoDisabled || a.Status == StatusDisabled)
+}
+
+// ClearAutoDisabled removes the runtime automatic disable state.
+func (a *Auth) ClearAutoDisabled() {
+	if a == nil {
+		return
+	}
+	a.AutoDisabled = false
+	a.AutoDisableReason = ""
+	a.AutoDisabledAt = time.Time{}
+}
 
 // MarkPluginVirtualAuth marks an auth that was expanded from a plugin-owned source file.
 func MarkPluginVirtualAuth(auth *Auth, sourcePath string, ordinal int) {

@@ -106,10 +106,17 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
+	wasAutoDisabled := targetAuth.AutoDisabled
 	applyAuthDisabledState(targetAuth, *req.Disabled)
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
+	}
+	if !*req.Disabled && wasAutoDisabled {
+		if _, _, errReset := h.authManager.ResetQuota(ctx, targetAuth.ID); errReset != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resume auth: %v", errReset)})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
@@ -143,10 +150,16 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 			!sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), sourcePath) {
 			continue
 		}
+		wasAutoDisabled := auth.AutoDisabled
 		applyAuthDisabledState(auth, disabled)
 		auth.UpdatedAt = now
 		if _, errUpdate := h.authManager.Update(ctx, auth); errUpdate != nil {
 			return fmt.Errorf("failed to update auth %s: %w", auth.ID, errUpdate)
+		}
+		if !disabled && wasAutoDisabled {
+			if _, _, errReset := h.authManager.ResetQuota(ctx, auth.ID); errReset != nil {
+				return fmt.Errorf("failed to resume auth %s: %w", auth.ID, errReset)
+			}
 		}
 	}
 	return nil
@@ -187,6 +200,7 @@ func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
 		return
 	}
 	auth.Disabled = disabled
+	auth.ClearAutoDisabled()
 	if disabled {
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "disabled via management API"

@@ -97,6 +97,29 @@ func TestAddCursorAPIKeyInlineNoBodyFallsBackToEnd(t *testing.T) {
 	}
 }
 
+func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
+	t.Parallel()
+	input := fixtureManagementHTML()
+	got, errPatch := AddRuntimeSchedulerToManagementHTML(input)
+	if errPatch != nil {
+		t.Fatalf("AddRuntimeSchedulerToManagementHTML() error = %v", errPatch)
+	}
+	for _, want := range [][]byte{
+		[]byte(runtimeSchedulerInlineMarker),
+		[]byte("routing/settings"),
+		[]byte("auto-disable-unauthorized"),
+		[]byte("auto_disable_reason"),
+	} {
+		if !bytes.Contains(got, want) {
+			t.Fatalf("runtime scheduler injection missing %q", want)
+		}
+	}
+	again, errAgain := AddRuntimeSchedulerToManagementHTML(got)
+	if errAgain != nil || !bytes.Equal(again, got) {
+		t.Fatalf("runtime scheduler injection is not idempotent: err=%v", errAgain)
+	}
+}
+
 // sameBacking 报告 b 是否为 a 的零拷贝切片（同一底层数组头地址）。
 func sameBacking(a, b []byte) bool {
 	if len(a) == 0 || len(b) == 0 {

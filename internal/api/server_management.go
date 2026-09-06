@@ -128,6 +128,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+		mgmt.GET("/routing/settings", s.mgmt.GetRoutingSettings)
+		mgmt.PUT("/routing/settings", s.mgmt.PutRoutingSettings)
+		mgmt.PATCH("/routing/settings", s.mgmt.PutRoutingSettings)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
@@ -338,6 +341,12 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	patchedData, errPatch = managementasset.AddCursorAPIKeyInlineToManagementHTML(data)
 	if errPatch != nil {
 		log.WithError(errPatch).Warn("management control panel does not support Cursor API key inline injection")
+	} else {
+		data = patchedData
+	}
+	patchedData, errPatch = managementasset.AddRuntimeSchedulerToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support runtime scheduler injection")
 	} else {
 		data = patchedData
 	}
