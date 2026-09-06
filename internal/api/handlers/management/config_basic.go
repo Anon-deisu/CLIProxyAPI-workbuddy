@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -126,9 +125,11 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
 		return
 	}
-	// Validate config using LoadConfigOptional with optional=false to enforce parsing
-	tmpDir := filepath.Dir(h.configFilePath)
-	tmpFile, err := os.CreateTemp(tmpDir, "config-validate-*.yaml")
+	// Validate config using LoadConfigOptional with optional=false to enforce parsing.
+	// Use the system temp dir instead of the config directory so validation does
+	// not require write permission on the config directory (the service may run
+	// as a non-owner group user).
+	tmpFile, err := os.CreateTemp("", "config-validate-*.yaml")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
 		return
