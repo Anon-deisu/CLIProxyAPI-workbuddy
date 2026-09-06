@@ -1089,9 +1089,9 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if !strings.HasPrefix(codexUserAgent, codexOriginator+"/") {
 		t.Fatalf("default Codex User-Agent = %s, want prefix %s/", codexUserAgent, codexOriginator)
 	}
-	// Pin the upstream codex-tui fingerprint shape.
-	if !strings.HasPrefix(codexUserAgent, "codex-tui/") {
-		t.Fatalf("default Codex User-Agent = %s, want codex-tui prefix", codexUserAgent)
+	// Pin the rust-v0.153.4 fingerprint shape: "codex_cli_rs/<ver> (<os>; <arch>) <terminal>".
+	if !strings.HasPrefix(codexUserAgent, "codex_cli_rs/") {
+		t.Fatalf("default Codex User-Agent = %s, want codex_cli_rs prefix", codexUserAgent)
 	}
 	if got := headers.Get("Originator"); got != codexOriginator {
 		t.Fatalf("Originator = %s, want %s", got, codexOriginator)

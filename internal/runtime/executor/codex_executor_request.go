@@ -23,8 +23,12 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.153.3 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.153.3)"
-	codexOriginator            = "codex-tui"
+	// codexUserAgent mirrors openai/codex rust-v0.153.4 get_codex_user_agent():
+	// "{originator}/{version} ({os_type} {os_version}; {arch}) {terminal}" with no
+	// MCP suffix. Since 0.15x the CLI no longer overrides the originator, so the
+	// default "codex_cli_rs" is what real clients send.
+	codexUserAgent             = "codex_cli_rs/0.153.4 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10"
+	codexOriginator            = "codex_cli_rs"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
