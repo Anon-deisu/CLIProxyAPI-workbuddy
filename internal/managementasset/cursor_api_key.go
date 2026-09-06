@@ -246,3 +246,207 @@ func AddCursorAPIKeyInlineToManagementHTML(data []byte) ([]byte, error) {
 	data = insertBytes(data, index, []byte(cursorAPIKeyInlineScript))
 	return data, nil
 }
+
+const runtimeSchedulerInlineMarker = `id="cpa-runtime-scheduler-script"`
+
+const runtimeSchedulerInlineScript = `
+<script id="cpa-runtime-scheduler-script">
+(function () {
+  'use strict';
+  if (window.__cpaRuntimeSchedulerLoaded) return;
+  window.__cpaRuntimeSchedulerLoaded = true;
+
+  var managementPath = '/v0/management/';
+  var capturedManagementKey = '';
+  var nativeFetch = window.fetch;
+
+  function captureAuthorization(value) {
+    if (typeof value !== 'string') return;
+    var match = value.match(/^\s*Bearer\s+(.+?)\s*$/i);
+    if (match && match[1]) capturedManagementKey = match[1];
+  }
+
+  function rememberedManagementKey() {
+    try {
+      var raw = localStorage.getItem('cli-proxy-auth');
+      if (!raw) return '';
+      if (raw.indexOf('enc::v1::') === 0) {
+        var key = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + window.location.host + '|' + navigator.userAgent);
+        var encoded = atob(raw.slice(9));
+        var decoded = new Uint8Array(encoded.length);
+        for (var i = 0; i < encoded.length; i += 1) decoded[i] = encoded.charCodeAt(i) ^ key[i % key.length];
+        raw = new TextDecoder().decode(decoded);
+      }
+      var parsed = JSON.parse(raw);
+      return String((parsed && parsed.state && parsed.state.managementKey) || (parsed && parsed.managementKey) || '');
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function currentManagementKey() {
+    return capturedManagementKey || rememberedManagementKey();
+  }
+
+  function request(method, path, body) {
+    var key = currentManagementKey();
+    var options = { method: method, headers: { 'Content-Type': 'application/json' } };
+    if (key) options.headers.Authorization = 'Bearer ' + key;
+    if (body !== undefined) options.body = JSON.stringify(body);
+    return nativeFetch.call(window, path, options).then(function (response) {
+      if (!response.ok) throw new Error('http ' + response.status);
+      return response;
+    });
+  }
+
+  var originalFetch = window.fetch;
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (String(url).indexOf(managementPath) !== -1) {
+      var headers = new Headers((init && init.headers) || (input && input.headers) || {});
+      captureAuthorization(headers.get('authorization') || '');
+    }
+    return originalFetch.apply(window, arguments);
+  };
+
+  function make(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function mount() {
+    if (document.getElementById('cpa-runtime-scheduler-panel')) return;
+    var toggle = make('button', 'cpa-runtime-scheduler-toggle', '账号调度');
+    toggle.type = 'button';
+    var panel = make('section', 'cpa-runtime-scheduler-panel');
+    panel.id = 'cpa-runtime-scheduler-panel';
+    panel.hidden = true;
+    var title = make('div', 'cpa-runtime-scheduler-title', '账号调度设置');
+    var hint = make('div', 'cpa-runtime-scheduler-hint', '仅当前进程生效，重启后恢复默认值');
+    var form = make('div', 'cpa-runtime-scheduler-form');
+    var strategyLabel = make('label', 'cpa-runtime-scheduler-label', '调度方式');
+    var strategy = document.createElement('select');
+    strategy.innerHTML = '<option value="round-robin">轮询</option><option value="remaining-quota">剩余额度优先</option><option value="fill-first">额度耗尽优先</option><option value="weighted-round-robin">权重轮询</option>';
+    strategyLabel.appendChild(strategy);
+    var unauthorizedLabel = make('label', 'cpa-runtime-scheduler-check');
+    var unauthorized = document.createElement('input');
+    unauthorized.type = 'checkbox';
+    unauthorizedLabel.appendChild(unauthorized);
+    unauthorizedLabel.appendChild(document.createTextNode('401 自动停用账号'));
+    var quotaLabel = make('label', 'cpa-runtime-scheduler-check');
+    var quota = document.createElement('input');
+    quota.type = 'checkbox';
+    quotaLabel.appendChild(quota);
+    quotaLabel.appendChild(document.createTextNode('额度用尽自动停用账号'));
+    var save = make('button', 'cpa-runtime-scheduler-save', '应用');
+    save.type = 'button';
+    var status = make('span', 'cpa-runtime-scheduler-status');
+    form.appendChild(strategyLabel);
+    form.appendChild(unauthorizedLabel);
+    form.appendChild(quotaLabel);
+    form.appendChild(save);
+    form.appendChild(status);
+    var disabledTitle = make('div', 'cpa-runtime-scheduler-subtitle', '自动禁用认证文件');
+    var disabledList = make('div', 'cpa-runtime-scheduler-disabled-list', '正在读取...');
+    panel.appendChild(title);
+    panel.appendChild(hint);
+    panel.appendChild(form);
+    panel.appendChild(disabledTitle);
+    panel.appendChild(disabledList);
+    document.body.appendChild(toggle);
+    document.body.appendChild(panel);
+
+    toggle.addEventListener('click', function () {
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) {
+        loadSettings();
+        loadDisabledAuths();
+      }
+    });
+
+    function loadSettings() {
+      request('GET', managementPath + 'routing/settings').then(function (response) {
+        return response.json();
+      }).then(function (data) {
+        strategy.value = data['scheduler-mode'] || data.strategy || 'round-robin';
+        unauthorized.checked = !!data['auto-disable-unauthorized'];
+        quota.checked = !!data['auto-disable-quota'];
+      }).catch(function () {
+        status.textContent = '读取失败';
+      });
+    }
+
+    function loadDisabledAuths() {
+      request('GET', managementPath + 'auth-files').then(function (response) {
+        return response.json();
+      }).then(function (data) {
+        var files = (data && data.files || []).filter(function (item) { return item && item.auto_disabled; });
+        disabledList.textContent = '';
+        if (!files.length) {
+          disabledList.appendChild(make('div', 'cpa-runtime-scheduler-empty', '暂无自动禁用认证文件'));
+          return;
+        }
+        files.forEach(function (item) {
+          var row = make('div', 'cpa-runtime-scheduler-disabled-row');
+          row.appendChild(make('strong', '', item.name || item.email || item.id || '未知认证'));
+          row.appendChild(make('span', '', '原因：' + (item.auto_disable_reason || item.status_message || '未知')));
+          disabledList.appendChild(row);
+        });
+      }).catch(function () {
+        disabledList.textContent = '读取认证文件状态失败';
+      });
+    }
+
+    save.addEventListener('click', function () {
+      save.disabled = true;
+      status.textContent = '应用中...';
+      request('PATCH', managementPath + 'routing/settings', {
+        'scheduler-mode': strategy.value,
+        'auto-disable-unauthorized': unauthorized.checked,
+        'auto-disable-quota': quota.checked
+      }).then(function () {
+        status.textContent = '已应用';
+        loadDisabledAuths();
+      }).catch(function () {
+        status.textContent = '应用失败';
+      }).finally(function () {
+        save.disabled = false;
+      });
+    });
+  }
+
+  var style = document.createElement('style');
+  style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
+    '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:340px;max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
+    '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-label{display:flex;justify-content:space-between;align-items:center;gap:12px}.cpa-runtime-scheduler-label select{flex:1;padding:6px;border:1px solid #d0d7de;border-radius:6px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:2px;padding:8px;border-radius:6px;background:#fff1f2;color:#9f1239;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
+  document.documentElement.appendChild(style);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mount, { once: true });
+  } else {
+    mount();
+  }
+})();
+</script>
+`
+
+// AddRuntimeSchedulerToManagementHTML injects runtime-only scheduler controls and
+// the automatic-disable reason list without modifying the downloaded bundle.
+func AddRuntimeSchedulerToManagementHTML(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty management html")
+	}
+	if bytes.Contains(data, []byte(runtimeSchedulerInlineMarker)) {
+		return data, nil
+	}
+	lower := bytes.ToLower(data)
+	index := bytes.LastIndex(lower, []byte("</body>"))
+	if index < 0 {
+		index = bytes.LastIndex(lower, []byte("</html>"))
+	}
+	if index < 0 {
+		index = len(data)
+	}
+	return insertBytes(data, index, []byte(runtimeSchedulerInlineScript)), nil
+}

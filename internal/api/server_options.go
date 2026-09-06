@@ -26,6 +26,7 @@ type serverOptionConfig struct {
 	postAuthPersistHook   auth.PostAuthHook
 	pluginHost            *pluginhost.Host
 	configReloadHook      func(context.Context, *config.Config)
+	runtimeConfigHook     func(context.Context, *config.Config)
 	exampleAPIKeySafeMode bool
 }
 
@@ -125,6 +126,13 @@ func WithPluginHost(host *pluginhost.Host) ServerOption {
 func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.configReloadHook = hook
+	}
+}
+
+// WithRuntimeConfigHook registers a callback for management settings that remain in memory only.
+func WithRuntimeConfigHook(hook func(context.Context, *config.Config)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.runtimeConfigHook = hook
 	}
 }
 

@@ -304,19 +304,96 @@ func normalizeRoutingStrategy(strategy string) (string, bool) {
 		return "weighted-round-robin", true
 	case "fill-first", "fillfirst", "ff":
 		return "fill-first", true
+	case "remaining-quota", "remaining_quota", "remainingquota", "quota":
+		return "remaining-quota", true
 	default:
 		return "", false
 	}
 }
 
+func activeRoutingStrategy(cfg *config.Config) string {
+	if cfg == nil {
+		return "round-robin"
+	}
+	strategy := strings.TrimSpace(cfg.Routing.SchedulerMode)
+	if strategy == "" {
+		strategy = strings.TrimSpace(cfg.Routing.Strategy)
+	}
+	if normalized, ok := normalizeRoutingStrategy(strategy); ok {
+		return normalized
+	}
+	return strategy
+}
+
 // RoutingStrategy
 func (h *Handler) GetRoutingStrategy(c *gin.Context) {
-	strategy, ok := normalizeRoutingStrategy(h.cfg.Routing.Strategy)
+	strategy, ok := normalizeRoutingStrategy(activeRoutingStrategy(h.cfg))
 	if !ok {
 		c.JSON(200, gin.H{"strategy": strings.TrimSpace(h.cfg.Routing.Strategy)})
 		return
 	}
 	c.JSON(200, gin.H{"strategy": strategy})
+}
+
+// GetRoutingSettings returns the runtime-only scheduler controls used by the management panel.
+func (h *Handler) GetRoutingSettings(c *gin.Context) {
+	h.mu.Lock()
+	cfg := h.cfg
+	strategy := activeRoutingStrategy(cfg)
+	unauthorized := cfg != nil && cfg.Routing.AutoDisableUnauthorized
+	quota := cfg != nil && cfg.Routing.AutoDisableQuota
+	h.mu.Unlock()
+	c.JSON(http.StatusOK, gin.H{
+		"strategy":                  strategy,
+		"scheduler-mode":            strategy,
+		"auto-disable-unauthorized": unauthorized,
+		"auto-disable-quota":        quota,
+		"runtime_only":              true,
+	})
+}
+
+// PutRoutingSettings updates scheduler controls in memory and deliberately skips config.yaml writes.
+func (h *Handler) PutRoutingSettings(c *gin.Context) {
+	var body struct {
+		Strategy                *string `json:"strategy"`
+		SchedulerMode           *string `json:"scheduler-mode"`
+		AutoDisableUnauthorized *bool   `json:"auto-disable-unauthorized"`
+		AutoDisableQuota        *bool   `json:"auto-disable-quota"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	mode := body.SchedulerMode
+	if mode == nil {
+		mode = body.Strategy
+	}
+	var normalizedMode string
+	if mode != nil {
+		var ok bool
+		normalizedMode, ok = normalizeRoutingStrategy(*mode)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid strategy"})
+			return
+		}
+	}
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
+		return
+	}
+
+	h.applyRuntimeConfig(c, func(cfg *config.Config) error {
+		if mode != nil {
+			cfg.Routing.SchedulerMode = normalizedMode
+		}
+		if body.AutoDisableUnauthorized != nil {
+			cfg.Routing.AutoDisableUnauthorized = *body.AutoDisableUnauthorized
+		}
+		if body.AutoDisableQuota != nil {
+			cfg.Routing.AutoDisableQuota = *body.AutoDisableQuota
+		}
+		return nil
+	})
 }
 func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 	var body struct {
@@ -332,6 +409,7 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 		return
 	}
 	h.cfg.Routing.Strategy = normalized
+	h.cfg.Routing.SchedulerMode = ""
 	h.persist(c)
 }
 

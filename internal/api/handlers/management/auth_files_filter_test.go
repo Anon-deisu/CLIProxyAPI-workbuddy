@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -250,6 +251,65 @@ func TestAuthFileLookupAndEntryBuildConcurrentEnsureIndex(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestBuildAuthFileEntryExposesAutomaticDisableReason(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:                "auto-disabled",
+		FileName:          "auto-disabled.json",
+		Provider:          "codex",
+		Status:            coreauth.StatusError,
+		AutoDisabled:      true,
+		AutoDisableReason: coreauth.AutoDisableReasonUnauthorized,
+		AutoDisabledAt:    time.Unix(123, 0),
+		StatusMessage:     "automatically disabled: unauthorized",
+		Attributes:        map[string]string{"path": filepath.Join(t.TempDir(), "auto-disabled.json")},
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("entry is nil")
+	}
+	if entry["disabled"] != true || entry["auto_disabled"] != true || entry["manual_disabled"] != false {
+		t.Fatalf("disable fields = %#v", entry)
+	}
+	if entry["auto_disable_reason"] != coreauth.AutoDisableReasonUnauthorized {
+		t.Fatalf("auto disable reason = %#v", entry["auto_disable_reason"])
+	}
+}
+
+func TestPatchAuthFileStatusResumesAutomaticDisable(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	registerAuthForLookupTest(t, manager, &coreauth.Auth{
+		ID:                "auto-resume",
+		FileName:          "auto-resume.json",
+		Provider:          "codex",
+		Status:            coreauth.StatusError,
+		AutoDisabled:      true,
+		AutoDisableReason: coreauth.AutoDisableReasonUnauthorized,
+		ModelStates:       map[string]*coreauth.ModelState{"gpt-5": {Status: coreauth.StatusError, Unavailable: true, NextRetryAfter: time.Now().Add(time.Hour)}},
+	})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/status", strings.NewReader(`{"name":"auto-resume.json","disabled":false}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchAuthFileStatus(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	updated, ok := manager.GetByID("auto-resume")
+	if !ok || updated == nil {
+		t.Fatal("resumed auth was not retained")
+	}
+	if updated.AutoDisabled || updated.Status != coreauth.StatusActive {
+		t.Fatalf("resumed auth state = %+v", updated)
+	}
+	if state := updated.ModelStates["gpt-5"]; state != nil && state.Unavailable {
+		t.Fatalf("resumed auth retained model cooldown: %+v", state)
+	}
 }
 
 func registerAuthForLookupTest(t *testing.T, manager *coreauth.Manager, auth *coreauth.Auth) {

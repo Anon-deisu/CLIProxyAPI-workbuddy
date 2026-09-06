@@ -234,8 +234,19 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
+	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "remaining-quota".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// SchedulerMode is a runtime-only override used by the management panel.
+	// It is deliberately not read from or written to config.yaml.
+	SchedulerMode string `yaml:"-" json:"scheduler-mode,omitempty"`
+
+	// AutoDisableUnauthorized excludes credentials after an upstream 401 once
+	// request-scoped errors and OAuth refresh recovery have been ruled out.
+	AutoDisableUnauthorized bool `yaml:"-" json:"auto-disable-unauthorized"`
+	// AutoDisableQuota excludes credentials after an explicit quota exhaustion
+	// response or a provider quota watermark reaches 100 percent.
+	AutoDisableQuota bool `yaml:"-" json:"auto-disable-quota"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,

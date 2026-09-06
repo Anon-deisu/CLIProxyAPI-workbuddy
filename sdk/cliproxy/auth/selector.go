@@ -67,8 +67,13 @@ func weightedSelectorStateModel(ctx context.Context, availabilityModel string) s
 	return availabilityModel
 }
 
-// FillFirstSelector selects the first available credential (deterministic ordering).
-// This "burns" one account before moving to the next, which can help stagger
+// RemainingQuotaSelector selects the available credential with the most remaining
+// observed quota. Credentials without a quota observation are preferred until a
+// provider reports a watermark for them.
+type RemainingQuotaSelector struct{}
+
+// FillFirstSelector selects the credential with the highest observed usage.
+// This burns one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
@@ -707,6 +712,17 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 	return picked, nil
 }
 
+// Pick selects the available credential with the most remaining observed quota.
+func (s *RemainingQuotaSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	available, errAvailable := getAvailableAuths(auths, provider, model, time.Now())
+	if errAvailable != nil {
+		return nil, errAvailable
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	return pickQuotaAuth(available, true), nil
+}
+
 // maxSmoothWeightedStateEntries bounds a single accumulator map so credentials that are
 // removed permanently cannot leak entries. Real pools stay far below this bound, so the
 // transient subsets produced by retry exclusions and cooldowns are never pruned.
@@ -818,14 +834,99 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	return available[0], nil
+	return pickQuotaAuth(available, false), nil
+}
+
+func pickQuotaAuth(auths []*Auth, preferRemaining bool) *Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	ordered := append([]*Auth(nil), auths...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return compareQuotaAuths(ordered[i], ordered[j], preferRemaining) < 0
+	})
+	return ordered[0]
+}
+
+func compareQuotaAuths(left, right *Auth, preferRemaining bool) int {
+	leftUsage, leftKnown := authQuotaUsedPercent(left)
+	rightUsage, rightKnown := authQuotaUsedPercent(right)
+	if leftKnown != rightKnown {
+		if !leftKnown == preferRemaining {
+			return -1
+		}
+		return 1
+	}
+	if leftKnown && leftUsage != rightUsage {
+		if preferRemaining {
+			if leftUsage < rightUsage {
+				return -1
+			}
+			return 1
+		}
+		if leftUsage > rightUsage {
+			return -1
+		}
+		return 1
+	}
+	leftID := ""
+	rightID := ""
+	if left != nil {
+		leftID = left.ID
+	}
+	if right != nil {
+		rightID = right.ID
+	}
+	if leftID < rightID {
+		return -1
+	}
+	if leftID > rightID {
+		return 1
+	}
+	return 0
+}
+
+func authQuotaUsedPercent(auth *Auth) (float64, bool) {
+	if auth == nil || len(auth.Quota.Signals) == 0 {
+		return 0, false
+	}
+	var (
+		usage float64
+		found bool
+	)
+	for key, rawValue := range auth.Quota.Signals {
+		name := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "_", "-"))
+		value := strings.TrimSpace(rawValue)
+		if strings.Contains(name, "limit-reached") {
+			if parsed, errParse := strconv.ParseBool(value); errParse == nil && parsed {
+				return 100, true
+			}
+		}
+		if !strings.Contains(name, "used-percent") {
+			continue
+		}
+		parsed, errParse := strconv.ParseFloat(value, 64)
+		if errParse != nil {
+			continue
+		}
+		if parsed < 0 {
+			parsed = 0
+		} else if parsed > 100 {
+			parsed = 100
+		}
+		if !found || parsed > usage {
+			usage = parsed
+			found = true
+		}
+	}
+	return usage, found
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Disabled || auth.Status == StatusDisabled {
+	if auth.IsDispatchDisabled() {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {

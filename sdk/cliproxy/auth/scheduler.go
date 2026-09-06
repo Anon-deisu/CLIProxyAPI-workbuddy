@@ -22,6 +22,7 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategyRemainingQuota     schedulerStrategy = 4
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -169,6 +170,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
+	case *RemainingQuotaSelector:
+		return schedulerStrategyRemainingQuota
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -671,7 +674,7 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 	}
 
 	providerKey := executorKeyFromAuth(auth)
-	if providerKey == "" || auth.Disabled || auth.Status == StatusDisabled {
+	if providerKey == "" || auth.IsDispatchDisabled() {
 		s.removeAuthFromProvidersLocked(authID)
 		return
 	}
@@ -1036,7 +1039,9 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	var picked *scheduledAuth
 	switch strategy {
 	case schedulerStrategyFillFirst:
-		picked = view.pickFirst(predicate)
+		picked = view.pickQuota(predicate, false)
+	case schedulerStrategyRemainingQuota:
+		picked = view.pickQuota(predicate, true)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
 	default:
@@ -1046,6 +1051,36 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		return nil
 	}
 	return picked.auth
+}
+
+func (v *readyView) pickQuota(predicate func(*scheduledAuth) bool, preferRemaining bool) *scheduledAuth {
+	if v == nil || len(v.flat) == 0 {
+		return nil
+	}
+	var candidates []*scheduledAuth
+	known := false
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil || predicate != nil && !predicate(entry) {
+			continue
+		}
+		candidates = append(candidates, entry)
+		if _, hasUsage := authQuotaUsedPercent(entry.auth); hasUsage {
+			known = true
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	if !known {
+		return candidates[0]
+	}
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if compareQuotaAuths(candidate.auth, best.auth, preferRemaining) < 0 {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) int {

@@ -44,7 +44,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *RemainingQuotaSelector:
 		return true
 	default:
 		return false
@@ -884,7 +884,7 @@ func (m *Manager) AvailableProviders() []string {
 	seen := make(map[string]struct{}, len(m.auths))
 	out := make([]string, 0, len(m.auths))
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.IsDispatchDisabled() {
 			continue
 		}
 		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
@@ -915,7 +915,7 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.IsDispatchDisabled() {
 			continue
 		}
 		if strings.ToLower(strings.TrimSpace(auth.Provider)) == provider {
@@ -1039,7 +1039,7 @@ func (m *Manager) closestCooldownWaitWithAttempted(providers []string, model str
 		minWait time.Duration
 	)
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.IsDispatchDisabled() {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
@@ -1131,7 +1131,7 @@ func (m *Manager) retryAllowed(attempt int, providers []string, model string, el
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, auth := range m.auths {
-		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		if auth == nil || auth.IsDispatchDisabled() {
 			continue
 		}
 		if pinnedAuthID != "" && auth.ID != pinnedAuthID {

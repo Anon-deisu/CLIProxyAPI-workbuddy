@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -269,7 +270,7 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 		if auth == nil {
 			continue
 		}
-		if !quotaCooldownDisabledForAuthWithConfig(auth, cfg) && !auth.Disabled && auth.Status != StatusDisabled {
+		if !quotaCooldownDisabledForAuthWithConfig(auth, cfg) && !auth.IsDispatchDisabled() {
 			continue
 		}
 		if clearCooldownStateForAuth(auth, now) {
@@ -348,7 +349,7 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 		return false
 	}
 	auth := m.auths[authID]
-	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || m.cooldownDisabledForAuth(auth) {
+	if auth == nil || auth.IsDispatchDisabled() || m.cooldownDisabledForAuth(auth) {
 		return false
 	}
 	updatedAt := record.UpdatedAt
@@ -492,13 +493,16 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	} else if len(auth.ModelStates) > 0 {
 		updateAggregatedAvailability(auth, now)
 	}
+	if auth.AutoDisabled && auth.AutoDisableReason == AutoDisableReasonQuotaExhausted {
+		auth.ClearAutoDisabled()
+	}
 
 	if len(models) == 0 {
 		models = append(models, registeredModels...)
 	}
 	models = dedupeStrings(models)
 
-	if !auth.Disabled && auth.Status != StatusDisabled && !hasModelError(auth, now) {
+	if !auth.IsDispatchDisabled() && !hasModelError(auth, now) {
 		auth.LastError = nil
 		auth.StatusMessage = ""
 		auth.Status = StatusActive
@@ -614,7 +618,7 @@ func (m *Manager) cooldownStateRecordsSnapshot() []CooldownStateRecord {
 }
 
 func (m *Manager) cooldownStateRecordsForAuthLocked(auth *Auth, now time.Time) []CooldownStateRecord {
-	if auth == nil || auth.ID == "" || auth.Disabled || auth.Status == StatusDisabled || m.cooldownDisabledForAuth(auth) {
+	if auth == nil || auth.ID == "" || auth.IsDispatchDisabled() || m.cooldownDisabledForAuth(auth) {
 		return nil
 	}
 	records := make([]CooldownStateRecord, 0, 1+len(auth.ModelStates))
@@ -924,12 +928,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.Generation++
 		auth.UpdatedAt = now
 
+		quotaObservationChanged := false
 		if !result.SkipQuotaObservation {
-			auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
+			quotaObservationChanged = auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
 			if modelState != nil {
 				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
 			}
 		}
+		m.maybeAutoDisableAuthLocked(auth, result.Error, quotaObservationChanged && quotaSignalsExhausted(auth.Quota), now)
 
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
@@ -1346,6 +1352,9 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
+	if auth.AutoDisabled {
+		return
+	}
 	auth.Unavailable = false
 	auth.Status = StatusActive
 	auth.StatusMessage = ""
@@ -1356,6 +1365,105 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
+}
+
+// maybeAutoDisableAuthLocked applies the opt-in runtime disable policies after
+// the result and current response quota observation have been recorded.
+func (m *Manager) maybeAutoDisableAuthLocked(auth *Auth, resultErr *Error, quotaExhausted bool, now time.Time) {
+	if m == nil || auth == nil || auth.Disabled || auth.Status == StatusDisabled || auth.AutoDisabled {
+		return
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return
+	}
+	unauthorized := statusCodeFromResult(resultErr) == http.StatusUnauthorized && !shouldSkipCredentialCooldown(resultErr)
+	if unauthorized && cfg.Routing.AutoDisableUnauthorized {
+		auth.AutoDisabled = true
+		auth.AutoDisableReason = AutoDisableReasonUnauthorized
+		auth.AutoDisabledAt = now
+		auth.Status = StatusError
+		auth.StatusMessage = "automatically disabled: unauthorized"
+		auth.Unavailable = true
+		auth.NextRetryAfter = time.Time{}
+		return
+	}
+	if (isQuotaExhaustedResultError(resultErr) || quotaExhausted) && cfg.Routing.AutoDisableQuota {
+		auth.AutoDisabled = true
+		auth.AutoDisableReason = AutoDisableReasonQuotaExhausted
+		auth.AutoDisabledAt = now
+		auth.Status = StatusError
+		auth.StatusMessage = "automatically disabled: quota exhausted"
+		auth.Unavailable = true
+		auth.NextRetryAfter = time.Time{}
+	}
+}
+
+func isQuotaExhaustedResultError(resultErr *Error) bool {
+	if resultErr == nil || statusCodeFromResult(resultErr) != http.StatusTooManyRequests {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(resultErr.Code), "usage_limit_reached") {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	if strings.Contains(lower, "usage_limit_reached") || strings.Contains(lower, "usage limit") ||
+		strings.Contains(lower, "quota exhausted") || strings.Contains(lower, "quota_exceeded") ||
+		strings.Contains(lower, "quota exceeded") {
+		return true
+	}
+	var payload any
+	if errUnmarshal := json.Unmarshal([]byte(resultErr.Message), &payload); errUnmarshal != nil {
+		return false
+	}
+	return containsQuotaExhaustedValue(payload)
+}
+
+func containsQuotaExhaustedValue(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			if text, ok := item.(string); ok {
+				if (strings.EqualFold(key, "type") || strings.EqualFold(key, "code")) && strings.EqualFold(strings.TrimSpace(text), "usage_limit_reached") {
+					return true
+				}
+				lower := strings.ToLower(text)
+				if strings.Contains(lower, "quota exhausted") || strings.Contains(lower, "quota exceeded") || strings.Contains(lower, "usage limit") {
+					return true
+				}
+			}
+			if containsQuotaExhaustedValue(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if containsQuotaExhaustedValue(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func quotaSignalsExhausted(quota QuotaState) bool {
+	for key, rawValue := range quota.Signals {
+		name := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "_", "-"))
+		value := strings.TrimSpace(rawValue)
+		if strings.Contains(name, "limit-reached") {
+			if parsed, errParse := strconv.ParseBool(value); errParse == nil && parsed {
+				return true
+			}
+		}
+		if !strings.Contains(name, "used-percent") {
+			continue
+		}
+		used, errParse := strconv.ParseFloat(value, 64)
+		if errParse == nil && used >= 100 {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneError(err *Error) *Error {

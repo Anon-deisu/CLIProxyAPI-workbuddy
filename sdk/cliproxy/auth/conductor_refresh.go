@@ -493,6 +493,9 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 			current.Generation++
 			current.UpdatedAt = now
 			current.LastError = refreshErrorFromError(err)
+			if unauthorized {
+				m.maybeAutoDisableAuthLocked(current, current.LastError, false, now)
+			}
 
 			hasValidAccessToken := current.HasValidAccessToken(now)
 			if !hasValidAccessToken {
@@ -542,7 +545,7 @@ func (m *Manager) refreshAuthForRequest(ctx context.Context, id, failedAccessTok
 	updated.LastError = nil
 	updated.StatusMessage = ""
 	updated.Unavailable = false
-	if updated.Status == StatusError || updated.Status == "" {
+	if !updated.AutoDisabled && (updated.Status == StatusError || updated.Status == "") {
 		updated.Status = StatusActive
 	}
 	updated.UpdatedAt = now

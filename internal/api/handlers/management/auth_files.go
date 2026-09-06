@@ -327,19 +327,27 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		name = auth.ID
 	}
 	entry := gin.H{
-		"id":             auth.ID,
-		"auth_index":     auth.Index,
-		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
-		"provider":       strings.TrimSpace(auth.Provider),
-		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
-		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
-		"runtime_only":   runtimeOnly,
-		"source":         "memory",
-		"size":           int64(0),
+		"id":              auth.ID,
+		"auth_index":      auth.Index,
+		"name":            name,
+		"type":            strings.TrimSpace(auth.Provider),
+		"provider":        strings.TrimSpace(auth.Provider),
+		"label":           auth.Label,
+		"status":          auth.Status,
+		"status_message":  auth.StatusMessage,
+		"disabled":        auth.Disabled || auth.AutoDisabled,
+		"manual_disabled": auth.Disabled,
+		"auto_disabled":   auth.AutoDisabled,
+		"unavailable":     auth.Unavailable,
+		"runtime_only":    runtimeOnly,
+		"source":          "memory",
+		"size":            int64(0),
+	}
+	if auth.AutoDisabled {
+		entry["auto_disable_reason"] = auth.AutoDisableReason
+		if !auth.AutoDisabledAt.IsZero() {
+			entry["auto_disabled_at"] = auth.AutoDisabledAt
+		}
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed

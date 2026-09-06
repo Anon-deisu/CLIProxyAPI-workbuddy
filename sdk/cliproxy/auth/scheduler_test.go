@@ -358,6 +358,42 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_RemainingQuotaPrefersLowerUsage(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RemainingQuotaSelector{},
+		&Auth{ID: "used-more", Provider: "codex", Quota: QuotaState{Signals: map[string]string{"X-Codex-Primary-Used-Percent": "80"}}},
+		&Auth{ID: "used-less", Provider: "codex", Quota: QuotaState{Signals: map[string]string{"X-Codex-Primary-Used-Percent": "20"}}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "used-less" {
+		t.Fatalf("pickSingle() auth = %#v, want used-less", got)
+	}
+}
+
+func TestSchedulerPick_FillFirstPrefersHigherUsageWhenObserved(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "used-less", Provider: "codex", Quota: QuotaState{Signals: map[string]string{"X-Codex-Primary-Used-Percent": "20"}}},
+		&Auth{ID: "used-more", Provider: "codex", Quota: QuotaState{Signals: map[string]string{"X-Codex-Primary-Used-Percent": "80"}}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "used-more" {
+		t.Fatalf("pickSingle() auth = %#v, want used-more", got)
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 

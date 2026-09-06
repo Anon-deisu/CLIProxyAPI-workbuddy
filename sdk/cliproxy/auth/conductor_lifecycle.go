@@ -86,7 +86,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.UpdatedAt = now
 	cooldownStateChanged := normalizeModelStates(auth)
-	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
+	if m.cooldownDisabledForAuth(auth) || auth.IsDispatchDisabled() {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
@@ -204,7 +204,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	} else {
 		auth.Generation++
 	}
-	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+	if !existing.IsDispatchDisabled() && !auth.IsDispatchDisabled() {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
@@ -220,7 +220,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	now := time.Now()
 	auth.UpdatedAt = now
 	cooldownStateChanged := normalizeModelStates(auth)
-	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
+	if m.cooldownDisabledForAuth(auth) || auth.IsDispatchDisabled() {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
