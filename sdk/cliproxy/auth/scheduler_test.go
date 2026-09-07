@@ -250,6 +250,27 @@ func TestSchedulerSkipsAuthAtConcurrencyLimit(t *testing.T) {
 	defer picked.ReleaseDispatchSlot()
 }
 
+func TestSchedulerReturns429WhenAllReadyAuthsAreAtConcurrencyLimit(t *testing.T) {
+	busy := &Auth{ID: "busy", Provider: "codex", Status: StatusActive, ConcurrencyLimit: 1}
+	if !busy.TryAcquireDispatchSlot() {
+		t.Fatal("failed to occupy busy auth")
+	}
+	defer busy.ReleaseDispatchSlot()
+
+	scheduler := newSchedulerForTest(&Codex2APIDefaultSelector{}, busy)
+	_, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick == nil {
+		t.Fatal("pickSingle() error = nil, want concurrency limit error")
+	}
+	var authErr *Error
+	if !errors.As(errPick, &authErr) || authErr.Code != ErrorCodeConcurrencyLimit {
+		t.Fatalf("pickSingle() error = %#v, want %s", errPick, ErrorCodeConcurrencyLimit)
+	}
+	if authErr.HTTPStatus != http.StatusTooManyRequests || authErr.Message != ErrorMessageConcurrencyLimit {
+		t.Fatalf("concurrency error = %#v, want HTTP 429 and exact message", authErr)
+	}
+}
+
 func TestManagerLegacySelectionSkipsAuthAtConcurrencyLimit(t *testing.T) {
 	manager := NewManager(nil, &Codex2APIDefaultSelector{}, nil)
 	manager.executors["codex"] = schedulerTestExecutor{provider: "codex"}
@@ -277,6 +298,76 @@ func TestManagerLegacySelectionSkipsAuthAtConcurrencyLimit(t *testing.T) {
 	}
 	if got := selected.ActiveDispatchRequests(); got != 0 {
 		t.Fatalf("selected auth active requests = %d, want 0 after SelectAuth", got)
+	}
+}
+
+func TestManagerLegacySelectionReturns429WhenAllAuthsAreAtConcurrencyLimit(t *testing.T) {
+	manager := NewManager(nil, &Codex2APIDefaultSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{provider: "codex"}
+	auth := &Auth{ID: "busy", Provider: "codex", Status: StatusActive, ConcurrencyLimit: 1}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registered, ok := manager.GetByID(auth.ID)
+	if !ok || registered == nil || !registered.TryAcquireDispatchSlot() {
+		t.Fatal("failed to occupy registered auth")
+	}
+	defer registered.ReleaseDispatchSlot()
+
+	_, errSelect := manager.SelectAuth(context.Background(), "codex", "", cliproxyexecutor.Options{})
+	if errSelect == nil {
+		t.Fatal("SelectAuth() error = nil, want concurrency limit error")
+	}
+	var authErr *Error
+	if !errors.As(errSelect, &authErr) || authErr.Code != ErrorCodeConcurrencyLimit {
+		t.Fatalf("SelectAuth() error = %#v, want %s", errSelect, ErrorCodeConcurrencyLimit)
+	}
+	if authErr.HTTPStatus != http.StatusTooManyRequests || authErr.Message != ErrorMessageConcurrencyLimit {
+		t.Fatalf("concurrency error = %#v, want HTTP 429 and exact message", authErr)
+	}
+}
+
+func TestManagerExecutionReturns429AtConcurrencyLimitWithoutRetry(t *testing.T) {
+	manager := NewManager(nil, &Codex2APIDefaultSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{provider: "codex"}
+	manager.requestRetry.Store(10)
+	auth := &Auth{ID: "busy", Provider: "codex", Status: StatusActive, ConcurrencyLimit: 1}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registered, ok := manager.GetByID(auth.ID)
+	if !ok || registered == nil || !registered.TryAcquireDispatchSlot() {
+		t.Fatal("failed to occupy registered auth")
+	}
+	defer registered.ReleaseDispatchSlot()
+
+	for name, execute := range map[string]func() error{
+		"execute": func() error {
+			_, err := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+			return err
+		},
+		"count": func() error {
+			_, err := manager.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+			return err
+		},
+		"stream": func() error {
+			stream, err := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{Stream: true})
+			if stream != nil {
+				return errors.New("ExecuteStream() returned a stream before an account slot was available")
+			}
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := execute()
+			var authErr *Error
+			if !errors.As(err, &authErr) || authErr.Code != ErrorCodeConcurrencyLimit || authErr.HTTPStatus != http.StatusTooManyRequests {
+				t.Fatalf("execution error = %#v, want HTTP 429 concurrency limit", err)
+			}
+			if wait, retry := manager.shouldRetryAfterError(err, 0, []string{"codex"}, "", time.Minute); retry || wait != 0 {
+				t.Fatalf("concurrency limit retry = %v wait=%s, want immediate rejection", retry, wait)
+			}
+		})
 	}
 }
 

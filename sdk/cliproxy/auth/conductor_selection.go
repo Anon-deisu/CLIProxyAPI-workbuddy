@@ -1180,6 +1180,10 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	if err == nil {
 		return 0, false
 	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && authErr.Code == ErrorCodeConcurrencyLimit {
+		return 0, false
+	}
 	var homeBusy *HomeConcurrencyBusyError
 	if errors.As(err, &homeBusy) && homeBusy != nil {
 		return 0, false
@@ -1467,7 +1471,22 @@ func shouldRetrySchedulerPick(err error) bool {
 	if !errors.As(err, &authErr) || authErr == nil {
 		return false
 	}
+	if authErr.Code == ErrorCodeConcurrencyLimit {
+		return false
+	}
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
+}
+
+func hasDispatchCapacity(auths []*Auth, excludedAuthID string) bool {
+	for _, auth := range auths {
+		if auth == nil || auth.ID == excludedAuthID {
+			continue
+		}
+		if auth.DispatchSlotAvailable() {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
@@ -1558,6 +1577,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	if !selected.TryAcquireDispatchSlot() {
+		if !hasDispatchCapacity(selectorAuths, selected.ID) {
+			return nil, nil, NewConcurrencyLimitError()
+		}
 		if tried == nil {
 			tried = make(map[string]struct{})
 		}
@@ -1907,6 +1929,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	if !selected.TryAcquireDispatchSlot() {
+		if !hasDispatchCapacity(selectorAuths, selected.ID) {
+			return nil, nil, "", NewConcurrencyLimitError()
+		}
 		if tried == nil {
 			tried = make(map[string]struct{})
 		}

@@ -180,6 +180,17 @@ func (a *Auth) TryAcquireDispatchSlot() bool {
 	return true
 }
 
+// DispatchSlotAvailable reports whether this auth can accept one more request.
+func (a *Auth) DispatchSlotAvailable() bool {
+	state := a.ensureDispatchState()
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.limit <= 0 || state.active < state.limit
+}
+
 // ReleaseDispatchSlot releases one in-flight request slot for this auth.
 func (a *Auth) ReleaseDispatchSlot() {
 	state := a.ensureDispatchState()
