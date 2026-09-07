@@ -107,6 +107,10 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 	for _, want := range [][]byte{
 		[]byte(runtimeSchedulerInlineMarker),
 		[]byte("routing/settings"),
+		[]byte("c2a-max-retry-count"),
+		[]byte("c2a-max-retry-interval"),
+		[]byte("estimated_cost_usd"),
+		[]byte("预估费用"),
 		[]byte("auto-disable-unauthorized"),
 		[]byte("auto_disable_reason"),
 	} {

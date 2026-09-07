@@ -929,7 +929,29 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 	if m == nil {
 		return 0, 0, 0
 	}
-	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
+	retry := int(m.requestRetry.Load())
+	maxRetryCredentials := int(m.maxRetryCredentials.Load())
+	maxWait := time.Duration(m.maxRetryInterval.Load())
+	if isCodex2APIDefaultSelector(m.Selector()) {
+		if override := m.c2aMaxRetryCount.Load(); override >= 0 {
+			retry = int(override)
+		}
+		if override := m.c2aMaxRetryInterval.Load(); override >= 0 {
+			maxWait = time.Duration(override)
+		}
+	}
+	return retry, maxRetryCredentials, maxWait
+}
+
+func isCodex2APIDefaultSelector(selector Selector) bool {
+	switch value := selector.(type) {
+	case *Codex2APIDefaultSelector:
+		return true
+	case *SessionAffinitySelector:
+		return value != nil && isCodex2APIDefaultSelector(value.fallback)
+	default:
+		return false
+	}
 }
 
 func effectiveRequestRetryLimit(auth *Auth, defaultRetry int) int {

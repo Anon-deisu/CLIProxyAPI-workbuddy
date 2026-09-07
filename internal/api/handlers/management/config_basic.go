@@ -342,12 +342,26 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	strategy := activeRoutingStrategy(cfg)
 	unauthorized := cfg != nil && cfg.Routing.AutoDisableUnauthorized
 	quota := cfg != nil && cfg.Routing.AutoDisableQuota
+	c2aRetryCount := 0
+	c2aRetryInterval := 0
+	if cfg != nil {
+		c2aRetryCount = cfg.RequestRetry
+		c2aRetryInterval = cfg.MaxRetryInterval
+		if cfg.Routing.C2AMaxRetryCount != nil {
+			c2aRetryCount = *cfg.Routing.C2AMaxRetryCount
+		}
+		if cfg.Routing.C2AMaxRetryInterval != nil {
+			c2aRetryInterval = *cfg.Routing.C2AMaxRetryInterval
+		}
+	}
 	h.mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{
 		"strategy":                  strategy,
 		"scheduler-mode":            strategy,
 		"auto-disable-unauthorized": unauthorized,
 		"auto-disable-quota":        quota,
+		"c2a-max-retry-count":       c2aRetryCount,
+		"c2a-max-retry-interval":    c2aRetryInterval,
 		"runtime_only":              true,
 	})
 }
@@ -359,6 +373,8 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		SchedulerMode           *string `json:"scheduler-mode"`
 		AutoDisableUnauthorized *bool   `json:"auto-disable-unauthorized"`
 		AutoDisableQuota        *bool   `json:"auto-disable-quota"`
+		C2AMaxRetryCount        *int    `json:"c2a-max-retry-count"`
+		C2AMaxRetryInterval     *int    `json:"c2a-max-retry-interval"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -377,7 +393,15 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 			return
 		}
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil {
+	if body.C2AMaxRetryCount != nil && (*body.C2AMaxRetryCount < -1 || *body.C2AMaxRetryCount > 1000000) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "c2a-max-retry-count must be -1 or between 0 and 1000000"})
+		return
+	}
+	if body.C2AMaxRetryInterval != nil && *body.C2AMaxRetryInterval < -1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "c2a-max-retry-interval must be -1 or non-negative"})
+		return
+	}
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
@@ -391,6 +415,22 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		}
 		if body.AutoDisableQuota != nil {
 			cfg.Routing.AutoDisableQuota = *body.AutoDisableQuota
+		}
+		if body.C2AMaxRetryCount != nil {
+			if *body.C2AMaxRetryCount < 0 {
+				cfg.Routing.C2AMaxRetryCount = nil
+			} else {
+				value := *body.C2AMaxRetryCount
+				cfg.Routing.C2AMaxRetryCount = &value
+			}
+		}
+		if body.C2AMaxRetryInterval != nil {
+			if *body.C2AMaxRetryInterval < 0 {
+				cfg.Routing.C2AMaxRetryInterval = nil
+			} else {
+				value := *body.C2AMaxRetryInterval
+				cfg.Routing.C2AMaxRetryInterval = &value
+			}
 		}
 		return nil
 	})

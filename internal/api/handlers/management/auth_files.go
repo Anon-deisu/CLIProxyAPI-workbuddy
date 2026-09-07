@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -354,6 +355,13 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	cost := coreusage.AuthCost(auth.ID)
+	entry["estimated_cost_usd"] = cost.EstimatedCostUSD
+	entry["estimated_cost_cycle_date"] = cost.CycleDate
+	entry["estimated_cost_input_tokens"] = cost.InputTokens
+	entry["estimated_cost_output_tokens"] = cost.OutputTokens
+	entry["estimated_cost_unpriced_input_tokens"] = cost.UnpricedInputTokens
+	entry["estimated_cost_unpriced_output_tokens"] = cost.UnpricedOutputTokens
 	entry["quota"] = quotaObservationPayloadForProvider(auth.Provider, auth.Quota)
 	if modelQuotas := modelQuotaObservationPayload(auth.Provider, auth.ModelStates); len(modelQuotas) > 0 {
 		entry["model_quotas"] = modelQuotas

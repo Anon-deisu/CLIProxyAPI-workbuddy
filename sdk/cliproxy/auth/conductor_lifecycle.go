@@ -30,6 +30,32 @@ func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxR
 	m.maxRetryInterval.Store(maxRetryInterval.Nanoseconds())
 }
 
+// SetC2ARetryConfig updates runtime-only retry overrides for the Codex2API default scheduler.
+// Nil values inherit the global retry settings.
+func (m *Manager) SetC2ARetryConfig(maxRetryCount *int, maxRetryInterval *time.Duration) {
+	if m == nil {
+		return
+	}
+	count := int32(-1)
+	if maxRetryCount != nil {
+		value := *maxRetryCount
+		if value < 0 {
+			value = 0
+		}
+		count = int32(value)
+	}
+	interval := int64(-1)
+	if maxRetryInterval != nil {
+		value := *maxRetryInterval
+		if value < 0 {
+			value = 0
+		}
+		interval = value.Nanoseconds()
+	}
+	m.c2aMaxRetryCount.Store(count)
+	m.c2aMaxRetryInterval.Store(interval)
+}
+
 // RegisterExecutor registers a provider executor with the manager.
 func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if executor == nil {

@@ -18,6 +18,37 @@ import (
 
 const requestScopedNotFoundMessage = "Item with id 'rs_0b5f3eb6f51f175c0169ca74e4a85881998539920821603a74' not found. Items are not persisted when `store` is set to false. Try again with `store` set to true, or remove this item from your input."
 
+func TestManagerC2ARetrySettingsOverrideOnlyCodex2APIDefault(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	manager.SetRetryConfig(3, 30*time.Second, 4)
+	count := 5
+	interval := 7 * time.Second
+	manager.SetC2ARetryConfig(&count, &interval)
+
+	retry, maxCredentials, maxWait := manager.retrySettings()
+	if retry != 3 || maxCredentials != 4 || maxWait != 30*time.Second {
+		t.Fatalf("non-C2A retry settings = (%d, %d, %s), want (3, 4, 30s)", retry, maxCredentials, maxWait)
+	}
+
+	manager.SetSelector(&Codex2APIDefaultSelector{})
+	retry, maxCredentials, maxWait = manager.retrySettings()
+	if retry != count || maxCredentials != 4 || maxWait != interval {
+		t.Fatalf("C2A retry settings = (%d, %d, %s), want (%d, 4, %s)", retry, maxCredentials, maxWait, count, interval)
+	}
+
+	manager.SetSelector(NewSessionAffinitySelector(&Codex2APIDefaultSelector{}))
+	retry, _, maxWait = manager.retrySettings()
+	if retry != count || maxWait != interval {
+		t.Fatalf("session-affinity C2A retry settings = (%d, %s), want (%d, %s)", retry, maxWait, count, interval)
+	}
+
+	manager.SetC2ARetryConfig(nil, nil)
+	retry, _, maxWait = manager.retrySettings()
+	if retry != 3 || maxWait != 30*time.Second {
+		t.Fatalf("cleared C2A retry settings = (%d, %s), want (3, 30s)", retry, maxWait)
+	}
+}
+
 func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)

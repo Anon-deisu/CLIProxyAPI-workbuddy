@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -516,6 +517,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	}
 	errPersist := m.persist(ctx, auth)
 	m.mu.Unlock()
+	coreusage.ResetAuthCost(authID)
 
 	defer func() {
 		if cooldownStateChanged {
