@@ -78,6 +78,9 @@ type Auth struct {
 	AutoDisableReason string `json:"-"`
 	// AutoDisabledAt records when runtime policy excluded this auth.
 	AutoDisabledAt time.Time `json:"-"`
+	// ConcurrencyLimit is the runtime-only maximum number of in-flight requests
+	// allowed for this credential. Zero means unlimited.
+	ConcurrencyLimit int `json:"-"`
 	// Unavailable flags transient provider unavailability (e.g. quota exceeded).
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
@@ -109,8 +112,96 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
-	recentRequests recentRequestRing `json:"-"`
-	indexAssigned  bool              `json:"-"`
+	recentRequests recentRequestRing  `json:"-"`
+	indexAssigned  bool               `json:"-"`
+	dispatchState  *authDispatchState `json:"-"`
+}
+
+type authDispatchState struct {
+	mu          sync.Mutex
+	active      int
+	limit       int
+	initialized bool
+}
+
+func (a *Auth) ensureDispatchState() *authDispatchState {
+	if a == nil {
+		return nil
+	}
+	if a.dispatchState == nil {
+		a.dispatchState = &authDispatchState{limit: a.ConcurrencyLimit, initialized: true}
+	}
+	return a.dispatchState
+}
+
+// SetConcurrencyLimit updates the runtime-only per-auth concurrency limit.
+// Zero means unlimited.
+func (a *Auth) SetConcurrencyLimit(limit int) {
+	if limit < 0 {
+		limit = 0
+	}
+	state := a.ensureDispatchState()
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.limit = limit
+	state.initialized = true
+	a.ConcurrencyLimit = limit
+	state.mu.Unlock()
+}
+
+// EffectiveConcurrencyLimit returns the current runtime-only limit.
+func (a *Auth) EffectiveConcurrencyLimit() int {
+	state := a.ensureDispatchState()
+	if state == nil {
+		return 0
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.initialized {
+		return a.ConcurrencyLimit
+	}
+	return state.limit
+}
+
+// TryAcquireDispatchSlot reserves one in-flight request slot for this auth.
+func (a *Auth) TryAcquireDispatchSlot() bool {
+	state := a.ensureDispatchState()
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.limit > 0 && state.active >= state.limit {
+		return false
+	}
+	state.active++
+	return true
+}
+
+// ReleaseDispatchSlot releases one in-flight request slot for this auth.
+func (a *Auth) ReleaseDispatchSlot() {
+	state := a.ensureDispatchState()
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if state.active > 0 {
+		state.active--
+	}
+	state.mu.Unlock()
+}
+
+// ActiveDispatchRequests returns the current in-flight request count.
+func (a *Auth) ActiveDispatchRequests() int {
+	state := a.ensureDispatchState()
+	if state == nil {
+		return 0
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.active
 }
 
 const (

@@ -33,7 +33,7 @@ type routingRuntimeState struct {
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
-		strategy:                 "round-robin",
+		strategy:                 "codex2api-default",
 		sessionAffinityTTL:       time.Hour,
 		sessionAffinitySubagents: true,
 	}
@@ -46,6 +46,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		strategy = runtimeMode
 	}
 	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "codex2api-default", "codex2api", "default", "round-robin", "roundrobin", "rr":
+		state.strategy = "codex2api-default"
 	case "weighted-round-robin", "weightedroundrobin", "wrr":
 		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
@@ -77,6 +79,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.FillFirstSelector{}
 	case "remaining-quota":
 		selector = &coreauth.RemainingQuotaSelector{}
+	case "codex2api-default":
+		selector = &coreauth.Codex2APIDefaultSelector{}
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}

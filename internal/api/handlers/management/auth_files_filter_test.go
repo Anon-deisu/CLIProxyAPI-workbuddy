@@ -278,6 +278,71 @@ func TestBuildAuthFileEntryExposesAutomaticDisableReason(t *testing.T) {
 	}
 }
 
+func TestBuildAuthFileEntryExposesConcurrencyState(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:               "concurrency-auth",
+		FileName:         "concurrency-auth.json",
+		Provider:         "codex",
+		Status:           coreauth.StatusActive,
+		ConcurrencyLimit: 2,
+		Attributes:       map[string]string{"path": filepath.Join(t.TempDir(), "concurrency-auth.json")},
+	}
+	if !auth.TryAcquireDispatchSlot() {
+		t.Fatal("failed to acquire test dispatch slot")
+	}
+	defer auth.ReleaseDispatchSlot()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("entry is nil")
+	}
+	if entry["concurrency_limit"] != 2 || entry["active_requests"] != 1 {
+		t.Fatalf("concurrency fields = %#v, want limit=2 active=1", entry)
+	}
+}
+
+func TestPatchAuthFileFieldsUpdatesConcurrencyInMemoryOnly(t *testing.T) {
+	authDir := t.TempDir()
+	filePath := filepath.Join(authDir, "concurrency-auth.json")
+	original := `{"type":"codex"}`
+	if errWrite := os.WriteFile(filePath, []byte(original), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	registerAuthForLookupTest(t, manager, &coreauth.Auth{
+		ID:       "concurrency-auth",
+		FileName: "concurrency-auth.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filePath,
+		},
+	})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"name":"concurrency-auth.json","concurrency_limit":3}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.PatchAuthFileFields(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	updated, ok := manager.GetByID("concurrency-auth")
+	if !ok || updated == nil || updated.EffectiveConcurrencyLimit() != 3 {
+		t.Fatalf("updated concurrency state = %#v, want limit=3", updated)
+	}
+	data, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("failed to read auth file: %v", errRead)
+	}
+	if string(data) != original {
+		t.Fatalf("auth file changed: got %q, want %q", string(data), original)
+	}
+}
+
 func TestPatchAuthFileStatusResumesAutomaticDisable(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	registerAuthForLookupTest(t, manager, &coreauth.Auth{

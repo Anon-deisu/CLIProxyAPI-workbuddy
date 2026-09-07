@@ -175,6 +175,111 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	}
 }
 
+func TestCodex2APIDefaultSelectorOrdersPriorityHealthAndUsage(t *testing.T) {
+	priorityCandidate := &Auth{
+		ID:       "priority-warm",
+		Provider: "codex",
+		Status:   StatusError,
+		Attributes: map[string]string{
+			"priority": "10",
+		},
+	}
+	healthyHighUsage := &Auth{
+		ID:       "healthy-high-usage",
+		Provider: "codex",
+		Status:   StatusActive,
+		Quota:    QuotaState{Signals: map[string]string{"used-percent": "70"}},
+	}
+	healthyLowUsage := &Auth{
+		ID:       "healthy-low-usage",
+		Provider: "codex",
+		Status:   StatusActive,
+		Quota:    QuotaState{Signals: map[string]string{"used-percent": "20"}},
+	}
+
+	if got := pickCodex2APIAuth([]*Auth{healthyHighUsage, healthyLowUsage}); got != healthyLowUsage {
+		t.Fatalf("healthy selection = %q, want %q", got.ID, healthyLowUsage.ID)
+	}
+	if got := pickCodex2APIAuth([]*Auth{healthyLowUsage, priorityCandidate}); got != priorityCandidate {
+		t.Fatalf("priority selection = %q, want %q", got.ID, priorityCandidate.ID)
+	}
+}
+
+func TestAuthDispatchSlotsRespectRuntimeLimit(t *testing.T) {
+	auth := &Auth{ID: "limited", ConcurrencyLimit: 1}
+	if !auth.TryAcquireDispatchSlot() {
+		t.Fatal("first dispatch slot acquisition failed")
+	}
+	if auth.TryAcquireDispatchSlot() {
+		t.Fatal("second dispatch slot acquisition succeeded at limit")
+	}
+	if got := auth.ActiveDispatchRequests(); got != 1 {
+		t.Fatalf("active requests = %d, want 1", got)
+	}
+
+	auth.SetConcurrencyLimit(0)
+	if !auth.TryAcquireDispatchSlot() {
+		t.Fatal("unlimited auth rejected a dispatch slot")
+	}
+	if got := auth.EffectiveConcurrencyLimit(); got != 0 {
+		t.Fatalf("effective concurrency limit = %d, want 0", got)
+	}
+	auth.ReleaseDispatchSlot()
+	auth.ReleaseDispatchSlot()
+	if got := auth.ActiveDispatchRequests(); got != 0 {
+		t.Fatalf("active requests after release = %d, want 0", got)
+	}
+}
+
+func TestSchedulerSkipsAuthAtConcurrencyLimit(t *testing.T) {
+	busy := &Auth{ID: "busy", Provider: "codex", Status: StatusActive, ConcurrencyLimit: 1}
+	ready := &Auth{ID: "ready", Provider: "codex", Status: StatusActive}
+	if !busy.TryAcquireDispatchSlot() {
+		t.Fatal("failed to occupy busy auth")
+	}
+	defer busy.ReleaseDispatchSlot()
+
+	scheduler := newSchedulerForTest(&Codex2APIDefaultSelector{}, busy, ready)
+	picked, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if picked == nil || picked.ID != ready.ID {
+		t.Fatalf("picked auth = %#v, want %q", picked, ready.ID)
+	}
+	defer picked.ReleaseDispatchSlot()
+}
+
+func TestManagerLegacySelectionSkipsAuthAtConcurrencyLimit(t *testing.T) {
+	manager := NewManager(nil, &Codex2APIDefaultSelector{}, nil)
+	manager.executors["codex"] = schedulerTestExecutor{provider: "codex"}
+
+	busy := &Auth{ID: "a-busy", Provider: "codex", Status: StatusActive, ConcurrencyLimit: 1}
+	ready := &Auth{ID: "b-ready", Provider: "codex", Status: StatusActive}
+	if _, errRegister := manager.Register(context.Background(), busy); errRegister != nil {
+		t.Fatalf("register busy auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), ready); errRegister != nil {
+		t.Fatalf("register ready auth: %v", errRegister)
+	}
+	registeredBusy, ok := manager.GetByID(busy.ID)
+	if !ok || registeredBusy == nil || !registeredBusy.TryAcquireDispatchSlot() {
+		t.Fatal("failed to occupy registered busy auth")
+	}
+	defer registeredBusy.ReleaseDispatchSlot()
+
+	selected, errSelect := manager.SelectAuth(context.Background(), "codex", "", cliproxyexecutor.Options{})
+	if errSelect != nil {
+		t.Fatalf("SelectAuth() error = %v", errSelect)
+	}
+	if selected == nil || selected.ID != ready.ID {
+		t.Fatalf("SelectAuth() auth = %#v, want %q", selected, ready.ID)
+	}
+	if got := selected.ActiveDispatchRequests(); got != 0 {
+		t.Fatalf("selected auth active requests = %d, want 0 after SelectAuth", got)
+	}
+}
+
 func TestSchedulerPick_WeightedRoundRobin(t *testing.T) {
 	t.Parallel()
 

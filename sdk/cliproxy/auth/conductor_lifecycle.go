@@ -77,6 +77,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	auth.ensureDispatchState()
 	now := time.Now()
 	if auth.Generation == 0 {
 		auth.Generation = 1
@@ -182,6 +183,12 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			auth = merged
 			NormalizeCredentialMetadata(auth.Metadata)
 		}
+	}
+	if auth.dispatchState == nil {
+		auth.dispatchState = existing.dispatchState
+	}
+	if auth.dispatchState == nil {
+		auth.ensureDispatchState()
 	}
 	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {
 		m.mu.Unlock()

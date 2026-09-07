@@ -33,6 +33,7 @@ func TestBuiltInSelectorCooldownErrorPreservesRouteModel(t *testing.T) {
 		"round-robin":          &RoundRobinSelector{},
 		"weighted-round-robin": &WeightedRoundRobinSelector{},
 		"fill-first":           &FillFirstSelector{},
+		"codex2api-default":    &Codex2APIDefaultSelector{},
 	}
 	for name, selector := range selectors {
 		t.Run(name, func(t *testing.T) {

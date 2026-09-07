@@ -44,7 +44,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *RemainingQuotaSelector:
+	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *RemainingQuotaSelector, *Codex2APIDefaultSelector:
 		return true
 	default:
 		return false
@@ -1557,6 +1557,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	if !selected.TryAcquireDispatchSlot() {
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
 		m.mu.Lock()
@@ -1580,8 +1587,10 @@ func (m *Manager) SelectAuth(ctx context.Context, provider, model string, opts c
 		return nil, errPick
 	}
 	if m.HomeEnabled() {
+		selected.ReleaseDispatchSlot()
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selected.ReleaseDispatchSlot()
 	return selected, nil
 }
 
@@ -1605,8 +1614,10 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	if m.HomeEnabled() {
+		selected.ReleaseDispatchSlot()
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selected.ReleaseDispatchSlot()
 	return selected, nil
 }
 
@@ -1628,11 +1639,16 @@ func (m *Manager) SelectAuthWithCredentialPolicy(ctx context.Context, provider, 
 		return nil, errPick
 	}
 	if selected == nil || !credentialPolicyAllows(policy, selected) {
+		if selected != nil {
+			selected.ReleaseDispatchSlot()
+		}
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no eligible auth"}
 	}
 	if m.HomeEnabled() {
+		selected.ReleaseDispatchSlot()
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selected.ReleaseDispatchSlot()
 	return selected, nil
 }
 
@@ -1890,9 +1906,17 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	if !selected.TryAcquireDispatchSlot() {
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 	providerKey := executorKeyFromAuth(selected)
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {
+		selected.ReleaseDispatchSlot()
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()
@@ -1980,6 +2004,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {
+		selected.ReleaseDispatchSlot()
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()

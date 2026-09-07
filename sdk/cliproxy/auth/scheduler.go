@@ -23,6 +23,7 @@ const (
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
 	schedulerStrategyRemainingQuota     schedulerStrategy = 4
+	schedulerStrategyCodex2APIDefault   schedulerStrategy = 5
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -172,6 +173,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyWeightedRoundRobin
 	case *RemainingQuotaSelector:
 		return schedulerStrategyRemainingQuota
+	case *Codex2APIDefaultSelector:
+		return schedulerStrategyCodex2APIDefault
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -1036,21 +1039,59 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
 		view = &bucket.ws
 	}
-	var picked *scheduledAuth
-	switch strategy {
-	case schedulerStrategyFillFirst:
-		picked = view.pickQuota(predicate, false)
-	case schedulerStrategyRemainingQuota:
-		picked = view.pickQuota(predicate, true)
-	case schedulerStrategyWeightedRoundRobin:
-		picked = view.pickWeighted(predicate)
-	default:
-		picked = view.pickRoundRobin(predicate)
+	busy := make(map[string]struct{})
+	for attempt := 0; attempt < len(view.flat); attempt++ {
+		candidatePredicate := func(entry *scheduledAuth) bool {
+			if entry == nil || entry.auth == nil {
+				return false
+			}
+			if _, excluded := busy[entry.auth.ID]; excluded {
+				return false
+			}
+			return predicate == nil || predicate(entry)
+		}
+		var picked *scheduledAuth
+		switch strategy {
+		case schedulerStrategyFillFirst:
+			picked = view.pickQuota(candidatePredicate, false)
+		case schedulerStrategyRemainingQuota:
+			picked = view.pickQuota(candidatePredicate, true)
+		case schedulerStrategyCodex2APIDefault:
+			picked = view.pickCodex2API(candidatePredicate)
+		case schedulerStrategyWeightedRoundRobin:
+			picked = view.pickWeighted(candidatePredicate)
+		default:
+			picked = view.pickRoundRobin(candidatePredicate)
+		}
+		if picked == nil || picked.auth == nil {
+			return nil
+		}
+		if picked.auth.TryAcquireDispatchSlot() {
+			return picked.auth
+		}
+		busy[picked.auth.ID] = struct{}{}
 	}
-	if picked == nil || picked.auth == nil {
+	return nil
+}
+
+func (v *readyView) pickCodex2API(predicate func(*scheduledAuth) bool) *scheduledAuth {
+	var candidates []*scheduledAuth
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil || predicate != nil && !predicate(entry) {
+			continue
+		}
+		candidates = append(candidates, entry)
+	}
+	if len(candidates) == 0 {
 		return nil
 	}
-	return picked.auth
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if compareCodex2APIAuth(candidate.auth, best.auth) < 0 {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func (v *readyView) pickQuota(predicate func(*scheduledAuth) bool, preferRemaining bool) *scheduledAuth {

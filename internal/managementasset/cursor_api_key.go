@@ -326,10 +326,7 @@ const runtimeSchedulerInlineScript = `
     var title = make('div', 'cpa-runtime-scheduler-title', '账号调度设置');
     var hint = make('div', 'cpa-runtime-scheduler-hint', '仅当前进程生效，重启后恢复默认值');
     var form = make('div', 'cpa-runtime-scheduler-form');
-    var strategyLabel = make('label', 'cpa-runtime-scheduler-label', '调度方式');
-    var strategy = document.createElement('select');
-    strategy.innerHTML = '<option value="round-robin">轮询</option><option value="remaining-quota">剩余额度优先</option><option value="fill-first">额度耗尽优先</option><option value="weighted-round-robin">权重轮询</option>';
-    strategyLabel.appendChild(strategy);
+    var strategyLabel = make('div', 'cpa-runtime-scheduler-default', '调度方式：Codex2API 默认（round-robin）');
     var unauthorizedLabel = make('label', 'cpa-runtime-scheduler-check');
     var unauthorized = document.createElement('input');
     unauthorized.type = 'checkbox';
@@ -348,7 +345,7 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(quotaLabel);
     form.appendChild(save);
     form.appendChild(status);
-    var disabledTitle = make('div', 'cpa-runtime-scheduler-subtitle', '自动禁用认证文件');
+    var disabledTitle = make('div', 'cpa-runtime-scheduler-subtitle', '账号调度与自动禁用认证文件');
     var disabledList = make('div', 'cpa-runtime-scheduler-disabled-list', '正在读取...');
     panel.appendChild(title);
     panel.appendChild(hint);
@@ -370,7 +367,6 @@ const runtimeSchedulerInlineScript = `
       request('GET', managementPath + 'routing/settings').then(function (response) {
         return response.json();
       }).then(function (data) {
-        strategy.value = data['scheduler-mode'] || data.strategy || 'round-robin';
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
       }).catch(function () {
@@ -382,7 +378,7 @@ const runtimeSchedulerInlineScript = `
       request('GET', managementPath + 'auth-files').then(function (response) {
         return response.json();
       }).then(function (data) {
-        var files = (data && data.files || []).filter(function (item) { return item && item.auto_disabled; });
+        var files = (data && data.files || []).filter(function (item) { return item && item.runtime_only !== true; });
         disabledList.textContent = '';
         if (!files.length) {
           disabledList.appendChild(make('div', 'cpa-runtime-scheduler-empty', '暂无自动禁用认证文件'));
@@ -390,8 +386,40 @@ const runtimeSchedulerInlineScript = `
         }
         files.forEach(function (item) {
           var row = make('div', 'cpa-runtime-scheduler-disabled-row');
-          row.appendChild(make('strong', '', item.name || item.email || item.id || '未知认证'));
-          row.appendChild(make('span', '', '原因：' + (item.auto_disable_reason || item.status_message || '未知')));
+          var identity = make('strong', '', item.name || item.email || item.id || '未知认证');
+          var detail = make('span', '', item.auto_disabled ? ('自动禁用原因：' + (item.auto_disable_reason || item.status_message || '未知')) : '状态正常');
+          var concurrency = document.createElement('input');
+          concurrency.type = 'number';
+          concurrency.min = '0';
+          concurrency.max = '1000000';
+          concurrency.step = '1';
+          concurrency.value = String(item.concurrency_limit || 0);
+          concurrency.title = '每账号最大并发数，0 表示不限制';
+          var saveConcurrency = make('button', 'cpa-runtime-scheduler-account-save', '并发');
+          saveConcurrency.type = 'button';
+          saveConcurrency.addEventListener('click', function () {
+            var limit = Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0));
+            saveConcurrency.disabled = true;
+            request('PATCH', managementPath + 'auth-files/fields', {
+              name: item.name || item.id,
+              auth_index: item.auth_index,
+              concurrency_limit: limit
+            }).then(function () {
+              concurrency.value = String(limit);
+              detail.textContent = item.auto_disabled ? ('自动禁用原因：' + (item.auto_disable_reason || item.status_message || '未知')) : '状态正常';
+            }).catch(function () {
+              detail.textContent = '并发设置失败';
+            }).finally(function () {
+              saveConcurrency.disabled = false;
+            });
+          });
+          row.appendChild(identity);
+          row.appendChild(detail);
+          var concurrencyLine = make('div', 'cpa-runtime-scheduler-account-concurrency');
+          concurrencyLine.appendChild(make('span', '', '最大并发'));
+          concurrencyLine.appendChild(concurrency);
+          concurrencyLine.appendChild(saveConcurrency);
+          row.appendChild(concurrencyLine);
           disabledList.appendChild(row);
         });
       }).catch(function () {
@@ -403,7 +431,6 @@ const runtimeSchedulerInlineScript = `
       save.disabled = true;
       status.textContent = '应用中...';
       request('PATCH', managementPath + 'routing/settings', {
-        'scheduler-mode': strategy.value,
         'auto-disable-unauthorized': unauthorized.checked,
         'auto-disable-quota': quota.checked
       }).then(function () {
@@ -420,7 +447,7 @@ const runtimeSchedulerInlineScript = `
   var style = document.createElement('style');
   style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
     '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:340px;max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
-    '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-label{display:flex;justify-content:space-between;align-items:center;gap:12px}.cpa-runtime-scheduler-label select{flex:1;padding:6px;border:1px solid #d0d7de;border-radius:6px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:2px;padding:8px;border-radius:6px;background:#fff1f2;color:#9f1239;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
+    '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save,.cpa-runtime-scheduler-account-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-disabled-row:has(span:first-of-type){border-left:3px solid #d0d7de}.cpa-runtime-scheduler-account-concurrency{display:flex;align-items:center;gap:5px;color:#57606a}.cpa-runtime-scheduler-account-concurrency input{width:70px;padding:4px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-account-save{padding:4px 8px;font-size:11px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mount, { once: true });

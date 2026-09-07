@@ -44,6 +44,12 @@ type WeightedRoundRobinSelector struct {
 	maxKeys int
 }
 
+// Codex2APIDefaultSelector implements the unified Codex2API default scheduler.
+// Priority, health, quota watermarks and dispatch score are evaluated as one
+// ordering rather than exposing quota as a standalone routing mode. Runtime
+// concurrency is enforced separately when a candidate is acquired.
+type Codex2APIDefaultSelector struct{}
+
 type smoothWeightedState struct {
 	current map[string]int64
 	weights map[string]int64
@@ -710,6 +716,146 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
 	}
 	return picked, nil
+}
+
+// Pick selects the best candidate using Codex2API's default ordering.
+func (s *Codex2APIDefaultSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	available, errAvailable := getAvailableAuths(auths, provider, model, time.Now())
+	if errAvailable != nil {
+		return nil, errAvailable
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	return pickCodex2APIAuth(available), nil
+}
+
+type codex2APIHealthTier int
+
+const (
+	codex2APIHealthy codex2APIHealthTier = iota
+	codex2APIWarm
+	codex2APIRisky
+	codex2APIBanned
+)
+
+func pickCodex2APIAuth(auths []*Auth) *Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	best := auths[0]
+	for _, candidate := range auths[1:] {
+		if compareCodex2APIAuth(candidate, best) < 0 {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func compareCodex2APIAuth(left, right *Auth) int {
+	leftPriority, rightPriority := authPriority(left), authPriority(right)
+	if leftPriority != rightPriority {
+		if leftPriority > rightPriority {
+			return -1
+		}
+		return 1
+	}
+	leftTier := codex2APIHealth(left)
+	rightTier := codex2APIHealth(right)
+	if leftTier != rightTier {
+		if leftTier < rightTier {
+			return -1
+		}
+		return 1
+	}
+	if leftTier == codex2APIHealthy {
+		leftUsage, leftKnown := authQuotaUsedPercent(left)
+		rightUsage, rightKnown := authQuotaUsedPercent(right)
+		if leftKnown != rightKnown {
+			if !leftKnown {
+				return -1
+			}
+			return 1
+		}
+		if leftKnown && leftUsage != rightUsage {
+			if leftUsage < rightUsage {
+				return -1
+			}
+			return 1
+		}
+	}
+	leftScore := codex2APIDispatchScore(left)
+	rightScore := codex2APIDispatchScore(right)
+	if leftScore != rightScore {
+		if leftScore > rightScore {
+			return -1
+		}
+		return 1
+	}
+	leftProven, rightProven := codex2APIProven(left), codex2APIProven(right)
+	if leftProven != rightProven {
+		if leftProven {
+			return -1
+		}
+		return 1
+	}
+	leftID, rightID := "", ""
+	if left != nil {
+		leftID = left.ID
+	}
+	if right != nil {
+		rightID = right.ID
+	}
+	if leftID < rightID {
+		return -1
+	}
+	if leftID > rightID {
+		return 1
+	}
+	return 0
+}
+
+func codex2APIHealth(auth *Auth) codex2APIHealthTier {
+	if auth == nil || auth.IsDispatchDisabled() {
+		return codex2APIBanned
+	}
+	if auth.Status == StatusError || auth.Unavailable || auth.LastError != nil {
+		if auth.Quota.Exceeded || !auth.NextRetryAfter.IsZero() {
+			return codex2APIRisky
+		}
+		return codex2APIWarm
+	}
+	if used, ok := authQuotaUsedPercent(auth); ok && used >= 80 {
+		return codex2APIWarm
+	}
+	return codex2APIHealthy
+}
+
+func codex2APIDispatchScore(auth *Auth) float64 {
+	if auth == nil {
+		return -1e9
+	}
+	score := 100.0
+	if used, ok := authQuotaUsedPercent(auth); ok {
+		score -= used * 0.5
+	}
+	if auth.Success+auth.Failed > 0 {
+		score -= float64(auth.Failed) / float64(auth.Success+auth.Failed) * 30
+	}
+	if auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["score_bias_override"]); raw != "" {
+			if bias, errParse := strconv.ParseFloat(raw, 64); errParse == nil {
+				score += bias
+			}
+		}
+	}
+	return score
+}
+
+func codex2APIProven(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	return auth.Success+auth.Failed > 10
 }
 
 // Pick selects the available credential with the most remaining observed quota.
