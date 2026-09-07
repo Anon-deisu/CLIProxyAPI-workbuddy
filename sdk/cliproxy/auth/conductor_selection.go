@@ -44,7 +44,7 @@ func (m *Manager) hasPluginScheduler() bool {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *RemainingQuotaSelector:
+	case *RoundRobinSelector, *WeightedRoundRobinSelector, *FillFirstSelector, *RemainingQuotaSelector, *Codex2APIDefaultSelector:
 		return true
 	default:
 		return false
@@ -929,7 +929,29 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 	if m == nil {
 		return 0, 0, 0
 	}
-	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
+	retry := int(m.requestRetry.Load())
+	maxRetryCredentials := int(m.maxRetryCredentials.Load())
+	maxWait := time.Duration(m.maxRetryInterval.Load())
+	if isCodex2APIDefaultSelector(m.Selector()) {
+		if override := m.c2aMaxRetryCount.Load(); override >= 0 {
+			retry = int(override)
+		}
+		if override := m.c2aMaxRetryInterval.Load(); override >= 0 {
+			maxWait = time.Duration(override)
+		}
+	}
+	return retry, maxRetryCredentials, maxWait
+}
+
+func isCodex2APIDefaultSelector(selector Selector) bool {
+	switch value := selector.(type) {
+	case *Codex2APIDefaultSelector:
+		return true
+	case *SessionAffinitySelector:
+		return value != nil && isCodex2APIDefaultSelector(value.fallback)
+	default:
+		return false
+	}
 }
 
 func effectiveRequestRetryLimit(auth *Auth, defaultRetry int) int {
@@ -1178,6 +1200,10 @@ func (m *Manager) shouldRetryAfterErrorWithHomeRetryLimit(ctx context.Context, o
 
 func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts cliproxyexecutor.Options, err error, attempt int, providers []string, model string, maxWait time.Duration, homeRetryLimit int, defaultRequestRetry int, attempted map[string]struct{}) (time.Duration, bool) {
 	if err == nil {
+		return 0, false
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && authErr.Code == ErrorCodeConcurrencyLimit {
 		return 0, false
 	}
 	var homeBusy *HomeConcurrencyBusyError
@@ -1467,7 +1493,22 @@ func shouldRetrySchedulerPick(err error) bool {
 	if !errors.As(err, &authErr) || authErr == nil {
 		return false
 	}
+	if authErr.Code == ErrorCodeConcurrencyLimit {
+		return false
+	}
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
+}
+
+func hasDispatchCapacity(auths []*Auth, excludedAuthID string) bool {
+	for _, auth := range auths {
+		if auth == nil || auth.ID == excludedAuthID {
+			continue
+		}
+		if auth.DispatchSlotAvailable() {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
@@ -1557,6 +1598,16 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if selected == nil {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	if !selected.TryAcquireDispatchSlot() {
+		if !hasDispatchCapacity(selectorAuths, selected.ID) {
+			return nil, nil, NewConcurrencyLimitError()
+		}
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
 	authCopy := selected.Clone()
 	if !selected.indexAssigned {
 		m.mu.Lock()
@@ -1580,8 +1631,10 @@ func (m *Manager) SelectAuth(ctx context.Context, provider, model string, opts c
 		return nil, errPick
 	}
 	if m.HomeEnabled() {
+		selected.ReleaseDispatchSlot()
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selected.ReleaseDispatchSlot()
 	return selected, nil
 }
 
@@ -1605,8 +1658,10 @@ func (m *Manager) SelectAuthByKind(ctx context.Context, provider, model, require
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
 	if m.HomeEnabled() {
+		selected.ReleaseDispatchSlot()
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selected.ReleaseDispatchSlot()
 	return selected, nil
 }
 
@@ -1628,11 +1683,16 @@ func (m *Manager) SelectAuthWithCredentialPolicy(ctx context.Context, provider, 
 		return nil, errPick
 	}
 	if selected == nil || !credentialPolicyAllows(policy, selected) {
+		if selected != nil {
+			selected.ReleaseDispatchSlot()
+		}
 		return nil, &Error{Code: "auth_not_found", Message: "selector returned no eligible auth"}
 	}
 	if m.HomeEnabled() {
+		selected.ReleaseDispatchSlot()
 		return nil, &Error{Code: "home_unavailable", Message: "legacy auth selection is unavailable while Home is enabled", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	selected.ReleaseDispatchSlot()
 	return selected, nil
 }
 
@@ -1890,9 +1950,20 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if selected == nil {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+	if !selected.TryAcquireDispatchSlot() {
+		if !hasDispatchCapacity(selectorAuths, selected.ID) {
+			return nil, nil, "", NewConcurrencyLimitError()
+		}
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		tried[selected.ID] = struct{}{}
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
 	providerKey := executorKeyFromAuth(selected)
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {
+		selected.ReleaseDispatchSlot()
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()
@@ -1980,6 +2051,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	executor, okExecutor := m.Executor(providerKey)
 	if !okExecutor {
+		selected.ReleaseDispatchSlot()
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	authCopy := selected.Clone()

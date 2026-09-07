@@ -248,6 +248,13 @@ type RoutingConfig struct {
 	// response or a provider quota watermark reaches 100 percent.
 	AutoDisableQuota bool `yaml:"-" json:"auto-disable-quota"`
 
+	// C2AMaxRetryCount overrides the global request-retry count for the Codex2API
+	// default scheduler. It is runtime-only; nil inherits the global setting.
+	C2AMaxRetryCount *int `yaml:"-" json:"c2a-max-retry-count,omitempty"`
+	// C2AMaxRetryInterval overrides the global max-retry-interval in seconds for
+	// the Codex2API default scheduler. It is runtime-only; nil inherits globally.
+	C2AMaxRetryInterval *int `yaml:"-" json:"c2a-max-retry-interval,omitempty"`
+
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
 	// followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,

@@ -183,23 +183,38 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		for _, chunk := range buffered {
 			if ok := emit(chunk); !ok {
 				discardStreamChunks(remaining)
+				if !failed {
+					auth.ReleaseDispatchSlot()
+				}
 				return
 			}
 		}
 		for chunk := range remaining {
 			if ok := emit(chunk); !ok {
 				discardStreamChunks(remaining)
+				if !failed {
+					auth.ReleaseDispatchSlot()
+				}
 				return
 			}
 		}
 		if tail := finishForceMappedStreamChunks(rewriter); len(tail) > 0 {
 			tailChunk := cliproxyexecutor.StreamChunk{Payload: tail}
 			if !emit(tailChunk) {
+				if !failed {
+					auth.ReleaseDispatchSlot()
+				}
 				return
 			}
 		}
-		if !failed && (ephemeralResult || claudeOAuthRequestCancellation(ctx, auth, nil) == nil) {
-			m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: true, Options: opts}, auth, ephemeralResult)
+		if !failed {
+			if ephemeralResult || claudeOAuthRequestCancellation(ctx, auth, nil) == nil {
+				m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: true, Options: opts}, auth, ephemeralResult)
+			} else {
+				// Downstream cancellation ends the stream without a result callback.
+				// Release the local dispatch reservation explicitly in that case.
+				auth.ReleaseDispatchSlot()
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -225,12 +240,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		var errIntercept error
 		execReq, execOpts, errIntercept = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
 		if errIntercept != nil {
+			auth.ReleaseDispatchSlot()
 			return nil, errIntercept
 		}
 		if executionModel == "" {
 			execReq = attachResolvedAPIKeyModelInfo(routing, execReq, auth, routeModel, execModel)
 		}
 		if errCtx := ctx.Err(); errCtx != nil {
+			auth.ReleaseDispatchSlot()
 			return nil, errCtx
 		}
 		entry := logEntryWithRequestID(ctx)
@@ -244,6 +261,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		durationStream := time.Since(startStream)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				auth.ReleaseDispatchSlot()
 				return nil, errCtx
 			}
 			if allowRetry && !ephemeralResult {
@@ -265,6 +283,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					if errStream != nil {
 						warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationRetry, errStream)
 						if errCtx := ctx.Err(); errCtx != nil {
+							auth.ReleaseDispatchSlot()
 							return nil, errCtx
 						}
 					}
@@ -277,6 +296,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		if !ephemeralResult {
 			if errCancel := claudeOAuthRequestCancellation(ctx, auth, errStream); errCancel != nil {
+				auth.ReleaseDispatchSlot()
 				return nil, errCancel
 			}
 		}
@@ -320,6 +340,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
+				auth.ReleaseDispatchSlot()
 				return nil, errCtx
 			}
 			if allowRetry && !ephemeralResult {
@@ -338,6 +359,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					retryErr = markUpstreamExecutionAttemptFromContext(ctx, retryErr)
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
+							auth.ReleaseDispatchSlot()
 							return nil, errCtx
 						}
 						bootstrapErr = retryErr
@@ -364,6 +386,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if !ephemeralResult {
 			if errCancel := claudeOAuthRequestCancellation(ctx, auth, bootstrapErr); errCancel != nil {
 				discardStreamChunks(streamResult.Chunks)
+				auth.ReleaseDispatchSlot()
 				return nil, errCancel
 			}
 		}

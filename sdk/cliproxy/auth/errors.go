@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -20,6 +21,21 @@ const connectionLifecycleErrorCode = ErrorCodeConnectionLifecycle
 
 // ErrorCodeForceCooldown marks failures that must enforce credential cooldown.
 const ErrorCodeForceCooldown = "force_cooldown"
+
+// ErrorCodeConcurrencyLimit identifies a request rejected because every eligible
+// credential has reached its runtime concurrency limit.
+const ErrorCodeConcurrencyLimit = "auth_concurrency_limit"
+
+const ErrorMessageConcurrencyLimit = "所有账号并发数满，请稍候重试"
+
+// NewConcurrencyLimitError creates the client-visible saturated-account error.
+func NewConcurrencyLimitError() *Error {
+	return &Error{
+		Code:       ErrorCodeConcurrencyLimit,
+		Message:    ErrorMessageConcurrencyLimit,
+		HTTPStatus: http.StatusTooManyRequests,
+	}
+}
 
 // Error describes an authentication related failure in a provider agnostic format.
 type Error struct {

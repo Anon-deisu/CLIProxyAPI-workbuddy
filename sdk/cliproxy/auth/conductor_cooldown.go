@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -516,6 +517,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	}
 	errPersist := m.persist(ctx, auth)
 	m.mu.Unlock()
+	coreusage.ResetAuthCost(authID)
 
 	defer func() {
 		if cooldownStateChanged {
@@ -747,6 +749,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		// A scheduler reservation covers one upstream attempt. Results release
+		// it for both streaming completion and non-streaming execution.
+		auth.ReleaseDispatchSlot()
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
 			if m != nil {
 				modelKey = m.selectionModelKeyForAuth(auth, result.RouteModel)
@@ -1011,6 +1016,9 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	var authSnapshot *Auth
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		// Neutral observations do not go through MarkResult, but they still finish
+		// the dispatch attempt that reserved this auth's runtime slot.
+		auth.ReleaseDispatchSlot()
 		now := time.Now()
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {

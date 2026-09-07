@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -327,21 +328,23 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		name = auth.ID
 	}
 	entry := gin.H{
-		"id":              auth.ID,
-		"auth_index":      auth.Index,
-		"name":            name,
-		"type":            strings.TrimSpace(auth.Provider),
-		"provider":        strings.TrimSpace(auth.Provider),
-		"label":           auth.Label,
-		"status":          auth.Status,
-		"status_message":  auth.StatusMessage,
-		"disabled":        auth.Disabled || auth.AutoDisabled,
-		"manual_disabled": auth.Disabled,
-		"auto_disabled":   auth.AutoDisabled,
-		"unavailable":     auth.Unavailable,
-		"runtime_only":    runtimeOnly,
-		"source":          "memory",
-		"size":            int64(0),
+		"id":                auth.ID,
+		"auth_index":        auth.Index,
+		"name":              name,
+		"type":              strings.TrimSpace(auth.Provider),
+		"provider":          strings.TrimSpace(auth.Provider),
+		"label":             auth.Label,
+		"status":            auth.Status,
+		"status_message":    auth.StatusMessage,
+		"disabled":          auth.Disabled || auth.AutoDisabled,
+		"manual_disabled":   auth.Disabled,
+		"auto_disabled":     auth.AutoDisabled,
+		"concurrency_limit": auth.EffectiveConcurrencyLimit(),
+		"active_requests":   auth.ActiveDispatchRequests(),
+		"unavailable":       auth.Unavailable,
+		"runtime_only":      runtimeOnly,
+		"source":            "memory",
+		"size":              int64(0),
 	}
 	if auth.AutoDisabled {
 		entry["auto_disable_reason"] = auth.AutoDisableReason
@@ -352,6 +355,13 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	cost := coreusage.AuthCost(auth.ID)
+	entry["estimated_cost_usd"] = cost.EstimatedCostUSD
+	entry["estimated_cost_cycle_date"] = cost.CycleDate
+	entry["estimated_cost_input_tokens"] = cost.InputTokens
+	entry["estimated_cost_output_tokens"] = cost.OutputTokens
+	entry["estimated_cost_unpriced_input_tokens"] = cost.UnpricedInputTokens
+	entry["estimated_cost_unpriced_output_tokens"] = cost.UnpricedOutputTokens
 	entry["quota"] = quotaObservationPayloadForProvider(auth.Provider, auth.Quota)
 	if modelQuotas := modelQuotaObservationPayload(auth.Provider, auth.ModelStates); len(modelQuotas) > 0 {
 		entry["model_quotas"] = modelQuotas

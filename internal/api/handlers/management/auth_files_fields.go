@@ -246,6 +246,14 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 	delete(req, "name")
+	authIndex := ""
+	if authIndexRaw, okAuthIndex := req["auth_index"]; okAuthIndex {
+		if errDecode := json.Unmarshal(authIndexRaw, &authIndex); errDecode != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index must be a string"})
+			return
+		}
+		delete(req, "auth_index")
+	}
 	var errNormalize error
 	req, errNormalize = normalizeAuthFilePatchFields(req)
 	if errNormalize != nil {
@@ -265,19 +273,8 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
+	// Find auth by name or ID, optionally disambiguated by runtime auth index.
+	targetAuth, _ := h.lookupAuthFile(name, authIndex)
 
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
@@ -290,6 +287,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	coreauth.NormalizeCredentialMetadata(targetAuth.Metadata)
 
 	changed := false
+	runtimeOnlyChanged := false
 	touchedRoots := make(map[string]struct{}, len(req))
 	for key, rawValue := range req {
 		fieldPath := strings.TrimSpace(key)
@@ -301,6 +299,26 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		if errDecode != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid field %s", fieldPath)})
 			return
+		}
+		if fieldPath == "concurrency_limit" {
+			limit := 0
+			if value != nil {
+				number, okNumber := value.(json.Number)
+				if !okNumber {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "concurrency_limit must be a non-negative integer or null"})
+					return
+				}
+				parsed, errInt := number.Int64()
+				if errInt != nil || parsed < 0 || parsed > 1000000 {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "concurrency_limit must be between 0 and 1000000"})
+					return
+				}
+				limit = int(parsed)
+			}
+			targetAuth.SetConcurrencyLimit(limit)
+			runtimeOnlyChanged = true
+			changed = true
+			continue
 		}
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
@@ -357,7 +375,11 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	targetAuth.UpdatedAt = time.Now()
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+	updateCtx := ctx
+	if runtimeOnlyChanged && !requestRetryPatch.Set && len(req) == 1 {
+		updateCtx = coreauth.WithSkipPersist(ctx)
+	}
+	if _, err := h.authManager.Update(updateCtx, targetAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
