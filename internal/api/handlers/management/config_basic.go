@@ -166,6 +166,9 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
+	if h.cfg != nil && h.cfg.Routing.AuthConcurrencyLimit != nil {
+		newCfg.Routing.AuthConcurrencyLimit = new(*h.cfg.Routing.AuthConcurrencyLimit)
+	}
 	h.cfg = newCfg
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }

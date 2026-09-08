@@ -2,6 +2,7 @@ package managementasset
 
 import (
 	"bytes"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -128,6 +129,111 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		t.Fatalf("runtime scheduler injection is not idempotent: err=%v", errAgain)
 	}
 }
+
+func TestRuntimeSchedulerTracksNativeAuthFileResponses(t *testing.T) {
+	node, errNode := exec.LookPath("node")
+	if errNode != nil {
+		t.Skip("Node.js is required for the inline JavaScript regression test")
+	}
+	start := strings.Index(runtimeSchedulerInlineScript, ">") + 1
+	end := strings.LastIndex(runtimeSchedulerInlineScript, "</script>")
+	script := runtimeSchedulerInlineScript[start:end]
+	command := exec.Command(node, "-e", runtimeSchedulerNetworkTest)
+	command.Stdin = strings.NewReader(script)
+	if output, errRun := command.CombinedOutput(); errRun != nil {
+		t.Fatalf("inline script regression: %v\n%s", errRun, output)
+	}
+}
+
+const runtimeSchedulerNetworkTest = `
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const listeners = {};
+const cards = ['a.json', 'b.json'].map(name => {
+  const card = { line: null };
+  card.querySelector = selector => {
+    if (selector.includes('fileName')) return {textContent: name, getAttribute: () => name};
+    if (selector.includes('body')) return {insertAdjacentElement: (_, node) => {
+      card.line = node;
+      node.remove = () => { card.line = null; };
+    }};
+    if (selector.includes('data-cpa-estimated-cost')) return card.line;
+    return null;
+  };
+  return card;
+});
+globalThis.window = globalThis;
+window.location = {href: 'https://panel.test/management.html', hash: '#/quota'};
+window.addEventListener = (type, callback) => { listeners[type] = callback; };
+globalThis.document = {
+  readyState: 'loading',
+  documentElement: {appendChild() {}},
+  addEventListener() {},
+  querySelectorAll: () => cards,
+  querySelector: () => ({}),
+  createElement: () => ({setAttribute() {}, textContent: ''})
+};
+globalThis.localStorage = {getItem: () => null};
+globalThis.XMLHttpRequest = class {
+  open(method, url) { this.method = method; this.url = url; }
+  setRequestHeader() {}
+  addEventListener(type, callback) { this[type] = callback; }
+  send() {}
+  complete(status, payload, responseType = '') {
+    this.status = status;
+    this.responseType = responseType;
+    this.response = payload;
+    this.responseText = JSON.stringify(payload);
+    if (this.load) this.load();
+  }
+};
+let fetchData = {files: []};
+window.fetch = async () => new Response(JSON.stringify(fetchData), {status: 200});
+vm.runInThisContext(fs.readFileSync(0, 'utf8'));
+const files = amount => ({files: [
+  {name:'a.json', estimated_cost_usd: amount},
+  {name:'b.json', estimated_cost_usd: 4.5}
+]});
+function xhr(path = 'auth-files', method = 'GET') {
+  const req = new XMLHttpRequest();
+  req.open(method, 'https://server.test/proxy/v0/management/' + path);
+  req.setRequestHeader('Authorization', 'Bearer test-session');
+  req.send();
+  return req;
+}
+(async () => {
+  xhr().complete(200, files(1.25));
+  assert.ok(cards[0].line, 'native XHR must render costs without polling or remembered credentials');
+  assert.ok(cards[0].line.textContent.endsWith('$1.250000'));
+  const slow = xhr();
+  xhr().complete(200, files(0), 'json');
+  assert.ok(cards[0].line.textContent.endsWith('$0.000000'), 'refresh must update costs immediately');
+  slow.complete(200, files(9));
+  assert.ok(cards[0].line.textContent.endsWith('$0.000000'), 'late response must not restore stale costs');
+  fetchData = files(2);
+  const response = await window.fetch('https://server.test/proxy/v0/management/auth-files', {headers: {Authorization:'Bearer test-session'}});
+  assert.equal((await response.json()).files[0].estimated_cost_usd, 2, 'observer must not consume the original response');
+  assert.ok(cards[0].line.textContent.endsWith('$2.000000'), 'native fetch must update costs too');
+  const observedFetch = window.fetch;
+  let refreshed;
+  window.fetch = function () { return refreshed = observedFetch.apply(window, arguments); };
+  fetchData = files(4);
+  xhr('api-call', 'POST').complete(200, {status_code:200});
+  await refreshed;
+  assert.ok(cards[0].line.textContent.endsWith('$4.000000'), 'single-account quota refresh must also update costs');
+  const late = xhr();
+  window.location.hash = '#/login';
+  listeners.hashchange();
+  late.complete(200, files(8));
+  assert.equal(cards[0].line, null, 'logout must discard cached and in-flight account costs');
+  window.location.hash = '#/quota';
+  xhr().complete(200, files(3));
+  xhr('config').complete(401, {error: 'invalid key'});
+  assert.equal(cards[0].line, null, 'unauthorized response must clear the captured session');
+  console.log('native XHR/fetch refresh, ordering and logout regression checks passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`
 
 // sameBacking reports whether both slices share the same backing array.
 func sameBacking(a, b []byte) bool {

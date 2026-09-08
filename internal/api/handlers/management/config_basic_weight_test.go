@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -148,5 +150,70 @@ func TestPutRoutingSettingsRejectsInvalidConcurrency(t *testing.T) {
 		if recorder.Code != http.StatusBadRequest || h.cfg.Routing.AutoDisableQuota {
 			t.Fatalf("invalid limit %s: status=%d quota=%v", value, recorder.Code, h.cfg.Routing.AutoDisableQuota)
 		}
+	}
+}
+
+func TestRoutingConcurrencySurvivesConfigReload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, reload := range []string{"watcher", "yaml-save"} {
+		t.Run(reload, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			auth, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: "existing", Provider: "codex"})
+			if errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			cfg := &config.Config{}
+			h := NewHandler(cfg, filepath.Join(t.TempDir(), "config.yaml"), manager)
+			for _, limit := range []int{1, 0} {
+				body, errMarshal := json.Marshal(map[string]int{"auth-concurrency-limit": limit})
+				if errMarshal != nil {
+					t.Fatal(errMarshal)
+				}
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+				h.PutRoutingSettings(ctx)
+				if recorder.Code != http.StatusOK {
+					t.Fatal(recorder.Body.String())
+				}
+				if reload == "watcher" {
+					reloaded, errParse := config.ParseConfigBytes([]byte("debug: true\n"))
+					if errParse != nil {
+						t.Fatal(errParse)
+					}
+					manager.SetConfig(reloaded)
+					h.SetConfig(reloaded)
+				} else {
+					saveRecorder := httptest.NewRecorder()
+					saveCtx, _ := gin.CreateTestContext(saveRecorder)
+					saveCtx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/config.yaml", strings.NewReader("debug: true\n"))
+					h.PutConfigYAML(saveCtx)
+					if saveRecorder.Code != http.StatusOK {
+						t.Fatal(saveRecorder.Body.String())
+					}
+					persisted, errRead := os.ReadFile(h.configFilePath)
+					if errRead != nil || strings.Contains(string(persisted), "auth-concurrency-limit") {
+						t.Fatalf("runtime limit persisted: error=%v data=%s", errRead, persisted)
+					}
+				}
+				getRecorder := httptest.NewRecorder()
+				getCtx, _ := gin.CreateTestContext(getRecorder)
+				h.GetRoutingSettings(getCtx)
+				var settings map[string]any
+				if errDecode := json.Unmarshal(getRecorder.Body.Bytes(), &settings); errDecode != nil {
+					t.Fatal(errDecode)
+				}
+				if settings["auth-concurrency-limit"] != float64(limit) {
+					t.Fatalf("after %s: settings limit=%v, want %d", reload, settings["auth-concurrency-limit"], limit)
+				}
+				newAuth, errNew := manager.Register(context.Background(), &coreauth.Auth{ID: "new", Provider: "codex"})
+				if errNew != nil {
+					t.Fatal(errNew)
+				}
+				if auth.EffectiveConcurrencyLimit() != limit || newAuth.EffectiveConcurrencyLimit() != limit {
+					t.Fatalf("after reload: existing=%d new=%d, want %d", auth.EffectiveConcurrencyLimit(), newAuth.EffectiveConcurrencyLimit(), limit)
+				}
+			}
+		})
 	}
 }

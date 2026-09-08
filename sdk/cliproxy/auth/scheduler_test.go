@@ -231,6 +231,40 @@ func TestAuthDispatchSlotsRespectRuntimeLimit(t *testing.T) {
 	}
 }
 
+func TestManagerConcurrencyReloadPreservesActiveSlots(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	cfg := &internalconfig.Config{}
+	cfg.Routing.AuthConcurrencyLimit = new(1)
+	manager.SetConfig(cfg)
+	auth, errRegister := manager.Register(context.Background(), &Auth{ID: "old", Provider: "codex"})
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	if !auth.TryAcquireDispatchSlot() {
+		t.Fatal("failed to acquire initial slot")
+	}
+	defer auth.ReleaseDispatchSlot()
+	manager.SetConfigSnapshot(&internalconfig.Config{Debug: true})
+	newAuth, errNew := manager.Register(context.Background(), &Auth{ID: "new", Provider: "codex"})
+	if errNew != nil {
+		t.Fatal(errNew)
+	}
+	if auth.ActiveDispatchRequests() != 1 || auth.DispatchSlotAvailable() || newAuth.EffectiveConcurrencyLimit() != 1 {
+		t.Fatalf("reload changed concurrency: active=%d available=%v new_limit=%d", auth.ActiveDispatchRequests(), auth.DispatchSlotAvailable(), newAuth.EffectiveConcurrencyLimit())
+	}
+	cfg.Routing.AuthConcurrencyLimit = new(0)
+	manager.SetConfig(cfg)
+	manager.SetConfigSnapshot(&internalconfig.Config{})
+	if !auth.DispatchSlotAvailable() || newAuth.EffectiveConcurrencyLimit() != 0 || auth.ActiveDispatchRequests() != 1 {
+		t.Fatal("explicit unlimited setting changed active slots or did not take effect")
+	}
+	fresh := NewManager(nil, nil, nil)
+	restarted, errRestart := fresh.Register(context.Background(), &Auth{ID: "restart", Provider: "codex"})
+	if errRestart != nil || restarted.EffectiveConcurrencyLimit() != 0 {
+		t.Fatalf("new manager inherited runtime settings: err=%v", errRestart)
+	}
+}
+
 func TestSchedulerSkipsAuthAtConcurrencyLimit(t *testing.T) {
 	busy := &Auth{ID: "busy", Provider: "codex", Status: StatusActive, ConcurrencyLimit: 1}
 	ready := &Auth{ID: "ready", Provider: "codex", Status: StatusActive}
