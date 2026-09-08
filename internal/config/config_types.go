@@ -247,7 +247,8 @@ type RoutingConfig struct {
 	// AutoDisableQuota excludes credentials after an explicit quota exhaustion
 	// response or a provider quota watermark reaches 100 percent.
 	AutoDisableQuota bool `yaml:"-" json:"auto-disable-quota"`
-	// AuthConcurrencyLimit is the runtime-only maximum number of in-flight requests allowed for every credential. Zero means unlimited.
+	// AuthConcurrencyLimit is the runtime-only in-flight request limit for every credential.
+	// Nil retains the current setting across config reloads; an explicit zero removes the limit.
 	AuthConcurrencyLimit *int `yaml:"-" json:"auth-concurrency-limit,omitempty"`
 
 	// C2AMaxRetryCount overrides the global request-retry count for the Codex2API

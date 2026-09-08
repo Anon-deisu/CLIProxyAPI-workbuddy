@@ -127,6 +127,10 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 		return
 	}
 	h.mu.Lock()
+	if cfg != nil && cfg.Routing.AuthConcurrencyLimit == nil && h.cfg != nil && h.cfg.Routing.AuthConcurrencyLimit != nil {
+		cfg = cfg.CloneForRuntime()
+		cfg.Routing.AuthConcurrencyLimit = new(*h.cfg.Routing.AuthConcurrencyLimit)
+	}
 	h.cfg = cfg
 	h.mu.Unlock()
 }

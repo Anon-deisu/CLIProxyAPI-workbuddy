@@ -150,6 +150,9 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	oldCooldownStore := m.cooldownStore
 	m.mu.RUnlock()
 	previousCfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg.Routing.AuthConcurrencyLimit == nil && previousCfg != nil && previousCfg.Routing.AuthConcurrencyLimit != nil {
+		cfg.Routing.AuthConcurrencyLimit = new(*previousCfg.Routing.AuthConcurrencyLimit)
+	}
 	if homeSessionAliasTTL(previousCfg) != homeSessionAliasTTL(cfg) {
 		m.homeSessionAliases.clear()
 	}

@@ -66,6 +66,31 @@ func TestServiceSyncPluginRuntimeConfigClearsPluginSchedulerWithoutHost(t *testi
 	}
 }
 
+func TestServiceConfigCommitPreservesRuntimeConcurrency(t *testing.T) {
+	initial := &config.Config{}
+	initial.Routing.AuthConcurrencyLimit = new(2)
+	service := &Service{cfg: initial}
+	reloaded := &config.Config{Debug: true}
+	commit := service.commitConfigUpdate(reloaded)
+	if commit.cfg.Routing.AuthConcurrencyLimit == nil || *commit.cfg.Routing.AuthConcurrencyLimit != 2 {
+		t.Fatalf("committed limit=%v, want 2", commit.cfg.Routing.AuthConcurrencyLimit)
+	}
+	if !commit.cfg.Debug || reloaded.Routing.AuthConcurrencyLimit != nil {
+		t.Fatal("reload fields lost or caller's config mutated")
+	}
+	*initial.Routing.AuthConcurrencyLimit = 9
+	if *commit.cfg.Routing.AuthConcurrencyLimit != 2 {
+		t.Fatal("inherited concurrency shares the previous config pointer")
+	}
+	unlimited := &config.Config{}
+	unlimited.Routing.AuthConcurrencyLimit = new(0)
+	service.commitConfigUpdate(unlimited)
+	commit = service.commitConfigUpdate(&config.Config{})
+	if commit.cfg.Routing.AuthConcurrencyLimit == nil || *commit.cfg.Routing.AuthConcurrencyLimit != 0 {
+		t.Fatal("explicit unlimited setting was not preserved")
+	}
+}
+
 func pluginSchedulerFromManager(t *testing.T, manager *coreauth.Manager) *pluginhost.Host {
 	t.Helper()
 	if manager == nil {

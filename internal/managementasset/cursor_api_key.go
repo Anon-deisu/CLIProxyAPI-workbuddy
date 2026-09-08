@@ -13,7 +13,7 @@ const cursorAPIKeyInlineMarker = `id="cpa-key-inline-script"`
 // cursorAPIKeyInlineScript is a self-contained IIFE injected alongside the
 // Cursor OAuth card. The standalone #/cursor-api-key page is gone; the only
 // add surface is a minimal inline API-Key input directly inside the Cursor
-// OAuth card (卡片内嵌输入框).
+// OAuth card.
 //
 // The OAuth page must show only: the API-Key input, a submit button, and the
 // existing OAuth login button. No headline, no label text, no list, no status
@@ -257,66 +257,168 @@ const runtimeSchedulerInlineScript = `
   window.__cpaRuntimeSchedulerLoaded = true;
 
   var managementPath = '/v0/management/';
-  var capturedManagementKey = '';
+  var managementBase = '';
+  var managementAuthorization = '';
+  var managementReady = false;
+  var sessionGeneration = 0;
+  var authFilesGeneration = 0;
+  var authFiles = new Map();
+  var authFilesRefreshPending = false;
   var nativeFetch = window.fetch;
 
-  function captureAuthorization(value) {
-    if (typeof value !== 'string') return;
-    var match = value.match(/^\s*Bearer\s+(.+?)\s*$/i);
-    if (match && match[1]) capturedManagementKey = match[1];
+  function clearManagementSession() {
+    sessionGeneration += 1;
+    managementBase = '';
+    managementAuthorization = '';
+    managementReady = false;
+    authFilesRefreshPending = false;
+    authFiles.clear();
+    renderQuotaCosts();
   }
 
-  function rememberedManagementKey() {
-    try {
-      var raw = localStorage.getItem('cli-proxy-auth');
-      if (!raw) return '';
-      if (raw.indexOf('enc::v1::') === 0) {
-        var key = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + window.location.host + '|' + navigator.userAgent);
-        var encoded = atob(raw.slice(9));
-        var decoded = new Uint8Array(encoded.length);
-        for (var i = 0; i < encoded.length; i += 1) decoded[i] = encoded.charCodeAt(i) ^ key[i % key.length];
-        raw = new TextDecoder().decode(decoded);
-      }
-      var parsed = JSON.parse(raw);
-      return String((parsed && parsed.state && parsed.state.managementKey) || (parsed && parsed.managementKey) || '');
-    } catch (_) {
-      return '';
+  function observeManagementRequest(method, url, headers) {
+    var parsed = new URL(url, window.location.href);
+    var index = parsed.pathname.indexOf(managementPath);
+    if (index < 0) return null;
+    var authorization = headers.get('authorization');
+    if (!authorization && headers.has('x-management-key')) authorization = 'Bearer ' + headers.get('x-management-key');
+    if (!authorization) return null;
+    var base = parsed.origin + parsed.pathname.slice(0, index) + managementPath;
+    if (base !== managementBase || authorization !== managementAuthorization) {
+      clearManagementSession();
+      managementBase = base;
+      managementAuthorization = authorization;
+    }
+    var endpoint = parsed.pathname.slice(index + managementPath.length);
+    var readsAuthFiles = method.toUpperCase() === 'GET' && endpoint === 'auth-files';
+    if (readsAuthFiles) authFilesGeneration += 1;
+    return { endpoint: endpoint, readsAuthFiles: readsAuthFiles, session: sessionGeneration, files: authFilesGeneration };
+  }
+
+  function observeManagementResponse(info, status, data) {
+    if (!info || info.session !== sessionGeneration) return;
+    if (status === 401 || status === 403) {
+      clearManagementSession();
+      return;
+    }
+    if (status < 200 || status >= 300) return;
+    managementReady = true;
+    if (info.readsAuthFiles && info.files === authFilesGeneration) {
+      authFiles = new Map(data.files.map(function (item) { return [item.name, item]; }));
+      renderQuotaCosts();
+    }
+    if (info.endpoint === 'reset-quota' || (info.endpoint === 'api-call' && document.querySelector('[class*="QuotaPage-module__page"]'))) {
+      refreshAuthFiles();
     }
   }
 
-  function currentManagementKey() {
-    return capturedManagementKey || rememberedManagementKey();
+  function refreshAuthFiles() {
+    if (authFilesRefreshPending) return;
+    authFilesRefreshPending = true;
+    var generation = sessionGeneration;
+    request('GET', 'auth-files').catch(function () {
+      console.warn('cpa: account costs refresh failed');
+    }).finally(function () {
+      if (generation === sessionGeneration) authFilesRefreshPending = false;
+    });
   }
 
   function request(method, path, body) {
-    var key = currentManagementKey();
-    var options = { method: method, headers: { 'Content-Type': 'application/json' } };
-    if (key) options.headers.Authorization = 'Bearer ' + key;
+    if (!managementReady) return Promise.reject(new Error('no-management-session'));
+    var options = { method: method, headers: { 'Content-Type': 'application/json', 'Authorization': managementAuthorization } };
     if (body !== undefined) options.body = JSON.stringify(body);
-    return nativeFetch.call(window, path, options).then(function (response) {
+    return window.fetch(managementBase + path, options).then(function (response) {
       if (!response.ok) throw new Error('http ' + response.status);
       return response;
     });
   }
 
-  var originalFetch = window.fetch;
-  window.fetch = function (input, init) {
-    var url = typeof input === 'string' ? input : (input && input.url) || '';
-    if (String(url).indexOf(managementPath) !== -1) {
-      var headers = new Headers((init && init.headers) || (input && input.headers) || {});
-      captureAuthorization(headers.get('authorization') || '');
-    }
-    return originalFetch.apply(window, arguments);
+  // Observe the panel's session and account responses without consuming them.
+  var nativeXHROpen = XMLHttpRequest.prototype.open;
+  var nativeXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+  var nativeXHRSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__cpaSchedulerMethod = method;
+    this.__cpaSchedulerURL = url;
+    this.__cpaSchedulerHeaders = new Headers();
+    return nativeXHROpen.apply(this, arguments);
   };
+  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    this.__cpaSchedulerHeaders.append(name, value);
+    return nativeXHRSetRequestHeader.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function () {
+    var info = observeManagementRequest(this.__cpaSchedulerMethod, this.__cpaSchedulerURL, this.__cpaSchedulerHeaders);
+    if (info) this.addEventListener('load', function () {
+      var data;
+      if (info.readsAuthFiles && this.status >= 200 && this.status < 300) {
+        try {
+          data = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
+        } catch (_) {
+          console.warn('cpa: invalid account list response');
+          return;
+        }
+      }
+      observeManagementResponse(info, this.status, data);
+    }, { once: true });
+    return nativeXHRSend.apply(this, arguments);
+  };
+  window.fetch = function (input, init) {
+    var isRequest = input instanceof Request;
+    var url = isRequest ? input.url : String(input);
+    var method = (init && init.method) || (isRequest && input.method) || 'GET';
+    var headers = new Headers((init && init.headers) || (isRequest && input.headers) || {});
+    var info = observeManagementRequest(method, url, headers);
+    return nativeFetch.apply(window, arguments).then(function (response) {
+      if (info && info.readsAuthFiles && response.ok) {
+        return response.clone().json().then(function (data) {
+          observeManagementResponse(info, response.status, data);
+          return response;
+        }, function () {
+          console.warn('cpa: invalid account list response');
+          return response;
+        });
+      }
+      observeManagementResponse(info, response.status);
+      return response;
+    });
+  };
+  window.addEventListener('unauthorized', clearManagementSession);
+  window.addEventListener('hashchange', function () {
+    if (/^#\/login(?:[/?]|$)/.test(window.location.hash)) clearManagementSession();
+  });
 
-   function make(tag, className, text) {
-     var node = document.createElement(tag);
-     if (className) node.className = className;
-     if (text !== undefined) node.textContent = text;
-     return node;
-   }
+  function make(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
 
-   function mount() {
+  function renderQuotaCosts() {
+    var cards = document.querySelectorAll('article[class*="QuotaCard-module__card"]');
+    for (var i = 0; i < cards.length; i += 1) {
+      var card = cards[i];
+      var nameNode = card.querySelector('[class*="QuotaCard-module__fileName"]');
+      var body = card.querySelector('[class*="QuotaCard-module__body"]');
+      if (!nameNode || !body) continue;
+      var item = authFiles.get(nameNode.getAttribute('title') || nameNode.textContent.trim());
+      var line = card.querySelector('[data-cpa-estimated-cost]');
+      if (!item) {
+        if (line) line.remove();
+        continue;
+      }
+      if (!line) {
+        line = make('div', 'cpa-quota-estimate');
+        line.setAttribute('data-cpa-estimated-cost', 'true');
+        body.insertAdjacentElement('afterend', line);
+      }
+      var text = '预估费用：$' + Number(item.estimated_cost_usd || 0).toFixed(6);
+      if (line.textContent !== text) line.textContent = text;
+    }
+  }
+
+  function mount() {
     if (document.getElementById('cpa-runtime-scheduler-panel')) return;
     var toggle = make('button', 'cpa-runtime-scheduler-toggle', '账号调度');
     toggle.type = 'button';
@@ -364,6 +466,7 @@ const runtimeSchedulerInlineScript = `
     quotaLabel.appendChild(document.createTextNode('额度用尽自动停用账号'));
     var save = make('button', 'cpa-runtime-scheduler-save', '应用');
     save.type = 'button';
+    save.disabled = true;
     var status = make('span', 'cpa-runtime-scheduler-status');
     form.appendChild(strategyLabel);
     form.appendChild(c2aRetryCountLabel);
@@ -392,7 +495,8 @@ const runtimeSchedulerInlineScript = `
     });
 
     function loadSettings() {
-      request('GET', managementPath + 'routing/settings').then(function (response) {
+      save.disabled = true;
+      request('GET', 'routing/settings').then(function (response) {
         return response.json();
       }).then(function (data) {
         c2aRetryCount.value = String(data['c2a-max-retry-count'] == null ? 0 : data['c2a-max-retry-count']);
@@ -400,13 +504,15 @@ const runtimeSchedulerInlineScript = `
         concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
+        status.textContent = '';
+        save.disabled = false;
       }).catch(function () {
         status.textContent = '读取失败';
       });
     }
 
     function loadAuthStatus() {
-      request('GET', managementPath + 'auth-files').then(function (response) {
+      request('GET', 'auth-files').then(function (response) {
         return response.json();
       }).then(function (data) {
         var files = (data && data.files || []).filter(function (item) { return item && item.runtime_only !== true; });
@@ -426,57 +532,10 @@ const runtimeSchedulerInlineScript = `
       });
     }
 
-    function renderQuotaCosts(files) {
-      var cards = document.querySelectorAll('[class*="QuotaCard-module__card"]');
-      for (var i = 0; i < cards.length; i += 1) {
-        var card = cards[i];
-        var nameNode = card.querySelector('[class*="QuotaCard-module__fileName"]');
-        var body = card.querySelector('[class*="QuotaCard-module__body"]');
-        if (!nameNode || !body) continue;
-        var item = files[nameNode.textContent.trim()];
-        var line = card.querySelector('[data-cpa-estimated-cost]');
-        if (!item) {
-          if (line) line.remove();
-          continue;
-        }
-        if (!line) {
-          line = make('div', 'cpa-quota-estimate');
-          line.setAttribute('data-cpa-estimated-cost', 'true');
-          body.insertAdjacentElement('afterend', line);
-        }
-        var amount = Number(item.estimated_cost_usd || 0);
-        var text = '预估费用：$' + (isFinite(amount) ? amount.toFixed(6) : '0.000000');
-        if (line.textContent !== text) line.textContent = text;
-      }
-    }
-
-    function refreshQuotaCosts() {
-      if (!document.querySelector('[class*="QuotaPage-module__page"]')) return;
-      request('GET', managementPath + 'auth-files').then(function (response) {
-        return response.json();
-      }).then(function (data) {
-        var files = {};
-        (data && data.files || []).forEach(function (item) {
-          if (item && item.name) files[item.name] = item;
-        });
-        renderQuotaCosts(files);
-        window.__cpaQuotaCostFiles = files;
-      });
-    }
-
-    function startQuotaCosts() {
-      var observer = new MutationObserver(function () {
-        renderQuotaCosts(window.__cpaQuotaCostFiles || {});
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-      refreshQuotaCosts();
-      setInterval(refreshQuotaCosts, 15000);
-    }
-
     save.addEventListener('click', function () {
       save.disabled = true;
       status.textContent = '应用中...';
-      request('PATCH', managementPath + 'routing/settings', {
+      request('PATCH', 'routing/settings', {
         'c2a-max-retry-count': Math.max(0, Math.min(1000000, parseInt(c2aRetryCount.value || '0', 10) || 0)),
         'c2a-max-retry-interval': Math.max(0, Math.min(1000000, parseInt(c2aRetryInterval.value || '0', 10) || 0)),
         'auth-concurrency-limit': Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0)),
@@ -490,13 +549,15 @@ const runtimeSchedulerInlineScript = `
         save.disabled = false;
       });
     });
-    startQuotaCosts();
+    new MutationObserver(renderQuotaCosts).observe(document.body, { childList: true, subtree: true });
+    renderQuotaCosts();
   }
 
   var style = document.createElement('style');
   style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
     '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:340px;max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
      '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
+  style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mount, { once: true });
