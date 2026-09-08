@@ -118,6 +118,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.EnsureIndex()
 	m.mu.Lock()
+	if cfg, okCfg := m.runtimeConfig.Load().(*internalconfig.Config); okCfg && cfg != nil && cfg.Routing.AuthConcurrencyLimit != nil {
+		auth.SetConcurrencyLimit(*cfg.Routing.AuthConcurrencyLimit)
+	}
 	if m.authEpochs == nil {
 		m.authEpochs = make(map[string]uint64)
 	}
@@ -396,6 +399,13 @@ func (m *Manager) Load(ctx context.Context) error {
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
+	}
+	if cfg.Routing.AuthConcurrencyLimit != nil {
+		for _, auth := range m.auths {
+			if auth != nil {
+				auth.SetConcurrencyLimit(*cfg.Routing.AuthConcurrencyLimit)
+			}
+		}
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()

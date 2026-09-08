@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"gopkg.in/yaml.v3"
 )
 
 func TestNormalizeRoutingStrategyWeightedRoundRobin(t *testing.T) {
@@ -77,5 +80,73 @@ func TestPutRoutingSettingsUpdatesC2ARetryOverridesInMemory(t *testing.T) {
 	}
 	if cfg.RequestRetry != 2 || cfg.MaxRetryInterval != 30 {
 		t.Fatalf("global retry settings changed: request=%d interval=%d", cfg.RequestRetry, cfg.MaxRetryInterval)
+	}
+}
+
+func TestPutRoutingSettingsAppliesConcurrencyToAllAccounts(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	for _, id := range []string{"first", "second"} {
+		if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: id, Provider: "codex"}); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	cfg := &config.Config{}
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	for _, limit := range []int{2, 1, 0} {
+		body, errMarshal := json.Marshal(map[string]int{"auth-concurrency-limit": limit})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+		h.PutRoutingSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("set uniform limit %d: status=%d body=%s", limit, recorder.Code, recorder.Body.String())
+		}
+		for _, auth := range manager.List() {
+			if got := auth.EffectiveConcurrencyLimit(); got != limit {
+				t.Fatalf("auth %s limit=%d, want uniform limit=%d", auth.ID, got, limit)
+			}
+		}
+		if limit == 2 {
+			if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: "new-account", Provider: "codex"}); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			newAuth, ok := manager.GetByID("new-account")
+			if !ok || newAuth.EffectiveConcurrencyLimit() != limit {
+				t.Fatalf("new account limit = %d, want uniform limit=%d", newAuth.EffectiveConcurrencyLimit(), limit)
+			}
+		}
+		getRecorder := httptest.NewRecorder()
+		getCtx, _ := gin.CreateTestContext(getRecorder)
+		h.GetRoutingSettings(getCtx)
+		var settings map[string]any
+		if errDecode := json.Unmarshal(getRecorder.Body.Bytes(), &settings); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		if settings["auth-concurrency-limit"] != float64(limit) {
+			t.Fatalf("GET uniform limit = %v, want %d", settings["auth-concurrency-limit"], limit)
+		}
+		data, errYAML := yaml.Marshal(cfg)
+		if errYAML != nil {
+			t.Fatal(errYAML)
+		}
+		if strings.Contains(string(data), "auth-concurrency-limit") {
+			t.Fatal("runtime concurrency limit leaked into YAML")
+		}
+	}
+}
+
+func TestPutRoutingSettingsRejectsInvalidConcurrency(t *testing.T) {
+	for _, value := range []string{"-1", "1000001", "1.5", `"2"`} {
+		h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"auth-concurrency-limit":`+value+`,"auto-disable-quota":true}`))
+		h.PutRoutingSettings(ctx)
+		if recorder.Code != http.StatusBadRequest || h.cfg.Routing.AutoDisableQuota {
+			t.Fatalf("invalid limit %s: status=%d quota=%v", value, recorder.Code, h.cfg.Routing.AutoDisableQuota)
+		}
 	}
 }

@@ -154,6 +154,15 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
+	if cfg.Routing.AuthConcurrencyLimit != nil {
+		m.mu.Lock()
+		for _, auth := range m.auths {
+			if auth != nil {
+				auth.SetConcurrencyLimit(*cfg.Routing.AuthConcurrencyLimit)
+			}
+		}
+		m.mu.Unlock()
+	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()

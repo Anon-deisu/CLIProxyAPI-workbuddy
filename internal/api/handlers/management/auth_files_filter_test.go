@@ -302,7 +302,7 @@ func TestBuildAuthFileEntryExposesConcurrencyState(t *testing.T) {
 	}
 }
 
-func TestPatchAuthFileFieldsUpdatesConcurrencyInMemoryOnly(t *testing.T) {
+func TestPatchAuthFileFieldsRejectsPerAccountConcurrency(t *testing.T) {
 	authDir := t.TempDir()
 	filePath := filepath.Join(authDir, "concurrency-auth.json")
 	original := `{"type":"codex"}`
@@ -327,12 +327,12 @@ func TestPatchAuthFileFieldsUpdatesConcurrencyInMemoryOnly(t *testing.T) {
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	h.PatchAuthFileFields(ctx)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
 	}
 	updated, ok := manager.GetByID("concurrency-auth")
-	if !ok || updated == nil || updated.EffectiveConcurrencyLimit() != 3 {
-		t.Fatalf("updated concurrency state = %#v, want limit=3", updated)
+	if !ok || updated == nil || updated.EffectiveConcurrencyLimit() != 0 {
+		t.Fatalf("updated concurrency state = %#v, want unchanged limit=0", updated)
 	}
 	data, errRead := os.ReadFile(filePath)
 	if errRead != nil {

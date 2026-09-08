@@ -344,9 +344,13 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	quota := cfg != nil && cfg.Routing.AutoDisableQuota
 	c2aRetryCount := 0
 	c2aRetryInterval := 0
+	authConcurrencyLimit := 0
 	if cfg != nil {
 		c2aRetryCount = cfg.RequestRetry
 		c2aRetryInterval = cfg.MaxRetryInterval
+		if cfg.Routing.AuthConcurrencyLimit != nil {
+			authConcurrencyLimit = *cfg.Routing.AuthConcurrencyLimit
+		}
 		if cfg.Routing.C2AMaxRetryCount != nil {
 			c2aRetryCount = *cfg.Routing.C2AMaxRetryCount
 		}
@@ -362,6 +366,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"auto-disable-quota":        quota,
 		"c2a-max-retry-count":       c2aRetryCount,
 		"c2a-max-retry-interval":    c2aRetryInterval,
+		"auth-concurrency-limit":    authConcurrencyLimit,
 		"runtime_only":              true,
 	})
 }
@@ -375,6 +380,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		AutoDisableQuota        *bool   `json:"auto-disable-quota"`
 		C2AMaxRetryCount        *int    `json:"c2a-max-retry-count"`
 		C2AMaxRetryInterval     *int    `json:"c2a-max-retry-interval"`
+		AuthConcurrencyLimit    *int    `json:"auth-concurrency-limit"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -401,7 +407,11 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "c2a-max-retry-interval must be -1 or non-negative"})
 		return
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil {
+	if body.AuthConcurrencyLimit != nil && (*body.AuthConcurrencyLimit < 0 || *body.AuthConcurrencyLimit > 1000000) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "auth-concurrency-limit must be between 0 and 1000000"})
+		return
+	}
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.AuthConcurrencyLimit == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
@@ -431,6 +441,10 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 				value := *body.C2AMaxRetryInterval
 				cfg.Routing.C2AMaxRetryInterval = &value
 			}
+		}
+		if body.AuthConcurrencyLimit != nil {
+			value := *body.AuthConcurrencyLimit
+			cfg.Routing.AuthConcurrencyLimit = &value
 		}
 		return nil
 	})

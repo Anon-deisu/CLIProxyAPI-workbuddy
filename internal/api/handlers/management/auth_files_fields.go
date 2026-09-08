@@ -287,7 +287,6 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	coreauth.NormalizeCredentialMetadata(targetAuth.Metadata)
 
 	changed := false
-	runtimeOnlyChanged := false
 	touchedRoots := make(map[string]struct{}, len(req))
 	for key, rawValue := range req {
 		fieldPath := strings.TrimSpace(key)
@@ -301,24 +300,8 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			return
 		}
 		if fieldPath == "concurrency_limit" {
-			limit := 0
-			if value != nil {
-				number, okNumber := value.(json.Number)
-				if !okNumber {
-					c.JSON(http.StatusBadRequest, gin.H{"error": "concurrency_limit must be a non-negative integer or null"})
-					return
-				}
-				parsed, errInt := number.Int64()
-				if errInt != nil || parsed < 0 || parsed > 1000000 {
-					c.JSON(http.StatusBadRequest, gin.H{"error": "concurrency_limit must be between 0 and 1000000"})
-					return
-				}
-				limit = int(parsed)
-			}
-			targetAuth.SetConcurrencyLimit(limit)
-			runtimeOnlyChanged = true
-			changed = true
-			continue
+			c.JSON(http.StatusBadRequest, gin.H{"error": "concurrency_limit is a global routing setting"})
+			return
 		}
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
@@ -375,11 +358,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	targetAuth.UpdatedAt = time.Now()
 
-	updateCtx := ctx
-	if runtimeOnlyChanged && !requestRetryPatch.Set && len(req) == 1 {
-		updateCtx = coreauth.WithSkipPersist(ctx)
-	}
-	if _, err := h.authManager.Update(updateCtx, targetAuth); err != nil {
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
