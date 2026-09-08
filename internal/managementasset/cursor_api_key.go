@@ -316,33 +316,7 @@ const runtimeSchedulerInlineScript = `
      return node;
    }
 
-   function formatEstimatedCost(value) {
-     var amount = Number(value || 0);
-     if (!isFinite(amount)) amount = 0;
-     return '$' + amount.toFixed(6);
-   }
-
-   function formatQuota(item) {
-     var signals = item && item.quota && item.quota.signals || {};
-     var usage = null;
-     function scanSignals(source) {
-       Object.keys(source || {}).forEach(function (key) {
-         if (key.toLowerCase().indexOf('used-percent') === -1) return;
-         var value = Number(source[key]);
-         if (isFinite(value)) usage = usage === null ? value : Math.max(usage, value);
-       });
-     }
-     scanSignals(signals);
-     Object.keys(item && item.model_quotas || {}).forEach(function (model) {
-       var modelQuota = item.model_quotas[model] || {};
-       scanSignals(modelQuota.signals || {});
-     });
-     if (usage !== null) return '额度：' + Math.max(0, Math.min(100, usage)).toFixed(1) + '%';
-     if (item && item.unavailable) return '额度：暂不可用';
-     return '额度：暂无数据';
-   }
-
-  function mount() {
+   function mount() {
     if (document.getElementById('cpa-runtime-scheduler-panel')) return;
     var toggle = make('button', 'cpa-runtime-scheduler-toggle', '账号调度');
     toggle.type = 'button';
@@ -369,6 +343,15 @@ const runtimeSchedulerInlineScript = `
     c2aRetryInterval.max = '1000000';
     c2aRetryInterval.step = '1';
     c2aRetryIntervalLabel.appendChild(c2aRetryInterval);
+    var concurrencyLabel = make('label', 'cpa-runtime-scheduler-number');
+    concurrencyLabel.appendChild(document.createTextNode('所有账号最大并发数'));
+    var concurrency = document.createElement('input');
+    concurrency.type = 'number';
+    concurrency.min = '0';
+    concurrency.max = '1000000';
+    concurrency.step = '1';
+    concurrency.title = '统一设置所有账号，0 表示不限制';
+    concurrencyLabel.appendChild(concurrency);
     var unauthorizedLabel = make('label', 'cpa-runtime-scheduler-check');
     var unauthorized = document.createElement('input');
     unauthorized.type = 'checkbox';
@@ -385,17 +368,18 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(strategyLabel);
     form.appendChild(c2aRetryCountLabel);
     form.appendChild(c2aRetryIntervalLabel);
+    form.appendChild(concurrencyLabel);
     form.appendChild(unauthorizedLabel);
     form.appendChild(quotaLabel);
     form.appendChild(save);
     form.appendChild(status);
-    var disabledTitle = make('div', 'cpa-runtime-scheduler-subtitle', '账号配额与调度');
-    var disabledList = make('div', 'cpa-runtime-scheduler-disabled-list', '正在读取...');
+    var statusTitle = make('div', 'cpa-runtime-scheduler-subtitle', '账号状态');
+    var statusList = make('div', 'cpa-runtime-scheduler-disabled-list', '正在读取...');
     panel.appendChild(title);
     panel.appendChild(hint);
     panel.appendChild(form);
-    panel.appendChild(disabledTitle);
-    panel.appendChild(disabledList);
+    panel.appendChild(statusTitle);
+    panel.appendChild(statusList);
     document.body.appendChild(toggle);
     document.body.appendChild(panel);
 
@@ -403,7 +387,7 @@ const runtimeSchedulerInlineScript = `
       panel.hidden = !panel.hidden;
       if (!panel.hidden) {
         loadSettings();
-        loadDisabledAuths();
+        loadAuthStatus();
       }
     });
 
@@ -413,6 +397,7 @@ const runtimeSchedulerInlineScript = `
       }).then(function (data) {
         c2aRetryCount.value = String(data['c2a-max-retry-count'] == null ? 0 : data['c2a-max-retry-count']);
         c2aRetryInterval.value = String(data['c2a-max-retry-interval'] == null ? 0 : data['c2a-max-retry-interval']);
+        concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
       }).catch(function () {
@@ -420,61 +405,72 @@ const runtimeSchedulerInlineScript = `
       });
     }
 
-    function loadDisabledAuths() {
+    function loadAuthStatus() {
       request('GET', managementPath + 'auth-files').then(function (response) {
         return response.json();
       }).then(function (data) {
         var files = (data && data.files || []).filter(function (item) { return item && item.runtime_only !== true; });
-        disabledList.textContent = '';
+        statusList.textContent = '';
         if (!files.length) {
-           disabledList.appendChild(make('div', 'cpa-runtime-scheduler-empty', '暂无认证文件'));
+          statusList.appendChild(make('div', 'cpa-runtime-scheduler-empty', '暂无认证文件'));
           return;
         }
         files.forEach(function (item) {
           var row = make('div', 'cpa-runtime-scheduler-disabled-row');
-           var identity = make('strong', '', item.name || item.email || item.id || '未知认证');
-           var detail = make('span', '', item.auto_disabled ? ('自动禁用原因：' + (item.auto_disable_reason || item.status_message || '未知')) : '状态正常');
-           var quotaState = make('span', 'cpa-runtime-scheduler-account-quota', formatQuota(item));
-           var estimate = make('span', 'cpa-runtime-scheduler-account-estimate', '预估费用：' + formatEstimatedCost(item.estimated_cost_usd));
-          var concurrency = document.createElement('input');
-          concurrency.type = 'number';
-          concurrency.min = '0';
-          concurrency.max = '1000000';
-          concurrency.step = '1';
-          concurrency.value = String(item.concurrency_limit || 0);
-          concurrency.title = '每账号最大并发数，0 表示不限制';
-          var saveConcurrency = make('button', 'cpa-runtime-scheduler-account-save', '并发');
-          saveConcurrency.type = 'button';
-          saveConcurrency.addEventListener('click', function () {
-            var limit = Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0));
-            saveConcurrency.disabled = true;
-            request('PATCH', managementPath + 'auth-files/fields', {
-              name: item.name || item.id,
-              auth_index: item.auth_index,
-              concurrency_limit: limit
-            }).then(function () {
-              concurrency.value = String(limit);
-              detail.textContent = item.auto_disabled ? ('自动禁用原因：' + (item.auto_disable_reason || item.status_message || '未知')) : '状态正常';
-            }).catch(function () {
-              detail.textContent = '并发设置失败';
-            }).finally(function () {
-              saveConcurrency.disabled = false;
-            });
-          });
-           row.appendChild(identity);
-           row.appendChild(detail);
-           row.appendChild(quotaState);
-           row.appendChild(estimate);
-          var concurrencyLine = make('div', 'cpa-runtime-scheduler-account-concurrency');
-          concurrencyLine.appendChild(make('span', '', '最大并发'));
-          concurrencyLine.appendChild(concurrency);
-          concurrencyLine.appendChild(saveConcurrency);
-          row.appendChild(concurrencyLine);
-          disabledList.appendChild(row);
+          row.appendChild(make('strong', '', item.name || item.email || item.id || '未知认证'));
+          row.appendChild(make('span', '', item.auto_disabled ? ('自动禁用原因：' + (item.auto_disable_reason || item.status_message || '未知')) : '状态正常'));
+          statusList.appendChild(row);
         });
       }).catch(function () {
-        disabledList.textContent = '读取认证文件状态失败';
+        statusList.textContent = '读取认证文件状态失败';
       });
+    }
+
+    function renderQuotaCosts(files) {
+      var cards = document.querySelectorAll('[class*="QuotaCard-module__card"]');
+      for (var i = 0; i < cards.length; i += 1) {
+        var card = cards[i];
+        var nameNode = card.querySelector('[class*="QuotaCard-module__fileName"]');
+        var body = card.querySelector('[class*="QuotaCard-module__body"]');
+        if (!nameNode || !body) continue;
+        var item = files[nameNode.textContent.trim()];
+        var line = card.querySelector('[data-cpa-estimated-cost]');
+        if (!item) {
+          if (line) line.remove();
+          continue;
+        }
+        if (!line) {
+          line = make('div', 'cpa-quota-estimate');
+          line.setAttribute('data-cpa-estimated-cost', 'true');
+          body.insertAdjacentElement('afterend', line);
+        }
+        var amount = Number(item.estimated_cost_usd || 0);
+        var text = '预估费用：$' + (isFinite(amount) ? amount.toFixed(6) : '0.000000');
+        if (line.textContent !== text) line.textContent = text;
+      }
+    }
+
+    function refreshQuotaCosts() {
+      if (!document.querySelector('[class*="QuotaPage-module__page"]')) return;
+      request('GET', managementPath + 'auth-files').then(function (response) {
+        return response.json();
+      }).then(function (data) {
+        var files = {};
+        (data && data.files || []).forEach(function (item) {
+          if (item && item.name) files[item.name] = item;
+        });
+        renderQuotaCosts(files);
+        window.__cpaQuotaCostFiles = files;
+      });
+    }
+
+    function startQuotaCosts() {
+      var observer = new MutationObserver(function () {
+        renderQuotaCosts(window.__cpaQuotaCostFiles || {});
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+      refreshQuotaCosts();
+      setInterval(refreshQuotaCosts, 15000);
     }
 
     save.addEventListener('click', function () {
@@ -483,23 +479,24 @@ const runtimeSchedulerInlineScript = `
       request('PATCH', managementPath + 'routing/settings', {
         'c2a-max-retry-count': Math.max(0, Math.min(1000000, parseInt(c2aRetryCount.value || '0', 10) || 0)),
         'c2a-max-retry-interval': Math.max(0, Math.min(1000000, parseInt(c2aRetryInterval.value || '0', 10) || 0)),
+        'auth-concurrency-limit': Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0)),
         'auto-disable-unauthorized': unauthorized.checked,
         'auto-disable-quota': quota.checked
       }).then(function () {
         status.textContent = '已应用';
-        loadDisabledAuths();
       }).catch(function () {
         status.textContent = '应用失败';
       }).finally(function () {
         save.disabled = false;
       });
     });
+    startQuotaCosts();
   }
 
   var style = document.createElement('style');
   style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
     '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:340px;max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
-    '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save,.cpa-runtime-scheduler-account-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-disabled-row:has(span:first-of-type){border-left:3px solid #d0d7de}.cpa-runtime-scheduler-account-quota,.cpa-runtime-scheduler-account-estimate{color:#57606a;font-variant-numeric:tabular-nums}.cpa-runtime-scheduler-account-concurrency{display:flex;align-items:center;gap:5px;color:#57606a}.cpa-runtime-scheduler-account-concurrency input{width:70px;padding:4px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-account-save{padding:4px 8px;font-size:11px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
+     '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mount, { once: true });
@@ -510,8 +507,8 @@ const runtimeSchedulerInlineScript = `
 </script>
 `
 
-// AddRuntimeSchedulerToManagementHTML injects runtime-only scheduler controls and
-// the automatic-disable reason list without modifying the downloaded bundle.
+// AddRuntimeSchedulerToManagementHTML injects runtime-only scheduler controls
+// and quota cost labels without modifying the downloaded bundle.
 func AddRuntimeSchedulerToManagementHTML(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty management html")

@@ -6,9 +6,7 @@ import (
 	"testing"
 )
 
-// fixtureManagementHTML 是一个逼近上游 bundle 结构的输入：拥有闭合的 </body>
-// 注入点，足以触发 AddCursorAPIKeyInlineToManagementHTML 的注入。具体 OAuth
-// 卡片结构由运行时的 findCursorCards 依据文案匹配，无需在此构造。
+// fixtureManagementHTML provides the bundle's closing body injection point.
 func fixtureManagementHTML() []byte {
 	return []byte("<!doctype html>\n" +
 		"<html>\n<head><title>management</title></head>\n<body>\n" +
@@ -25,7 +23,7 @@ func TestAddCursorAPIKeyInlineToManagementHTML(t *testing.T) {
 		t.Fatalf("AddCursorAPIKeyInlineToManagementHTML() error = %v", errPatch)
 	}
 
-	// 注入点必须在 </body> 之前，且幂等标记必须出现。
+	// The idempotency marker must appear before the closing body tag.
 	markerIdx := bytes.Index(got, []byte(cursorAPIKeyInlineMarker))
 	if markerIdx < 0 {
 		t.Fatalf("patched management html missing idempotency marker %q", cursorAPIKeyInlineMarker)
@@ -34,7 +32,7 @@ func TestAddCursorAPIKeyInlineToManagementHTML(t *testing.T) {
 		t.Fatalf("inline script (%d) injected after </body> (%d)", markerIdx, bodyIdx)
 	}
 
-	// 不再注入独立页导航/路由痕迹（旧版 AddCursorAPIKeyManagerToManagementHTML 已删除）。
+	// The removed standalone page must not return.
 	for _, gone := range [][]byte{
 		[]byte(`path:` + "\x60/cursor-api-key\x60"),
 		[]byte("cpa-native-route-host"),
@@ -45,7 +43,7 @@ func TestAddCursorAPIKeyInlineToManagementHTML(t *testing.T) {
 		}
 	}
 
-	// 内联管理脚本的 CRUD 后端与关键 UI 文案必须存在。
+	// Preserve the backend endpoint and inline input.
 	for _, want := range [][]byte{
 		[]byte("cpa-key-inline-script"),
 		[]byte("managementPath = '/v0/management/'"),
@@ -58,7 +56,7 @@ func TestAddCursorAPIKeyInlineToManagementHTML(t *testing.T) {
 		}
 	}
 
-	// 再次修补必须无副作用（幂等）。
+	// Repeated injection must be idempotent.
 	again, errAgain := AddCursorAPIKeyInlineToManagementHTML(got)
 	if errAgain != nil {
 		t.Fatalf("second AddCursorAPIKeyInlineToManagementHTML() error = %v", errAgain)
@@ -66,7 +64,7 @@ func TestAddCursorAPIKeyInlineToManagementHTML(t *testing.T) {
 	if !bytes.Equal(again, got) {
 		t.Fatal("Cursor API key inline patch is not idempotent")
 	}
-	// 幂等命中时输入缓冲被原样返回（不拷贝、不追加）。
+	// An idempotent pass must reuse the input buffer.
 	if !sameBacking(got, again) {
 		t.Fatal("idempotent pass should return the already-patched buffer unchanged")
 	}
@@ -109,6 +107,8 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("routing/settings"),
 		[]byte("c2a-max-retry-count"),
 		[]byte("c2a-max-retry-interval"),
+		[]byte("auth-concurrency-limit"),
+		[]byte("QuotaCard-module__body"),
 		[]byte("estimated_cost_usd"),
 		[]byte("预估费用"),
 		[]byte("auto-disable-unauthorized"),
@@ -118,13 +118,18 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 			t.Fatalf("runtime scheduler injection missing %q", want)
 		}
 	}
+	for _, removed := range []string{"cpa-runtime-scheduler-account-estimate", "cpa-runtime-scheduler-account-concurrency", "auth-files/fields", "formatQuota"} {
+		if bytes.Contains(got, []byte(removed)) {
+			t.Fatalf("runtime panel still contains misplaced quota/account controls: %s", removed)
+		}
+	}
 	again, errAgain := AddRuntimeSchedulerToManagementHTML(got)
 	if errAgain != nil || !bytes.Equal(again, got) {
 		t.Fatalf("runtime scheduler injection is not idempotent: err=%v", errAgain)
 	}
 }
 
-// sameBacking 报告 b 是否为 a 的零拷贝切片（同一底层数组头地址）。
+// sameBacking reports whether both slices share the same backing array.
 func sameBacking(a, b []byte) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return len(a) == len(b)
