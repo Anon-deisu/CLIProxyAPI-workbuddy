@@ -109,6 +109,7 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("c2a-max-retry-count"),
 		[]byte("c2a-max-retry-interval"),
 		[]byte("auth-concurrency-limit"),
+		[]byte("codex-fingerprint-convergence"),
 		[]byte("QuotaCard-module__body"),
 		[]byte("estimated_cost_usd"),
 		[]byte("预估费用"),

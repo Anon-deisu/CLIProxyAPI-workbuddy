@@ -2,10 +2,15 @@ package helps
 
 import (
 	"context"
+	"crypto/sha256"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 type CodexCache struct {
@@ -125,4 +130,96 @@ func SetCodexCacheBestEffort(ctx context.Context, key string, cache CodexCache) 
 // CodexPromptCacheKey builds the Home KV key for a model/user prompt cache.
 func CodexPromptCacheKey(modelName string, userScope string) string {
 	return "cpa:codex:prompt-cache:" + homekv.HashKeyPart(modelName) + ":" + homekv.HashKeyPart(userScope)
+}
+
+// CodexFingerprint holds one request's account-scoped identity. Headers and body
+// share it so that the turn ID and timestamp agree on both transports.
+type CodexFingerprint struct {
+	InstallationID string
+	SessionID      string
+	TurnID         string
+	StartedAt      int64
+
+	originalPromptCacheKey string
+	originalMetadata       string
+}
+
+// NewCodexFingerprint follows sub2api's full convergence semantics. CPA's stable
+// auth ID replaces a persisted random seed; tokens and caller IDs never enter it.
+func NewCodexFingerprint(authID string) *CodexFingerprint {
+	return &CodexFingerprint{
+		InstallationID: codexFingerprintUUID(authID, "installation"),
+		SessionID:      codexFingerprintUUID(authID, "session"),
+		TurnID:         uuid.NewString(),
+		StartedAt:      time.Now().UnixMilli(),
+	}
+}
+
+func codexFingerprintUUID(authID, kind string) string {
+	digest := sha256.Sum256([]byte("cli-proxy-api:codex:fingerprint:v1:" + kind + ":" + authID))
+	id := uuid.UUID(digest[:16])
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return id.String()
+}
+
+// TurnMetadata preserves unrelated fields while normalizing embedded identity.
+func (f *CodexFingerprint) TurnMetadata(raw string) string {
+	if !gjson.Valid(raw) || !gjson.Parse(raw).IsObject() {
+		raw = "{}"
+	}
+	raw, _ = sjson.Set(raw, "installation_id", f.InstallationID)
+	raw, _ = sjson.Set(raw, "session_id", f.SessionID)
+	raw, _ = sjson.Set(raw, "thread_id", f.SessionID)
+	raw, _ = sjson.Set(raw, "turn_id", f.TurnID)
+	raw, _ = sjson.Set(raw, "window_id", f.SessionID+":0")
+	raw, _ = sjson.Set(raw, "turn_started_at_unix_ms", f.StartedAt)
+	if f.originalPromptCacheKey != "" && gjson.Get(raw, "prompt_cache_key").String() == f.originalPromptCacheKey {
+		raw, _ = sjson.Set(raw, "prompt_cache_key", f.SessionID)
+	}
+	return raw
+}
+
+// ApplyBody changes only client_metadata and a cache key proven to be the
+// client's default session ID. It never decodes or copies the full input tree.
+func (f *CodexFingerprint) ApplyBody(body []byte) []byte {
+	root := util.ParseGJSONBytesNoCopy(body)
+	metadata := root.Get("client_metadata")
+	f.originalMetadata = metadata.Raw
+	clientSession := metadata.Get("session_id")
+	cacheKey := root.Get("prompt_cache_key")
+	if clientSession.Type == gjson.String && clientSession.String() != "" && cacheKey.Type == gjson.String && cacheKey.String() == clientSession.String() {
+		f.originalPromptCacheKey = cacheKey.String()
+		body = SetStringIfDifferent(body, "prompt_cache_key", f.SessionID)
+	}
+	raw := metadata.Raw
+	if !metadata.IsObject() {
+		raw = "{}"
+	}
+	raw, _ = sjson.Set(raw, "x-codex-installation-id", f.InstallationID)
+	raw, _ = sjson.Set(raw, "session_id", f.SessionID)
+	raw, _ = sjson.Set(raw, "thread_id", f.SessionID)
+	raw, _ = sjson.Set(raw, "turn_id", f.TurnID)
+	raw, _ = sjson.Set(raw, "x-codex-window-id", f.SessionID+":0")
+	raw, _ = sjson.Set(raw, "x-codex-turn-metadata", f.TurnMetadata(metadata.Get("x-codex-turn-metadata").String()))
+	body, _ = sjson.SetRawBytes(body, "client_metadata", []byte(raw))
+	return body
+}
+
+// RestoreResponse restores echoed request metadata without replacing matching
+// strings inside generated text, tool output, or unrelated response fields.
+func (f *CodexFingerprint) RestoreResponse(payload []byte) []byte {
+	for _, prefix := range []string{"", "response."} {
+		if f.originalPromptCacheKey != "" && gjson.GetBytes(payload, prefix+"prompt_cache_key").String() == f.SessionID {
+			payload, _ = sjson.SetBytes(payload, prefix+"prompt_cache_key", f.originalPromptCacheKey)
+		}
+		if gjson.GetBytes(payload, prefix+"client_metadata").Exists() {
+			if f.originalMetadata == "" {
+				payload, _ = sjson.DeleteBytes(payload, prefix+"client_metadata")
+			} else {
+				payload, _ = sjson.SetRawBytes(payload, prefix+"client_metadata", []byte(f.originalMetadata))
+			}
+		}
+	}
+	return payload
 }

@@ -135,10 +135,7 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 	}
 
 	s.cfgMu.Lock()
-	if newCfg.Routing.AuthConcurrencyLimit == nil && s.cfg != nil && s.cfg.Routing.AuthConcurrencyLimit != nil {
-		newCfg = newCfg.CloneForRuntime()
-		newCfg.Routing.AuthConcurrencyLimit = new(*s.cfg.Routing.AuthConcurrencyLimit)
-	}
+	newCfg = newCfg.CloneForReload(s.cfg)
 	s.cfg = newCfg
 	s.cfgMu.Unlock()
 	s.configSequence++

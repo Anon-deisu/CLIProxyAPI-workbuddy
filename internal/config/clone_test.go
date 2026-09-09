@@ -13,6 +13,9 @@ func TestCloneForRuntimeNil(t *testing.T) {
 	if got := cfg.CloneForRuntime(); got != nil {
 		t.Fatalf("CloneForRuntime() = %#v, want nil", got)
 	}
+	if got := cfg.CloneForReload(&Config{}); got != nil {
+		t.Fatalf("CloneForReload() = %#v, want nil", got)
+	}
 }
 
 func TestParseConfigBytes_AntigravitySensitiveWords(t *testing.T) {
@@ -115,6 +118,78 @@ func TestCloneForRuntimeDeepCopiesConfig(t *testing.T) {
 	}
 }
 
+func TestCloneForReloadInheritsOnlySupportedRuntimeFields(t *testing.T) {
+	previousLimit := 2
+	previousConvergence := true
+	previousRetryCount := 7
+	previous := &Config{}
+	previous.Routing.AuthConcurrencyLimit = &previousLimit
+	previous.Routing.CodexFingerprintConvergence = &previousConvergence
+	previous.Routing.C2AMaxRetryCount = &previousRetryCount
+	previous.Routing.C2AMaxRetryInterval = new(30)
+	previous.Routing.SchedulerMode = "remaining-quota"
+	previous.Routing.AutoDisableUnauthorized = true
+	previous.Routing.AutoDisableQuota = true
+	previous.Home.Enabled = true
+	previous.CodexOptimizeMultiAgentV2 = true
+	current := &Config{Debug: true}
+
+	clone := current.CloneForReload(previous)
+	if clone == current {
+		t.Fatal("CloneForReload() returned the original pointer")
+	}
+	if clone.Routing.AuthConcurrencyLimit == nil || *clone.Routing.AuthConcurrencyLimit != previousLimit {
+		t.Fatalf("inherited concurrency limit = %v, want %d", clone.Routing.AuthConcurrencyLimit, previousLimit)
+	}
+	if clone.Routing.CodexFingerprintConvergence == nil || !*clone.Routing.CodexFingerprintConvergence {
+		t.Fatalf("inherited convergence = %v, want true", clone.Routing.CodexFingerprintConvergence)
+	}
+	want := &Config{Debug: true, Routing: RoutingConfig{AuthConcurrencyLimit: new(2), CodexFingerprintConvergence: new(true)}}
+	if !reflect.DeepEqual(clone, want) {
+		t.Fatal("reload lost current fields or inherited unsupported fields")
+	}
+	if current.Routing.AuthConcurrencyLimit != nil || current.Routing.CodexFingerprintConvergence != nil {
+		t.Fatal("inheriting runtime fields mutated the caller config")
+	}
+
+	previousLimit = 9
+	previousConvergence = false
+	if *clone.Routing.AuthConcurrencyLimit != 2 || !*clone.Routing.CodexFingerprintConvergence {
+		t.Fatal("inherited runtime fields share pointers with the previous config")
+	}
+
+	explicitLimit := 0
+	explicitConvergence := false
+	explicit := &Config{}
+	explicit.Routing.AuthConcurrencyLimit = &explicitLimit
+	explicit.Routing.CodexFingerprintConvergence = &explicitConvergence
+	previousConvergence = true
+	explicitClone := explicit.CloneForReload(previous)
+	if explicitClone.Routing.AuthConcurrencyLimit == nil || *explicitClone.Routing.AuthConcurrencyLimit != 0 {
+		t.Fatalf("explicit concurrency limit = %v, want 0", explicitClone.Routing.AuthConcurrencyLimit)
+	}
+	if explicitClone.Routing.CodexFingerprintConvergence == nil || *explicitClone.Routing.CodexFingerprintConvergence {
+		t.Fatalf("explicit convergence = %v, want false", explicitClone.Routing.CodexFingerprintConvergence)
+	}
+	if explicit.Routing.AuthConcurrencyLimit == nil || *explicit.Routing.AuthConcurrencyLimit != 0 || explicit.Routing.CodexFingerprintConvergence == nil || *explicit.Routing.CodexFingerprintConvergence {
+		t.Fatal("cloning explicit runtime fields mutated the caller config")
+	}
+	assertNoSharedRuntimeReferences(t, reflect.ValueOf(explicit), reflect.ValueOf(explicitClone), "Config")
+	inheritedFalse := (&Config{}).CloneForReload(explicitClone)
+	if inheritedFalse.Routing.CodexFingerprintConvergence == nil || *inheritedFalse.Routing.CodexFingerprintConvergence {
+		t.Fatal("reload did not inherit explicit false")
+	}
+	assertNoSharedRuntimeReferences(t, reflect.ValueOf(explicitClone), reflect.ValueOf(inheritedFalse), "Config")
+
+	withoutPrevious := current.CloneForReload(nil)
+	if withoutPrevious == current || !reflect.DeepEqual(withoutPrevious, current) {
+		t.Fatal("reload without a previous config did not preserve an independent snapshot")
+	}
+	if withoutPrevious.Routing.CodexFingerprintConvergence != nil || withoutPrevious.Routing.AuthConcurrencyLimit != nil {
+		t.Fatal("reload invented unset runtime fields")
+	}
+}
+
 func TestCloneForRuntimeDoesNotShareReferenceFields(t *testing.T) {
 	cfg := sampleCloneRuntimeConfig()
 	clone := cfg.CloneForRuntime()
@@ -135,6 +210,10 @@ func sampleCloneRuntimeConfig() *Config {
 				KeepAliveSeconds: 3,
 				BootstrapRetries: 2,
 			},
+		},
+		Routing: RoutingConfig{
+			AuthConcurrencyLimit:        new(2),
+			CodexFingerprintConvergence: new(false),
 		},
 		Home: HomeConfig{
 			Enabled: true,

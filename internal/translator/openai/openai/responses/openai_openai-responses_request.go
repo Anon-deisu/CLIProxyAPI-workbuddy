@@ -70,7 +70,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		outputCallIDs := make(map[string]struct{})
 		for _, item := range inputItems {
 			itemType := item.Get("type").String()
-			if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
+			if !isResponsesToolOutputType(itemType) {
 				continue
 			}
 			callID := translatorcommon.ExtractResponsesCallID(item)
@@ -169,7 +169,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
 			}
-			if itemType != "function_call" && itemType != "custom_tool_call" {
+			if !isResponsesToolCallType(itemType) {
 				flushPendingToolCalls()
 			}
 
@@ -233,7 +233,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				reasoningContent := collectOpenAIResponsesReasoningContent(item)
 				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, reasoningContent)
 
-			case "function_call":
+			case "function_call", "shell_call", "local_shell_call", "apply_patch_call":
 				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, item.Get("reasoning_content").String())
 				// Buffer consecutive function calls and emit them as one assistant message.
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
@@ -242,25 +242,26 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolCall, _ = sjson.SetBytes(toolCall, "id", callId)
 				}
 
-				if name := item.Get("name"); name.Exists() {
-					functionName := name.String()
+				functionName, arguments := responsesToolCallNameAndArguments(itemType, item)
+				if itemType == "function_call" && functionName != "" {
 					if namespace := strings.TrimSpace(item.Get("namespace").String()); namespace != "" {
 						functionName = qualifyResponsesNamespaceToolName(namespace, functionName)
 					} else {
 						functionName = canonicalResponsesToolName(inputRawJSON, functionName)
 					}
+				}
+				if functionName != "" {
 					toolCall, _ = sjson.SetBytes(toolCall, "function.name", functionName)
 				}
-
-				if arguments := item.Get("arguments"); arguments.Exists() {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments.String())
+				if arguments != "" {
+					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments)
 				}
 				pendingToolCalls = append(pendingToolCalls, gjson.ParseBytes(toolCall).Value())
 				if callID := translatorcommon.ExtractResponsesCallID(item); callID != "" {
 					pendingToolCallIDs = append(pendingToolCallIDs, callID)
 				}
 
-			case "function_call_output":
+			case "function_call_output", "shell_call_output", "local_shell_call_output", "apply_patch_call_output":
 				mergeableAssistantIndex = -1
 				// Handle function call output conversion to tool message
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
@@ -544,6 +545,58 @@ func collectOpenAIResponsesReasoningContent(item gjson.Result) string {
 		return "[reasoning unavailable]"
 	}
 	return reasoningText.String()
+}
+
+// isResponsesToolCallType reports whether a Responses input item is a tool call
+// whose arguments must be replayed into the chat-completions tool_calls array.
+func isResponsesToolCallType(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call", "shell_call", "local_shell_call", "apply_patch_call":
+		return true
+	default:
+		return false
+	}
+}
+
+// isResponsesToolOutputType reports whether a Responses input item carries the
+// result of a tool call.
+func isResponsesToolOutputType(itemType string) bool {
+	switch itemType {
+	case "function_call_output", "custom_tool_call_output", "shell_call_output", "local_shell_call_output", "apply_patch_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
+// responsesToolCallNameAndArguments maps a Responses tool call to the function
+// name and JSON arguments used by the chat-completions representation. Built-in
+// typed tools (shell/local_shell/apply_patch) carry their payload in dedicated
+// fields instead of name/arguments.
+func responsesToolCallNameAndArguments(itemType string, item gjson.Result) (string, string) {
+	name := strings.TrimSpace(item.Get("name").String())
+	arguments := item.Get("arguments").String()
+	switch itemType {
+	case "custom_tool_call":
+		if arguments == "" {
+			raw, _ := sjson.Set(`{"input":""}`, "input", item.Get("input").String())
+			arguments = raw
+		}
+	case "shell_call":
+		name = "shell"
+		arguments = item.Get("action").Raw
+	case "local_shell_call":
+		name = "local_shell"
+		arguments = item.Get("action").Raw
+	case "apply_patch_call":
+		name = "apply_patch"
+		operation := item.Get("operation")
+		if operation.Exists() {
+			raw, _ := sjson.SetRaw(`{"operation":{}}`, "operation", operation.Raw)
+			arguments = raw
+		}
+	}
+	return name, arguments
 }
 
 func combineOpenAIResponsesReasoning(existing, incoming string) string {
