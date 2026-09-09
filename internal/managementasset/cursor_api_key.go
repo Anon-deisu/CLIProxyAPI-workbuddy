@@ -464,6 +464,12 @@ const runtimeSchedulerInlineScript = `
     quota.type = 'checkbox';
     quotaLabel.appendChild(quota);
     quotaLabel.appendChild(document.createTextNode('额度用尽自动停用账号'));
+    var fingerprintLabel = make('label', 'cpa-runtime-scheduler-check');
+    var fingerprintConvergence = document.createElement('input');
+    fingerprintConvergence.type = 'checkbox';
+    fingerprintConvergence.title = '仅 Codex OAuth/SetupToken 生效，每个账号固定使用独立身份';
+    fingerprintLabel.appendChild(fingerprintConvergence);
+    fingerprintLabel.appendChild(document.createTextNode('Codex 账号指纹收敛'));
     var save = make('button', 'cpa-runtime-scheduler-save', '应用');
     save.type = 'button';
     save.disabled = true;
@@ -474,6 +480,7 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(concurrencyLabel);
     form.appendChild(unauthorizedLabel);
     form.appendChild(quotaLabel);
+    form.appendChild(fingerprintLabel);
     form.appendChild(save);
     form.appendChild(status);
     var statusTitle = make('div', 'cpa-runtime-scheduler-subtitle', '账号状态');
@@ -504,6 +511,7 @@ const runtimeSchedulerInlineScript = `
         concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
+        fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
         status.textContent = '';
         save.disabled = false;
       }).catch(function () {
@@ -540,7 +548,8 @@ const runtimeSchedulerInlineScript = `
         'c2a-max-retry-interval': Math.max(0, Math.min(1000000, parseInt(c2aRetryInterval.value || '0', 10) || 0)),
         'auth-concurrency-limit': Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0)),
         'auto-disable-unauthorized': unauthorized.checked,
-        'auto-disable-quota': quota.checked
+        'auto-disable-quota': quota.checked,
+        'codex-fingerprint-convergence': fingerprintConvergence.checked
       }).then(function () {
         status.textContent = '已应用';
       }).catch(function () {

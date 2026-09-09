@@ -121,17 +121,13 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 	return NewHandler(cfg, "", manager)
 }
 
-// SetConfig updates the in-memory config reference when the server hot-reloads.
+// SetConfig installs an independent config snapshot when the server hot-reloads.
 func (h *Handler) SetConfig(cfg *config.Config) {
 	if h == nil {
 		return
 	}
 	h.mu.Lock()
-	if cfg != nil && cfg.Routing.AuthConcurrencyLimit == nil && h.cfg != nil && h.cfg.Routing.AuthConcurrencyLimit != nil {
-		cfg = cfg.CloneForRuntime()
-		cfg.Routing.AuthConcurrencyLimit = new(*h.cfg.Routing.AuthConcurrencyLimit)
-	}
-	h.cfg = cfg
+	h.cfg = cfg.CloneForReload(h.cfg)
 	h.mu.Unlock()
 }
 

@@ -8,6 +8,8 @@ type CodexExecutor struct {
 	cfg *config.Config
 }
 
-func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
+func NewCodexExecutor(cfg *config.Config) *CodexExecutor {
+	return &CodexExecutor{cfg: cfg.CloneForRuntime()}
+}
 
 func (e *CodexExecutor) Identifier() string { return "codex" }

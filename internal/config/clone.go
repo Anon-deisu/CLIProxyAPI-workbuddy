@@ -17,6 +17,27 @@ func (cfg *Config) CloneForRuntime() *Config {
 	return cloned.Interface().(*Config)
 }
 
+// CloneForReload returns an independent runtime snapshot, inheriting only missing
+// AuthConcurrencyLimit and CodexFingerprintConvergence values from previous.
+func (cfg *Config) CloneForReload(previous *Config) *Config {
+	if cfg == nil {
+		return nil
+	}
+	cloned := cfg.CloneForRuntime()
+	if previous == nil {
+		return cloned
+	}
+	if cloned.Routing.AuthConcurrencyLimit == nil && previous.Routing.AuthConcurrencyLimit != nil {
+		value := *previous.Routing.AuthConcurrencyLimit
+		cloned.Routing.AuthConcurrencyLimit = &value
+	}
+	if cloned.Routing.CodexFingerprintConvergence == nil && previous.Routing.CodexFingerprintConvergence != nil {
+		value := *previous.Routing.CodexFingerprintConvergence
+		cloned.Routing.CodexFingerprintConvergence = &value
+	}
+	return cloned
+}
+
 func cloneRuntimeValue(v reflect.Value) reflect.Value {
 	if !v.IsValid() {
 		return v

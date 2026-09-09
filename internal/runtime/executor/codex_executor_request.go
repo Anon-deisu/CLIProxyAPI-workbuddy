@@ -90,9 +90,11 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 
 type codexIdentityConfuseState struct {
 	enabled                bool
+	convergence            bool
 	authID                 string
 	originalPromptCacheKey string
 	promptCacheKey         string
+	fingerprint            *helps.CodexFingerprint
 	turnIDs                []codexIdentityReplacement
 }
 
@@ -146,7 +148,11 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 	rawJSON = helps.SanitizeCodexInputItemIDs(rawJSON)
 	var identityState codexIdentityConfuseState
-	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
+	if strings.HasSuffix(url, "/responses") {
+		rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
+	} else {
+		rawJSON, identityState = applyCodexLegacyIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
+	}
 	if identityState.promptCacheKey != "" {
 		cache.ID = identityState.promptCacheKey
 	}
@@ -161,6 +167,19 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
+	if codexFingerprintConvergenceEnabled(cfg, auth) {
+		if !util.ParseGJSONBytesNoCopy(rawJSON).IsObject() {
+			return rawJSON, codexIdentityConfuseState{}
+		}
+		fingerprint := helps.NewCodexFingerprint(strings.TrimSpace(auth.ID))
+		return fingerprint.ApplyBody(rawJSON), codexIdentityConfuseState{
+			enabled: true, convergence: true, authID: strings.TrimSpace(auth.ID), fingerprint: fingerprint,
+		}
+	}
+	return applyCodexLegacyIdentityConfuseBody(cfg, auth, userPayload, rawJSON)
+}
+
+func applyCodexLegacyIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
 	if !codexIdentityConfuseEnabled(cfg) || auth == nil || strings.TrimSpace(auth.ID) == "" || len(rawJSON) == 0 {
 		return rawJSON, codexIdentityConfuseState{}
 	}
@@ -191,6 +210,20 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 	if state == nil || !state.enabled {
+		return
+	}
+	if state.convergence {
+		fingerprint := state.fingerprint
+		setHeaderCasePreserved(headers, "X-Codex-Installation-Id", fingerprint.InstallationID)
+		setCodexSessionHeaderCasePreserved(headers, "Session-Id", fingerprint.SessionID)
+		if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
+			setHeaderCasePreserved(headers, "Conversation_id", fingerprint.SessionID)
+		}
+		setHeaderCasePreserved(headers, "X-Client-Request-Id", fingerprint.SessionID)
+		setHeaderCasePreserved(headers, "Thread-Id", fingerprint.SessionID)
+		setHeaderCasePreserved(headers, "X-Codex-Window-Id", fingerprint.SessionID+":0")
+		metadata := fingerprint.TurnMetadata(headerValueCaseInsensitive(headers, "X-Codex-Turn-Metadata"))
+		setHeaderCasePreserved(headers, "X-Codex-Turn-Metadata", metadata)
 		return
 	}
 
@@ -230,6 +263,9 @@ func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexI
 }
 
 func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
+	if state.convergence {
+		return payload
+	}
 	payload = replaceCodexIdentityResponsePayload(payload, state.originalPromptCacheKey, state.promptCacheKey)
 	for _, turnID := range state.turnIDs {
 		payload = replaceCodexIdentityResponsePayload(payload, turnID.original, turnID.confused)
@@ -238,6 +274,9 @@ func applyCodexIdentityConfuseResponsePayload(payload []byte, state codexIdentit
 }
 
 func applyCodexIdentityExposeResponsePayload(payload []byte, state codexIdentityConfuseState) []byte {
+	if state.convergence {
+		return state.fingerprint.RestoreResponse(payload)
+	}
 	payload = replaceCodexIdentityResponsePayload(payload, state.promptCacheKey, state.originalPromptCacheKey)
 	for _, turnID := range state.turnIDs {
 		payload = replaceCodexIdentityResponsePayload(payload, turnID.confused, turnID.original)
@@ -275,6 +314,13 @@ func codexIdentityConfuseEnabled(cfg *config.Config) bool {
 	}
 	strategy := strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
 	return cfg.Routing.SessionAffinity || strategy == "fill-first" || strategy == "fillfirst" || strategy == "ff"
+}
+
+func codexFingerprintConvergenceEnabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
+	if cfg == nil || cfg.Routing.CodexFingerprintConvergence == nil || !*cfg.Routing.CodexFingerprintConvergence || auth == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && auth.AuthKind() == cliproxyauth.AuthKindOAuth && !codexAuthUsesAPIKey(auth) && strings.TrimSpace(auth.ID) != ""
 }
 
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {

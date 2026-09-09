@@ -510,9 +510,109 @@ func TestExistingWebsocketSessionConnRequiresMatchingHealthyConnection(t *testin
 	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://other.test/responses"); got != nil {
 		t.Fatal("websocket session matched a different URL")
 	}
-	sess.setUpstreamDisconnectError(conn, errors.New("upstream disconnected"))
+	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", true); got != nil {
+		t.Fatal("native websocket session matched convergence mode")
+	}
+	sess.connMu.Lock()
+	sess.convergence = true
+	sess.connMu.Unlock()
+	if gotConn, gotCloser := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", true); gotConn != conn || gotCloser != closer {
+		t.Fatal("matching converged websocket session was not reusable")
+	}
 	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses"); got != nil {
+		t.Fatal("converged websocket session matched the default native mode")
+	}
+	sess.setUpstreamDisconnectError(conn, errors.New("upstream disconnected"))
+	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", true); got != nil {
 		t.Fatal("disconnected websocket session remained reusable")
+	}
+}
+
+func TestCodexWebsocketFingerprintConvergenceSessionIsolation(t *testing.T) {
+	tests := []struct {
+		name            string
+		wantConvergence bool
+		method          string
+		apiKey          bool
+	}{
+		{name: "enable-nonstream", wantConvergence: true, method: "Execute"},
+		{name: "disable-stream", method: "ExecuteStream"},
+		{name: "api-key-nonstream", wantConvergence: true, method: "Execute", apiKey: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialAttempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dialAttempts.Add(1)
+				w.WriteHeader(http.StatusBadGateway)
+			}))
+			defer server.Close()
+
+			convergence := tt.wantConvergence
+			exec := NewCodexWebsocketsExecutor(&config.Config{
+				Routing:   config.RoutingConfig{CodexFingerprintConvergence: &convergence},
+				SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll},
+			})
+			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+			const sessionID = "fingerprint-convergence-session"
+			auth := &cliproxyauth.Auth{
+				ID:         "codex-convergence-auth",
+				Provider:   "codex",
+				Attributes: map[string]string{"base_url": server.URL},
+				Metadata:   map[string]any{"access_token": "test-token"},
+			}
+			if tt.apiKey {
+				auth.Attributes["api_key"] = "sk-test"
+			}
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/responses"
+			conn := &websocket.Conn{}
+			sess := &codexWebsocketSession{
+				sessionID:   sessionID,
+				conn:        conn,
+				connCloser:  &websocketConnectionCloser{},
+				authID:      auth.ID,
+				wsURL:       wsURL,
+				convergence: !tt.wantConvergence,
+			}
+			sess.resetUpstreamDisconnectError(conn)
+			exec.store.sessions[sessionID] = sess
+			req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[]}`)}
+			// Reject binding to observe successful matching without sending on the placeholder connection.
+			opts := cliproxyexecutor.Options{
+				SourceFormat:       sdktranslator.FormatOpenAIResponse,
+				Metadata:           map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID},
+				ExecutionLifecycle: rejectingExecutionLifecycle{},
+			}
+			ctx := cliproxyexecutor.WithUpstreamAttemptTracker(cliproxyexecutor.WithRequiredUpstreamWebsocket(context.Background()))
+			var errExecute error
+			if tt.method == "Execute" {
+				_, errExecute = exec.Execute(ctx, auth, req, opts)
+			} else {
+				_, errExecute = exec.ExecuteStream(ctx, auth, req, opts)
+			}
+			if tt.apiKey {
+				if errExecute == nil || errExecute.Error() != "lifecycle bind rejected" {
+					t.Fatalf("API key error = %T %v, want native connection to reach lifecycle bind", errExecute, errExecute)
+				}
+			} else {
+				if !cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errExecute) {
+					t.Fatalf("mode mismatch error = %T %v, want typed replay-required", errExecute, errExecute)
+				}
+				if got, _ := existingWebsocketSessionConn(sess, auth.ID, wsURL, !tt.wantConvergence); got != conn {
+					t.Fatal("required mode mismatch detached or replaced the retained connection")
+				}
+			}
+			if cliproxyexecutor.UpstreamAttempted(ctx) {
+				t.Fatal("required request was marked as an upstream attempt before lifecycle bind")
+			}
+			if got := dialAttempts.Load(); got != 0 {
+				t.Fatalf("required request dial attempts = %d, want 0", got)
+			}
+			if !sess.reqMu.TryLock() {
+				t.Fatal("required request left the session request lock held")
+			}
+			sess.reqMu.Unlock()
+		})
 	}
 }
 

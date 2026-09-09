@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -285,6 +286,95 @@ func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.
 	}
 	if gotKey := gjson.GetBytes(clientBody, "prompt_cache_key").String(); gotKey != "cache-1" {
 		t.Fatalf("client prompt_cache_key = %q, want cache-1", gotKey)
+	}
+}
+
+func TestCodexFingerprintConvergenceConfigSnapshot(t *testing.T) {
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{ID: "fingerprint-snapshot", Provider: "codex", Metadata: map[string]any{"access_token": "test-token"}}
+	native := NewCodexExecutor(cfg)
+	cfg.Routing.CodexFingerprintConvergence = new(true)
+	converged := NewCodexExecutor(cfg)
+	*cfg.Routing.CodexFingerprintConvergence = false
+	if codexFingerprintConvergenceEnabled(native.cfg, auth) || !codexFingerprintConvergenceEnabled(converged.cfg, auth) {
+		t.Fatal("runtime setting mutation changed an executor's active request snapshot")
+	}
+}
+
+func TestCodexFingerprintConvergenceUsesStableUniqueAccountIdentity(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: &enabled}}
+	authA := &cliproxyauth.Auth{ID: "auth-converged-a", Provider: "codex", Metadata: map[string]any{"access_token": "token-a"}}
+	authB := &cliproxyauth.Auth{ID: "auth-converged-b", Provider: "codex", Metadata: map[string]any{"access_token": "token-b"}}
+	request := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"client-session","client_metadata":{"x-codex-installation-id":"client-install","session_id":"client-session","thread_id":"client-thread","x-codex-window-id":"client-thread:0"}}`)
+
+	first, firstState := applyCodexIdentityConfuseBody(cfg, authA, request, request)
+	second, secondState := applyCodexIdentityConfuseBody(cfg, authA, request, request)
+	other, otherState := applyCodexIdentityConfuseBody(cfg, authB, request, request)
+
+	if !firstState.convergence || !secondState.convergence || !otherState.convergence {
+		t.Fatal("expected convergence state for Codex OAuth accounts")
+	}
+	for _, field := range []string{"x-codex-installation-id", "session_id", "thread_id", "x-codex-window-id"} {
+		firstValue := gjson.GetBytes(first, "client_metadata."+field).String()
+		secondValue := gjson.GetBytes(second, "client_metadata."+field).String()
+		otherValue := gjson.GetBytes(other, "client_metadata."+field).String()
+		if firstValue == "" || firstValue != secondValue {
+			t.Fatalf("client_metadata.%s is not stable: first=%q second=%q", field, firstValue, secondValue)
+		}
+		if firstValue == otherValue {
+			t.Fatalf("client_metadata.%s is reused across accounts: %q", field, firstValue)
+		}
+	}
+	firstHeaders := make(http.Header)
+	applyCodexIdentityConfuseHeaders(firstHeaders, &firstState)
+	if got := firstHeaders.Get("X-Codex-Installation-Id"); got != gjson.GetBytes(first, "client_metadata.x-codex-installation-id").String() {
+		t.Fatalf("installation header=%q does not match body=%q", got, gjson.GetBytes(first, "client_metadata.x-codex-installation-id").String())
+	}
+}
+
+func TestCodexFingerprintConvergenceDoesNotAffectAPIKeys(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: &enabled}}
+	auth := &cliproxyauth.Auth{ID: "api-key-auth", Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
+	body := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"client-session","client_metadata":{"x-codex-installation-id":"client-install"}}`)
+	updated, state := applyCodexIdentityConfuseBody(cfg, auth, body, body)
+	if state.convergence || !bytes.Equal(updated, body) {
+		t.Fatalf("API key body changed by convergence: state=%+v body=%s", state, string(updated))
+	}
+}
+
+func TestCodexFingerprintConvergencePreservesExplicitCacheKeysAndPayload(t *testing.T) {
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: new(true)}}
+	auth := &cliproxyauth.Auth{ID: "fingerprint-cache", Provider: "codex", Metadata: map[string]any{"access_token": "test-token"}}
+	for _, payload := range []string{
+		`{"prompt_cache_key":"explicit-cache","client_metadata":{"session_id":"client-session","custom":{"large":9007199254740993}},"input":"client-session"}`,
+		`{"input":"no cache key"}`,
+	} {
+		body := []byte(payload)
+		updated, state := applyCodexIdentityConfuseBody(cfg, auth, body, body)
+		if got, want := gjson.GetBytes(updated, "prompt_cache_key").Raw, gjson.GetBytes(body, "prompt_cache_key").Raw; got != want {
+			t.Fatalf("explicit or missing prompt_cache_key changed: got=%s want=%s", got, want)
+		}
+		if got, want := gjson.GetBytes(updated, "client_metadata.custom").Raw, gjson.GetBytes(body, "client_metadata.custom").Raw; got != want {
+			t.Fatalf("unrelated metadata changed: got=%s want=%s", got, want)
+		}
+		if !state.convergence || string(body) != payload {
+			t.Fatal("convergence was skipped or mutated the client payload")
+		}
+	}
+}
+
+func TestCodexFingerprintConvergenceSkipsNonResponseEndpoints(t *testing.T) {
+	e := NewCodexExecutor(&config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: new(true)}})
+	auth := &cliproxyauth.Auth{ID: "fingerprint-endpoints", Provider: "codex", Metadata: map[string]any{"access_token": "test-token"}}
+	for _, path := range []string{"/responses/compact", "/images/generations", "/images/edits"} {
+		body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+		req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: body}
+		_, updated, state, err := e.cacheHelper(context.Background(), sdktranslator.FormatOpenAIResponse, "https://example.test"+path, auth, req, body, body)
+		if err != nil || state.convergence || !bytes.Equal(updated, body) {
+			t.Fatalf("unsupported endpoint %s changed: body=%s state=%+v err=%v", path, updated, state, err)
+		}
 	}
 }
 

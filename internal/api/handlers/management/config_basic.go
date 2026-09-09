@@ -166,10 +166,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
-	if h.cfg != nil && h.cfg.Routing.AuthConcurrencyLimit != nil {
-		newCfg.Routing.AuthConcurrencyLimit = new(*h.cfg.Routing.AuthConcurrencyLimit)
-	}
-	h.cfg = newCfg
+	h.cfg = newCfg.CloneForReload(h.cfg)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 
@@ -348,11 +345,15 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	c2aRetryCount := 0
 	c2aRetryInterval := 0
 	authConcurrencyLimit := 0
+	codexFingerprintConvergence := false
 	if cfg != nil {
 		c2aRetryCount = cfg.RequestRetry
 		c2aRetryInterval = cfg.MaxRetryInterval
 		if cfg.Routing.AuthConcurrencyLimit != nil {
 			authConcurrencyLimit = *cfg.Routing.AuthConcurrencyLimit
+		}
+		if cfg.Routing.CodexFingerprintConvergence != nil {
+			codexFingerprintConvergence = *cfg.Routing.CodexFingerprintConvergence
 		}
 		if cfg.Routing.C2AMaxRetryCount != nil {
 			c2aRetryCount = *cfg.Routing.C2AMaxRetryCount
@@ -363,27 +364,29 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	}
 	h.mu.Unlock()
 	c.JSON(http.StatusOK, gin.H{
-		"strategy":                  strategy,
-		"scheduler-mode":            strategy,
-		"auto-disable-unauthorized": unauthorized,
-		"auto-disable-quota":        quota,
-		"c2a-max-retry-count":       c2aRetryCount,
-		"c2a-max-retry-interval":    c2aRetryInterval,
-		"auth-concurrency-limit":    authConcurrencyLimit,
-		"runtime_only":              true,
+		"strategy":                      strategy,
+		"scheduler-mode":                strategy,
+		"auto-disable-unauthorized":     unauthorized,
+		"auto-disable-quota":            quota,
+		"c2a-max-retry-count":           c2aRetryCount,
+		"c2a-max-retry-interval":        c2aRetryInterval,
+		"auth-concurrency-limit":        authConcurrencyLimit,
+		"codex-fingerprint-convergence": codexFingerprintConvergence,
+		"runtime_only":                  true,
 	})
 }
 
 // PutRoutingSettings updates scheduler controls in memory and deliberately skips config.yaml writes.
 func (h *Handler) PutRoutingSettings(c *gin.Context) {
 	var body struct {
-		Strategy                *string `json:"strategy"`
-		SchedulerMode           *string `json:"scheduler-mode"`
-		AutoDisableUnauthorized *bool   `json:"auto-disable-unauthorized"`
-		AutoDisableQuota        *bool   `json:"auto-disable-quota"`
-		C2AMaxRetryCount        *int    `json:"c2a-max-retry-count"`
-		C2AMaxRetryInterval     *int    `json:"c2a-max-retry-interval"`
-		AuthConcurrencyLimit    *int    `json:"auth-concurrency-limit"`
+		Strategy                    *string `json:"strategy"`
+		SchedulerMode               *string `json:"scheduler-mode"`
+		AutoDisableUnauthorized     *bool   `json:"auto-disable-unauthorized"`
+		AutoDisableQuota            *bool   `json:"auto-disable-quota"`
+		C2AMaxRetryCount            *int    `json:"c2a-max-retry-count"`
+		C2AMaxRetryInterval         *int    `json:"c2a-max-retry-interval"`
+		AuthConcurrencyLimit        *int    `json:"auth-concurrency-limit"`
+		CodexFingerprintConvergence *bool   `json:"codex-fingerprint-convergence"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -414,7 +417,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth-concurrency-limit must be between 0 and 1000000"})
 		return
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.AuthConcurrencyLimit == nil {
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
@@ -448,6 +451,10 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		if body.AuthConcurrencyLimit != nil {
 			value := *body.AuthConcurrencyLimit
 			cfg.Routing.AuthConcurrencyLimit = &value
+		}
+		if body.CodexFingerprintConvergence != nil {
+			value := *body.CodexFingerprintConvergence
+			cfg.Routing.CodexFingerprintConvergence = &value
 		}
 		return nil
 	})

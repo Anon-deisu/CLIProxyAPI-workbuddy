@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -40,7 +41,7 @@ func TestPutRoutingSettingsUpdatesMemoryOnly(t *testing.T) {
 	h := NewHandlerWithoutConfigFilePath(cfg, nil)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"scheduler-mode":"remaining-quota","auto-disable-unauthorized":true,"auto-disable-quota":true}`))
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"scheduler-mode":"remaining-quota","auto-disable-unauthorized":true,"auto-disable-quota":true,"codex-fingerprint-convergence":true}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	h.PutRoutingSettings(ctx)
@@ -48,7 +49,7 @@ func TestPutRoutingSettingsUpdatesMemoryOnly(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
-	if cfg.Routing.SchedulerMode != "remaining-quota" || !cfg.Routing.AutoDisableUnauthorized || !cfg.Routing.AutoDisableQuota {
+	if cfg.Routing.SchedulerMode != "remaining-quota" || !cfg.Routing.AutoDisableUnauthorized || !cfg.Routing.AutoDisableQuota || cfg.Routing.CodexFingerprintConvergence == nil || !*cfg.Routing.CodexFingerprintConvergence {
 		t.Fatalf("runtime routing config = %+v", cfg.Routing)
 	}
 	var response map[string]any
@@ -57,6 +58,232 @@ func TestPutRoutingSettingsUpdatesMemoryOnly(t *testing.T) {
 	}
 	if response["runtime_only"] != true {
 		t.Fatalf("response = %#v, want runtime_only=true", response)
+	}
+}
+
+func TestPutRoutingSettingsCanDisableCodexFingerprintConvergence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	enabled := true
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: &enabled}}
+	h := NewHandlerWithoutConfigFilePath(cfg, nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"codex-fingerprint-convergence":false}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	h.PutRoutingSettings(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if cfg.Routing.CodexFingerprintConvergence == nil || *cfg.Routing.CodexFingerprintConvergence {
+		t.Fatalf("convergence = %v, want explicit false", cfg.Routing.CodexFingerprintConvergence)
+	}
+	reloaded := &config.Config{Debug: true}
+	h.SetConfig(reloaded)
+	if h.cfg.Routing.CodexFingerprintConvergence == nil || *h.cfg.Routing.CodexFingerprintConvergence || h.cfg.Routing.AuthConcurrencyLimit != nil {
+		t.Fatalf("routing after explicit false hot reload = %+v", h.cfg.Routing)
+	}
+	if reloaded.Routing.CodexFingerprintConvergence != nil || h.cfg.Routing.CodexFingerprintConvergence == cfg.Routing.CodexFingerprintConvergence {
+		t.Fatal("hot reload mutated the caller or shares the previous convergence pointer")
+	}
+}
+
+func TestGetRoutingSettingsReportsCodexFingerprintConvergenceStates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	enabled := true
+	disabled := false
+	for _, test := range []struct {
+		name  string
+		value *bool
+		want  bool
+	}{
+		{name: "unset", want: false},
+		{name: "true", value: &enabled, want: true},
+		{name: "false", value: &disabled, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Routing.CodexFingerprintConvergence = test.value
+			h := NewHandlerWithoutConfigFilePath(cfg, nil)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+
+			h.GetRoutingSettings(ctx)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("GET status = %d, body=%s", recorder.Code, recorder.Body.String())
+			}
+			var settings map[string]any
+			if errDecode := json.Unmarshal(recorder.Body.Bytes(), &settings); errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			if got, ok := settings["codex-fingerprint-convergence"].(bool); !ok || got != test.want {
+				t.Fatalf("convergence = %#v, want %v", settings["codex-fingerprint-convergence"], test.want)
+			}
+
+			patchRecorder := httptest.NewRecorder()
+			patchCtx, _ := gin.CreateTestContext(patchRecorder)
+			patchCtx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"auto-disable-quota":true}`))
+			h.PutRoutingSettings(patchCtx)
+			if patchRecorder.Code != http.StatusOK || !cfg.Routing.AutoDisableQuota {
+				t.Fatalf("PATCH status = %d, body=%s", patchRecorder.Code, patchRecorder.Body.String())
+			}
+			if cfg.Routing.CodexFingerprintConvergence != test.value || (test.value != nil && *test.value != test.want) {
+				t.Fatal("PATCH changed omitted convergence setting")
+			}
+		})
+	}
+}
+
+func TestSetConfigInheritsConvergenceWithoutSharingCaller(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		limit *int
+	}{
+		{name: "no-concurrency"},
+		{name: "explicit-concurrency", limit: new(0)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			initial := &config.Config{}
+			initial.Routing.CodexFingerprintConvergence = new(true)
+			h := NewHandlerWithoutConfigFilePath(initial, nil)
+			reloaded := &config.Config{Debug: true}
+			reloaded.Routing.AuthConcurrencyLimit = test.limit
+			reloaded.APIKeys = []string{"caller-key"}
+
+			h.SetConfig(reloaded)
+
+			if h.cfg == reloaded || h.cfg == initial || !h.cfg.Debug {
+				t.Fatal("SetConfig() did not install an independent config with the reload fields")
+			}
+			if reloaded.Routing.CodexFingerprintConvergence != nil || reloaded.Routing.AuthConcurrencyLimit != test.limit {
+				t.Fatal("SetConfig() mutated the caller config while inheriting convergence")
+			}
+			if h.cfg.Routing.CodexFingerprintConvergence == nil || !*h.cfg.Routing.CodexFingerprintConvergence {
+				t.Fatalf("inherited convergence = %v, want true", h.cfg.Routing.CodexFingerprintConvergence)
+			}
+			if h.cfg.Routing.CodexFingerprintConvergence == initial.Routing.CodexFingerprintConvergence {
+				t.Fatal("inherited convergence shares the previous config pointer")
+			}
+			if !reflect.DeepEqual(h.cfg.Routing.AuthConcurrencyLimit, test.limit) || (test.limit != nil && h.cfg.Routing.AuthConcurrencyLimit == test.limit) {
+				t.Fatal("explicit concurrency was changed or shares the caller pointer")
+			}
+			*initial.Routing.CodexFingerprintConvergence = false
+			reloaded.APIKeys[0] = "changed-key"
+			if !*h.cfg.Routing.CodexFingerprintConvergence || h.cfg.APIKeys[0] != "caller-key" {
+				t.Fatal("reload snapshot changed with the previous or caller config")
+			}
+
+			explicit := &config.Config{}
+			explicit.Routing.CodexFingerprintConvergence = new(false)
+			h.SetConfig(explicit)
+			if h.cfg.Routing.CodexFingerprintConvergence == nil || *h.cfg.Routing.CodexFingerprintConvergence {
+				t.Fatalf("explicit convergence = %v, want false", h.cfg.Routing.CodexFingerprintConvergence)
+			}
+			if h.cfg.Routing.CodexFingerprintConvergence == explicit.Routing.CodexFingerprintConvergence {
+				t.Fatal("explicit convergence shares the caller config pointer")
+			}
+		})
+	}
+}
+
+func TestPutRoutingSettingsRuntimeHookReceivesIndependentSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{}
+	cfg.APIKeys = []string{"caller-key"}
+	h := NewHandlerWithoutConfigFilePath(cfg, nil)
+	var snapshots []*config.Config
+	h.SetRuntimeConfigHook(func(_ context.Context, got *config.Config) {
+		snapshots = append(snapshots, got)
+	})
+	for index, enabled := range []bool{true, false} {
+		body, errMarshal := json.Marshal(map[string]any{"auth-concurrency-limit": 2, "codex-fingerprint-convergence": enabled})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+		h.PutRoutingSettings(ctx)
+		if recorder.Code != http.StatusOK || len(snapshots) != index+1 {
+			t.Fatalf("status=%d snapshots=%d body=%s", recorder.Code, len(snapshots), recorder.Body.String())
+		}
+		snapshot := snapshots[index]
+		if snapshot == nil || snapshot == cfg || snapshot == h.cfg || h.cfg != cfg {
+			t.Fatal("runtime hook did not receive an independent snapshot of the active caller config")
+		}
+		if cfg.Routing.CodexFingerprintConvergence == nil || *cfg.Routing.CodexFingerprintConvergence != enabled || !reflect.DeepEqual(snapshot, cfg) {
+			t.Fatal("caller config and runtime hook snapshot do not contain the requested settings")
+		}
+		if snapshot.Routing.AuthConcurrencyLimit == cfg.Routing.AuthConcurrencyLimit || snapshot.Routing.CodexFingerprintConvergence == cfg.Routing.CodexFingerprintConvergence {
+			t.Fatal("runtime hook snapshot shares runtime field pointers")
+		}
+	}
+	if !*snapshots[0].Routing.CodexFingerprintConvergence || *snapshots[1].Routing.CodexFingerprintConvergence {
+		t.Fatal("a later runtime update changed an earlier hook snapshot")
+	}
+	*snapshots[1].Routing.CodexFingerprintConvergence = true
+	*snapshots[1].Routing.AuthConcurrencyLimit = 9
+	snapshots[1].APIKeys[0] = "hook-key"
+	if *cfg.Routing.CodexFingerprintConvergence || *cfg.Routing.AuthConcurrencyLimit != 2 || cfg.APIKeys[0] != "caller-key" {
+		t.Fatal("mutating the runtime hook snapshot changed the active config")
+	}
+}
+
+func TestPutConfigYAMLPreservesRuntimeRoutingFieldsWithoutPersisting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, state := range []struct {
+		name  string
+		value *bool
+	}{
+		{name: "unset"},
+		{name: "true", value: new(true)},
+		{name: "false", value: new(false)},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Routing.AuthConcurrencyLimit = new(2)
+			cfg.Routing.CodexFingerprintConvergence = state.value
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			h := NewHandler(cfg, configPath, nil)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/v0/management/config.yaml", strings.NewReader("debug: true\n"))
+			h.PutConfigYAML(ctx)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			if !h.cfg.Debug || h.cfg.Routing.AuthConcurrencyLimit == nil || *h.cfg.Routing.AuthConcurrencyLimit != 2 || !reflect.DeepEqual(h.cfg.Routing.CodexFingerprintConvergence, state.value) {
+				t.Fatalf("runtime fields after YAML reload = %+v", h.cfg.Routing)
+			}
+			if h.cfg == cfg || h.cfg.Routing.AuthConcurrencyLimit == cfg.Routing.AuthConcurrencyLimit || (state.value != nil && h.cfg.Routing.CodexFingerprintConvergence == state.value) {
+				t.Fatal("YAML reload shares the original config or runtime field pointers")
+			}
+			if errSave := config.SaveConfigPreserveComments(configPath, h.cfg); errSave != nil {
+				t.Fatal(errSave)
+			}
+			persisted, errRead := os.ReadFile(configPath)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			if strings.Contains(string(persisted), "auth-concurrency-limit") || strings.Contains(string(persisted), "codex-fingerprint-convergence") {
+				t.Fatalf("runtime routing fields persisted to YAML: %s", persisted)
+			}
+			reloaded, errLoad := config.LoadConfig(configPath)
+			if errLoad != nil {
+				t.Fatal(errLoad)
+			}
+			if reloaded.Routing.AuthConcurrencyLimit != nil || reloaded.Routing.CodexFingerprintConvergence != nil {
+				t.Fatal("fresh config loaded runtime routing fields from YAML")
+			}
+			h.SetConfig(reloaded)
+			if h.cfg.Routing.AuthConcurrencyLimit == nil || *h.cfg.Routing.AuthConcurrencyLimit != 2 || !reflect.DeepEqual(h.cfg.Routing.CodexFingerprintConvergence, state.value) {
+				t.Fatalf("runtime fields after watcher reload = %+v", h.cfg.Routing)
+			}
+			if reloaded.Routing.AuthConcurrencyLimit != nil || reloaded.Routing.CodexFingerprintConvergence != nil {
+				t.Fatal("watcher reload changed the caller config")
+			}
+		})
 	}
 }
 

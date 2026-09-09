@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -262,6 +263,67 @@ func TestManagerConcurrencyReloadPreservesActiveSlots(t *testing.T) {
 	restarted, errRestart := fresh.Register(context.Background(), &Auth{ID: "restart", Provider: "codex"})
 	if errRestart != nil || restarted.EffectiveConcurrencyLimit() != 0 {
 		t.Fatalf("new manager inherited runtime settings: err=%v", errRestart)
+	}
+}
+
+func TestManagerConfigReloadPreservesCodexFingerprintConvergence(t *testing.T) {
+	for _, method := range []string{"SetConfig", "SetConfigSnapshot", "ApplyConfigWithCooldownStateStore"} {
+		t.Run(method, func(t *testing.T) {
+			for _, state := range []struct {
+				name     string
+				previous *bool
+				value    *bool
+				want     *bool
+			}{
+				{name: "unset"},
+				{name: "enabled", value: new(true), want: new(true)},
+				{name: "inherit-enabled", previous: new(true), want: new(true)},
+				{name: "disabled", previous: new(true), value: new(false), want: new(false)},
+				{name: "inherit-disabled", previous: new(false), want: new(false)},
+				{name: "reenabled", previous: new(false), value: new(true), want: new(true)},
+			} {
+				t.Run(state.name, func(t *testing.T) {
+					manager := NewManager(nil, nil, nil)
+					initial := &internalconfig.Config{}
+					initial.Routing.CodexFingerprintConvergence = state.previous
+					manager.SetConfig(initial)
+					previous := manager.runtimeConfigSnapshot()
+					if previous == initial || (state.previous != nil && previous.Routing.CodexFingerprintConvergence == state.previous) {
+						t.Fatal("manager initial config shares the caller pointer")
+					}
+					cfg := &internalconfig.Config{Debug: true}
+					cfg.Routing.CodexFingerprintConvergence = state.value
+					before := cfg.CloneForRuntime()
+					switch method {
+					case "SetConfig":
+						manager.SetConfig(cfg)
+					case "SetConfigSnapshot":
+						manager.SetConfigSnapshot(cfg)
+					case "ApplyConfigWithCooldownStateStore":
+						if !manager.ApplyConfigWithCooldownStateStore(context.Background(), cfg, nil) {
+							t.Fatal("config application failed")
+						}
+					}
+					snapshot := manager.runtimeConfigSnapshot()
+					if snapshot == nil || snapshot == cfg || snapshot == previous {
+						t.Fatal("manager did not install an independent config snapshot")
+					}
+					if !snapshot.Debug || !reflect.DeepEqual(snapshot.Routing.CodexFingerprintConvergence, state.want) || snapshot.Routing.AuthConcurrencyLimit != nil {
+						t.Fatalf("manager routing = %+v", snapshot.Routing)
+					}
+					if !reflect.DeepEqual(cfg, before) {
+						t.Fatal("manager changed the caller config")
+					}
+					if state.want != nil && (snapshot.Routing.CodexFingerprintConvergence == cfg.Routing.CodexFingerprintConvergence || snapshot.Routing.CodexFingerprintConvergence == previous.Routing.CodexFingerprintConvergence) {
+						t.Fatal("manager convergence shares the caller or previous config pointer")
+					}
+					manager.SetConfig(nil)
+					if !reflect.DeepEqual(manager.runtimeConfigSnapshot().Routing.CodexFingerprintConvergence, state.want) {
+						t.Fatal("nil config reload lost the runtime convergence setting")
+					}
+				})
+			}
+		})
 	}
 }
 

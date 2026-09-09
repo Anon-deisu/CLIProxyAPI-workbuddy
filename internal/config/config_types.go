@@ -268,6 +268,10 @@ type RoutingConfig struct {
 	// AuthConcurrencyLimit is the runtime-only in-flight request limit for every credential.
 	// Nil retains the current setting across config reloads; an explicit zero removes the limit.
 	AuthConcurrencyLimit *int `yaml:"-" json:"auth-concurrency-limit,omitempty"`
+	// CodexFingerprintConvergence is a runtime-only opt-in for account-scoped Codex
+	// OAuth/SetupToken identity convergence. Nil retains the current setting across
+	// config reloads; false explicitly restores native request identity behavior.
+	CodexFingerprintConvergence *bool `yaml:"-" json:"codex-fingerprint-convergence,omitempty"`
 
 	// C2AMaxRetryCount overrides the global request-retry count for the Codex2API
 	// default scheduler. It is runtime-only; nil inherits the global setting.
