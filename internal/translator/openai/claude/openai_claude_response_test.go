@@ -339,9 +339,9 @@ func TestStreamingTool_StopReasonWithEmittedTool(t *testing.T) {
 
 func TestExtractOpenAIUsageSeparatesCacheReadAndWrite(t *testing.T) {
 	usage := gjson.Parse(`{"prompt_tokens":9000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":8000,"cache_creation_tokens":200}}`)
-	input, output, cached := extractOpenAIUsage(usage)
-	if input != 800 || output != 50 || cached != 8000 {
-		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
+	input, output, cached, cacheWrite := extractOpenAIUsage(usage)
+	if input != 800 || output != 50 || cached != 8000 || cacheWrite != 200 {
+		t.Fatalf("input=%d output=%d cached=%d cacheWrite=%d", input, output, cached, cacheWrite)
 	}
 }
 
@@ -351,7 +351,7 @@ func TestExtractOpenAIUsageSeparatesCacheReadAndWrite(t *testing.T) {
 // reported input_tokens collapses to 0.
 func TestExtractOpenAIUsageKeepsSplitStyleFreshInput(t *testing.T) {
 	usage := gjson.Parse(`{"prompt_tokens":2,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":25117}}`)
-	input, output, cached := extractOpenAIUsage(usage)
+	input, output, cached, _ := extractOpenAIUsage(usage)
 	if input != 2 || output != 50 || cached != 25117 {
 		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
 	}
@@ -360,7 +360,7 @@ func TestExtractOpenAIUsageKeepsSplitStyleFreshInput(t *testing.T) {
 // Cache is absent entirely: nothing to strip, fresh input passes through.
 func TestExtractOpenAIUsageNoCache(t *testing.T) {
 	usage := gjson.Parse(`{"prompt_tokens":300,"completion_tokens":50,"prompt_tokens_details":{}}`)
-	input, output, cached := extractOpenAIUsage(usage)
+	input, output, cached, _ := extractOpenAIUsage(usage)
 	if input != 300 || output != 50 || cached != 0 {
 		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
 	}
@@ -737,7 +737,7 @@ func TestStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_write_tokens field",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
@@ -745,15 +745,15 @@ func TestStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_creation_tokens alias",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_creation_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
 		},
 		{
-			name:                 "cached_tokens greater than prompt_tokens clamps input_tokens to zero",
+			name:                 "cached_tokens greater than prompt_tokens keeps split-style fresh input",
 			usageJSON:            `{"prompt_tokens":500,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":50}}`,
-			wantInputTokens:      0,
+			wantInputTokens:      500,
 			wantOutputTokens:     100,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 50,
@@ -818,7 +818,7 @@ func TestNonStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_write_tokens field",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
@@ -826,15 +826,15 @@ func TestNonStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 		{
 			name:                 "cache_creation_tokens alias",
 			usageJSON:            `{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":800,"cache_creation_tokens":150}}`,
-			wantInputTokens:      200,
+			wantInputTokens:      50,
 			wantOutputTokens:     200,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 150,
 		},
 		{
-			name:                 "cached_tokens greater than prompt_tokens clamps input_tokens to zero",
+			name:                 "cached_tokens greater than prompt_tokens keeps split-style fresh input",
 			usageJSON:            `{"prompt_tokens":500,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":50}}`,
-			wantInputTokens:      0,
+			wantInputTokens:      500,
 			wantOutputTokens:     100,
 			wantCacheReadTokens:  800,
 			wantCacheWriteTokens: 50,
@@ -896,7 +896,177 @@ func TestNonStreamingToolMissingIDGetsFallbackAndRealIDPassesThrough(t *testing.
 	if id := content[0].Get("id").String(); !strings.HasPrefix(id, "toolu_") {
 		t.Fatalf("fallback id=%q", id)
 	}
-	if id := content[1].Get("id").String(); id != "toolu:raw\nid" {
-		t.Fatalf("raw id changed: %q", id)
+	// Claude requires tool_use.id to match ^[a-zA-Z0-9_-]+$, so characters the
+	// upstream stream may contain (':' and newlines here) become '_'.
+	if id := content[1].Get("id").String(); id != "toolu_raw_id" {
+		t.Fatalf("sanitized id = %q, want toolu_raw_id", id)
+	}
+}
+
+func assertSequentialContentBlocks(t *testing.T, events []sseEvent) {
+	t.Helper()
+	activeBlockIndex := int64(-1)
+	for _, e := range events {
+		switch e.Type {
+		case "content_block_start":
+			if activeBlockIndex != -1 {
+				t.Fatalf("content_block_start emitted for index %d while block %d is still open (events=%+v)",
+					gjson.Get(e.Payload, "index").Int(), activeBlockIndex, events)
+			}
+			activeBlockIndex = gjson.Get(e.Payload, "index").Int()
+		case "content_block_delta":
+			idx := gjson.Get(e.Payload, "index").Int()
+			if activeBlockIndex == -1 {
+				t.Fatalf("content_block_delta emitted for index %d but no block is open (events=%+v)", idx, events)
+			}
+			if idx != activeBlockIndex {
+				t.Fatalf("content_block_delta emitted for index %d but active block is %d (events=%+v)", idx, activeBlockIndex, events)
+			}
+		case "content_block_stop":
+			idx := gjson.Get(e.Payload, "index").Int()
+			if activeBlockIndex == -1 {
+				t.Fatalf("content_block_stop emitted for index %d but no block is open (events=%+v)", idx, events)
+			}
+			if idx != activeBlockIndex {
+				t.Fatalf("content_block_stop emitted for index %d but active block is %d (events=%+v)", idx, activeBlockIndex, events)
+			}
+			activeBlockIndex = -1
+		}
+	}
+	if activeBlockIndex != -1 {
+		t.Fatalf("stream ended with unclosed block %d (events=%+v)", activeBlockIndex, events)
+	}
+}
+
+func TestStreaming_InterleavedContentAndToolUse_StrictSequentialBlocks(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":"}}]},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"\n"},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	assertSequentialContentBlocks(t, events)
+
+	// Ensure tool call arguments were preserved and complete
+	var toolDeltas []sseEvent
+	for _, e := range events {
+		if e.Type == "content_block_delta" && gjson.Get(e.Payload, "delta.type").String() == "input_json_delta" {
+			toolDeltas = append(toolDeltas, e)
+		}
+	}
+	if len(toolDeltas) != 1 {
+		t.Fatalf("expected 1 tool input_json_delta, got %d", len(toolDeltas))
+	}
+	partialJSON := gjson.Get(toolDeltas[0].Payload, "delta.partial_json").String()
+	if gotCmd := gjson.Get(partialJSON, "command").String(); gotCmd != "ls" {
+		t.Fatalf("expected command 'ls', got %q", gotCmd)
+	}
+}
+
+func TestStreaming_ParallelToolCalls_StrictSequentialBlocks(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[
+			{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"ls\"}"}},
+			{"index":1,"id":"call_2","type":"function","function":{"name":"Read","arguments":"{\"path\":\"/tmp\"}"}}
+		]},"finish_reason":"tool_calls"}]}`,
+	)
+
+	assertSequentialContentBlocks(t, events)
+
+	starts := toolUseStarts(events)
+	if len(starts) != 2 {
+		t.Fatalf("expected 2 tool_use starts, got %d", len(starts))
+	}
+	if id := gjson.Get(starts[0].Payload, "content_block.id").String(); id != "call_1" {
+		t.Fatalf("first tool id = %q, want %q", id, "call_1")
+	}
+	if name := gjson.Get(starts[0].Payload, "content_block.name").String(); name != "Bash" {
+		t.Fatalf("first tool name = %q, want %q", name, "Bash")
+	}
+	if id := gjson.Get(starts[1].Payload, "content_block.id").String(); id != "call_2" {
+		t.Fatalf("second tool id = %q, want %q", id, "call_2")
+	}
+	if name := gjson.Get(starts[1].Payload, "content_block.name").String(); name != "Read" {
+		t.Fatalf("second tool name = %q, want %q", name, "Read")
+	}
+
+	var toolDeltas []sseEvent
+	for _, e := range events {
+		if e.Type == "content_block_delta" && gjson.Get(e.Payload, "delta.type").String() == "input_json_delta" {
+			toolDeltas = append(toolDeltas, e)
+		}
+	}
+	if len(toolDeltas) != 2 {
+		t.Fatalf("expected 2 tool input_json_delta, got %d", len(toolDeltas))
+	}
+	if cmd := gjson.Get(gjson.Get(toolDeltas[0].Payload, "delta.partial_json").String(), "command").String(); cmd != "ls" {
+		t.Fatalf("first tool cmd = %q, want 'ls'", cmd)
+	}
+	if path := gjson.Get(gjson.Get(toolDeltas[1].Payload, "delta.partial_json").String(), "path").String(); path != "/tmp" {
+		t.Fatalf("second tool path = %q, want '/tmp'", path)
+	}
+}
+
+func TestStreaming_InterleavedTextAndThinkingPreservesOrder(t *testing.T) {
+	events := runStream(t, streamReq,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":"}}]},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"Note A: "},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"running check"},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"reasoning_content":"Thinking about safety"},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"Note B: done"},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pwd\"}"}}]},"finish_reason":null}]}`,
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	)
+
+	assertSequentialContentBlocks(t, events)
+
+	// Block sequence should be:
+	// 0: tool_use (Bash, command: "pwd")
+	// 1: text ("Note A: running check")
+	// 2: thinking ("Thinking about safety")
+	// 3: text ("Note B: done")
+	var blockStarts []string
+	for _, e := range events {
+		if e.Type == "content_block_start" {
+			blockStarts = append(blockStarts, gjson.Get(e.Payload, "content_block.type").String())
+		}
+	}
+	expectedStarts := []string{"tool_use", "text", "thinking", "text"}
+	if len(blockStarts) != len(expectedStarts) {
+		t.Fatalf("expected block starts %v, got %v", expectedStarts, blockStarts)
+	}
+	for i, want := range expectedStarts {
+		if blockStarts[i] != want {
+			t.Fatalf("block %d type = %q, want %q", i, blockStarts[i], want)
+		}
+	}
+
+	// Verify text and thinking contents
+	var textDeltas []string
+	var thinkingDeltas []string
+	var toolDelta string
+	for _, e := range events {
+		if e.Type == "content_block_delta" {
+			dt := gjson.Get(e.Payload, "delta.type").String()
+			switch dt {
+			case "text_delta":
+				textDeltas = append(textDeltas, gjson.Get(e.Payload, "delta.text").String())
+			case "thinking_delta":
+				thinkingDeltas = append(thinkingDeltas, gjson.Get(e.Payload, "delta.thinking").String())
+			case "input_json_delta":
+				toolDelta = gjson.Get(e.Payload, "delta.partial_json").String()
+			}
+		}
+	}
+
+	if gotCmd := gjson.Get(toolDelta, "command").String(); gotCmd != "pwd" {
+		t.Fatalf("tool command = %q, want 'pwd'", gotCmd)
+	}
+	if len(textDeltas) != 2 || textDeltas[0] != "Note A: running check" || textDeltas[1] != "Note B: done" {
+		t.Fatalf("unexpected text deltas: %v", textDeltas)
+	}
+	if len(thinkingDeltas) != 1 || thinkingDeltas[0] != "Thinking about safety" {
+		t.Fatalf("unexpected thinking deltas: %v", thinkingDeltas)
 	}
 }
