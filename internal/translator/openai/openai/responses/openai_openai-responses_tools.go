@@ -36,14 +36,20 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 			return
 		}
 		var custom bool
-		switch strings.TrimSpace(tool.Get("type").String()) {
+		toolType := strings.TrimSpace(tool.Get("type").String())
+		switch toolType {
 		case "", "function":
 		case "custom":
 			custom = true
+		case "shell", "local_shell", "apply_patch":
+			// Built-in typed tools carry no "name" field; their type is the name.
 		default:
 			return
 		}
 		localName := responsesToolName(tool)
+		if localName == "" && toolType != "" && toolType != "function" && toolType != "custom" {
+			localName = toolType
+		}
 		if localName == "" {
 			return
 		}
