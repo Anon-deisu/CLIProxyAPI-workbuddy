@@ -26,7 +26,8 @@ import (
 // providers that require a browser-like TLS and HTTP/2 transport. Each request
 // gets a dedicated connection that is closed with the response body.
 type utlsRoundTripper struct {
-	dialer proxy.Dialer
+	dialer     proxy.Dialer
+	codexHTTP2 bool
 }
 
 type closeConnectionBody struct {
@@ -55,6 +56,14 @@ func (b *closeConnectionBody) Close() error {
 }
 
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+	return newUtlsRoundTripperWithProfile(proxyURL, false)
+}
+
+func newCodexUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
+	return newUtlsRoundTripperWithProfile(proxyURL, true)
+}
+
+func newUtlsRoundTripperWithProfile(proxyURL string, codexHTTP2 bool) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
 	if proxyURL != "" {
 		proxyDialer, mode, errBuild := proxyutil.BuildDialer(proxyURL)
@@ -64,7 +73,7 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 			dialer = proxyDialer
 		}
 	}
-	return &utlsRoundTripper{dialer: dialer}
+	return &utlsRoundTripper{dialer: dialer, codexHTTP2: codexHTTP2}
 }
 
 func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr string) (*http2.ClientConn, error) {
@@ -91,6 +100,9 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 	}
 
 	tr := &http2.Transport{}
+	if t.codexHTTP2 {
+		tr = codexHTTP2Transport()
+	}
 	h2Conn, errClientConn := tr.NewClientConn(tlsConn)
 	if errClientConn != nil {
 		if errClose := tlsConn.Close(); errClose != nil {
@@ -100,6 +112,15 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 	}
 
 	return h2Conn, nil
+}
+
+func codexHTTP2Transport() *http2.Transport {
+	return &http2.Transport{
+		MaxReadFrameSize:          16384,
+		MaxHeaderListSize:         16384,
+		MaxDecoderHeaderTableSize: 4096,
+		MaxEncoderHeaderTableSize: 4096,
+	}
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -367,6 +388,15 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // for Anthropic and a Chrome profile for ChatGPT, with a standard-transport
 // fallback for other hosts.
 func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	return newUtlsHTTPClient(ctx, cfg, auth, timeout, false)
+}
+
+// NewCodexHTTPClient creates an HTTP client using the Codex-specific TLS and HTTP/2 profile.
+func NewCodexHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	return newUtlsHTTPClient(ctx, cfg, auth, timeout, true)
+}
+
+func newUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, codex bool) *http.Client {
 	var proxyURL string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
@@ -381,6 +411,9 @@ func NewUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyau
 	}
 
 	var chromeRT http.RoundTripper = newUtlsRoundTripper(proxyURL)
+	if codex {
+		chromeRT = newCodexUtlsRoundTripper(proxyURL)
+	}
 	var anthropicRT http.RoundTripper = cachedClaudeCodeRoundTripper(proxyURL)
 	var standardTransport http.RoundTripper = http.DefaultTransport
 	if proxyURL != "" {

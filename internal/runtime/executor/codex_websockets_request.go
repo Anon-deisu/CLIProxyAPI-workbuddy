@@ -128,7 +128,14 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs, ginHeaders)
-	applyCodexCloakingHeaders(headers, cfg)
+	applyCodexCloakingHeaders(headers, cfg, auth)
+	if !isAPIKey {
+		if hint := effectiveCodexRoutingHint(cfg); hint != "" {
+			headers.Set("x-codex-routing-hint", hint)
+		} else {
+			headers.Del("x-codex-routing-hint")
+		}
+	}
 
 	return headers
 }

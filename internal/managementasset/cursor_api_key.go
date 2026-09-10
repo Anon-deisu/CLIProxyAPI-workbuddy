@@ -470,6 +470,16 @@ const runtimeSchedulerInlineScript = `
     fingerprintConvergence.title = '仅 Codex OAuth/SetupToken 生效，每个账号固定使用独立身份';
     fingerprintLabel.appendChild(fingerprintConvergence);
     fingerprintLabel.appendChild(document.createTextNode('Codex 账号指纹收敛'));
+    var routingLabel = make('label', 'cpa-runtime-scheduler-number');
+    routingLabel.appendChild(document.createTextNode('Codex 路由提示'));
+    var routingHint = document.createElement('select');
+    [['europe', '欧洲'], ['north-america', '北美'], ['asia-pacific', '亚太'], ['', '关闭']].forEach(function (option) {
+      var item = document.createElement('option');
+      item.value = option[0];
+      item.textContent = option[1];
+      routingHint.appendChild(item);
+    });
+    routingLabel.appendChild(routingHint);
     var save = make('button', 'cpa-runtime-scheduler-save', '应用');
     save.type = 'button';
     save.disabled = true;
@@ -481,6 +491,7 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(unauthorizedLabel);
     form.appendChild(quotaLabel);
     form.appendChild(fingerprintLabel);
+    form.appendChild(routingLabel);
     form.appendChild(save);
     form.appendChild(status);
     var statusTitle = make('div', 'cpa-runtime-scheduler-subtitle', '账号状态');
@@ -493,13 +504,82 @@ const runtimeSchedulerInlineScript = `
     document.body.appendChild(toggle);
     document.body.appendChild(panel);
 
+    var savedPosition = null;
+    try { savedPosition = JSON.parse(localStorage.getItem('cpa-runtime-scheduler-position') || 'null'); } catch (_) {}
+    if (savedPosition && typeof savedPosition.left === 'number' && typeof savedPosition.top === 'number') {
+      panel.style.left = Math.max(8, Math.min(window.innerWidth - 360, savedPosition.left)) + 'px';
+      panel.style.top = Math.max(8, Math.min(window.innerHeight - 120, savedPosition.top)) + 'px';
+      panel.style.right = 'auto'; panel.style.bottom = 'auto';
+    }
+    function overlaps(first, second, padding) {
+      return first.left < second.right + padding && first.right > second.left - padding && first.top < second.bottom + padding && first.bottom > second.top - padding;
+    }
+    function setPanelPosition(left, top) {
+      var rect = panel.getBoundingClientRect();
+      left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, left));
+      top = Math.max(8, Math.min(window.innerHeight - rect.height - 8, top));
+      panel.style.left = left + 'px'; panel.style.top = top + 'px';
+      panel.style.right = 'auto'; panel.style.bottom = 'auto';
+    }
+    function avoidManagementSaveButton() {
+      if (panel.hidden) return;
+      var panelRect = panel.getBoundingClientRect();
+      var buttons = document.querySelectorAll('button,[role="button"]');
+      for (var i = 0; i < buttons.length; i += 1) {
+        var button = buttons[i];
+        if (button === toggle || panel.contains(button)) continue;
+        var text = (button.textContent || '').trim().toLowerCase();
+        if (!text || (text.indexOf('保存') < 0 && text.indexOf('save') < 0)) continue;
+        var buttonRect = button.getBoundingClientRect();
+        if (buttonRect.width === 0 || buttonRect.height === 0 || !overlaps(panelRect, buttonRect, 0)) continue;
+        var candidates = [
+          [buttonRect.right + 12, buttonRect.top],
+          [buttonRect.left - panelRect.width - 12, buttonRect.top],
+          [buttonRect.left, buttonRect.top - panelRect.height - 12],
+          [buttonRect.left, buttonRect.bottom + 12],
+          [8, 8]
+        ];
+        for (var j = 0; j < candidates.length; j += 1) {
+          setPanelPosition(candidates[j][0], candidates[j][1]);
+          panelRect = panel.getBoundingClientRect();
+          if (!overlaps(panelRect, buttonRect, 8)) {
+            localStorage.setItem('cpa-runtime-scheduler-position', JSON.stringify({left: panelRect.left, top: panelRect.top}));
+            return;
+          }
+        }
+      }
+    }
+    title.style.cursor = 'move';
+    title.addEventListener('pointerdown', function (event) {
+      var rect = panel.getBoundingClientRect();
+      var offsetX = event.clientX - rect.left, offsetY = event.clientY - rect.top;
+      function move(moveEvent) {
+        var left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, moveEvent.clientX - offsetX));
+        var top = Math.max(8, Math.min(window.innerHeight - rect.height - 8, moveEvent.clientY - offsetY));
+        panel.style.left = left + 'px'; panel.style.top = top + 'px';
+        panel.style.right = 'auto'; panel.style.bottom = 'auto';
+      }
+      function stop() {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', stop);
+        avoidManagementSaveButton();
+        var saved = panel.getBoundingClientRect();
+        localStorage.setItem('cpa-runtime-scheduler-position', JSON.stringify({left: saved.left, top: saved.top}));
+      }
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', stop, { once: true });
+      event.preventDefault();
+    });
+
     toggle.addEventListener('click', function () {
       panel.hidden = !panel.hidden;
       if (!panel.hidden) {
+        setTimeout(avoidManagementSaveButton, 0);
         loadSettings();
         loadAuthStatus();
       }
     });
+    window.addEventListener('resize', avoidManagementSaveButton);
 
     function loadSettings() {
       save.disabled = true;
@@ -512,6 +592,7 @@ const runtimeSchedulerInlineScript = `
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
+        routingHint.value = data['codex-routing-hint'] == null ? 'europe' : String(data['codex-routing-hint']);
         status.textContent = '';
         save.disabled = false;
       }).catch(function () {
@@ -549,7 +630,8 @@ const runtimeSchedulerInlineScript = `
         'auth-concurrency-limit': Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0)),
         'auto-disable-unauthorized': unauthorized.checked,
         'auto-disable-quota': quota.checked,
-        'codex-fingerprint-convergence': fingerprintConvergence.checked
+        'codex-fingerprint-convergence': fingerprintConvergence.checked,
+        'codex-routing-hint': routingHint.value
       }).then(function () {
         status.textContent = '已应用';
       }).catch(function () {
@@ -564,7 +646,7 @@ const runtimeSchedulerInlineScript = `
 
   var style = document.createElement('style');
   style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
-    '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:340px;max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
+     '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:min(340px,calc(100vw - 16px));max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
      '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
   document.documentElement.appendChild(style);

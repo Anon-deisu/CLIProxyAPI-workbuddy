@@ -18,7 +18,7 @@ func (cfg *Config) CloneForRuntime() *Config {
 }
 
 // CloneForReload returns an independent runtime snapshot, inheriting only missing
-// AuthConcurrencyLimit and CodexFingerprintConvergence values from previous.
+// AuthConcurrencyLimit, CodexFingerprintConvergence, and CodexRoutingHint values from previous.
 func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if cfg == nil {
 		return nil
@@ -34,6 +34,10 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if cloned.Routing.CodexFingerprintConvergence == nil && previous.Routing.CodexFingerprintConvergence != nil {
 		value := *previous.Routing.CodexFingerprintConvergence
 		cloned.Routing.CodexFingerprintConvergence = &value
+	}
+	if cloned.Routing.CodexRoutingHint == nil && previous.Routing.CodexRoutingHint != nil {
+		value := *previous.Routing.CodexRoutingHint
+		cloned.Routing.CodexRoutingHint = &value
 	}
 	return cloned
 }

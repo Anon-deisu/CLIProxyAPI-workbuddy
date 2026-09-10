@@ -272,6 +272,9 @@ type RoutingConfig struct {
 	// OAuth/SetupToken identity convergence. Nil retains the current setting across
 	// config reloads; false explicitly restores native request identity behavior.
 	CodexFingerprintConvergence *bool `yaml:"-" json:"codex-fingerprint-convergence,omitempty"`
+	// CodexRoutingHint is a runtime-only upstream routing hint for Codex OAuth requests.
+	// An empty value disables the hint; omitted values use the default "europe" hint.
+	CodexRoutingHint *string `yaml:"-" json:"codex-routing-hint,omitempty"`
 
 	// C2AMaxRetryCount overrides the global request-retry count for the Codex2API
 	// default scheduler. It is runtime-only; nil inherits the global setting.
