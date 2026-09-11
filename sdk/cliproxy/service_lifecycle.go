@@ -84,6 +84,13 @@ func (s *Service) Run(ctx context.Context) error {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
 		}
+		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
+			includeBaseline: true,
+			auths:           s.coreManager.List(),
+		})
+		interval := 15 * time.Minute
+		s.coreManager.StartAutoRefresh(ctx, interval)
+		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
 
 	if !homeEnabled {
