@@ -346,6 +346,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	c2aRetryInterval := 0
 	authConcurrencyLimit := 0
 	codexFingerprintConvergence := false
+	codexRoutingHint := "europe"
 	if cfg != nil {
 		c2aRetryCount = cfg.RequestRetry
 		c2aRetryInterval = cfg.MaxRetryInterval
@@ -354,6 +355,9 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		}
 		if cfg.Routing.CodexFingerprintConvergence != nil {
 			codexFingerprintConvergence = *cfg.Routing.CodexFingerprintConvergence
+		}
+		if cfg.Routing.CodexRoutingHint != nil {
+			codexRoutingHint = strings.TrimSpace(*cfg.Routing.CodexRoutingHint)
 		}
 		if cfg.Routing.C2AMaxRetryCount != nil {
 			c2aRetryCount = *cfg.Routing.C2AMaxRetryCount
@@ -372,6 +376,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"c2a-max-retry-interval":        c2aRetryInterval,
 		"auth-concurrency-limit":        authConcurrencyLimit,
 		"codex-fingerprint-convergence": codexFingerprintConvergence,
+		"codex-routing-hint":            codexRoutingHint,
 		"runtime_only":                  true,
 	})
 }
@@ -387,6 +392,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		C2AMaxRetryInterval         *int    `json:"c2a-max-retry-interval"`
 		AuthConcurrencyLimit        *int    `json:"auth-concurrency-limit"`
 		CodexFingerprintConvergence *bool   `json:"codex-fingerprint-convergence"`
+		CodexRoutingHint            *string `json:"codex-routing-hint"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -417,7 +423,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth-concurrency-limit must be between 0 and 1000000"})
 		return
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil {
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexRoutingHint == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
@@ -455,6 +461,18 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		if body.CodexFingerprintConvergence != nil {
 			value := *body.CodexFingerprintConvergence
 			cfg.Routing.CodexFingerprintConvergence = &value
+		}
+		if body.CodexRoutingHint != nil {
+			value := strings.ToLower(strings.TrimSpace(*body.CodexRoutingHint))
+			switch value {
+			case "", "off", "none", "disabled", "europe", "north-america", "asia-pacific":
+				if value == "off" || value == "none" || value == "disabled" {
+					value = ""
+				}
+			default:
+				return fmt.Errorf("invalid codex-routing-hint")
+			}
+			cfg.Routing.CodexRoutingHint = &value
 		}
 		return nil
 	})

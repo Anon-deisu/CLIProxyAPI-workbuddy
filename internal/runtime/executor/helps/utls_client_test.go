@@ -151,6 +151,41 @@ func TestUtlsRoundTripperDialUsesRequestContext(t *testing.T) {
 	}
 }
 
+func TestCodexHTTP2TransportProfile(t *testing.T) {
+	transport := codexHTTP2Transport()
+	if transport.MaxReadFrameSize != 16384 {
+		t.Fatalf("MaxReadFrameSize = %d, want 16384", transport.MaxReadFrameSize)
+	}
+	if transport.MaxHeaderListSize != 16384 {
+		t.Fatalf("MaxHeaderListSize = %d, want 16384", transport.MaxHeaderListSize)
+	}
+	if transport.MaxDecoderHeaderTableSize != 4096 || transport.MaxEncoderHeaderTableSize != 4096 {
+		t.Fatalf("header table sizes = decoder %d encoder %d, want 4096/4096", transport.MaxDecoderHeaderTableSize, transport.MaxEncoderHeaderTableSize)
+	}
+}
+
+func TestCodexHTTP2ProfileIsScopedToCodexClient(t *testing.T) {
+	standardClient := NewUtlsHTTPClient(t.Context(), nil, nil, 0)
+	standardFallback, ok := standardClient.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("standard transport = %T, want fallbackRoundTripper", standardClient.Transport)
+	}
+	standardChrome, ok := standardFallback.chrome.(*utlsRoundTripper)
+	if !ok || standardChrome.codexHTTP2 {
+		t.Fatalf("standard Chrome transport = %#v, want non-Codex profile", standardFallback.chrome)
+	}
+
+	codexClient := NewCodexHTTPClient(t.Context(), nil, nil, 0)
+	codexFallback, ok := codexClient.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("Codex transport = %T, want fallbackRoundTripper", codexClient.Transport)
+	}
+	codexChrome, ok := codexFallback.chrome.(*utlsRoundTripper)
+	if !ok || !codexChrome.codexHTTP2 {
+		t.Fatalf("Codex Chrome transport = %#v, want Codex profile", codexFallback.chrome)
+	}
+}
+
 func TestUtlsRoundTripperHandshakeUsesRequestContext(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	t.Cleanup(func() {

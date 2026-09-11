@@ -1842,6 +1842,36 @@ func TestApplyCodexHeadersDefaultsToCodexCloaking(t *testing.T) {
 	}
 }
 
+func TestCodexOAuthPersonaAndRoutingHintAreStableAcrossHTTPAndWebsocket(t *testing.T) {
+	enabled := true
+	hint := "asia-pacific"
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: &enabled, CodexRoutingHint: &hint}}
+	auth := &cliproxyauth.Auth{
+		ID:         "runtime-auth-id",
+		Provider:   "codex",
+		Attributes: map[string]string{"auth_kind": cliproxyauth.AuthKindOAuth},
+		Metadata:   map[string]any{"account_id": "stable-account"},
+	}
+	req, errRequest := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
+	}
+	applyCodexHeadersFromSources(req, auth, "oauth-token", false, cfg, nil)
+	wsHeaders := applyCodexWebsocketHeaders(context.Background(), nil, auth, "oauth-token", cfg)
+	if req.Header.Get("User-Agent") == codexUserAgent {
+		t.Fatalf("HTTP request unexpectedly used legacy Codex User-Agent: %q", req.Header.Get("User-Agent"))
+	}
+	if req.Header.Get("User-Agent") != wsHeaders.Get("User-Agent") {
+		t.Fatalf("HTTP/WebSocket User-Agent mismatch: %q vs %q", req.Header.Get("User-Agent"), wsHeaders.Get("User-Agent"))
+	}
+	if req.Header.Get("Originator") != wsHeaders.Get("Originator") {
+		t.Fatalf("HTTP/WebSocket Originator mismatch: %q vs %q", req.Header.Get("Originator"), wsHeaders.Get("Originator"))
+	}
+	if req.Header.Get("x-codex-routing-hint") != hint || wsHeaders.Get("x-codex-routing-hint") != hint {
+		t.Fatalf("routing hint mismatch: HTTP=%q WebSocket=%q", req.Header.Get("x-codex-routing-hint"), wsHeaders.Get("x-codex-routing-hint"))
+	}
+}
+
 func TestApplyCodexHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeaders(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {

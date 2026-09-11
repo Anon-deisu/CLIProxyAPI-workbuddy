@@ -43,6 +43,18 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 
+// SanitizeCodexRoutingHint trims the runtime Codex routing hint.
+func (cfg *Config) SanitizeCodexRoutingHint() {
+	if cfg == nil || cfg.Routing.CodexRoutingHint == nil {
+		return
+	}
+	value := strings.ToLower(strings.TrimSpace(*cfg.Routing.CodexRoutingHint))
+	if value == "off" || value == "none" || value == "disabled" {
+		value = ""
+	}
+	cfg.Routing.CodexRoutingHint = &value
+}
+
 // SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
 // configured Claude fingerprint baseline values.
 func (cfg *Config) SanitizeClaudeHeaderDefaults() {

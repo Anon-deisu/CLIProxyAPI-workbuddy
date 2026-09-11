@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	"strings"
 
@@ -33,6 +34,48 @@ const (
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
+
+type codexPersona struct {
+	userAgent  string
+	originator string
+}
+
+var codexPersonas = []codexPersona{
+	{userAgent: "codex_cli_rs/0.154.0 (Ubuntu 24.04; x86_64) kitty", originator: "codex_cli_rs"},
+	{userAgent: "codex_cli_rs/0.154.0 (Fedora 41; x86_64) foot", originator: "codex_cli_rs"},
+	{userAgent: "codex_cli_rs/0.154.0 (Debian 12.7; x86_64) alacritty", originator: "codex_cli_rs"},
+	{userAgent: "codex_exec/0.154.0 (macOS 15.6; arm64) Terminal.app", originator: "codex_exec"},
+}
+
+func codexPersonaForAuth(auth *cliproxyauth.Auth) codexPersona {
+	if auth == nil {
+		return codexPersona{userAgent: codexUserAgent, originator: codexOriginator}
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"codex_fingerprint_seed", "account_id"} {
+			if value, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+				seed := strings.TrimSpace(value)
+				hash := fnv.New32a()
+				_, _ = hash.Write([]byte(seed))
+				return codexPersonas[hash.Sum32()%uint32(len(codexPersonas))]
+			}
+		}
+	}
+	seed := strings.TrimSpace(auth.ID)
+	if seed == "" {
+		return codexPersona{userAgent: codexUserAgent, originator: codexOriginator}
+	}
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(seed))
+	return codexPersonas[hash.Sum32()%uint32(len(codexPersonas))]
+}
+
+func effectiveCodexRoutingHint(cfg *config.Config) string {
+	if cfg == nil || cfg.Routing.CodexRoutingHint == nil {
+		return "europe"
+	}
+	return strings.TrimSpace(*cfg.Routing.CodexRoutingHint)
+}
 
 var dataTag = []byte("data:")
 
@@ -84,7 +127,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewCodexHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -416,11 +459,24 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
-	applyCodexCloakingHeaders(r.Header, cfg)
+	applyCodexCloakingHeaders(r.Header, cfg, auth)
+	if !isAPIKey {
+		if hint := effectiveCodexRoutingHint(cfg); hint != "" {
+			r.Header.Set("x-codex-routing-hint", hint)
+		} else {
+			r.Header.Del("x-codex-routing-hint")
+		}
+	}
 }
 
-func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
+func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config, auth *cliproxyauth.Auth) {
 	if headers == nil || cfg == nil || cfg.Codex.DisableCodexCloaking {
+		return
+	}
+	persona := codexPersonaForAuth(auth)
+	if codexFingerprintConvergenceEnabled(cfg, auth) && !codexAuthUsesAPIKey(auth) {
+		headers.Set("User-Agent", persona.userAgent)
+		headers.Set("Originator", persona.originator)
 		return
 	}
 	headers.Set("User-Agent", codexUserAgent)
