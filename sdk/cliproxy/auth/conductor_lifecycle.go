@@ -56,6 +56,21 @@ func (m *Manager) SetC2ARetryConfig(maxRetryCount *int, maxRetryInterval *time.D
 	m.c2aMaxRetryInterval.Store(interval)
 }
 
+// SetC2AMaxRetryCredentials updates the runtime-only credential limit for the Codex2API default scheduler.
+func (m *Manager) SetC2AMaxRetryCredentials(value *int) {
+	if m == nil {
+		return
+	}
+	limit := int32(-1)
+	if value != nil {
+		limit = int32(*value)
+		if limit < 0 {
+			limit = 0
+		}
+	}
+	m.c2aMaxRetryCredentials.Store(limit)
+}
+
 // RegisterExecutor registers a provider executor with the manager.
 func (m *Manager) RegisterExecutor(executor ProviderExecutor) {
 	if executor == nil {

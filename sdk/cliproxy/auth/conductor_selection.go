@@ -939,6 +939,9 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 		if override := m.c2aMaxRetryInterval.Load(); override >= 0 {
 			maxWait = time.Duration(override)
 		}
+		if override := m.c2aMaxRetryCredentials.Load(); override >= 0 {
+			maxRetryCredentials = int(override)
+		}
 	}
 	return retry, maxRetryCredentials, maxWait
 }

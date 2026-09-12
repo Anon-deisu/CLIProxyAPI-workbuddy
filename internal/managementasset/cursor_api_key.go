@@ -445,6 +445,15 @@ const runtimeSchedulerInlineScript = `
     c2aRetryInterval.max = '1000000';
     c2aRetryInterval.step = '1';
     c2aRetryIntervalLabel.appendChild(c2aRetryInterval);
+    var c2aRetryCredentialsLabel = make('label', 'cpa-runtime-scheduler-number');
+    c2aRetryCredentialsLabel.appendChild(document.createTextNode('C2A 每轮最大账号数'));
+    var c2aRetryCredentials = document.createElement('input');
+    c2aRetryCredentials.type = 'number';
+    c2aRetryCredentials.min = '0';
+    c2aRetryCredentials.max = '1000000';
+    c2aRetryCredentials.step = '1';
+    c2aRetryCredentials.title = '0 表示每轮尝试所有可用账号';
+    c2aRetryCredentialsLabel.appendChild(c2aRetryCredentials);
     var concurrencyLabel = make('label', 'cpa-runtime-scheduler-number');
     concurrencyLabel.appendChild(document.createTextNode('所有账号最大并发数'));
     var concurrency = document.createElement('input');
@@ -487,6 +496,7 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(strategyLabel);
     form.appendChild(c2aRetryCountLabel);
     form.appendChild(c2aRetryIntervalLabel);
+    form.appendChild(c2aRetryCredentialsLabel);
     form.appendChild(concurrencyLabel);
     form.appendChild(unauthorizedLabel);
     form.appendChild(quotaLabel);
@@ -503,6 +513,41 @@ const runtimeSchedulerInlineScript = `
     panel.appendChild(statusList);
     document.body.appendChild(toggle);
     document.body.appendChild(panel);
+
+    var savedTogglePosition = null;
+    try { savedTogglePosition = JSON.parse(localStorage.getItem('cpa-runtime-scheduler-toggle-position') || 'null'); } catch (_) {}
+    if (savedTogglePosition && typeof savedTogglePosition.left === 'number' && typeof savedTogglePosition.top === 'number') {
+      toggle.style.left = Math.max(8, Math.min(window.innerWidth - 160, savedTogglePosition.left)) + 'px';
+      toggle.style.top = Math.max(8, Math.min(window.innerHeight - 56, savedTogglePosition.top)) + 'px';
+      toggle.style.right = 'auto'; toggle.style.bottom = 'auto';
+    }
+    var suppressToggleClick = false;
+    toggle.addEventListener('pointerdown', function (event) {
+      var rect = toggle.getBoundingClientRect();
+      var startX = event.clientX, startY = event.clientY;
+      var originLeft = rect.left, originTop = rect.top;
+      var moved = false;
+      function move(moveEvent) {
+        var dx = moveEvent.clientX - startX, dy = moveEvent.clientY - startY;
+        if (!moved && Math.sqrt(dx * dx + dy * dy) < 4) return;
+        moved = true;
+        suppressToggleClick = true;
+        var left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, originLeft + dx));
+        var top = Math.max(8, Math.min(window.innerHeight - rect.height - 8, originTop + dy));
+        toggle.style.left = left + 'px'; toggle.style.top = top + 'px';
+        toggle.style.right = 'auto'; toggle.style.bottom = 'auto';
+      }
+      function stop() {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', stop);
+        if (moved) {
+          var saved = toggle.getBoundingClientRect();
+          localStorage.setItem('cpa-runtime-scheduler-toggle-position', JSON.stringify({left: saved.left, top: saved.top}));
+        }
+      }
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', stop, { once: true });
+    });
 
     var savedPosition = null;
     try { savedPosition = JSON.parse(localStorage.getItem('cpa-runtime-scheduler-position') || 'null'); } catch (_) {}
@@ -572,6 +617,10 @@ const runtimeSchedulerInlineScript = `
     });
 
     toggle.addEventListener('click', function () {
+      if (suppressToggleClick) {
+        suppressToggleClick = false;
+        return;
+      }
       panel.hidden = !panel.hidden;
       if (!panel.hidden) {
         setTimeout(avoidManagementSaveButton, 0);
@@ -588,6 +637,7 @@ const runtimeSchedulerInlineScript = `
       }).then(function (data) {
         c2aRetryCount.value = String(data['c2a-max-retry-count'] == null ? 0 : data['c2a-max-retry-count']);
         c2aRetryInterval.value = String(data['c2a-max-retry-interval'] == null ? 0 : data['c2a-max-retry-interval']);
+        c2aRetryCredentials.value = String(data['c2a-max-retry-credentials'] == null ? 0 : data['c2a-max-retry-credentials']);
         concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
@@ -626,7 +676,8 @@ const runtimeSchedulerInlineScript = `
       status.textContent = '应用中...';
       request('PATCH', 'routing/settings', {
         'c2a-max-retry-count': Math.max(0, Math.min(1000000, parseInt(c2aRetryCount.value || '0', 10) || 0)),
-        'c2a-max-retry-interval': Math.max(0, Math.min(1000000, parseInt(c2aRetryInterval.value || '0', 10) || 0)),
+         'c2a-max-retry-interval': Math.max(0, Math.min(1000000, parseInt(c2aRetryInterval.value || '0', 10) || 0)),
+         'c2a-max-retry-credentials': Math.max(0, Math.min(1000000, parseInt(c2aRetryCredentials.value || '0', 10) || 0)),
         'auth-concurrency-limit': Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0)),
         'auto-disable-unauthorized': unauthorized.checked,
         'auto-disable-quota': quota.checked,
@@ -645,9 +696,9 @@ const runtimeSchedulerInlineScript = `
   }
 
   var style = document.createElement('style');
-  style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
+   style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:grab;touch-action:none;user-select:none;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
      '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:min(340px,calc(100vw - 16px));max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
-     '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
+     '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {

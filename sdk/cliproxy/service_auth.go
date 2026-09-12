@@ -366,6 +366,7 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 		c2aInterval = &interval
 	}
 	s.coreManager.SetC2ARetryConfig(cfg.Routing.C2AMaxRetryCount, c2aInterval)
+	s.coreManager.SetC2AMaxRetryCredentials(cfg.Routing.C2AMaxRetryCredentials)
 	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 }
 

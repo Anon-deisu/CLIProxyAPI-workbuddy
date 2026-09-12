@@ -282,6 +282,9 @@ type RoutingConfig struct {
 	// C2AMaxRetryInterval overrides the global max-retry-interval in seconds for
 	// the Codex2API default scheduler. It is runtime-only; nil inherits globally.
 	C2AMaxRetryInterval *int `yaml:"-" json:"c2a-max-retry-interval,omitempty"`
+	// C2AMaxRetryCredentials overrides the global per-round credential limit for
+	// the Codex2API default scheduler. Zero keeps the all-credentials behavior.
+	C2AMaxRetryCredentials *int `yaml:"-" json:"c2a-max-retry-credentials,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,

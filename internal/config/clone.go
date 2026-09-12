@@ -18,7 +18,7 @@ func (cfg *Config) CloneForRuntime() *Config {
 }
 
 // CloneForReload returns an independent runtime snapshot, inheriting only missing
-// AuthConcurrencyLimit, CodexFingerprintConvergence, and CodexRoutingHint values from previous.
+// AuthConcurrencyLimit, CodexFingerprintConvergence, CodexRoutingHint, and C2A retry values from previous.
 func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if cfg == nil {
 		return nil
@@ -38,6 +38,18 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if cloned.Routing.CodexRoutingHint == nil && previous.Routing.CodexRoutingHint != nil {
 		value := *previous.Routing.CodexRoutingHint
 		cloned.Routing.CodexRoutingHint = &value
+	}
+	if cloned.Routing.C2AMaxRetryCount == nil && previous.Routing.C2AMaxRetryCount != nil {
+		value := *previous.Routing.C2AMaxRetryCount
+		cloned.Routing.C2AMaxRetryCount = &value
+	}
+	if cloned.Routing.C2AMaxRetryInterval == nil && previous.Routing.C2AMaxRetryInterval != nil {
+		value := *previous.Routing.C2AMaxRetryInterval
+		cloned.Routing.C2AMaxRetryInterval = &value
+	}
+	if cloned.Routing.C2AMaxRetryCredentials == nil && previous.Routing.C2AMaxRetryCredentials != nil {
+		value := *previous.Routing.C2AMaxRetryCredentials
+		cloned.Routing.C2AMaxRetryCredentials = &value
 	}
 	return cloned
 }

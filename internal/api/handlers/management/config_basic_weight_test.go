@@ -307,7 +307,7 @@ func TestPutRoutingSettingsUpdatesC2ARetryOverridesInMemory(t *testing.T) {
 	h := NewHandlerWithoutConfigFilePath(cfg, nil)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"c2a-max-retry-count":5,"c2a-max-retry-interval":7}`))
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"c2a-max-retry-count":5,"c2a-max-retry-interval":7,"c2a-max-retry-credentials":1}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	h.PutRoutingSettings(ctx)
@@ -320,6 +320,9 @@ func TestPutRoutingSettingsUpdatesC2ARetryOverridesInMemory(t *testing.T) {
 	}
 	if cfg.Routing.C2AMaxRetryInterval == nil || *cfg.Routing.C2AMaxRetryInterval != 7 {
 		t.Fatalf("c2a max retry interval = %v, want 7", cfg.Routing.C2AMaxRetryInterval)
+	}
+	if cfg.Routing.C2AMaxRetryCredentials == nil || *cfg.Routing.C2AMaxRetryCredentials != 1 {
+		t.Fatalf("c2a max retry credentials = %v, want 1", cfg.Routing.C2AMaxRetryCredentials)
 	}
 	if cfg.RequestRetry != 2 || cfg.MaxRetryInterval != 30 {
 		t.Fatalf("global retry settings changed: request=%d interval=%d", cfg.RequestRetry, cfg.MaxRetryInterval)

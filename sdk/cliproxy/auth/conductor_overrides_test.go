@@ -24,6 +24,8 @@ func TestManagerC2ARetrySettingsOverrideOnlyCodex2APIDefault(t *testing.T) {
 	count := 5
 	interval := 7 * time.Second
 	manager.SetC2ARetryConfig(&count, &interval)
+	credentials := 2
+	manager.SetC2AMaxRetryCredentials(&credentials)
 
 	retry, maxCredentials, maxWait := manager.retrySettings()
 	if retry != 3 || maxCredentials != 4 || maxWait != 30*time.Second {
@@ -32,8 +34,8 @@ func TestManagerC2ARetrySettingsOverrideOnlyCodex2APIDefault(t *testing.T) {
 
 	manager.SetSelector(&Codex2APIDefaultSelector{})
 	retry, maxCredentials, maxWait = manager.retrySettings()
-	if retry != count || maxCredentials != 4 || maxWait != interval {
-		t.Fatalf("C2A retry settings = (%d, %d, %s), want (%d, 4, %s)", retry, maxCredentials, maxWait, count, interval)
+	if retry != count || maxCredentials != credentials || maxWait != interval {
+		t.Fatalf("C2A retry settings = (%d, %d, %s), want (%d, %d, %s)", retry, maxCredentials, maxWait, count, credentials, interval)
 	}
 
 	manager.SetSelector(NewSessionAffinitySelector(&Codex2APIDefaultSelector{}))
@@ -43,9 +45,10 @@ func TestManagerC2ARetrySettingsOverrideOnlyCodex2APIDefault(t *testing.T) {
 	}
 
 	manager.SetC2ARetryConfig(nil, nil)
-	retry, _, maxWait = manager.retrySettings()
-	if retry != 3 || maxWait != 30*time.Second {
-		t.Fatalf("cleared C2A retry settings = (%d, %s), want (3, 30s)", retry, maxWait)
+	manager.SetC2AMaxRetryCredentials(nil)
+	retry, maxCredentials, maxWait = manager.retrySettings()
+	if retry != 3 || maxCredentials != 4 || maxWait != 30*time.Second {
+		t.Fatalf("cleared C2A retry settings = (%d, %d, %s), want (3, 4, 30s)", retry, maxCredentials, maxWait)
 	}
 }
 
