@@ -13,3 +13,7 @@ func NewCodexExecutor(cfg *config.Config) *CodexExecutor {
 }
 
 func (e *CodexExecutor) Identifier() string { return "codex" }
+
+func (e *CodexExecutor) modelLevelCooling() bool {
+	return e != nil && e.cfg != nil && e.cfg.Codex.ModelLevelCooling
+}
