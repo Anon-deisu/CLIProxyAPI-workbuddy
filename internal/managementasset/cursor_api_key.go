@@ -473,6 +473,12 @@ const runtimeSchedulerInlineScript = `
     quota.type = 'checkbox';
     quotaLabel.appendChild(quota);
     quotaLabel.appendChild(document.createTextNode('额度用尽自动停用账号'));
+    var disableCoolingLabel = make('label', 'cpa-runtime-scheduler-check');
+    var disableCooling = document.createElement('input');
+    disableCooling.type = 'checkbox';
+    disableCooling.title = '所有账号忽略账号和模型的错误冷却，等同于 disable_cooling=true';
+    disableCoolingLabel.appendChild(disableCooling);
+    disableCoolingLabel.appendChild(document.createTextNode('无视指数冷却'));
     var fingerprintLabel = make('label', 'cpa-runtime-scheduler-check');
     var fingerprintConvergence = document.createElement('input');
     fingerprintConvergence.type = 'checkbox';
@@ -500,6 +506,7 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(concurrencyLabel);
     form.appendChild(unauthorizedLabel);
     form.appendChild(quotaLabel);
+    form.appendChild(disableCoolingLabel);
     form.appendChild(fingerprintLabel);
     form.appendChild(routingLabel);
     form.appendChild(save);
@@ -641,6 +648,7 @@ const runtimeSchedulerInlineScript = `
         concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
+        disableCooling.checked = !!data['disable-cooling'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
         routingHint.value = data['codex-routing-hint'] == null ? 'europe' : String(data['codex-routing-hint']);
         status.textContent = '';
@@ -680,7 +688,8 @@ const runtimeSchedulerInlineScript = `
          'c2a-max-retry-credentials': Math.max(0, Math.min(1000000, parseInt(c2aRetryCredentials.value || '0', 10) || 0)),
         'auth-concurrency-limit': Math.max(0, Math.min(1000000, parseInt(concurrency.value || '0', 10) || 0)),
         'auto-disable-unauthorized': unauthorized.checked,
-        'auto-disable-quota': quota.checked,
+         'auto-disable-quota': quota.checked,
+         'disable-cooling': disableCooling.checked,
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
         'codex-routing-hint': routingHint.value
       }).then(function () {

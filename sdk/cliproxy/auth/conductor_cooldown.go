@@ -57,6 +57,9 @@ func quotaCooldownDisabledForAuthWithConfig(auth *Auth, cfg *internalconfig.Conf
 	if cfg != nil && cfg.Home.Enabled {
 		return true
 	}
+	if cfg != nil && cfg.Routing.DisableCooling != nil && *cfg.Routing.DisableCooling {
+		return true
+	}
 	if auth != nil {
 		if override, ok := auth.DisableCoolingOverride(); ok {
 			return override

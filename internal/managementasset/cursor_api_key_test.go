@@ -109,6 +109,8 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("c2a-max-retry-count"),
 		[]byte("c2a-max-retry-interval"),
 		[]byte("c2a-max-retry-credentials"),
+		[]byte("disable-cooling"),
+		[]byte("无视指数冷却"),
 		[]byte("auth-concurrency-limit"),
 		[]byte("codex-fingerprint-convergence"),
 		[]byte("codex-routing-hint"),

@@ -39,6 +39,10 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 		value := *previous.Routing.CodexRoutingHint
 		cloned.Routing.CodexRoutingHint = &value
 	}
+	if cloned.Routing.DisableCooling == nil && previous.Routing.DisableCooling != nil {
+		value := *previous.Routing.DisableCooling
+		cloned.Routing.DisableCooling = &value
+	}
 	if cloned.Routing.C2AMaxRetryCount == nil && previous.Routing.C2AMaxRetryCount != nil {
 		value := *previous.Routing.C2AMaxRetryCount
 		cloned.Routing.C2AMaxRetryCount = &value

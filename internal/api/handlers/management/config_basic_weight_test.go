@@ -75,6 +75,20 @@ func TestPutRoutingSettingsUpdatesCodexRoutingHint(t *testing.T) {
 	}
 }
 
+func TestPutRoutingSettingsUpdatesDisableCooling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{}
+	h := NewHandlerWithoutConfigFilePath(cfg, nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"disable-cooling":true}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.PutRoutingSettings(ctx)
+	if recorder.Code != http.StatusOK || cfg.Routing.DisableCooling == nil || !*cfg.Routing.DisableCooling {
+		t.Fatalf("status = %d, body=%s, routing = %+v", recorder.Code, recorder.Body.String(), cfg.Routing)
+	}
+}
+
 func TestPutRoutingSettingsCanDisableCodexFingerprintConvergence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	enabled := true

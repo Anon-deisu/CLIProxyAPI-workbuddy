@@ -365,6 +365,39 @@ func TestCodexFingerprintConvergencePreservesExplicitCacheKeysAndPayload(t *test
 	}
 }
 
+func TestCodexFingerprintConvergencePreservesUserPromptCacheSession(t *testing.T) {
+	enabled := true
+	executor := &CodexExecutor{cfg: &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: &enabled}}}
+	auth := &cliproxyauth.Auth{
+		ID:       "cache-preserving-auth",
+		Provider: "codex",
+		Metadata: map[string]any{"access_token": "test-token"},
+	}
+	clientBody := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"user-cache-key","client_metadata":{"session_id":"user-cache-key","thread_id":"user-thread"}}`)
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: clientBody}
+	httpReq, body, state, err := executor.cacheHelper(context.Background(), sdktranslator.FormatOpenAIResponse, "https://example.test/responses", auth, req, clientBody, clientBody)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+	applyCodexHeaders(httpReq, auth, "oauth-token", true, executor.cfg)
+	applyCodexIdentityConfuseHeaders(httpReq.Header, &state)
+	if !state.convergence {
+		t.Fatal("expected Codex fingerprint convergence")
+	}
+	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "user-cache-key" {
+		t.Fatalf("prompt_cache_key = %q, want user-cache-key", got)
+	}
+	if got := httpReq.Header.Get("Session-Id"); got != "user-cache-key" {
+		t.Fatalf("Session-Id = %q, want user-cache-key", got)
+	}
+	if got := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); got == "" {
+		t.Fatal("missing account-scoped installation identity")
+	}
+	if got := gjson.GetBytes(body, "client_metadata.session_id").String(); got == "user-cache-key" || got == "" {
+		t.Fatalf("account fingerprint session_id = %q, want stable non-user identity", got)
+	}
+}
+
 func TestCodexFingerprintConvergenceSkipsNonResponseEndpoints(t *testing.T) {
 	e := NewCodexExecutor(&config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: new(true)}})
 	auth := &cliproxyauth.Auth{ID: "fingerprint-endpoints", Provider: "codex", Metadata: map[string]any{"access_token": "test-token"}}

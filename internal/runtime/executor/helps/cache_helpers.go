@@ -174,24 +174,16 @@ func (f *CodexFingerprint) TurnMetadata(raw string) string {
 	raw, _ = sjson.Set(raw, "turn_id", f.TurnID)
 	raw, _ = sjson.Set(raw, "window_id", f.SessionID+":0")
 	raw, _ = sjson.Set(raw, "turn_started_at_unix_ms", f.StartedAt)
-	if f.originalPromptCacheKey != "" && gjson.Get(raw, "prompt_cache_key").String() == f.originalPromptCacheKey {
-		raw, _ = sjson.Set(raw, "prompt_cache_key", f.SessionID)
-	}
 	return raw
 }
 
-// ApplyBody changes only client_metadata and a cache key proven to be the
-// client's default session ID. It never decodes or copies the full input tree.
+// ApplyBody changes only client metadata. Explicit prompt cache keys remain
+// client-owned so upstream prompt caching survives account fingerprint convergence.
+// It never decodes or copies the full input tree.
 func (f *CodexFingerprint) ApplyBody(body []byte) []byte {
 	root := util.ParseGJSONBytesNoCopy(body)
 	metadata := root.Get("client_metadata")
 	f.originalMetadata = metadata.Raw
-	clientSession := metadata.Get("session_id")
-	cacheKey := root.Get("prompt_cache_key")
-	if clientSession.Type == gjson.String && clientSession.String() != "" && cacheKey.Type == gjson.String && cacheKey.String() == clientSession.String() {
-		f.originalPromptCacheKey = cacheKey.String()
-		body = SetStringIfDifferent(body, "prompt_cache_key", f.SessionID)
-	}
 	raw := metadata.Raw
 	if !metadata.IsObject() {
 		raw = "{}"

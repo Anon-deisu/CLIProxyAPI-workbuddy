@@ -258,8 +258,12 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 	if state.convergence {
 		fingerprint := state.fingerprint
 		setHeaderCasePreserved(headers, "X-Codex-Installation-Id", fingerprint.InstallationID)
-		setCodexSessionHeaderCasePreserved(headers, "Session-Id", fingerprint.SessionID)
-		if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
+		if codexSessionHeaderValue(headers) == "" {
+			setCodexSessionHeaderCasePreserved(headers, "Session-Id", fingerprint.SessionID)
+		}
+		// Conversation_id is a user cache/session key when supplied by the client.
+		// Preserve it while the account fingerprint remains in the identity fields.
+		if headerValueCaseInsensitive(headers, "Conversation_id") == "" {
 			setHeaderCasePreserved(headers, "Conversation_id", fingerprint.SessionID)
 		}
 		setHeaderCasePreserved(headers, "X-Client-Request-Id", fingerprint.SessionID)

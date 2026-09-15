@@ -52,6 +52,24 @@ func TestManagerC2ARetrySettingsOverrideOnlyCodex2APIDefault(t *testing.T) {
 	}
 }
 
+func TestRuntimeDisableCoolingOverridesExplicitAccountCooling(t *testing.T) {
+	accountCooling := false
+	forceDisable := true
+	auth := &Auth{
+		ID:       "runtime-cooling-auth",
+		Provider: "codex",
+		Metadata: map[string]any{"disable_cooling": accountCooling},
+	}
+	cfg := &internalconfig.Config{Routing: internalconfig.RoutingConfig{DisableCooling: &forceDisable}}
+	if !quotaCooldownDisabledForAuthWithConfig(auth, cfg) {
+		t.Fatal("runtime disable-cooling should override an explicit account false")
+	}
+	forceDisable = false
+	if quotaCooldownDisabledForAuthWithConfig(auth, cfg) {
+		t.Fatal("runtime disable-cooling=false should restore account-level cooling behavior")
+	}
+}
+
 func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)

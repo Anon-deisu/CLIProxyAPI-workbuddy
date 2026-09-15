@@ -1588,6 +1588,39 @@ func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
 	}
 }
 
+func TestCodexFingerprintConvergenceWebsocketPreservesUserCacheSession(t *testing.T) {
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: new(true)}}
+	auth := &cliproxyauth.Auth{ID: "ws-cache-preserving-auth", Provider: "codex", Metadata: map[string]any{"access_token": "test-token"}}
+	var installationID, userAgent string
+	for _, key := range []string{"user-cache-a", "user-cache-b", "user-cache-a"} {
+		payload := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"` + key + `","client_metadata":{"session_id":"` + key + `"}}`)
+		req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}
+		body, headers := applyCodexPromptCacheHeaders(sdktranslator.FormatOpenAIResponse, req, payload)
+		body, state := applyCodexIdentityConfuseBody(cfg, auth, payload, body)
+		headers = applyCodexWebsocketHeaders(context.Background(), headers, auth, "test-token", cfg)
+		applyCodexIdentityConfuseHeaders(headers, &state)
+		if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != key {
+			t.Fatalf("prompt_cache_key = %q, want %q", got, key)
+		}
+		if got := headerValueCaseInsensitive(headers, "session_id"); got != key {
+			t.Fatalf("session_id = %q, want %q", got, key)
+		}
+		if got := headers.Get("Conversation_id"); got != key {
+			t.Fatalf("Conversation_id = %q, want %q", got, key)
+		}
+		if installationID == "" {
+			installationID = headers.Get("X-Codex-Installation-Id")
+			userAgent = headers.Get("User-Agent")
+		}
+		if headers.Get("X-Codex-Installation-Id") != installationID || headers.Get("User-Agent") != userAgent {
+			t.Fatal("user cache keys changed the account persona")
+		}
+		if headers.Get("Thread-Id") != state.fingerprint.SessionID || headers.Get("X-Codex-Routing-Hint") != "europe" {
+			t.Fatal("account thread identity or routing hint changed")
+		}
+	}
+}
+
 func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testing.T) {
 	cfg := &config.Config{
 		Routing: config.RoutingConfig{SessionAffinity: true},
