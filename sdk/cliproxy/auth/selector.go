@@ -1074,6 +1074,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.IsDispatchDisabled() {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if auth.CodexQuotaResumeAt.After(now) {
+		return true, blockReasonCooldown, auth.CodexQuotaResumeAt
+	}
 	if hasUnauthorizedAuthFailure(auth) {
 		return true, blockReasonOther, time.Time{}
 	}

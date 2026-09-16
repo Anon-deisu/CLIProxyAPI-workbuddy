@@ -124,6 +124,9 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("预估费用"),
 		[]byte("auto-disable-unauthorized"),
 		[]byte("auto_disable_reason"),
+		[]byte("quota_paused"),
+		[]byte("quota_resume_at"),
+		[]byte("额度耗尽自动调度"),
 	} {
 		if !bytes.Contains(got, want) {
 			t.Fatalf("runtime scheduler injection missing %q", want)

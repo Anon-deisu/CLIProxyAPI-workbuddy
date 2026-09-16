@@ -282,10 +282,17 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 		if auth == nil {
 			continue
 		}
-		if !quotaCooldownDisabledForAuthWithConfig(auth, cfg) && !auth.IsDispatchDisabled() {
-			continue
+		changed := false
+		if !cfg.Routing.AutoDisableQuota && !auth.CodexQuotaResumeAt.IsZero() {
+			auth.CodexQuotaResumeAt = time.Time{}
+			auth.Generation++
+			auth.UpdatedAt = now
+			changed = true
 		}
-		if clearCooldownStateForAuth(auth, now) {
+		if quotaCooldownDisabledForAuthWithConfig(auth, cfg) || auth.IsDispatchDisabled() {
+			changed = clearCooldownStateForAuth(auth, now) || changed
+		}
+		if changed {
 			snapshots = append(snapshots, auth.Clone())
 		}
 	}
@@ -508,6 +515,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	if auth.AutoDisabled && auth.AutoDisableReason == AutoDisableReasonQuotaExhausted {
 		auth.ClearAutoDisabled()
 	}
+	auth.CodexQuotaResumeAt = time.Time{}
 
 	if len(models) == 0 {
 		models = append(models, registeredModels...)
@@ -756,10 +764,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	quotaWindowChanged := false
 	now := time.Now()
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		previousQuotaResumeAt := auth.CodexQuotaResumeAt
 		// A scheduler reservation covers one upstream attempt. Results release
 		// it for both streaming completion and non-streaming execution.
 		auth.ReleaseDispatchSlot()
@@ -778,6 +788,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
+		}
+		quotaObservationChanged := false
+		if !result.SkipQuotaObservation {
+			quotaObservationChanged = auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
+		}
+		quotaWindowFailure := false
+		cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+		if cfg != nil && cfg.Routing.AutoDisableQuota && strings.EqualFold(auth.Provider, "codex") && isQuotaExhaustedResultError(result.Error) {
+			windows := codexAccountQuotaWindows(auth.Quota, now)
+			quotaWindowFailure = auth.CodexQuotaResumeAt.After(now) || (quotaObservationChanged && (windows.sevenDayExhausted || windows.fiveHourResetAt.After(now)))
 		}
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
@@ -802,7 +822,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
-		} else {
+		} else if !quotaWindowFailure {
 			if modelKey != "" {
 				if !shouldSkipCredentialCooldown(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
@@ -961,14 +981,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.Generation++
 		auth.UpdatedAt = now
 
-		quotaObservationChanged := false
-		if !result.SkipQuotaObservation {
-			quotaObservationChanged = auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
-			if modelState != nil {
-				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
-			}
+		if !result.SkipQuotaObservation && modelState != nil {
+			modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
 		}
-		m.maybeAutoDisableAuthLocked(auth, result.Error, quotaObservationChanged && quotaSignalsExhausted(auth.Quota), now)
+		m.maybeAutoDisableAuthLocked(auth, result.Error, quotaObservationChanged, now)
+		quotaWindowChanged = !previousQuotaResumeAt.Equal(auth.CodexQuotaResumeAt)
 
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
@@ -980,13 +997,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
-		if !result.CredentialScope && modelKey != "" {
+		if !result.CredentialScope && !quotaWindowChanged && modelKey != "" {
 			targetModels = append(targetModels, modelKey)
 			if routeKey := canonicalModelKey(result.RouteModel); routeKey != "" && routeKey != modelKey {
 				targetModels = append(targetModels, routeKey)
 			}
 		}
-		m.scheduler.upsertAuthResult(authSnapshot, targetModels, result.CredentialScope)
+		m.scheduler.upsertAuthResult(authSnapshot, targetModels, result.CredentialScope || quotaWindowChanged)
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -1412,7 +1429,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 
 // maybeAutoDisableAuthLocked applies the opt-in runtime disable policies after
 // the result and current response quota observation have been recorded.
-func (m *Manager) maybeAutoDisableAuthLocked(auth *Auth, resultErr *Error, quotaExhausted bool, now time.Time) {
+func (m *Manager) maybeAutoDisableAuthLocked(auth *Auth, resultErr *Error, quotaObserved bool, now time.Time) {
 	if m == nil || auth == nil || auth.Disabled || auth.Status == StatusDisabled || auth.AutoDisabled {
 		return
 	}
@@ -1431,12 +1448,35 @@ func (m *Manager) maybeAutoDisableAuthLocked(auth *Auth, resultErr *Error, quota
 		auth.NextRetryAfter = time.Time{}
 		return
 	}
-	if (isQuotaExhaustedResultError(resultErr) || quotaExhausted) && cfg.Routing.AutoDisableQuota {
+	if !cfg.Routing.AutoDisableQuota {
+		return
+	}
+	quotaExhausted := isQuotaExhaustedResultError(resultErr) || (quotaObserved && quotaSignalsExhausted(auth.Quota))
+	if strings.EqualFold(auth.Provider, "codex") {
+		// Only a fresh, identified account window may disable a Codex account.
+		// A generic 429 or an additional-model limit cannot prove 7D exhaustion.
+		if !quotaObserved {
+			return
+		}
+		windows := codexAccountQuotaWindows(auth.Quota, now)
+		quotaExhausted = windows.sevenDayExhausted
+		if !auth.CodexQuotaResumeAt.After(now) {
+			auth.CodexQuotaResumeAt = time.Time{}
+		}
+		if windows.fiveHourResetAt.After(auth.CodexQuotaResumeAt) {
+			auth.CodexQuotaResumeAt = windows.fiveHourResetAt
+		}
+	}
+	if quotaExhausted {
 		auth.AutoDisabled = true
 		auth.AutoDisableReason = AutoDisableReasonQuotaExhausted
 		auth.AutoDisabledAt = now
 		auth.Status = StatusError
 		auth.StatusMessage = "automatically disabled: quota exhausted"
+		if strings.EqualFold(auth.Provider, "codex") {
+			auth.StatusMessage = "automatically disabled: Codex 7D quota exhausted"
+			auth.CodexQuotaResumeAt = time.Time{}
+		}
 		auth.Unavailable = true
 		auth.NextRetryAfter = time.Time{}
 	}

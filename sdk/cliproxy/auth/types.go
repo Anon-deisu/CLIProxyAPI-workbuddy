@@ -78,6 +78,9 @@ type Auth struct {
 	AutoDisableReason string `json:"-"`
 	// AutoDisabledAt records when runtime policy excluded this auth.
 	AutoDisabledAt time.Time `json:"-"`
+	// CodexQuotaResumeAt excludes an account until its observed 5H quota resets.
+	// This runtime-only quota gate is independent of error backoff and Disabled.
+	CodexQuotaResumeAt time.Time `json:"-"`
 	// ConcurrencyLimit is the runtime-only maximum number of in-flight requests
 	// allowed for this credential. Zero means unlimited.
 	ConcurrencyLimit int `json:"-"`

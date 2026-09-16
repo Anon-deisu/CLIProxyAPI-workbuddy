@@ -327,6 +327,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	quotaPaused := auth.CodexQuotaResumeAt.After(time.Now())
 	entry := gin.H{
 		"id":                auth.ID,
 		"auth_index":        auth.Index,
@@ -341,7 +342,8 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		"auto_disabled":     auth.AutoDisabled,
 		"concurrency_limit": auth.EffectiveConcurrencyLimit(),
 		"active_requests":   auth.ActiveDispatchRequests(),
-		"unavailable":       auth.Unavailable,
+		"unavailable":       auth.Unavailable || quotaPaused,
+		"quota_paused":      quotaPaused,
 		"runtime_only":      runtimeOnly,
 		"source":            "memory",
 		"size":              int64(0),
@@ -351,6 +353,10 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		if !auth.AutoDisabledAt.IsZero() {
 			entry["auto_disabled_at"] = auth.AutoDisabledAt
 		}
+	}
+	if quotaPaused {
+		entry["quota_resume_at"] = auth.CodexQuotaResumeAt
+		entry["quota_pause_reason"] = "codex_5h_exhausted"
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed

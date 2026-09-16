@@ -1099,6 +1099,9 @@ func retryRoundAvailabilityForAuth(auth *Auth, model string, now time.Time) (boo
 	if auth == nil || next.IsZero() || reason == blockReasonDisabled {
 		return false, time.Time{}
 	}
+	if auth.CodexQuotaResumeAt.After(now) {
+		return true, auth.CodexQuotaResumeAt
+	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 		return credentialRetryRoundStateEligible(auth.LastError, true), next
 	}

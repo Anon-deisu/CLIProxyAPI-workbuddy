@@ -267,6 +267,7 @@ type RoutingConfig struct {
 	AutoDisableUnauthorized bool `yaml:"-" json:"auto-disable-unauthorized"`
 	// AutoDisableQuota excludes credentials after an explicit quota exhaustion
 	// response or a provider quota watermark reaches 100 percent.
+	// Codex account windows are handled separately: 5H pauses until reset; 7D disables.
 	AutoDisableQuota bool `yaml:"-" json:"auto-disable-quota"`
 	// AuthConcurrencyLimit is the runtime-only in-flight request limit for every credential.
 	// Nil retains the current setting across config reloads; an explicit zero removes the limit.

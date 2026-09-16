@@ -3,14 +3,53 @@ package auth
 import (
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	maxQuotaSignalHeaders = 64
-	maxQuotaSignalValue   = 512
+	maxQuotaSignalHeaders      = 64
+	maxQuotaSignalValue        = 512
+	codexFiveHourWindowMinutes = 5 * 60
+	codexSevenDayWindowMinutes = 7 * 24 * 60
 )
+
+type codexQuotaWindows struct {
+	fiveHourResetAt   time.Time
+	sevenDayExhausted bool
+}
+
+// codexAccountQuotaWindows uses durations, not primary/secondary ordering, to
+// identify account windows. Additional model and code-review limits are excluded.
+func codexAccountQuotaWindows(quota QuotaState, now time.Time) codexQuotaWindows {
+	var windows codexQuotaWindows
+	for _, prefix := range []string{"X-Codex-Primary-", "X-Codex-Secondary-"} {
+		minutes, errMinutes := strconv.Atoi(quota.Signals[prefix+"Window-Minutes"])
+		if errMinutes != nil || (minutes != codexFiveHourWindowMinutes && minutes != codexSevenDayWindowMinutes) {
+			continue
+		}
+		used, errUsed := strconv.ParseFloat(quota.Signals[prefix+"Used-Percent"], 64)
+		if errUsed != nil || used != 100 {
+			continue
+		}
+		var resetAt time.Time
+		if seconds, errReset := strconv.ParseInt(quota.Signals[prefix+"Reset-At"], 10, 64); errReset == nil && seconds > 0 {
+			resetAt = time.Unix(seconds, 0)
+		} else if seconds, errReset := strconv.ParseInt(quota.Signals[prefix+"Reset-After-Seconds"], 10, 64); errReset == nil && seconds >= 0 && seconds <= int64(minutes)*60 && !quota.ObservedAt.IsZero() {
+			resetAt = quota.ObservedAt.Add(time.Duration(seconds) * time.Second)
+		}
+		if !resetAt.IsZero() && !resetAt.After(now) {
+			continue
+		}
+		if minutes == codexSevenDayWindowMinutes {
+			windows.sevenDayExhausted = true
+		} else if resetAt.After(windows.fiveHourResetAt) {
+			windows.fiveHourResetAt = resetAt
+		}
+	}
+	return windows
+}
 
 // ProviderSupportsQuotaObservation reports whether the named provider emits a
 // passive credential-level quota snapshot understood by collectQuotaSignals.

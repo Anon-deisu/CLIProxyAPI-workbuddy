@@ -471,8 +471,9 @@ const runtimeSchedulerInlineScript = `
     var quotaLabel = make('label', 'cpa-runtime-scheduler-check');
     var quota = document.createElement('input');
     quota.type = 'checkbox';
+    quota.title = 'Codex：5H 耗尽暂停至重置，7D 耗尽自动停用；不受无视指数冷却影响';
     quotaLabel.appendChild(quota);
-    quotaLabel.appendChild(document.createTextNode('额度用尽自动停用账号'));
+    quotaLabel.appendChild(document.createTextNode('额度耗尽自动调度'));
     var disableCoolingLabel = make('label', 'cpa-runtime-scheduler-check');
     var disableCooling = document.createElement('input');
     disableCooling.type = 'checkbox';
@@ -671,7 +672,17 @@ const runtimeSchedulerInlineScript = `
         files.forEach(function (item) {
           var row = make('div', 'cpa-runtime-scheduler-disabled-row');
           row.appendChild(make('strong', '', item.name || item.email || item.id || '未知认证'));
-          row.appendChild(make('span', '', item.auto_disabled ? ('自动禁用原因：' + (item.auto_disable_reason || item.status_message || '未知')) : '状态正常'));
+          var accountStatus = '状态正常';
+          if (item.auto_disabled) {
+            accountStatus = '自动禁用原因：' + (item.status_message || item.auto_disable_reason || '未知');
+          } else if (item.disabled) {
+            accountStatus = '已停用';
+          } else if (item.quota_paused) {
+            accountStatus = '5H 额度耗尽，恢复时间：' + new Date(item.quota_resume_at).toLocaleString();
+          } else if (item.unavailable) {
+            accountStatus = item.status_message || '暂不可用';
+          }
+          row.appendChild(make('span', '', accountStatus));
           statusList.appendChild(row);
         });
       }).catch(function () {

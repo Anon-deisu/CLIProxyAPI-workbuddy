@@ -260,6 +260,16 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
+	if strings.EqualFold(auth.Provider, "codex") && strings.EqualFold(existing.Provider, "codex") {
+		// Auth-file reloads and token refreshes cannot erase a runtime quota gate.
+		auth.CodexQuotaResumeAt = existing.CodexQuotaResumeAt
+		if shouldSkipPersist(ctx) && existing.AutoDisabled && existing.AutoDisableReason == AutoDisableReasonQuotaExhausted {
+			auth.AutoDisabled = true
+			auth.AutoDisableReason = existing.AutoDisableReason
+			auth.AutoDisabledAt = existing.AutoDisabledAt
+			auth.StatusMessage = existing.StatusMessage
+		}
+	}
 	if auth.Generation <= existing.Generation {
 		auth.Generation = existing.Generation + 1
 	} else {

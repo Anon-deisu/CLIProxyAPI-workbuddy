@@ -786,7 +786,7 @@ func isCredentialBlocked(auth *Auth, supportedModelCount int, now time.Time) boo
 	if auth == nil {
 		return true
 	}
-	if auth.Disabled || auth.Status == StatusDisabled {
+	if auth.IsDispatchDisabled() || auth.CodexQuotaResumeAt.After(now) {
 		return true
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
@@ -835,7 +835,7 @@ func (s *authScheduler) upsertAuthResultLocked(auth *Auth, targetModels []string
 		updatedAt:  auth.UpdatedAt,
 	}
 
-	if providerKey == "" || auth.Disabled || auth.Status == StatusDisabled {
+	if providerKey == "" || auth.IsDispatchDisabled() {
 		s.removeAuthFromProvidersLocked(authID)
 		return
 	}
