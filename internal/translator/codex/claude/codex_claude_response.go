@@ -105,6 +105,19 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		template = []byte(`{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`)
 		template, _ = sjson.SetBytes(template, "message.model", rootResult.Get("response.model").String())
 		template, _ = sjson.SetBytes(template, "message.id", rootResult.Get("response.id").String())
+		if usage := rootResult.Get("response.usage"); usage.Get("input_tokens").Exists() {
+			input, _, cached, cacheWrite := extractResponsesUsage(usage)
+			template, _ = sjson.SetBytes(template, "message.usage.input_tokens", input)
+			if cached > 0 {
+				template, _ = sjson.SetBytes(template, "message.usage.cache_read_input_tokens", cached)
+			}
+			if cacheWrite > 0 {
+				template, _ = sjson.SetBytes(template, "message.usage.cache_creation_input_tokens", cacheWrite)
+			}
+			if estimated := usage.Get("estimated"); estimated.Exists() {
+				template, _ = sjson.SetBytes(template, "message.usage.estimated", estimated.Bool())
+			}
+		}
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_start", template, 2)
 	case "response.reasoning_summary_part.added":
@@ -827,6 +840,9 @@ func extractResponsesUsage(usage gjson.Result) (int64, int64, int64, int64) {
 }
 
 func setClaudeReasoningUsage(out []byte, usage gjson.Result) []byte {
+	if estimated := usage.Get("estimated"); estimated.Exists() {
+		out, _ = sjson.SetBytes(out, "usage.estimated", estimated.Bool())
+	}
 	detail := usage.Get("output_tokens_details.reasoning_tokens")
 	if !detail.Exists() || detail.Type != gjson.Number {
 		return out

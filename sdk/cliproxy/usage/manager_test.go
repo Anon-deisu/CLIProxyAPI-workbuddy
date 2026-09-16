@@ -108,6 +108,14 @@ func TestAuthCostLedgerUsesCodexPriceRules(t *testing.T) {
 	}
 }
 
+func TestPrismCostUsesCodexPriceRules(t *testing.T) {
+	prism, ok := modelPrice("prism", "gpt-6-astra")
+	codex, _ := modelPrice("codex", "gpt-6-astra")
+	if !ok || prism != codex {
+		t.Fatalf("Prism price = %+v (%t), want Codex price %+v", prism, ok, codex)
+	}
+}
+
 func TestAuthCostLedgerResetsAtLocalDayBoundaryAndExplicitReset(t *testing.T) {
 	ledger := newAuthCostLedger()
 	first := time.Date(2026, time.January, 12, 23, 59, 0, 0, time.Local)

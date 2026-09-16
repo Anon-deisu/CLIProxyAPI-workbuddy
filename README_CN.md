@@ -10,6 +10,8 @@ CLIProxyAPI 是一个为 CLI 提供 OpenAI/Gemini/Claude/Codex/Grok 兼容 API �
 
 Prism 使用独立的账号、调用者和会话工作区，每次生成创建新的上游会话并携带完整客户端历史。仅此通道将 `max` 映射为 `xhigh`；工具通过显式结构化协议适配客户端 function/custom 调用，不是上游原生 tools 透传。SSE 由异步轮询结果转换，不提供原生逐 token 输出；托管工具不支持。可用 `codex.prism-base-url` 覆盖服务地址。
 
+Prism 响应和内部账本均包含 token 用量。上游没有返回 usage 时，使用 tokenizer 统计适配器发送的提示文本与收到的模型文本，并在 `usage.estimated` 标记为 `true`；不推测缓存或隐藏思考 token，数值不等于上游实际账单。若上游提供完整用量则保留原始统计。沙箱资源凭据按有效期自动续期，不重新提交生成；生成失败信息附带阶段、请求 ID 和会话 ID，便于排查生产环境问题。
+
 您可以通过任何与 OpenAI（包括 Responses）、Gemini（包括 Interactions）或 Claude 兼容的客户端或 SDK，以本地方式或多 CLI 账户访问以下提供商。
 
 <table>

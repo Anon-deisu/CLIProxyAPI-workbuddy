@@ -212,7 +212,7 @@ func (e *PrismExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	e.remember(opts, body, response)
 	reporter.SetTranslatedReasoningEffort(body, "codex")
-	reporter.EnsurePublished(ctx)
+	reporter.Publish(ctx, helps.ParseOpenAIUsage(response))
 	completed, _ := json.Marshal(map[string]any{"type": "response.completed", "response": json.RawMessage(response)})
 	var param any
 	original := opts.OriginalRequest
@@ -260,8 +260,18 @@ func (e *PrismExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 			return true
 		}
+		inputTokens, errCount := helps.PrismInputTokens(body, model)
+		if errCount != nil {
+			reporter.PublishFailure(ctx, errCount)
+			send(cliproxyexecutor.StreamChunk{Err: errCount})
+			return
+		}
 		for i, eventType := range []string{"response.created", "response.in_progress"} {
-			event, _ := json.Marshal(map[string]any{"type": eventType, "sequence_number": i, "response": map[string]any{"id": responseID, "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "in_progress", "output": []any{}}})
+			initial := map[string]any{"id": responseID, "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "in_progress", "output": []any{}}
+			if target == sdktranslator.FormatClaude && eventType == "response.created" {
+				initial["usage"] = map[string]any{"input_tokens": inputTokens, "output_tokens": 0, "total_tokens": inputTokens, "estimated": true}
+			}
+			event, _ := json.Marshal(map[string]any{"type": eventType, "sequence_number": i, "response": initial})
 			if !translate(append(append([]byte("data: "), event...), []byte("\n\n")...)) {
 				return
 			}
@@ -285,7 +295,7 @@ func (e *PrismExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return
 		}
 		reporter.SetTranslatedReasoningEffort(body, "codex")
-		reporter.EnsurePublished(ctx)
+		reporter.Publish(ctx, helps.ParseOpenAIUsage(response))
 		for _, event := range events {
 			if !translate(event) {
 				return

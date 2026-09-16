@@ -194,7 +194,7 @@ func lookupModelPrice(table map[string]ModelPrice, model string) (ModelPrice, bo
 }
 
 func modelPrice(provider, model string) (ModelPrice, bool) {
-	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") || strings.EqualFold(strings.TrimSpace(provider), "prism") {
 		normalized := normalizeCostModel(model)
 		if strings.HasPrefix(normalized, "gpt-6") || strings.HasPrefix(normalized, "gpt6") {
 			model = "gpt-6-astra"

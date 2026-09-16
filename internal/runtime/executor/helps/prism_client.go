@@ -18,6 +18,8 @@ import (
 
 const PrismDefaultBaseURL = "https://prism.openai.com"
 
+const prismResourceRefreshLead = time.Minute
+
 type PrismHTTPError struct {
 	Code    int
 	Message string
@@ -27,14 +29,16 @@ func (e *PrismHTTPError) Error() string   { return e.Message }
 func (e *PrismHTTPError) StatusCode() int { return e.Code }
 
 type PrismClient struct {
-	mu           sync.Mutex
-	http         *http.Client
-	baseURL      string
-	projectName  string
-	projectID    string
-	userID       string
-	sandbox      prismSandbox
-	pollInterval time.Duration
+	mu                sync.Mutex
+	http              *http.Client
+	baseURL           string
+	projectName       string
+	projectID         string
+	userID            string
+	sandbox           prismSandbox
+	accessToken       string
+	resourcesExpireAt time.Time
+	pollInterval      time.Duration
 }
 
 type prismSandbox struct {
@@ -58,6 +62,7 @@ type PrismRun struct {
 	client         *PrismClient
 	turn           prismTurn
 	conversationID string
+	sandboxToken   string
 }
 
 func NewPrismClient(httpClient *http.Client, baseURL, projectName string) *PrismClient {
@@ -127,6 +132,7 @@ func (c *PrismClient) prepare(ctx context.Context, accessToken string) error {
 		return &PrismHTTPError{Code: http.StatusUnauthorized, Message: "Prism could not restore the OpenAI session"}
 	}
 	c.userID = auth.User.ID
+	c.accessToken = accessToken
 	if c.projectID == "" {
 		var list struct {
 			Projects []struct {
@@ -157,19 +163,22 @@ func (c *PrismClient) prepare(ctx context.Context, accessToken string) error {
 			c.projectID = created.ID
 		}
 	}
-	if c.sandbox.Token != "" {
+	if c.sandbox.Token != "" && time.Now().Add(prismResourceRefreshLead).Before(c.resourcesExpireAt) {
 		return nil
 	}
-	var sandbox prismSandbox
-	if err = c.request(ctx, http.MethodPost, "/api/backend/1/new", nil, &sandbox, ""); err != nil {
-		return err
+	sandbox := c.sandbox
+	if sandbox.Token == "" {
+		if err = c.request(ctx, http.MethodPost, "/api/backend/1/new", nil, &sandbox, ""); err != nil {
+			return err
+		}
 	}
 	if sandbox.URL == "" || sandbox.Token == "" {
 		return fmt.Errorf("Prism returned incomplete sandbox credentials")
 	}
 	var resource struct {
-		Token   string `json:"access_token"`
-		BaseURL string `json:"resources_base_url"`
+		Token     string `json:"access_token"`
+		BaseURL   string `json:"resources_base_url"`
+		ExpiresAt int64  `json:"expires_at"`
 	}
 	if err = c.request(ctx, http.MethodPost, "/api/projects/"+url.PathEscape(c.projectID)+"/sandbox/resources-token", map[string]any{"sandbox_session_id": nil, "sandbox_token": sandbox.Token}, &resource, ""); err != nil {
 		return err
@@ -193,6 +202,7 @@ func (c *PrismClient) prepare(ctx context.Context, accessToken string) error {
 		}
 		if syncState.Status == "synced" {
 			c.sandbox = sandbox
+			c.resourcesExpireAt = time.Unix(resource.ExpiresAt, 0)
 			return nil
 		}
 		if syncState.Status != "syncing" {
@@ -213,7 +223,7 @@ func (c *PrismClient) Start(ctx context.Context, accessToken, model, effort stri
 		"projectId": c.projectID, "userId": c.userID, "model": model, "reasoning_effort": effort,
 		"frontend_origin": c.baseURL, "sandbox_url": strings.TrimRight(c.sandbox.URL, "/") + "/", "sandbox_token": c.sandbox.Token,
 	}}
-	run := &PrismRun{client: c, conversationID: conversationID}
+	run := &PrismRun{client: c, conversationID: conversationID, sandboxToken: c.sandbox.Token}
 	if err := c.request(ctx, http.MethodPost, "/api/llm/response_with_tools_start", body, &run.turn, ""); err != nil {
 		return nil, err
 	}
@@ -221,6 +231,7 @@ func (c *PrismClient) Start(ctx context.Context, accessToken, model, effort stri
 }
 
 func (r *PrismRun) Wait(ctx context.Context) (json.RawMessage, error) {
+	stage := "start"
 	for r.turn.Status != "completed" {
 		if r.turn.Status != "started" && r.turn.Status != "pending" {
 			return nil, fmt.Errorf("invalid Prism turn status %q", r.turn.Status)
@@ -235,6 +246,10 @@ func (r *PrismRun) Wait(ctx context.Context) (json.RawMessage, error) {
 			}
 		}
 		var next prismTurn
+		if errRefresh := r.refreshResources(ctx); errRefresh != nil {
+			return nil, errRefresh
+		}
+		stage = "status"
 		if err := r.client.request(ctx, http.MethodPost, "/api/llm/response_with_tools_status", map[string]any{"request_id": r.turn.RequestID, "turn_state": r.turn.State}, &next, ""); err != nil {
 			return nil, err
 		}
@@ -250,19 +265,34 @@ func (r *PrismRun) Wait(ctx context.Context) (json.RawMessage, error) {
 		case "sandbox_reconnecting":
 			code = http.StatusServiceUnavailable
 			r.client.mu.Lock()
-			r.client.sandbox = prismSandbox{}
+			if r.client.sandbox.Token == r.sandboxToken {
+				r.client.sandbox = prismSandbox{}
+			}
 			r.client.mu.Unlock()
 		case "unauthorized", "session_expired":
 			code = http.StatusUnauthorized
 		case "rate_limit_exceeded", "quota_exceeded":
 			code = http.StatusTooManyRequests
 		}
-		return nil, &PrismHTTPError{Code: code, Message: "Prism generation failed: " + failure.Reason + ": " + failure.Message}
+		return nil, &PrismHTTPError{Code: code, Message: fmt.Sprintf("Prism generation failed: %s: %s (stage=%s request_id=%s conversation_id=%s)", failure.Reason, failure.Message, stage, r.turn.RequestID, r.conversationID)}
 	}
 	return r.turn.Response.Payload, nil
 }
 
+func (r *PrismRun) refreshResources(ctx context.Context) error {
+	c := r.client
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sandbox.Token == r.sandboxToken && !time.Now().Add(prismResourceRefreshLead).Before(c.resourcesExpireAt) {
+		return c.prepare(ctx, c.accessToken)
+	}
+	return nil
+}
+
 func (r *PrismRun) Stop(ctx context.Context) error {
+	if r.turn.Status == "completed" {
+		return nil
+	}
 	return r.client.request(ctx, http.MethodPost, "/api/llm/response_with_tools_stop", map[string]any{
 		"request_id": r.turn.RequestID, "conversation_id": r.conversationID, "turn_state": r.turn.State,
 	}, nil, "")

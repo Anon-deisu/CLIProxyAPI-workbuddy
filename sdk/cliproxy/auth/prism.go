@@ -54,17 +54,20 @@ func (m *Manager) pickPrism(ctx context.Context, opts cliproxyexecutor.Options, 
 		if !prismPlusCredential(a) || !eligibility.allows(a) || (pinned != "" && a.ID != pinned) {
 			continue
 		}
-		if _, used := tried[a.ID]; !used {
-			candidates = append(candidates, a)
-		}
+		candidates = append(candidates, a)
 	}
 	if len(candidates) == 0 {
 		return nil, nil, &Error{Code: "auth_not_found", Message: "Prism requires an enabled Plus account with an access token"}
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
 	start := int(m.prismOffset % uint64(len(candidates)))
+	hasUntried := false
 	for i := range candidates {
 		a := candidates[(start+i)%len(candidates)]
+		if _, used := tried[a.ID]; used {
+			continue
+		}
+		hasUntried = true
 		if !a.TryAcquireDispatchSlot() {
 			continue
 		}
@@ -74,6 +77,9 @@ func (m *Manager) pickPrism(ctx context.Context, opts cliproxyexecutor.Options, 
 		selected.PrismRoute = true
 		opts.Metadata[cliproxyexecutor.PrismRouteMetadataKey] = true
 		return selected, exec, nil
+	}
+	if !hasUntried {
+		return nil, nil, &Error{Code: "auth_not_found", Message: "all enabled Plus accounts have been attempted"}
 	}
 	return nil, nil, NewConcurrencyLimitError()
 }

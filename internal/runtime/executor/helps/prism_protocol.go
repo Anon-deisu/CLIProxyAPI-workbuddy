@@ -13,6 +13,7 @@ import (
 
 const prismToolProtocol = `Act as a protocol adapter for the external client whose complete request follows.
 Honor the instructions and conversation in that request. Its function tools execute at the client, not in your sandbox.
+Respond only to the latest unfinished client turn. Earlier assistant messages and completed tool calls are history, not new requests to repeat.
 Do not invoke sandbox tools, inspect the workspace, or invent client tool results.
 Return exactly one JSON object, without Markdown, with keys "content" (string) and "tool_calls" (array).
 To request a declared function, return a tool_calls entry with "name" and "arguments" (a JSON object).
@@ -48,6 +49,47 @@ func BuildPrismInput(body []byte) (json.RawMessage, error) {
 		return map[string]any{"type": "message", "role": role, "content": []map[string]string{{"type": "input_text", "text": text}}}
 	}
 	return json.Marshal([]map[string]any{message("system", prismToolProtocol), message("user", "Complete client request:\n"+string(body))})
+}
+
+// PrismInputTokens counts the text sent by this adapter, excluding unknown sandbox system context.
+func PrismInputTokens(request []byte, model string) (int64, error) {
+	input, err := BuildPrismInput(request)
+	if err != nil {
+		return 0, err
+	}
+	var parts []string
+	for _, message := range gjson.ParseBytes(input).Array() {
+		for _, part := range message.Get("content").Array() {
+			parts = append(parts, part.Get("text").String())
+		}
+	}
+	codec, errCodec := TokenizerForModel(model)
+	if errCodec != nil {
+		return 0, errCodec
+	}
+	count, errCount := codec.Count(strings.Join(parts, "\n"))
+	return int64(count), errCount
+}
+
+func prismUsage(payload, request []byte, model, generated string) (json.RawMessage, error) {
+	reported := gjson.GetBytes(payload, "usage")
+	if reported.Get("input_tokens").Exists() && reported.Get("output_tokens").Exists() {
+		return json.RawMessage(reported.Raw), nil
+	}
+	input, err := PrismInputTokens(request, model)
+	if err != nil {
+		return nil, fmt.Errorf("count Prism input tokens: %w", err)
+	}
+	codec, errCodec := TokenizerForModel(model)
+	if errCodec != nil {
+		return nil, errCodec
+	}
+	output, errCount := codec.Count(generated)
+	if errCount != nil {
+		return nil, fmt.Errorf("count Prism output tokens: %w", errCount)
+	}
+	// Prism currently omits usage. Do not invent cached or hidden reasoning token counts.
+	return json.Marshal(map[string]any{"input_tokens": input, "output_tokens": output, "total_tokens": input + int64(output), "estimated": true})
 }
 
 func PrismResponse(payload, request []byte, model, responseID string) ([]byte, error) {
@@ -107,7 +149,15 @@ func PrismResponse(payload, request []byte, model, responseID string) ([]byte, e
 		}
 		output = append(output, item)
 	}
-	return json.Marshal(map[string]any{"id": responseID, "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": model, "output": output, "error": nil, "incomplete_details": nil})
+	usage, errUsage := prismUsage(payload, request, model, text.String())
+	if errUsage != nil {
+		return nil, errUsage
+	}
+	response, errMarshal := json.Marshal(map[string]any{"id": responseID, "object": "response", "created_at": time.Now().Unix(), "status": "completed", "model": model, "output": output, "usage": usage, "error": nil, "incomplete_details": nil})
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
+	return EnsureResponsesUsageDetails(response), nil
 }
 
 // PrismResponseEvents preserves Responses event ordering without inventing token streaming.

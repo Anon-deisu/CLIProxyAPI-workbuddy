@@ -110,3 +110,32 @@ func TestPrismSelectionRespectsPinnedAccountAndConcurrency(t *testing.T) {
 		t.Fatal("Prism exceeded the pinned account concurrency limit")
 	}
 }
+
+func TestPrismFailoverDoesNotSkipNextAccount(t *testing.T) {
+	m := NewManager(nil, &RoundRobinSelector{}, nil)
+	m.executors["codex"] = schedulerTestExecutor{provider: "codex"}
+	m.runtimeConfig.Store(&config.Config{Routing: config.RoutingConfig{Prism: new(true)}})
+	for _, id := range []string{"a", "b", "c"} {
+		if _, err := m.Register(context.Background(), &Auth{ID: id, Provider: "codex", Attributes: map[string]string{"plan_type": "plus"}, Metadata: map[string]any{"access_token": "test-token"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts := cliproxyexecutor.Options{Metadata: make(map[string]any)}
+	for i, want := range []string{"a", "b", "c", "a"} {
+		var tried map[string]struct{}
+		if i == 1 {
+			tried = map[string]struct{}{"a": {}}
+		}
+		selected, _, err := m.pickNext(context.Background(), "codex", "", opts, tried)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected.ReleaseDispatchSlot()
+		if selected.ID != want {
+			t.Fatalf("pick %d = %s, want %s", i, selected.ID, want)
+		}
+	}
+	if _, _, err := m.pickNext(context.Background(), "codex", "", opts, map[string]struct{}{"a": {}, "b": {}, "c": {}}); err == nil {
+		t.Fatal("retried a credential already attempted in this request")
+	}
+}

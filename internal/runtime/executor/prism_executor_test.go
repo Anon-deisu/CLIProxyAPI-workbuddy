@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -41,7 +42,7 @@ func TestPrismExecutorProtocolsAndScopedMax(t *testing.T) {
 		case "/api/backend/1/new":
 			response = map[string]string{"url": server.URL + "/s/sandboxes/proxy", "token": "sandbox-token"}
 		case "/api/projects/probe-project/sandbox/resources-token":
-			response = map[string]string{"access_token": "resource-token", "resources_base_url": server.URL}
+			response = map[string]any{"access_token": "resource-token", "resources_base_url": server.URL, "expires_at": time.Now().Add(time.Hour).Unix()}
 		case "/api/y":
 			response = map[string]string{"docId": "probe-project", "token": "document-token"}
 		case "/s/sandboxes/proxy/wait-for-sync":
@@ -79,6 +80,79 @@ func TestPrismExecutorProtocolsAndScopedMax(t *testing.T) {
 			}
 			if string(req.Payload) != tc.body {
 				t.Fatal("Prism modified the original request")
+			}
+			usage := gjson.GetBytes(out.Payload, "usage")
+			inputKey, outputKey := "input_tokens", "output_tokens"
+			if tc.format == "openai" {
+				inputKey, outputKey = "prompt_tokens", "completion_tokens"
+			}
+			if usage.Get(inputKey).Int() <= 0 || usage.Get(outputKey).Int() <= 0 || !usage.Get("estimated").Bool() {
+				t.Fatalf("%s response missing usable token counts: %s", tc.format, out.Payload)
+			}
+			stream, errStream := e.ExecuteStream(context.Background(), a, req, opts)
+			if errStream != nil {
+				t.Fatal(errStream)
+			}
+			var transcript strings.Builder
+			for chunk := range stream.Chunks {
+				if chunk.Err != nil {
+					t.Fatal(chunk.Err)
+				}
+				transcript.Write(chunk.Payload)
+				transcript.WriteByte('\n')
+			}
+			var text strings.Builder
+			completed := 0
+			var finalUsage gjson.Result
+			for _, line := range strings.Split(transcript.String(), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "event:") || line == "" {
+					continue
+				}
+				line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if line == "[DONE]" {
+					continue
+				}
+				if !gjson.Valid(line) {
+					t.Fatalf("invalid stream frame: %s", line)
+				}
+				frame := gjson.Parse(line)
+				switch tc.format {
+				case "openai-response":
+					if frame.Get("type").String() != "response.completed" && frame.Get("response.usage.total_tokens").Int() > 0 {
+						t.Fatal("Responses billed usage before the terminal event")
+					}
+					if frame.Get("type").String() == "response.output_text.delta" {
+						text.WriteString(frame.Get("delta").String())
+					}
+					if frame.Get("type").String() == "response.completed" {
+						completed++
+						finalUsage = frame.Get("response.usage")
+					}
+				case "openai":
+					text.WriteString(frame.Get("choices.0.delta.content").String())
+					if frame.Get("choices.0.finish_reason").String() == "stop" {
+						completed++
+						finalUsage = frame.Get("usage")
+					}
+				case "claude":
+					text.WriteString(frame.Get("delta.text").String())
+					if frame.Get("type").String() == "message_start" && frame.Get("message.usage.input_tokens").Int() <= 0 {
+						t.Fatal("Claude start frame has zero input tokens")
+					}
+					if frame.Get("type").String() == "message_delta" {
+						finalUsage = frame.Get("usage")
+					}
+					if frame.Get("type").String() == "message_stop" {
+						completed++
+					}
+				}
+			}
+			if completed != 1 || text.String() != "PRISM_OK" {
+				t.Fatalf("%s stream repeated or failed to terminate: completions=%d text=%q", tc.format, completed, text.String())
+			}
+			if finalUsage.Get(inputKey).Int() != usage.Get(inputKey).Int() || finalUsage.Get(outputKey).Int() != usage.Get(outputKey).Int() || !finalUsage.Get("estimated").Bool() {
+				t.Fatalf("%s stream usage differs from non-stream: %s vs %s", tc.format, finalUsage.Raw, usage.Raw)
 			}
 		})
 	}
