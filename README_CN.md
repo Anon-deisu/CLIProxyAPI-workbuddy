@@ -6,6 +6,10 @@
 
 CLIProxyAPI 是一个为 CLI 提供 OpenAI/Gemini/Claude/Codex/Grok 兼容 API 接口的代理服务器。
 
+在管理面板的“账号调度”弹窗中启用 **Prism**，Codex 文本请求将通过 Prism 执行，仅轮询已启用的 Plus 账号，不使用原 Codex 额度或冷却状态判断可用性，也不覆盖这些状态。该开关仅当前进程生效，热重载保留，重启后关闭。认证使用账号 AT 恢复 Prism 会话，继续沿用现有 Codex RT 刷新流程。
+
+Prism 使用独立的账号、调用者和会话工作区，每次生成创建新的上游会话并携带完整客户端历史。仅此通道将 `max` 映射为 `xhigh`；工具通过显式结构化协议适配客户端 function/custom 调用，不是上游原生 tools 透传。SSE 由异步轮询结果转换，不提供原生逐 token 输出；托管工具不支持。可用 `codex.prism-base-url` 覆盖服务地址。
+
 您可以通过任何与 OpenAI（包括 Responses）、Gemini（包括 Interactions）或 Claude 兼容的客户端或 SDK，以本地方式或多 CLI 账户访问以下提供商。
 
 <table>

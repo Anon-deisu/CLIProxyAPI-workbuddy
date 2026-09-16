@@ -89,6 +89,42 @@ func TestPutRoutingSettingsUpdatesDisableCooling(t *testing.T) {
 	}
 }
 
+func TestRoutingSettingsPrismRoundTripAndReload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	for _, enabled := range []bool{true, false} {
+		body, errMarshal := json.Marshal(map[string]bool{"prism": enabled})
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+		h.PutRoutingSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("PATCH prism=%t: status=%d body=%s", enabled, recorder.Code, recorder.Body.String())
+		}
+		h.SetConfig(&config.Config{})
+		recorder = httptest.NewRecorder()
+		ctx, _ = gin.CreateTestContext(recorder)
+		h.GetRoutingSettings(ctx)
+		var settings map[string]any
+		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &settings); errDecode != nil {
+			t.Fatal(errDecode)
+		}
+		if settings["prism"] != enabled {
+			t.Fatalf("Prism after reload = %v, want %t", settings["prism"], enabled)
+		}
+		encoded, errMarshal := yaml.Marshal(h.cfg)
+		if errMarshal != nil {
+			t.Fatal(errMarshal)
+		}
+		if strings.Contains(string(encoded), "prism:") {
+			t.Fatal("runtime Prism switch was persisted to YAML")
+		}
+	}
+}
+
 func TestPutRoutingSettingsCanDisableCodexFingerprintConvergence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	enabled := true

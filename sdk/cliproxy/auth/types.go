@@ -114,6 +114,8 @@ type Auth struct {
 
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
+	// PrismRoute is set only on an execution snapshot, never on stored credentials.
+	PrismRoute bool `json:"-"`
 
 	recentRequests recentRequestRing  `json:"-"`
 	indexAssigned  bool               `json:"-"`

@@ -349,7 +349,9 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	authConcurrencyLimit := 0
 	codexFingerprintConvergence := false
 	codexRoutingHint := "europe"
+	prism := false
 	if cfg != nil {
+		prism = cfg.Routing.Prism != nil && *cfg.Routing.Prism
 		c2aRetryCount = cfg.RequestRetry
 		c2aRetryInterval = cfg.MaxRetryInterval
 		if cfg.Routing.AuthConcurrencyLimit != nil {
@@ -388,6 +390,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"auth-concurrency-limit":        authConcurrencyLimit,
 		"codex-fingerprint-convergence": codexFingerprintConvergence,
 		"codex-routing-hint":            codexRoutingHint,
+		"prism":                         prism,
 		"runtime_only":                  true,
 	})
 }
@@ -406,6 +409,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		AuthConcurrencyLimit        *int    `json:"auth-concurrency-limit"`
 		CodexFingerprintConvergence *bool   `json:"codex-fingerprint-convergence"`
 		CodexRoutingHint            *string `json:"codex-routing-hint"`
+		Prism                       *bool   `json:"prism"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -440,12 +444,16 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth-concurrency-limit must be between 0 and 1000000"})
 		return
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexRoutingHint == nil {
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexRoutingHint == nil && body.Prism == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
 
 	h.applyRuntimeConfig(c, func(cfg *config.Config) error {
+		if body.Prism != nil {
+			value := *body.Prism
+			cfg.Routing.Prism = &value
+		}
 		if mode != nil {
 			cfg.Routing.SchedulerMode = normalizedMode
 		}

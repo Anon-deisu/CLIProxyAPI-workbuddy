@@ -486,6 +486,12 @@ const runtimeSchedulerInlineScript = `
     fingerprintConvergence.title = '仅 Codex OAuth/SetupToken 生效，每个账号固定使用独立身份';
     fingerprintLabel.appendChild(fingerprintConvergence);
     fingerprintLabel.appendChild(document.createTextNode('Codex 账号指纹收敛'));
+    var prismLabel = make('label', 'cpa-runtime-scheduler-check');
+    var prism = document.createElement('input');
+    prism.type = 'checkbox';
+    prism.title = '使用已启用的 Plus 账号，不受原 Codex 额度限制；仅 Prism 将 max 映射为 xhigh';
+    prismLabel.appendChild(prism);
+    prismLabel.appendChild(document.createTextNode('Prism'));
     var routingLabel = make('label', 'cpa-runtime-scheduler-number');
     routingLabel.appendChild(document.createTextNode('Codex 路由提示'));
     var routingHint = document.createElement('select');
@@ -509,6 +515,7 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(quotaLabel);
     form.appendChild(disableCoolingLabel);
     form.appendChild(fingerprintLabel);
+    form.appendChild(prismLabel);
     form.appendChild(routingLabel);
     form.appendChild(save);
     form.appendChild(status);
@@ -651,6 +658,7 @@ const runtimeSchedulerInlineScript = `
         quota.checked = !!data['auto-disable-quota'];
         disableCooling.checked = !!data['disable-cooling'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
+        prism.checked = !!data['prism'];
         routingHint.value = data['codex-routing-hint'] == null ? 'europe' : String(data['codex-routing-hint']);
         status.textContent = '';
         save.disabled = false;
@@ -702,6 +710,7 @@ const runtimeSchedulerInlineScript = `
          'auto-disable-quota': quota.checked,
          'disable-cooling': disableCooling.checked,
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
+        'prism': prism.checked,
         'codex-routing-hint': routingHint.value
       }).then(function () {
         status.textContent = '已应用';

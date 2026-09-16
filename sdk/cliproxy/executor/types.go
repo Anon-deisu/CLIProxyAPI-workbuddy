@@ -31,6 +31,9 @@ const ServiceTierMetadataKey = "service_tier"
 // Missing or true means generation is enabled; only an explicit false disables generation.
 const GenerateMetadataKey = "generate"
 
+// PrismRouteMetadataKey records the transport selected for this execution attempt.
+const PrismRouteMetadataKey = "prism_route"
+
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"

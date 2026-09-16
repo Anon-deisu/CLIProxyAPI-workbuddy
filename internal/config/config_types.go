@@ -163,7 +163,9 @@ type AntigravityConnectionPoolConfig struct {
 
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
-	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// PrismBaseURL overrides the Prism service origin for an explicitly enabled Prism route.
+	PrismBaseURL    string `yaml:"prism-base-url,omitempty" json:"prism-base-url,omitempty"`
+	IdentityConfuse bool   `yaml:"identity-confuse" json:"identity-confuse"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
 	// StreamBootstrapBuffering holds back initial handshake events (response.created,
@@ -279,6 +281,9 @@ type RoutingConfig struct {
 	// CodexRoutingHint is a runtime-only upstream routing hint for Codex OAuth requests.
 	// An empty value disables the hint; omitted values use the default "europe" hint.
 	CodexRoutingHint *string `yaml:"-" json:"codex-routing-hint,omitempty"`
+	// Prism routes Codex generation through Prism using enabled Plus credentials.
+	// It is runtime-only and survives config reloads, but not process restarts.
+	Prism *bool `yaml:"-" json:"prism,omitempty"`
 	// DisableCooling is a runtime-only force override for all account and model cooldowns.
 	// A true value makes every registered account behave as if disable_cooling were true.
 	DisableCooling *bool `yaml:"-" json:"disable-cooling,omitempty"`

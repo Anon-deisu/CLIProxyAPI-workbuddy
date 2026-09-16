@@ -37,14 +37,16 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 //
 // For non-websocket downstream requests, it always uses the legacy HTTP implementation.
 type CodexAutoExecutor struct {
-	httpExec *CodexExecutor
-	wsExec   *CodexWebsocketsExecutor
+	httpExec  *CodexExecutor
+	wsExec    *CodexWebsocketsExecutor
+	prismExec *PrismExecutor
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 	return &CodexAutoExecutor{
-		httpExec: NewCodexExecutor(cfg),
-		wsExec:   NewCodexWebsocketsExecutor(cfg),
+		httpExec:  NewCodexExecutor(cfg),
+		wsExec:    NewCodexWebsocketsExecutor(cfg),
+		prismExec: NewPrismExecutor(cfg),
 	}
 }
 
@@ -65,6 +67,9 @@ func (e *CodexAutoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 }
 
 func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	if prismRequestSelected(opts) {
+		return e.prismExec.Execute(ctx, auth, req, opts)
+	}
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
@@ -78,6 +83,9 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 }
 
 func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	if prismRequestSelected(opts) {
+		return e.prismExec.ExecuteStream(ctx, auth, req, opts)
+	}
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
