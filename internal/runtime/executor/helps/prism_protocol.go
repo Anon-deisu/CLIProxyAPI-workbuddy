@@ -18,6 +18,7 @@ Do not invoke sandbox tools, inspect the workspace, or invent client tool result
 Return exactly one JSON object, without Markdown, with keys "content" (string) and "tool_calls" (array).
 To request a declared function, return a tool_calls entry with "name" and "arguments" (a JSON object).
 To request a declared custom tool, return "name" and "input" (a string conforming to its declared format) instead of arguments.
+Tools with any other type are hosted capabilities requested from the upstream service. Use a matching native capability when available and return its final result as content; never expose a hosted capability as a client tool call and never claim it ran when unavailable.
 If tools are needed, do not invent their results. The client will execute them and send function_call_output items in its next complete request.
 Use existing function_call_output items as the tool results, preserving the original user instructions.
 Honor tool_choice and parallel_tool_calls. With tool_choice none, do not request any tools.
@@ -40,11 +41,6 @@ func PrismReasoningEffort(effort string) (string, error) {
 }
 
 func BuildPrismInput(body []byte) (json.RawMessage, error) {
-	for _, tool := range gjson.GetBytes(body, "tools").Array() {
-		if kind := tool.Get("type").String(); kind != "function" && kind != "custom" {
-			return nil, &PrismHTTPError{Code: http.StatusBadRequest, Message: "Prism supports client function and custom tools, not hosted tools"}
-		}
-	}
 	message := func(role, text string) map[string]any {
 		return map[string]any{"type": "message", "role": role, "content": []map[string]string{{"type": "input_text", "text": text}}}
 	}
@@ -88,8 +84,17 @@ func prismUsage(payload, request []byte, model, generated string) (json.RawMessa
 	if errCount != nil {
 		return nil, fmt.Errorf("count Prism output tokens: %w", errCount)
 	}
-	// Prism currently omits usage. Do not invent cached or hidden reasoning token counts.
-	return json.Marshal(map[string]any{"input_tokens": input, "output_tokens": output, "total_tokens": input + int64(output), "estimated": true})
+	// Prism currently omits usage. Apply the configured local billing assumption
+	// consistently to downstream responses and CPA's internal cost ledger.
+	cached := input * 95 / 100
+	return json.Marshal(map[string]any{
+		"input_tokens":          input,
+		"output_tokens":         output,
+		"total_tokens":          input + int64(output),
+		"estimated":             true,
+		"input_tokens_details":  map[string]int64{"cached_tokens": cached},
+		"output_tokens_details": map[string]int64{"reasoning_tokens": 0},
+	})
 }
 
 func PrismResponse(payload, request []byte, model, responseID string) ([]byte, error) {
@@ -116,15 +121,21 @@ func PrismResponse(payload, request []byte, model, responseID string) ([]byte, e
 		return nil, &PrismHTTPError{Code: http.StatusBadGateway, Message: "Prism returned an invalid client tool protocol response"}
 	}
 	declared := make(map[string]string)
+	hasHostedTools := false
 	for _, tool := range gjson.GetBytes(request, "tools").Array() {
-		declared[tool.Get("name").String()] = tool.Get("type").String()
+		kind := tool.Get("type").String()
+		if kind == "function" || kind == "custom" {
+			declared[tool.Get("name").String()] = kind
+		} else {
+			hasHostedTools = true
+		}
 	}
 	choice := gjson.GetBytes(request, "tool_choice")
 	if choice.String() == "none" && len(envelope.ToolCalls) != 0 {
 		return nil, &PrismHTTPError{Code: http.StatusBadGateway, Message: "Prism did not honor tool_choice none"}
 	}
 	namedChoice := choice.Get("type").String() == "function" || choice.Get("type").String() == "custom"
-	if (choice.String() == "required" || namedChoice) && len(envelope.ToolCalls) == 0 {
+	if ((choice.String() == "required" && !hasHostedTools) || namedChoice) && len(envelope.ToolCalls) == 0 {
 		return nil, &PrismHTTPError{Code: http.StatusBadGateway, Message: "Prism did not return the required client tool call"}
 	}
 	if parallel := gjson.GetBytes(request, "parallel_tool_calls"); parallel.Exists() && !parallel.Bool() && len(envelope.ToolCalls) > 1 {

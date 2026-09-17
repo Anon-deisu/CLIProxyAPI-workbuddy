@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
@@ -21,12 +22,18 @@ const PrismDefaultBaseURL = "https://prism.openai.com"
 const prismResourceRefreshLead = time.Minute
 
 type PrismHTTPError struct {
-	Code    int
-	Message string
+	Code           int
+	Message        string
+	RefreshSandbox bool
 }
 
 func (e *PrismHTTPError) Error() string   { return e.Message }
 func (e *PrismHTTPError) StatusCode() int { return e.Code }
+
+func ShouldRefreshPrismSandbox(err error) bool {
+	var prismErr *PrismHTTPError
+	return errors.As(err, &prismErr) && prismErr.RefreshSandbox
+}
 
 type PrismClient struct {
 	mu                sync.Mutex
@@ -261,20 +268,30 @@ func (r *PrismRun) Wait(ctx context.Context) (json.RawMessage, error) {
 			return nil, fmt.Errorf("invalid Prism failure response: %w", err)
 		}
 		code := http.StatusBadGateway
+		refreshSandbox := false
 		switch failure.Reason {
 		case "sandbox_reconnecting":
 			code = http.StatusServiceUnavailable
-			r.client.mu.Lock()
-			if r.client.sandbox.Token == r.sandboxToken {
-				r.client.sandbox = prismSandbox{}
-			}
-			r.client.mu.Unlock()
+			refreshSandbox = true
 		case "unauthorized", "session_expired":
 			code = http.StatusUnauthorized
 		case "rate_limit_exceeded", "quota_exceeded":
 			code = http.StatusTooManyRequests
 		}
-		return nil, &PrismHTTPError{Code: code, Message: fmt.Sprintf("Prism generation failed: %s: %s (stage=%s request_id=%s conversation_id=%s)", failure.Reason, failure.Message, stage, r.turn.RequestID, r.conversationID)}
+		messageLower := strings.ToLower(failure.Message)
+		if failure.Reason == "unknown" && strings.Contains(messageLower, "error while processing conversation") {
+			code = http.StatusServiceUnavailable
+			refreshSandbox = true
+		}
+		if refreshSandbox {
+			r.client.mu.Lock()
+			if r.client.sandbox.Token == r.sandboxToken {
+				r.client.sandbox = prismSandbox{}
+				r.client.resourcesExpireAt = time.Time{}
+			}
+			r.client.mu.Unlock()
+		}
+		return nil, &PrismHTTPError{Code: code, Message: fmt.Sprintf("Prism generation failed: %s: %s (stage=%s request_id=%s conversation_id=%s)", failure.Reason, failure.Message, stage, r.turn.RequestID, r.conversationID), RefreshSandbox: refreshSandbox}
 	}
 	return r.turn.Response.Payload, nil
 }

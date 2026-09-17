@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,9 @@ func TestPrismProtocolFunctionCall(t *testing.T) {
 	if usage.Get("total_tokens").Int() != usage.Get("input_tokens").Int()+usage.Get("output_tokens").Int() {
 		t.Fatal("Prism usage totals do not match")
 	}
+	if got, want := usage.Get("input_tokens_details.cached_tokens").Int(), usage.Get("input_tokens").Int()*95/100; got != want {
+		t.Fatalf("estimated cached tokens = %d, want %d", got, want)
+	}
 	events, err := PrismResponseEvents(response)
 	if err != nil || !strings.Contains(string(events[len(events)-1]), "response.completed") {
 		t.Fatalf("tool SSE did not complete: %v", err)
@@ -52,6 +56,21 @@ func TestPrismProtocolPreservesReportedUsage(t *testing.T) {
 	}
 }
 
+func TestPrismProtocolAcceptsHostedTools(t *testing.T) {
+	request := []byte(`{"input":"find current docs","tools":[{"type":"web_search_preview"},{"type":"image_generation"}],"tool_choice":"required"}`)
+	if _, err := BuildPrismInput(request); err != nil {
+		t.Fatalf("hosted tools rejected: %v", err)
+	}
+	payload := []byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"content\":\"hosted result\",\"tool_calls\":[]}"}]}]}`)
+	response, err := PrismResponse(payload, request, "gpt-6-astra", "resp-hosted")
+	if err != nil {
+		t.Fatalf("hosted final response rejected: %v", err)
+	}
+	if gjson.GetBytes(response, "output.0.content.0.text").String() != "hosted result" {
+		t.Fatalf("unexpected hosted response: %s", response)
+	}
+}
+
 func TestPrismCompletedRunDoesNotSendStop(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -69,7 +88,9 @@ func TestPrismCompletedRunDoesNotSendStop(t *testing.T) {
 }
 
 func TestPrismGenerationErrorIncludesTraceWithoutCredentials(t *testing.T) {
-	run := &PrismRun{conversationID: "cdx1-test", turn: prismTurn{Status: "completed", RequestID: "request-test", State: json.RawMessage(`{"sandbox_token":"private-token"}`)}}
+	client := NewPrismClient(http.DefaultClient, "https://prism.example", "test")
+	client.sandbox = prismSandbox{URL: "https://prism.example/s/sandboxes/proxy", Token: "sandbox-test"}
+	run := &PrismRun{client: client, conversationID: "cdx1-test", sandboxToken: "sandbox-test", turn: prismTurn{Status: "completed", RequestID: "request-test", State: json.RawMessage(`{"sandbox_token":"private-token"}`)}}
 	run.turn.Response.Status = "error"
 	run.turn.Response.Payload = json.RawMessage(`{"reason":"unknown","message":"Error while processing conversation"}`)
 	_, err := run.Wait(context.Background())
@@ -83,6 +104,13 @@ func TestPrismGenerationErrorIncludesTraceWithoutCredentials(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "private-token") {
 		t.Fatal("generation error leaked turn credentials")
+	}
+	var prismErr *PrismHTTPError
+	if !errors.As(err, &prismErr) || !prismErr.RefreshSandbox || prismErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("conversation processing failure is not recoverable: %#v", err)
+	}
+	if client.sandbox.Token != "" {
+		t.Fatal("conversation processing failure retained the broken sandbox")
 	}
 }
 

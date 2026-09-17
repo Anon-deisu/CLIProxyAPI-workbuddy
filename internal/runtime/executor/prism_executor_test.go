@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -88,6 +89,13 @@ func TestPrismExecutorProtocolsAndScopedMax(t *testing.T) {
 			}
 			if usage.Get(inputKey).Int() <= 0 || usage.Get(outputKey).Int() <= 0 || !usage.Get("estimated").Bool() {
 				t.Fatalf("%s response missing usable token counts: %s", tc.format, out.Payload)
+			}
+			if tc.format != "claude" {
+				if got, want := usage.Get(inputKey+"_details.cached_tokens").Int(), usage.Get(inputKey).Int()*95/100; got != want {
+					t.Fatalf("%s cached tokens = %d, want %d", tc.format, got, want)
+				}
+			} else if usage.Get("cache_read_input_tokens").Int() <= usage.Get("input_tokens").Int() {
+				t.Fatalf("Claude cached usage was not split from input: %s", usage.Raw)
 			}
 			stream, errStream := e.ExecuteStream(context.Background(), a, req, opts)
 			if errStream != nil {
@@ -204,5 +212,61 @@ func TestPrismExecutorConversationIsolation(t *testing.T) {
 				t.Fatal("another caller or conversation could access response history")
 			}
 		}
+	}
+}
+
+func TestPrismExecutorRecoversConversationProcessingBeforeStreaming(t *testing.T) {
+	var starts, sandboxes int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var response any = map[string]any{"status": "success"}
+		switch r.URL.Path {
+		case "/auth/session":
+			response = map[string]any{"userTier": "logged_in", "user": map[string]string{"id": "test-user"}}
+		case "/api/projects":
+			if r.Method == http.MethodGet {
+				response = map[string]any{"projects": []any{}}
+			} else {
+				response = map[string]string{"uuid": "test-project"}
+			}
+		case "/api/backend/1/new":
+			sandboxes++
+			response = map[string]string{"url": server.URL + "/s/sandboxes/proxy", "token": fmt.Sprintf("sandbox-%d", sandboxes)}
+		case "/api/projects/test-project/sandbox/resources-token":
+			response = map[string]any{"access_token": "resource", "resources_base_url": server.URL, "expires_at": time.Now().Add(time.Hour).Unix()}
+		case "/api/y":
+			response = map[string]string{"docId": "test-project", "token": "document"}
+		case "/s/sandboxes/proxy/wait-for-sync":
+			response = map[string]string{"status": "synced"}
+		case "/api/llm/response_with_tools_start":
+			starts++
+			if starts == 1 {
+				response = map[string]any{"status": "completed", "request_id": "failed", "response": map[string]any{"status": "error", "payload": map[string]string{"reason": "unknown", "message": "Error while processing conversation (400 Bad Request). Please submit prompt again."}}}
+			} else {
+				response = map[string]any{"status": "completed", "request_id": "success", "response": map[string]any{"status": "success", "payload": map[string]any{"output": []any{map[string]any{"type": "message", "content": []any{map[string]string{"type": "output_text", "text": `{"content":"hello","tool_calls":[]}`}}}}}}}
+			}
+		}
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	executor := NewPrismExecutor(&config.Config{Codex: config.CodexConfig{PrismBaseURL: server.URL}})
+	auth := &cliproxyauth.Auth{ID: "plus", Metadata: map[string]any{"access_token": "test-at"}}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Metadata: map[string]any{cliproxyexecutor.CanonicalSessionIDMetadataKey: "session"}}
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{Model: "gpt-6-astra", Payload: []byte(`{"input":"你好，只回复 hello"}`)}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire strings.Builder
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatal(chunk.Err)
+		}
+		wire.Write(chunk.Payload)
+	}
+	if starts != 2 || sandboxes != 2 || strings.Count(wire.String(), `"type":"response.completed"`) != 1 || strings.Count(wire.String(), `"delta":"hello"`) != 1 {
+		t.Fatalf("recovery duplicated or skipped output: starts=%d sandboxes=%d wire=%s", starts, sandboxes, wire.String())
 	}
 }

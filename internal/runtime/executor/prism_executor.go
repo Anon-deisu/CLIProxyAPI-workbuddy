@@ -192,23 +192,38 @@ func (e *PrismExecutor) start(ctx context.Context, auth *cliproxyauth.Auth, req 
 	return run, body, errStart
 }
 
+func (e *PrismExecutor) generate(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, responseID string) ([]byte, []byte, error) {
+	model := thinking.ParseSuffix(req.Model).ModelName
+	for attempt := 0; attempt < 2; attempt++ {
+		run, body, errStart := e.start(ctx, auth, req, opts)
+		if errStart != nil {
+			return nil, nil, errStart
+		}
+		payload, errWait := run.Wait(ctx)
+		stopCancelledPrismRun(ctx, run)
+		if errWait != nil {
+			if attempt == 0 && helps.ShouldRefreshPrismSandbox(errWait) {
+				continue
+			}
+			return nil, nil, errWait
+		}
+		response, errResponse := helps.PrismResponse(payload, body, model, responseID)
+		if errResponse != nil {
+			return nil, nil, errResponse
+		}
+		return body, response, nil
+	}
+	return nil, nil, fmt.Errorf("Prism sandbox recovery exhausted")
+}
+
 func (e *PrismExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	model := thinking.ParseSuffix(req.Model).ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
 	defer reporter.TrackFailure(ctx, &err)
-	run, body, err := e.start(ctx, auth, req, opts)
-	if err != nil {
-		return resp, err
-	}
-	defer stopCancelledPrismRun(ctx, run)
-	payload, errWait := run.Wait(ctx)
-	if errWait != nil {
-		return resp, errWait
-	}
-	response, errResponse := helps.PrismResponse(payload, body, model, "resp_"+uuid.NewString())
-	if errResponse != nil {
-		return resp, errResponse
+	body, response, errGenerate := e.generate(ctx, auth, req, opts, "resp_"+uuid.NewString())
+	if errGenerate != nil {
+		return resp, errGenerate
 	}
 	e.remember(opts, body, response)
 	reporter.SetTranslatedReasoningEffort(body, "codex")
@@ -229,79 +244,48 @@ func (e *PrismExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	model := thinking.ParseSuffix(req.Model).ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, model, auth)
 	defer reporter.TrackFailure(ctx, &err)
-	run, body, err := e.start(ctx, auth, req, opts)
-	if err != nil {
-		return nil, err
-	}
 	responseID := "resp_" + uuid.NewString()
-	output := make(chan cliproxyexecutor.StreamChunk)
-	go func() {
-		defer close(output)
-		defer stopCancelledPrismRun(ctx, run)
-		send := func(chunk cliproxyexecutor.StreamChunk) bool {
-			select {
-			case <-ctx.Done():
-				return false
-			case output <- chunk:
-				return true
+	body, response, errGenerate := e.generate(ctx, auth, req, opts, responseID)
+	if errGenerate != nil {
+		return nil, errGenerate
+	}
+	e.remember(opts, body, response)
+	events, errEvents := helps.PrismResponseEvents(response)
+	if errEvents != nil {
+		return nil, fmt.Errorf("Prism event conversion: %w", errEvents)
+	}
+	inputTokens, errCount := helps.PrismInputTokens(body, model)
+	if errCount != nil {
+		return nil, errCount
+	}
+	reporter.SetTranslatedReasoningEffort(body, "codex")
+	reporter.Publish(ctx, helps.ParseOpenAIUsage(response))
+	var param any
+	original := opts.OriginalRequest
+	if len(original) == 0 {
+		original = req.Payload
+	}
+	target := cliproxyexecutor.ResponseFormatOrSource(opts)
+	translated := make([][]byte, 0, len(events)+2)
+	for i, eventType := range []string{"response.created", "response.in_progress"} {
+		initial := map[string]any{"id": responseID, "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "in_progress", "output": []any{}}
+		if target == sdktranslator.FormatClaude && eventType == "response.created" {
+			initial["usage"] = map[string]any{
+				"input_tokens": inputTokens, "output_tokens": 0, "total_tokens": inputTokens, "estimated": true,
+				"input_tokens_details": map[string]int64{"cached_tokens": inputTokens * 95 / 100},
 			}
 		}
-		var param any
-		original := opts.OriginalRequest
-		if len(original) == 0 {
-			original = req.Payload
-		}
-		target := cliproxyexecutor.ResponseFormatOrSource(opts)
-		translate := func(event []byte) bool {
-			for _, chunk := range sdktranslator.TranslateStream(ctx, sdktranslator.FormatCodex, target, req.Model, original, body, event, &param) {
-				if !send(cliproxyexecutor.StreamChunk{Payload: chunk}) {
-					return false
-				}
-			}
-			return true
-		}
-		inputTokens, errCount := helps.PrismInputTokens(body, model)
-		if errCount != nil {
-			reporter.PublishFailure(ctx, errCount)
-			send(cliproxyexecutor.StreamChunk{Err: errCount})
-			return
-		}
-		for i, eventType := range []string{"response.created", "response.in_progress"} {
-			initial := map[string]any{"id": responseID, "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "in_progress", "output": []any{}}
-			if target == sdktranslator.FormatClaude && eventType == "response.created" {
-				initial["usage"] = map[string]any{"input_tokens": inputTokens, "output_tokens": 0, "total_tokens": inputTokens, "estimated": true}
-			}
-			event, _ := json.Marshal(map[string]any{"type": eventType, "sequence_number": i, "response": initial})
-			if !translate(append(append([]byte("data: "), event...), []byte("\n\n")...)) {
-				return
-			}
-		}
-		payload, errWait := run.Wait(ctx)
-		if errWait != nil {
-			reporter.PublishFailure(ctx, errWait)
-			send(cliproxyexecutor.StreamChunk{Err: errWait})
-			return
-		}
-		response, errResponse := helps.PrismResponse(payload, body, model, responseID)
-		if errResponse != nil {
-			reporter.PublishFailure(ctx, errResponse)
-			send(cliproxyexecutor.StreamChunk{Err: errResponse})
-			return
-		}
-		e.remember(opts, body, response)
-		events, errEvents := helps.PrismResponseEvents(response)
-		if errEvents != nil {
-			send(cliproxyexecutor.StreamChunk{Err: fmt.Errorf("Prism event conversion: %w", errEvents)})
-			return
-		}
-		reporter.SetTranslatedReasoningEffort(body, "codex")
-		reporter.Publish(ctx, helps.ParseOpenAIUsage(response))
-		for _, event := range events {
-			if !translate(event) {
-				return
-			}
-		}
-	}()
+		event, _ := json.Marshal(map[string]any{"type": eventType, "sequence_number": i, "response": initial})
+		translated = append(translated, sdktranslator.TranslateStream(ctx, sdktranslator.FormatCodex, target, req.Model, original, body, append(append([]byte("data: "), event...), []byte("\n\n")...), &param)...)
+	}
+	for _, event := range events {
+		translated = append(translated, sdktranslator.TranslateStream(ctx, sdktranslator.FormatCodex, target, req.Model, original, body, event, &param)...)
+	}
+	output := make(chan cliproxyexecutor.StreamChunk, len(translated))
+	for _, chunk := range translated {
+		output <- cliproxyexecutor.StreamChunk{Payload: chunk}
+	}
+	close(output)
 	return &cliproxyexecutor.StreamResult{Headers: http.Header{"Content-Type": {"text/event-stream"}, "X-Prism-Transport": {"polling"}}, Chunks: output}, nil
 }
 
