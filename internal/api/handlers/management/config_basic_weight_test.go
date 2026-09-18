@@ -61,6 +61,45 @@ func TestPutRoutingSettingsUpdatesMemoryOnly(t *testing.T) {
 	}
 }
 
+func TestRoutingSettingsCodexTurnStateRoundTrip(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	for _, enabled := range []bool{true, false} {
+		body, _ := json.Marshal(map[string]any{"codex-turn-state-enabled": enabled})
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+		h.PutRoutingSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH: %s", rec.Body.String())
+		}
+		h.SetConfig(&config.Config{})
+		rec = httptest.NewRecorder()
+		ctx, _ = gin.CreateTestContext(rec)
+		h.GetRoutingSettings(ctx)
+		var settings map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
+			t.Fatal(err)
+		}
+		if settings["codex-turn-state-enabled"] != enabled {
+			t.Fatal("runtime toggle lost across reload")
+		}
+		yamlBytes, _ := yaml.Marshal(h.cfg)
+		if strings.Contains(string(yamlBytes), "codex-turn-state-enabled") {
+			t.Fatal("runtime toggle was persisted")
+		}
+		rec = httptest.NewRecorder()
+		ctx, _ = gin.CreateTestContext(rec)
+		h.GetCodexTurnStateStatus(ctx)
+		var status map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		if status["enabled"] != enabled || status["ttl_seconds"] != float64(3600) {
+			t.Fatal("incorrect keeper status")
+		}
+	}
+}
+
 func TestPutRoutingSettingsUpdatesCodexRoutingHint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{}

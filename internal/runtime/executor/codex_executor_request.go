@@ -128,6 +128,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := helps.NewCodexHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient = e.turnStates.WrapHTTPClient(httpClient, auth)
 	return httpClient.Do(httpReq)
 }
 

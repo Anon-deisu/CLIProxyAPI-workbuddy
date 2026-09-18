@@ -264,6 +264,7 @@ const runtimeSchedulerInlineScript = `
   var authFilesGeneration = 0;
   var authFiles = new Map();
   var authFilesRefreshPending = false;
+  var resetTurnStateView = function () {};
   var nativeFetch = window.fetch;
 
   function clearManagementSession() {
@@ -273,6 +274,7 @@ const runtimeSchedulerInlineScript = `
     managementReady = false;
     authFilesRefreshPending = false;
     authFiles.clear();
+    resetTurnStateView();
     renderQuotaCosts();
   }
 
@@ -486,6 +488,70 @@ const runtimeSchedulerInlineScript = `
     fingerprintConvergence.title = '仅 Codex OAuth/SetupToken 生效，每个账号固定使用独立身份';
     fingerprintLabel.appendChild(fingerprintConvergence);
     fingerprintLabel.appendChild(document.createTextNode('Codex 账号指纹收敛'));
+    var turnStateLabel = make('label', 'cpa-runtime-scheduler-check');
+    var turnStateEnabled = document.createElement('input');
+    turnStateEnabled.type = 'checkbox';
+    turnStateLabel.appendChild(turnStateEnabled);
+    turnStateLabel.appendChild(document.createTextNode('Codex 292 state 自动续期'));
+    var turnStateList = make('div', 'cpa-runtime-scheduler-turn-states', '未开启');
+    var turnStateData = null;
+    var turnStateLoadedAt = 0;
+    var turnStatePending = false;
+    resetTurnStateView = function () {
+      turnStateData = null;
+      turnStatePending = false;
+      turnStateEnabled.checked = false;
+      turnStateList.textContent = '未连接管理接口';
+    };
+    function renderTurnStates() {
+      if (!turnStateData) return;
+      turnStateList.textContent = '';
+      if (!turnStateData.enabled) {
+        turnStateList.textContent = '未开启';
+        return;
+      }
+      if (!turnStateData.accounts.length) {
+        turnStateList.textContent = '等待可用 Codex 账号';
+        return;
+      }
+      var elapsed = Math.floor((performance.now() - turnStateLoadedAt) / 1000);
+      turnStateData.accounts.forEach(function (item) {
+        var row = make('div', 'cpa-runtime-scheduler-turn-state-row');
+        row.appendChild(make('strong', '', item.name));
+        var remaining = Math.max(0, item.remaining_seconds - elapsed);
+        var text = item.refreshing ? '正在采集...' : (item.last_error ? '采集失败 · 等待重试' : '等待采集');
+        if (remaining > 0) {
+          var minutes = Math.floor(remaining / 60);
+          var seconds = String(remaining % 60).padStart(2, '0');
+          text = '292 剩余（估算）：' + minutes + ':' + seconds;
+          if (item.refreshing) text += ' · 续期中';
+        } else if (item.status === 'active') {
+          text = item.refreshing ? '已到期 · 续期中' : '已到期 · 等待续期';
+        }
+        row.appendChild(make('span', '', text));
+        if (item.last_error) row.appendChild(make('span', 'cpa-runtime-scheduler-turn-state-error', item.last_error));
+        turnStateList.appendChild(row);
+      });
+    }
+    function loadTurnStates() {
+      if (turnStatePending || !managementReady) return;
+      turnStatePending = true;
+      var generation = sessionGeneration;
+      request('GET', 'routing/codex-turn-state').then(function (response) {
+        return response.json();
+      }).then(function (data) {
+        if (generation !== sessionGeneration) return;
+        turnStateData = data;
+        turnStateLoadedAt = performance.now();
+        renderTurnStates();
+      }).catch(function () {
+        if (generation !== sessionGeneration) return;
+        turnStateData = null;
+        turnStateList.textContent = '读取 state 状态失败';
+      }).finally(function () {
+        if (generation === sessionGeneration) turnStatePending = false;
+      });
+    }
     var cacheRewriteLabel = make('label', 'cpa-runtime-scheduler-check');
     var cacheRewrite = document.createElement('input');
     cacheRewrite.type = 'checkbox';
@@ -541,6 +607,8 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(quotaLabel);
     form.appendChild(disableCoolingLabel);
     form.appendChild(fingerprintLabel);
+    form.appendChild(turnStateLabel);
+    form.appendChild(turnStateList);
     form.appendChild(cacheRewriteLabel);
     form.appendChild(cacheMinLabel);
     form.appendChild(cacheMaxLabel);
@@ -669,6 +737,7 @@ const runtimeSchedulerInlineScript = `
         setTimeout(avoidManagementSaveButton, 0);
         loadSettings();
         loadAuthStatus();
+        loadTurnStates();
       }
     });
     window.addEventListener('resize', avoidManagementSaveButton);
@@ -686,6 +755,7 @@ const runtimeSchedulerInlineScript = `
         quota.checked = !!data['auto-disable-quota'];
         disableCooling.checked = !!data['disable-cooling'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
+        turnStateEnabled.checked = !!data['codex-turn-state-enabled'];
         var rewrite = data['cache-token-rewrite'] || {};
         cacheRewrite.checked = !!rewrite.enabled;
         cacheMin.value = rewrite['min-percent'] == null ? '' : String(rewrite['min-percent']);
@@ -743,6 +813,7 @@ const runtimeSchedulerInlineScript = `
          'auto-disable-quota': quota.checked,
          'disable-cooling': disableCooling.checked,
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
+        'codex-turn-state-enabled': turnStateEnabled.checked,
         'cache-token-rewrite': {
           enabled: cacheRewrite.checked,
           'min-percent': cacheMin.value === '' ? null : Number(cacheMin.value),
@@ -751,6 +822,7 @@ const runtimeSchedulerInlineScript = `
         'codex-routing-hint': routingHint.value
       }).then(function () {
         status.textContent = '已应用';
+        loadTurnStates();
       }).catch(function () {
         status.textContent = '应用失败';
       }).finally(function () {
@@ -758,6 +830,8 @@ const runtimeSchedulerInlineScript = `
       });
     });
     new MutationObserver(renderQuotaCosts).observe(document.body, { childList: true, subtree: true });
+    setInterval(function () { if (!panel.hidden) loadTurnStates(); }, 5000);
+    setInterval(function () { if (!panel.hidden) renderTurnStates(); }, 1000);
     renderQuotaCosts();
   }
 
@@ -766,6 +840,7 @@ const runtimeSchedulerInlineScript = `
      '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:min(340px,calc(100vw - 16px));max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
      '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
+  style.textContent += '.cpa-runtime-scheduler-turn-states{font-size:12px;color:#57606a;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;letter-spacing:0}.cpa-runtime-scheduler-turn-state-row{display:grid;gap:3px;padding:6px 0;border-bottom:1px solid #d8dee4}.cpa-runtime-scheduler-turn-state-error{color:#b42318}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mount, { once: true });

@@ -42,6 +42,10 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 		value := *previous.Routing.CodexRoutingHint
 		cloned.Routing.CodexRoutingHint = &value
 	}
+	if cloned.Routing.CodexTurnStateEnabled == nil && previous.Routing.CodexTurnStateEnabled != nil {
+		value := *previous.Routing.CodexTurnStateEnabled
+		cloned.Routing.CodexTurnStateEnabled = &value
+	}
 	if cloned.Routing.DisableCooling == nil && previous.Routing.DisableCooling != nil {
 		value := *previous.Routing.DisableCooling
 		cloned.Routing.DisableCooling = &value

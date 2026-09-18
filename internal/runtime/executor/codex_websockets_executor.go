@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
@@ -49,6 +50,16 @@ func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 }
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
+
+// SetTurnStateKeeper binds the service-owned keeper before publishing this executor.
+func (e *CodexAutoExecutor) SetTurnStateKeeper(keeper *helps.CodexTurnStateKeeper) {
+	e.httpExec.turnStates = keeper
+	e.wsExec.turnStates = keeper
+}
+
+func (e *CodexAutoExecutor) CodexTurnStateKeeper() *helps.CodexTurnStateKeeper {
+	return e.httpExec.turnStates
+}
 
 func (e *CodexAutoExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if e == nil || e.httpExec == nil {

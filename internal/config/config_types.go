@@ -164,6 +164,8 @@ type AntigravityConnectionPoolConfig struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// TurnStateProbeModel selects the lightweight keeper probe model; empty uses the built-in default.
+	TurnStateProbeModel string `yaml:"turn-state-probe-model,omitempty" json:"turn-state-probe-model,omitempty"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
 	// StreamBootstrapBuffering holds back initial handshake events (response.created,
@@ -276,6 +278,8 @@ type RoutingConfig struct {
 	// OAuth/SetupToken identity convergence. Nil retains the current setting across
 	// config reloads; false explicitly restores native request identity behavior.
 	CodexFingerprintConvergence *bool `yaml:"-" json:"codex-fingerprint-convergence,omitempty"`
+	// CodexTurnStateEnabled enables the runtime-only, account-scoped turn-state keeper.
+	CodexTurnStateEnabled *bool `yaml:"-" json:"codex-turn-state-enabled,omitempty"`
 	// CodexRoutingHint is a runtime-only upstream routing hint for Codex OAuth requests.
 	// An empty value disables the hint; omitted values use the default "europe" hint.
 	CodexRoutingHint *string `yaml:"-" json:"codex-routing-hint,omitempty"`

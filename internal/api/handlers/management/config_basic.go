@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
@@ -348,6 +349,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	c2aRetryCredentials := 0
 	authConcurrencyLimit := 0
 	codexFingerprintConvergence := false
+	codexTurnStateEnabled := false
 	codexRoutingHint := "europe"
 	cacheTokenRewrite := config.CacheTokenRewriteConfig{}
 	if cfg != nil {
@@ -361,6 +363,9 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		}
 		if cfg.Routing.CodexFingerprintConvergence != nil {
 			codexFingerprintConvergence = *cfg.Routing.CodexFingerprintConvergence
+		}
+		if cfg.Routing.CodexTurnStateEnabled != nil {
+			codexTurnStateEnabled = *cfg.Routing.CodexTurnStateEnabled
 		}
 		if cfg.Routing.CodexRoutingHint != nil {
 			codexRoutingHint = strings.TrimSpace(*cfg.Routing.CodexRoutingHint)
@@ -391,10 +396,33 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"c2a-max-retry-credentials":     c2aRetryCredentials,
 		"auth-concurrency-limit":        authConcurrencyLimit,
 		"codex-fingerprint-convergence": codexFingerprintConvergence,
+		"codex-turn-state-enabled":      codexTurnStateEnabled,
 		"codex-routing-hint":            codexRoutingHint,
 		"cache-token-rewrite":           cacheTokenRewrite,
 		"runtime_only":                  true,
 	})
+}
+
+// GetCodexTurnStateStatus returns only per-account validity estimates and collection status.
+func (h *Handler) GetCodexTurnStateStatus(c *gin.Context) {
+	h.mu.Lock()
+	enabled := h.cfg != nil && h.cfg.Routing.CodexTurnStateEnabled != nil && *h.cfg.Routing.CodexTurnStateEnabled
+	manager := h.authManager
+	h.mu.Unlock()
+	accounts := []helps.CodexTurnStateStatus{}
+	if manager != nil {
+		if executor, ok := manager.Executor("codex"); ok {
+			if source, ok := executor.(interface {
+				CodexTurnStateKeeper() *helps.CodexTurnStateKeeper
+			}); ok {
+				if keeper := source.CodexTurnStateKeeper(); keeper != nil {
+					accounts = keeper.Snapshot()
+				}
+			}
+		}
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"enabled": enabled, "accounts": accounts, "ttl_seconds": int64(helps.CodexTurnStateTTL / time.Second)})
 }
 
 // PutRoutingSettings updates scheduler controls in memory and deliberately skips config.yaml writes.
@@ -410,6 +438,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		C2AMaxRetryCredentials      *int                            `json:"c2a-max-retry-credentials"`
 		AuthConcurrencyLimit        *int                            `json:"auth-concurrency-limit"`
 		CodexFingerprintConvergence *bool                           `json:"codex-fingerprint-convergence"`
+		CodexTurnStateEnabled       *bool                           `json:"codex-turn-state-enabled"`
 		CodexRoutingHint            *string                         `json:"codex-routing-hint"`
 		CacheTokenRewrite           *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
 	}
@@ -452,7 +481,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth-concurrency-limit must be between 0 and 1000000"})
 		return
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
@@ -502,6 +531,10 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		if body.CodexFingerprintConvergence != nil {
 			value := *body.CodexFingerprintConvergence
 			cfg.Routing.CodexFingerprintConvergence = &value
+		}
+		if body.CodexTurnStateEnabled != nil {
+			value := *body.CodexTurnStateEnabled
+			cfg.Routing.CodexTurnStateEnabled = &value
 		}
 		if body.CodexRoutingHint != nil {
 			value := strings.ToLower(strings.TrimSpace(*body.CodexRoutingHint))

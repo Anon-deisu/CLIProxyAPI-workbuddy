@@ -104,6 +104,31 @@ func TestRegisterAvailableExecutors(t *testing.T) {
 	}
 }
 
+func TestCodexTurnStateKeeperSurvivesExecutorReplacement(t *testing.T) {
+	service := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil)}
+	auth := &coreauth.Auth{ID: "codex", Provider: "codex"}
+	service.registerExecutorForAuth(auth, false)
+	keeper := service.codexTurnStates
+	defer keeper.Close()
+	initial, _ := service.coreManager.Executor("codex")
+	service.cfg = &config.Config{}
+	service.cfg.Routing.CodexTurnStateEnabled = new(true)
+	service.registerExecutorForAuth(auth, true)
+	replacement, _ := service.coreManager.Executor("codex")
+	if replacement == initial {
+		t.Fatal("executor was not replaced")
+	}
+	if replacement.(*runtimeexecutor.CodexAutoExecutor).CodexTurnStateKeeper() != keeper {
+		t.Fatal("config reload lost the service-owned keeper")
+	}
+	service.cfg = &config.Config{}
+	service.cfg.Routing.CodexTurnStateEnabled = new(false)
+	service.registerAvailableExecutors(t.Context(), executorRegistrationOptions{})
+	if len(keeper.Snapshot()) != 0 {
+		t.Fatal("disabled keeper retained cached state")
+	}
+}
+
 func TestSyncPluginModelRuntimePreservesSDKExecutorUnlessForced(t *testing.T) {
 	manager := coreauth.NewManager(nil, nil, nil)
 	custom := serviceTestSDKExecutor{}

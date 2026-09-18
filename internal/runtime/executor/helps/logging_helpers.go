@@ -70,6 +70,9 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 	if ginCtx == nil {
 		return
 	}
+	if info.Provider == "codex" {
+		info.Body = RedactCodexTurnStatePayload(info.Body)
+	}
 	if !cfg.RequestLog {
 		deferAPIRequest(ginCtx, info)
 		return
@@ -294,6 +297,9 @@ func RecordAPIWebsocketRequest(ctx context.Context, cfg *config.Config, info Ups
 	if ginCtx == nil {
 		return
 	}
+	if info.Provider == "codex" {
+		info.Body = RedactCodexTurnStatePayload(info.Body)
+	}
 
 	builder := &strings.Builder{}
 	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
@@ -404,7 +410,7 @@ func AppendAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload
 // quota event headers carried by the frame into the request log.
 func AppendCodexAPIWebsocketResponse(ctx context.Context, cfg *config.Config, payload []byte) {
 	logging.MergeResponseHeaders(ctx, ParseCodexQuotaEventHeaders(payload))
-	AppendAPIWebsocketResponse(ctx, cfg, payload)
+	AppendAPIWebsocketResponse(ctx, cfg, RedactCodexTurnStatePayload(payload))
 }
 
 // RecordAPIWebsocketError stores an upstream websocket error event in Gin context.

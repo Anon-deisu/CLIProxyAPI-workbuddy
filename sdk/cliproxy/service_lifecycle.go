@@ -291,6 +291,11 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
 		}
+		s.executorRegistrationMu.Lock()
+		if s.codexTurnStates != nil {
+			s.codexTurnStates.Close()
+		}
+		s.executorRegistrationMu.Unlock()
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {
 				log.Errorf("failed to stop file watcher: %v", err)

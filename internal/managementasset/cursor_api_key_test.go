@@ -163,6 +163,109 @@ func TestRuntimeSchedulerTracksNativeAuthFileResponses(t *testing.T) {
 	}
 }
 
+func TestRuntimeSchedulerTurnStateControls(t *testing.T) {
+	node, errNode := exec.LookPath("node")
+	if errNode != nil {
+		t.Skip("Node.js is required for the inline JavaScript regression test")
+	}
+	start := strings.Index(runtimeSchedulerInlineScript, ">") + 1
+	end := strings.LastIndex(runtimeSchedulerInlineScript, "</script>")
+	command := exec.Command(node, "-e", runtimeSchedulerTurnStateTest)
+	command.Stdin = strings.NewReader(runtimeSchedulerInlineScript[start:end])
+	if output, errRun := command.CombinedOutput(); errRun != nil {
+		t.Fatalf("turn-state UI regression: %v\n%s", errRun, output)
+	}
+}
+
+const runtimeSchedulerTurnStateTest = `
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const nodes = [], timers = [], listeners = {};
+class Element {
+  constructor(tag) { this.tagName = tag; this.children = []; this.style = {}; this.listeners = {}; this._text = ''; this.hidden = false; this.value = ''; nodes.push(this); }
+  set textContent(value) { this._text = value; this.children = []; }
+  get textContent() { return this._text + this.children.map(node => node.textContent).join(''); }
+  appendChild(child) { this.children.push(child); return child; }
+  addEventListener(type, callback) { this.listeners[type] = callback; }
+  click() { if (this.listeners.click) this.listeners.click(); }
+  contains(node) { return this.children.includes(node); }
+  getBoundingClientRect() { return {left:10,top:10,width:320,height:500,right:330,bottom:510}; }
+  reportValidity() { return true; }
+}
+globalThis.window = globalThis;
+window.location = {href: 'https://panel.test/management.html', hash:'#/quota'};
+window.innerWidth = 1280; window.innerHeight = 800;
+window.addEventListener = (type, callback) => { listeners[type] = callback; };
+globalThis.document = {
+  readyState:'complete', documentElement:new Element('html'), body:new Element('body'),
+  createElement: tag => new Element(tag),
+  createTextNode: text => { const node = new Element('text'); node.textContent = text; return node; },
+  getElementById: id => nodes.find(node => node.id === id),
+  querySelectorAll: () => [], querySelector: () => null
+};
+globalThis.localStorage = {getItem: () => null};
+globalThis.MutationObserver = class { observe() {} };
+globalThis.XMLHttpRequest = class { open() {} setRequestHeader() {} send() {} };
+globalThis.setInterval = (callback, interval) => { timers.push({callback,interval}); };
+let now = 0;
+Object.defineProperty(globalThis, 'performance', {value:{now: () => now}});
+let enabled = false, patch = null, failStatus = false, lateResolve;
+let delayStatus = false;
+window.fetch = async (url, options = {}) => {
+  if (url.endsWith('routing/settings')) {
+    if (options.method === 'PATCH') {
+      patch = JSON.parse(options.body); enabled = patch['codex-turn-state-enabled'];
+      return new Response('{}');
+    }
+    return new Response(JSON.stringify({'codex-turn-state-enabled':enabled}));
+  }
+  if (url.endsWith('auth-files')) return new Response('{"files":[]}');
+  if (url.endsWith('routing/codex-turn-state')) {
+    if (delayStatus) return new Promise(resolve => {lateResolve = resolve;});
+    if (failStatus) return new Response('{}', {status:500});
+    return new Response(JSON.stringify({enabled, accounts:[
+      {auth_id:'a',name:'account-a',status:'active',remaining_seconds:330},
+      {auth_id:'b',name:'account-b',status:'active',remaining_seconds:125,refreshing:true}
+    ]}));
+  }
+  throw new Error('unexpected request ' + url);
+};
+vm.runInThisContext(fs.readFileSync(0, 'utf8'));
+const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmediate); };
+(async () => {
+  await window.fetch('https://panel.test/v0/management/routing/settings', {headers:{Authorization:'Bearer synthetic-key'}});
+  const toggle = nodes.find(node => node.className === 'cpa-runtime-scheduler-toggle');
+  const list = nodes.find(node => node.className === 'cpa-runtime-scheduler-turn-states');
+  const checkbox = nodes.find(node => node.tagName === 'label' && node.textContent === 'Codex 292 state 自动续期').children[0];
+  const save = nodes.find(node => node.className === 'cpa-runtime-scheduler-save');
+  toggle.click(); await flush();
+  assert.equal(checkbox.checked, false);
+  assert.equal(list.textContent, '未开启');
+  checkbox.checked = true; save.click(); await flush();
+  assert.equal(patch['codex-turn-state-enabled'], true);
+  assert.match(list.textContent, /account-a.*5:30.*account-b.*2:05.*续期中/);
+  now += 2000;
+  timers.find(timer => timer.interval === 1000).callback();
+  assert.match(list.textContent, /5:28.*2:03/);
+  now += 3600000;
+  timers.find(timer => timer.interval === 1000).callback();
+  assert.match(list.textContent, /已到期/);
+  assert.doesNotMatch(list.textContent, /-\d+:/);
+  failStatus = true;
+  timers.find(timer => timer.interval === 5000).callback(); await flush();
+  assert.equal(list.textContent, '读取 state 状态失败');
+  failStatus = false; delayStatus = true;
+  timers.find(timer => timer.interval === 5000).callback(); await flush();
+  listeners.unauthorized();
+  lateResolve(new Response(JSON.stringify({enabled:true,accounts:[{name:'stale-account',remaining_seconds:300}]})));
+  await flush();
+  assert.equal(list.textContent, '未连接管理接口');
+  assert.equal(checkbox.checked, false);
+  console.log('turn-state toggle, per-account countdown, expiry and logout checks passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`
+
 const runtimeSchedulerNetworkTest = `
 const assert = require('node:assert/strict');
 const fs = require('node:fs');

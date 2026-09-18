@@ -131,6 +131,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/settings", s.mgmt.GetRoutingSettings)
 		mgmt.PUT("/routing/settings", s.mgmt.PutRoutingSettings)
 		mgmt.PATCH("/routing/settings", s.mgmt.PutRoutingSettings)
+		mgmt.GET("/routing/codex-turn-state", s.mgmt.GetCodexTurnStateStatus)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
