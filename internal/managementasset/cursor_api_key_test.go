@@ -225,8 +225,8 @@ window.fetch = async (url, options = {}) => {
     if (delayStatus) return new Promise(resolve => {lateResolve = resolve;});
     if (failStatus) return new Response('{}', {status:500});
     return new Response(JSON.stringify({enabled, accounts:[
-      {auth_id:'a',name:'account-a',status:'active',remaining_seconds:330},
-      {auth_id:'b',name:'account-b',status:'active',remaining_seconds:125,refreshing:true}
+      {auth_id:'a',name:'account-a',status:'active',remaining_seconds:330,token_length:292},
+      {auth_id:'b',name:'account-b',status:'active',remaining_seconds:125,refreshing:true,token_length:332}
     ]}));
   }
   throw new Error('unexpected request ' + url);
@@ -237,14 +237,14 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   await window.fetch('https://panel.test/v0/management/routing/settings', {headers:{Authorization:'Bearer synthetic-key'}});
   const toggle = nodes.find(node => node.className === 'cpa-runtime-scheduler-toggle');
   const list = nodes.find(node => node.className === 'cpa-runtime-scheduler-turn-states');
-  const checkbox = nodes.find(node => node.tagName === 'label' && node.textContent === 'Codex 292 state 自动续期').children[0];
+  const checkbox = nodes.find(node => node.tagName === 'label' && node.textContent === 'Codex 292/332 state 自动续期').children[0];
   const save = nodes.find(node => node.className === 'cpa-runtime-scheduler-save');
   toggle.click(); await flush();
   assert.equal(checkbox.checked, false);
   assert.equal(list.textContent, '未开启');
   checkbox.checked = true; save.click(); await flush();
   assert.equal(patch['codex-turn-state-enabled'], true);
-  assert.match(list.textContent, /account-a.*5:30.*account-b.*2:05.*续期中/);
+  assert.match(list.textContent, /account-a.*292 剩余.*5:30.*account-b.*332 剩余.*2:05.*续期中/);
   now += 2000;
   timers.find(timer => timer.interval === 1000).callback();
   assert.match(list.textContent, /5:28.*2:03/);

@@ -10,9 +10,9 @@ CLIProxyAPI 是一个为 CLI 提供 OpenAI/Gemini/Claude/Codex/Grok 兼容 API �
 
 该功能只修改下游返回的用量，不修改上游请求、CPA 内部统计或费用账本。未返回输入用量的响应不凭空生成 token 数；关闭后透传原始用量。设置只在当前进程生效，热重载保留，重启后默认关闭。
 
-同一弹窗提供 **Codex 292 state 自动续期** 开关，勾选后点击“应用”生效。每个可用 Codex OAuth 账号独立直连采集、缓存和续期，HTTP 请求注入 `X-Codex-Turn-State`，WebSocket 每轮注入 `client_metadata["x-codex-turn-state"]`。每 45 秒检查一次，按 state 签发时间加 1 小时估算有效期；不足 5 分钟或收到该账号的 312 长度 state 时触发续期。同账号的并发续期合并，续期失败保留尚未过期的旧 state，到期后停止注入。首次采集完成前请求正常转发，弹窗分别显示各账号的估算剩余时间和采集状态。
+同一弹窗提供 **Codex 292/332 state 自动续期** 开关，勾选后点击“应用”生效。Plus/Pro 账号接受 292 类 state，Team/Business（包括 team5x、self_serve_business 类套餐）接受 332 类 state，长度校验沿用正负 4 字符容差。套餐从账号属性、`plan_type` / `chatgpt_plan_type` 元数据或 JWT 声明读取，缺少套餐信息时保留原来的 292 类规则。每个可用 Codex OAuth 账号独立直连采集、缓存和续期，HTTP 请求注入 `X-Codex-Turn-State`，WebSocket 每轮注入 `client_metadata["x-codex-turn-state"]`。每 45 秒检查一次，按 state 签发时间加 1 小时估算有效期；不足 5 分钟或收到该账号的 312 长度 state 时触发续期。同账号的并发续期合并，续期失败保留尚未过期的旧 state，到期后停止注入。首次采集完成前请求正常转发，弹窗分别显示各账号缓存 state 的实际长度、估算剩余时间和采集状态；套餐类别变化时清除旧缓存。
 
-“292 / 312”是参考项目的字符串长度分类，不是 HTTP 状态码或模型能力保证。实现参考 [codex-state-kit](https://github.com/DouDOU-start/codex-state-kit/blob/fe12b67b17e6040a2ef026a5ec1442b6a2955cea/docs/turn-state-notes.md) 的协议位置；默认使用 `gpt-6-astra` 发送最小探测，可通过 `codex.turn-state-probe-model` 调整。采集会发起真实上游请求，仅缓存到内存；开关默认关闭，热重载保留，关闭会停止采集并清空缓存，重启后恢复关闭。
+“292 / 312 / 332”是字符串长度分类，不是 HTTP 状态码或模型能力保证。实现参考 [codex-state-kit](https://github.com/DouDOU-start/codex-state-kit/blob/fe12b67b17e6040a2ef026a5ec1442b6a2955cea/docs/turn-state-notes.md) 的协议位置；默认使用 `gpt-6-astra` 发送最小探测，可通过 `codex.turn-state-probe-model` 调整。采集会发起真实上游请求，仅缓存到内存；开关默认关闭，热重载保留，关闭会停止采集并清空缓存，重启后恢复关闭。
 
 您可以通过任何与 OpenAI（包括 Responses）、Gemini（包括 Interactions）或 Claude 兼容的客户端或 SDK，以本地方式或多 CLI 账户访问以下提供商。
 

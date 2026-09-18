@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -29,6 +30,9 @@ const (
 	codexTurnStateProbeModel       = "gpt-6-astra"
 	codexTurnStateProbeConcurrency = 4
 	codexTurnStateMetadataPath     = "client_metadata.x-codex-turn-state"
+	codexTurnStatePersonalLength   = 292
+	codexTurnStateTeamLength       = 332
+	codexTurnStateLengthTolerance  = 4
 )
 
 // CodexTurnStateStatus exposes estimated validity without exposing the opaque state.
@@ -149,7 +153,38 @@ func codexTurnStateBaseURL(auth *cliproxyauth.Auth) string {
 }
 
 func codexTurnStateScope(auth *cliproxyauth.Auth) string {
-	return codexTurnStateAccountID(auth) + "\x00" + codexTurnStateBaseURL(auth)
+	return fmt.Sprintf("%s\x00%s\x00%d", codexTurnStateAccountID(auth), codexTurnStateBaseURL(auth), codexTurnStateExpectedLength(auth))
+}
+
+func codexTurnStateExpectedLength(auth *cliproxyauth.Auth) int {
+	plan := strings.TrimSpace(auth.Attributes["plan_type"])
+	for _, key := range []string{"plan_type", "chatgpt_plan_type"} {
+		if plan != "" {
+			break
+		}
+		value, _ := auth.Metadata[key].(string)
+		plan = strings.TrimSpace(value)
+	}
+	if plan == "" {
+		for _, key := range []string{"access_token", "id_token"} {
+			token, _ := auth.Metadata[key].(string)
+			if token == "" {
+				continue
+			}
+			claims, errParse := codexauth.ParseJWTToken(token)
+			if errParse == nil {
+				plan = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+				if plan != "" {
+					break
+				}
+			}
+		}
+	}
+	plan = strings.ToLower(plan)
+	if strings.HasPrefix(plan, "team") || strings.HasPrefix(plan, "business") || strings.HasPrefix(plan, "self_serve_business") {
+		return codexTurnStateTeamLength
+	}
+	return codexTurnStatePersonalLength
 }
 
 func (k *CodexTurnStateKeeper) entryLocked(auth *cliproxyauth.Auth) *codexTurnStateEntry {
@@ -239,7 +274,7 @@ func (k *CodexTurnStateKeeper) refreshLocked(entry *codexTurnStateEntry) {
 		var expires time.Time
 		if errFetch == nil {
 			token = strings.TrimSpace(token)
-			expires, errFetch = codexTurnStateExpiry(token, time.Now())
+			expires, errFetch = codexTurnStateExpiry(auth, token, time.Now())
 		}
 		k.mu.Lock()
 		defer k.mu.Unlock()
@@ -308,12 +343,13 @@ func codexTurnStateDegraded(token string) bool {
 	return strings.HasPrefix(token, "gAAAAA") && len(token) >= 308 && len(token) <= 316
 }
 
-func codexTurnStateExpiry(token string, now time.Time) (time.Time, error) {
+func codexTurnStateExpiry(auth *cliproxyauth.Auth, token string, now time.Time) (time.Time, error) {
 	if codexTurnStateDegraded(token) {
 		return time.Time{}, fmt.Errorf("upstream returned a 312-length turn state")
 	}
-	if len(token) < 288 || len(token) > 296 || !strings.HasPrefix(token, "gAAAAA") {
-		return time.Time{}, fmt.Errorf("upstream did not return a 292-length turn state")
+	expectedLength := codexTurnStateExpectedLength(auth)
+	if len(token) < expectedLength-codexTurnStateLengthTolerance || len(token) > expectedLength+codexTurnStateLengthTolerance || !strings.HasPrefix(token, "gAAAAA") {
+		return time.Time{}, fmt.Errorf("upstream did not return a %d-length turn state for this account (received length %d)", expectedLength, len(token))
 	}
 	raw, errDecode := base64.RawURLEncoding.DecodeString(strings.TrimRight(token, "="))
 	if errDecode != nil || len(raw) < 9 || raw[0] != 0x80 {

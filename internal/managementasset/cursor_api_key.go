@@ -492,7 +492,7 @@ const runtimeSchedulerInlineScript = `
     var turnStateEnabled = document.createElement('input');
     turnStateEnabled.type = 'checkbox';
     turnStateLabel.appendChild(turnStateEnabled);
-    turnStateLabel.appendChild(document.createTextNode('Codex 292 state 自动续期'));
+    turnStateLabel.appendChild(document.createTextNode('Codex 292/332 state 自动续期'));
     var turnStateList = make('div', 'cpa-runtime-scheduler-turn-states', '未开启');
     var turnStateData = null;
     var turnStateLoadedAt = 0;
@@ -523,7 +523,7 @@ const runtimeSchedulerInlineScript = `
         if (remaining > 0) {
           var minutes = Math.floor(remaining / 60);
           var seconds = String(remaining % 60).padStart(2, '0');
-          text = '292 剩余（估算）：' + minutes + ':' + seconds;
+          text = item.token_length + ' 剩余（估算）：' + minutes + ':' + seconds;
           if (item.refreshing) text += ' · 续期中';
         } else if (item.status === 'active') {
           text = item.refreshing ? '已到期 · 续期中' : '已到期 · 等待续期';

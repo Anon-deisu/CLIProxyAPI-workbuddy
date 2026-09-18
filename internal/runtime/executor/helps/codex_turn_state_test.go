@@ -27,6 +27,10 @@ func testTurnState(issued time.Time, degraded bool, marker byte) string {
 	if degraded {
 		size = 233
 	}
+	return testTurnStateBytes(issued, size, marker)
+}
+
+func testTurnStateBytes(issued time.Time, size int, marker byte) string {
 	raw := make([]byte, size)
 	raw[0] = 0x80
 	binary.BigEndian.PutUint64(raw[1:9], uint64(issued.Unix()))
@@ -55,7 +59,7 @@ func TestCodexTurnStateTimestampAndClassification(t *testing.T) {
 		{"malformed", strings.Repeat("a", 292), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			expires, err := codexTurnStateExpiry(tc.token, now)
+			expires, err := codexTurnStateExpiry(turnStateTestAuth("a"), tc.token, now)
 			if (err == nil) != tc.valid {
 				t.Fatalf("valid = %v, want %v: %v", err == nil, tc.valid, err)
 			}
@@ -64,6 +68,108 @@ func TestCodexTurnStateTimestampAndClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCodexTurnStatePlanClassification(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	quality292 := testTurnState(now, false, 1)
+	quality332 := testTurnStateBytes(now, 249, 2)
+	if len(quality332) != 332 {
+		t.Fatal("invalid Team test state")
+	}
+	for _, tc := range []struct {
+		plan string
+		team bool
+	}{
+		{"plus", false}, {"pro", false}, {"", false},
+		{"team", true}, {"team5x", true}, {"team_5x", true},
+		{"business", true}, {"self_serve_business_prolite", true}, {" Team5x ", true},
+	} {
+		for _, source := range []string{"attribute", "plan_type", "chatgpt_plan_type", "id_token", "access_token"} {
+			t.Run(tc.plan+"/"+source, func(t *testing.T) {
+				auth := turnStateTestAuth("a")
+				switch source {
+				case "attribute":
+					auth.Attributes = map[string]string{"plan_type": tc.plan}
+				case "id_token", "access_token":
+					claims, _ := json.Marshal(map[string]any{"https://api.openai.com/auth": map[string]string{"chatgpt_plan_type": tc.plan}})
+					auth.Metadata[source] = "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".synthetic"
+				default:
+					auth.Metadata[source] = tc.plan
+				}
+				for _, candidate := range []struct {
+					token string
+					valid bool
+				}{
+					{quality292, !tc.team}, {quality332, tc.team},
+					{strings.TrimRight(quality332, "="), tc.team},
+					{testTurnState(now, true, 0), false},
+					{testTurnStateBytes(now.Add(-time.Hour), 249, 2), false},
+				} {
+					expires, err := codexTurnStateExpiry(auth, candidate.token, now)
+					if (err == nil) != candidate.valid {
+						t.Fatalf("length=%d valid=%v want=%v: %v", len(candidate.token), err == nil, candidate.valid, err)
+					}
+					if candidate.valid && !expires.Equal(now.Add(time.Hour)) {
+						t.Fatal("incorrect state expiry")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCodexTurnStateMixedPlansAndPlanChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		plus, team := turnStateTestAuth("plus"), turnStateTestAuth("team")
+		plus.Metadata["plan_type"] = "plus"
+		team.Metadata["chatgpt_plan_type"] = "business"
+		keeper := NewCodexTurnStateKeeper(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{plus, team} })
+		defer keeper.Close()
+		keeper.fetch = func(_ context.Context, _ *config.Config, auth *cliproxyauth.Auth) (string, error) {
+			if auth.ID == team.ID {
+				return testTurnStateBytes(time.Now(), 249, 2), nil
+			}
+			return testTurnState(time.Now(), false, 1), nil
+		}
+		keeper.Configure(&config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true)}})
+		synctest.Wait()
+		plusToken, _ := keeper.Token(plus)
+		teamToken, _ := keeper.Token(team)
+		if len(plusToken) != 292 || len(teamToken) != 332 {
+			t.Fatal("mixed plans did not retain their own state")
+		}
+		for _, account := range keeper.Snapshot() {
+			if account.Status != "active" || account.LastError != "" {
+				t.Fatalf("state rejected: %+v", account)
+			}
+			if account.AuthID == team.ID && account.TokenLength != 332 {
+				t.Fatal("Team status reported wrong state length")
+			}
+		}
+		headers := http.Header{CodexTurnStateHeader: {plusToken}}
+		body, used := keeper.StampWebsocket(team, headers, []byte(`{"input":[]}`))
+		if used != teamToken || gjson.GetBytes(body, codexTurnStateMetadataPath).String() != teamToken {
+			t.Fatal("Team websocket did not inject its 332 state")
+		}
+		client := keeper.WrapHTTPClient(&http.Client{Transport: turnStateRoundTripper(func(req *http.Request) (*http.Response, error) {
+			if req.Header.Get(CodexTurnStateHeader) != teamToken {
+				t.Error("Team HTTP did not inject its 332 state")
+			}
+			return &http.Response{StatusCode: 200, Header: http.Header{CodexTurnStateHeader: {teamToken}}, Body: http.NoBody}, nil
+		})}, team)
+		req, _ := http.NewRequest(http.MethodPost, "https://codex.test/responses", strings.NewReader(`{"input":[]}`))
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		changed := team.Clone()
+		changed.Metadata["chatgpt_plan_type"] = "pro"
+		if token, _ := keeper.Token(changed); token != "" {
+			t.Fatal("plan change reused incompatible cached state")
+		}
+	})
 }
 
 func TestCodexTurnStateAccountsRenewIndependently(t *testing.T) {
@@ -220,7 +326,7 @@ func TestFetchCodexTurnStateLive(t *testing.T) {
 	if errFetch != nil {
 		t.Fatal(errFetch)
 	}
-	expires, errState := codexTurnStateExpiry(token, time.Now())
+	expires, errState := codexTurnStateExpiry(auth, token, time.Now())
 	if errState != nil {
 		if codexTurnStateDegraded(token) {
 			t.Skipf("direct probe returned state_length=%d; valid-state inference cannot be tested on this attempt", len(token))
