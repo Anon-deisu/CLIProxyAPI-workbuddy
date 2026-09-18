@@ -119,12 +119,12 @@ type turn struct {
 	accountID string
 	model     string
 
-	mu        sync.Mutex
-	streamID  string
-	maxIn     int64 // Anthropic usage events are cumulative per component
-	maxOut    int64
-	maxCache  int64
-	metered   int64 // total already pushed into the limiter (F12)
+	mu       sync.Mutex
+	streamID string
+	maxIn    int64 // Anthropic usage events are cumulative per component
+	maxOut   int64
+	maxCache int64
+	metered  int64 // total already pushed into the limiter (F12)
 }
 
 func (t *turn) setStreamID(id string) {

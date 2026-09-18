@@ -4,8 +4,15 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+import (
+	"fmt"
+	"math"
+)
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// CacheTokenRewrite overrides only downstream cache usage. Nil disables it.
+	CacheTokenRewrite *CacheTokenRewriteConfig `yaml:"-" json:"cache-token-rewrite,omitempty"`
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
@@ -64,6 +71,29 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// CacheTokenRewriteConfig chooses a percentage once per downstream request.
+// An omitted maximum uses a fixed percentage. These controls are runtime-only.
+type CacheTokenRewriteConfig struct {
+	Enabled    bool     `json:"enabled"`
+	MinPercent *float64 `json:"min-percent"`
+	MaxPercent *float64 `json:"max-percent"`
+}
+
+func (c CacheTokenRewriteConfig) Validate() error {
+	if c.MinPercent == nil && (c.Enabled || c.MaxPercent != nil) {
+		return fmt.Errorf("cache-token-rewrite requires min-percent")
+	}
+	for _, value := range []*float64{c.MinPercent, c.MaxPercent} {
+		if value != nil && (math.IsNaN(*value) || math.IsInf(*value, 0) || *value < 0 || *value > 100) {
+			return fmt.Errorf("cache-token-rewrite percentages must be between 0 and 100")
+		}
+	}
+	if c.MaxPercent != nil && *c.MaxPercent < *c.MinPercent {
+		return fmt.Errorf("cache-token-rewrite max-percent must be at least min-percent")
+	}
+	return nil
 }
 
 // ClaudeCodeConfig configures Claude Code compatibility behavior.

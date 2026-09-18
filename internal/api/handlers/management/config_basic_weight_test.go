@@ -89,11 +89,11 @@ func TestPutRoutingSettingsUpdatesDisableCooling(t *testing.T) {
 	}
 }
 
-func TestRoutingSettingsPrismRoundTripAndReload(t *testing.T) {
+func TestRoutingSettingsCacheTokenRewriteRoundTripAndReload(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
 	for _, enabled := range []bool{true, false} {
-		body, errMarshal := json.Marshal(map[string]bool{"prism": enabled})
+		body, errMarshal := json.Marshal(map[string]any{"cache-token-rewrite": map[string]any{"enabled": enabled, "min-percent": 80, "max-percent": 95}})
 		if errMarshal != nil {
 			t.Fatal(errMarshal)
 		}
@@ -102,7 +102,7 @@ func TestRoutingSettingsPrismRoundTripAndReload(t *testing.T) {
 		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
 		h.PutRoutingSettings(ctx)
 		if recorder.Code != http.StatusOK {
-			t.Fatalf("PATCH prism=%t: status=%d body=%s", enabled, recorder.Code, recorder.Body.String())
+			t.Fatalf("PATCH rewrite=%t: status=%d body=%s", enabled, recorder.Code, recorder.Body.String())
 		}
 		h.SetConfig(&config.Config{})
 		recorder = httptest.NewRecorder()
@@ -112,15 +112,43 @@ func TestRoutingSettingsPrismRoundTripAndReload(t *testing.T) {
 		if errDecode := json.Unmarshal(recorder.Body.Bytes(), &settings); errDecode != nil {
 			t.Fatal(errDecode)
 		}
-		if settings["prism"] != enabled {
-			t.Fatalf("Prism after reload = %v, want %t", settings["prism"], enabled)
+		want := map[string]any{"enabled": enabled, "min-percent": float64(80), "max-percent": float64(95)}
+		if !reflect.DeepEqual(settings["cache-token-rewrite"], want) {
+			t.Fatalf("rewrite after reload = %v, want %v", settings["cache-token-rewrite"], want)
 		}
 		encoded, errMarshal := yaml.Marshal(h.cfg)
 		if errMarshal != nil {
 			t.Fatal(errMarshal)
 		}
-		if strings.Contains(string(encoded), "prism:") {
-			t.Fatal("runtime Prism switch was persisted to YAML")
+		if strings.Contains(string(encoded), "cache-token-rewrite:") {
+			t.Fatal("runtime cache token rewrite was persisted to YAML")
+		}
+	}
+}
+
+func TestRoutingSettingsCacheTokenRewriteValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	for _, raw := range []string{
+		`{"enabled":true}`, `{"enabled":true,"min-percent":-1}`, `{"enabled":true,"min-percent":101}`,
+		`{"enabled":true,"min-percent":90,"max-percent":80}`, `{"enabled":true,"max-percent":95}`,
+		`{"enabled":true,"min-percent":"95"}`, `{"enabled":true,"min-percent":80,"max-percent":101}`,
+	} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"auto-disable-quota":true,"cache-token-rewrite":`+raw+`}`))
+		h.PutRoutingSettings(ctx)
+		if recorder.Code != http.StatusBadRequest || h.cfg.Routing.AutoDisableQuota {
+			t.Fatalf("invalid rewrite mutated config: status=%d, body=%s", recorder.Code, recorder.Body.String())
+		}
+	}
+	for _, raw := range []string{`{"enabled":true,"min-percent":0}`, `{"enabled":true,"min-percent":95.5,"max-percent":null}`, `{"enabled":true,"min-percent":100}`, `{"enabled":false}`} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"cache-token-rewrite":`+raw+`}`))
+		h.PutRoutingSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("valid rewrite rejected: status=%d, body=%s", recorder.Code, recorder.Body.String())
 		}
 	}
 }

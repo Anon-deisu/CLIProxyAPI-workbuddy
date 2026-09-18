@@ -1661,7 +1661,7 @@ func (s *Session) sendNativeResult(req *agentv1.ExecServerMessage, variant strin
 		} else {
 			value.Result = &agentv1.ReadResult_Success{Success: &agentv1.ReadSuccess{
 				Path: args.GetPath(), TotalLines: int32(lineCount(content)),
-				Output: &agentv1.ReadSuccess_Content{Content: content},
+				Output:   &agentv1.ReadSuccess_Content{Content: content},
 				FileSize: int64(len([]byte(content))), RangeApplied: args.Offset != nil || args.Limit != nil,
 			}}
 		}

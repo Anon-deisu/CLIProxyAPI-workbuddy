@@ -122,7 +122,14 @@ func TestCloneForReloadInheritsOnlySupportedRuntimeFields(t *testing.T) {
 	previousLimit := 2
 	previousConvergence := true
 	previousRetryCount := 7
+	previousCacheMin := 80.0
+	previousCacheMax := 95.0
 	previous := &Config{}
+	previous.CacheTokenRewrite = &CacheTokenRewriteConfig{
+		Enabled:    true,
+		MinPercent: &previousCacheMin,
+		MaxPercent: &previousCacheMax,
+	}
 	previous.Routing.AuthConcurrencyLimit = &previousLimit
 	previous.Routing.CodexFingerprintConvergence = &previousConvergence
 	previous.Routing.C2AMaxRetryCount = &previousRetryCount
@@ -144,9 +151,22 @@ func TestCloneForReloadInheritsOnlySupportedRuntimeFields(t *testing.T) {
 	if clone.Routing.CodexFingerprintConvergence == nil || !*clone.Routing.CodexFingerprintConvergence {
 		t.Fatalf("inherited convergence = %v, want true", clone.Routing.CodexFingerprintConvergence)
 	}
-	want := &Config{Debug: true, Routing: RoutingConfig{AuthConcurrencyLimit: new(2), CodexFingerprintConvergence: new(true)}}
+	want := &Config{
+		SDKConfig: SDKConfig{CacheTokenRewrite: &CacheTokenRewriteConfig{
+			Enabled:    true,
+			MinPercent: new(80.0),
+			MaxPercent: new(95.0),
+		}},
+		Debug: true,
+		Routing: RoutingConfig{
+			AuthConcurrencyLimit:        new(2),
+			CodexFingerprintConvergence: new(true),
+			C2AMaxRetryCount:            new(7),
+			C2AMaxRetryInterval:         new(30),
+		},
+	}
 	if !reflect.DeepEqual(clone, want) {
-		t.Fatal("reload lost current fields or inherited unsupported fields")
+		t.Fatalf("reload lost current fields or inherited unsupported fields: clone=%#v want=%#v", clone, want)
 	}
 	if current.Routing.AuthConcurrencyLimit != nil || current.Routing.CodexFingerprintConvergence != nil {
 		t.Fatal("inheriting runtime fields mutated the caller config")
@@ -154,7 +174,9 @@ func TestCloneForReloadInheritsOnlySupportedRuntimeFields(t *testing.T) {
 
 	previousLimit = 9
 	previousConvergence = false
-	if *clone.Routing.AuthConcurrencyLimit != 2 || !*clone.Routing.CodexFingerprintConvergence {
+	previousCacheMin = 10
+	previousCacheMax = 20
+	if *clone.Routing.AuthConcurrencyLimit != 2 || !*clone.Routing.CodexFingerprintConvergence || *clone.CacheTokenRewrite.MinPercent != 80 || *clone.CacheTokenRewrite.MaxPercent != 95 {
 		t.Fatal("inherited runtime fields share pointers with the previous config")
 	}
 

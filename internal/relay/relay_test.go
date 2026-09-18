@@ -125,9 +125,9 @@ func TestLimiterSeparateOpusBucket(t *testing.T) {
 	ls := NewLimiterSet(config.RelayConfig{
 		QueueDepth: 1,
 		Limits: config.RelayLimitsConfig{
-			PlanCap5h:      100000,
-			OpusPlanCap5h:  1000,
-			QuietHours:     &quiet,
+			PlanCap5h:     100000,
+			OpusPlanCap5h: 1000,
+			QuietHours:    &quiet,
 		},
 	})
 	l := ls.For("acct-3")

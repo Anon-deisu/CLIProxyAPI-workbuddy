@@ -115,9 +115,6 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 	// Extract and set usage metadata (token counts).
 	if usageResult := gjson.GetBytes(rawJSON, "response.usage"); usageResult.Exists() {
-		if estimated := usageResult.Get("estimated"); estimated.Exists() {
-			template, _ = sjson.SetBytes(template, "usage.estimated", estimated.Bool())
-		}
 		if outputTokensResult := usageResult.Get("output_tokens"); outputTokensResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.completion_tokens", outputTokensResult.Int())
 		}
@@ -422,9 +419,6 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 
 	// Extract and set usage metadata (token counts).
 	if usageResult := responseResult.Get("usage"); usageResult.Exists() {
-		if estimated := usageResult.Get("estimated"); estimated.Exists() {
-			template, _ = sjson.SetBytes(template, "usage.estimated", estimated.Bool())
-		}
 		if outputTokensResult := usageResult.Get("output_tokens"); outputTokensResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.completion_tokens", outputTokensResult.Int())
 		}

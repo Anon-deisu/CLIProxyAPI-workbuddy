@@ -42,7 +42,16 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	return h.executeWithAuthManagerFormats(ctx, handlerType, handlerType, modelName, rawJSON, alt, allowImageModel, modelExecutionOptions{})
 }
 
-func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) ([]byte, http.Header, *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (resultBody []byte, resultHeaders http.Header, resultErr *interfaces.ErrorMessage) {
+	if !execOptions.InternalSource {
+		rewriter := newCacheTokenRewriter(h.Cfg, modelExecutionResponseProtocol(entryProtocol, exitProtocol))
+		defer func() {
+			if resultErr == nil && rewriter != nil {
+				resultBody = rewriter.rewriteJSON(resultBody)
+				resultHeaders = rewriter.downstreamHeaders(resultHeaders)
+			}
+		}()
+	}
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)

@@ -36,8 +36,8 @@ type AccountLimiter struct {
 	sonnet7d *rollingCounter
 	opus5h   *rollingCounter
 
-	quietEnabled bool
-	loc          *time.Location
+	quietEnabled  bool
+	loc           *time.Location
 	quietStartMin int // per-account jittered quiet window start (minutes from midnight)
 	quietEndMin   int // per-account jittered quiet window end
 
@@ -48,10 +48,10 @@ type AccountLimiter struct {
 
 // LimiterSet owns one AccountLimiter per account, built from config.
 type LimiterSet struct {
-	cfg       config.RelayConfig
+	cfg        config.RelayConfig
 	queueDepth int
-	mu        sync.Mutex
-	accounts  map[string]*AccountLimiter
+	mu         sync.Mutex
+	accounts   map[string]*AccountLimiter
 }
 
 // NewLimiterSet builds the set from relay config.

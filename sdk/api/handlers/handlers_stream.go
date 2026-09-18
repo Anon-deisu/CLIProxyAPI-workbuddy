@@ -294,7 +294,16 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	return h.executeStreamWithAuthManagerFormats(ctx, handlerType, handlerType, modelName, rawJSON, alt, allowImageModel, modelExecutionOptions{})
 }
 
-func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (resultData <-chan []byte, resultHeaders http.Header, resultErrors <-chan *interfaces.ErrorMessage) {
+	if !execOptions.InternalSource {
+		rewriter := newCacheTokenRewriter(h.Cfg, modelExecutionResponseProtocol(entryProtocol, exitProtocol))
+		defer func() {
+			if rewriter != nil {
+				resultData, resultErrors = rewriter.wrapStream(ctx, resultData, resultErrors)
+				resultHeaders = rewriter.downstreamHeaders(resultHeaders)
+			}
+		}()
+	}
 	originalRequestedModel := modelName
 	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)
 	if !preparedRoute {

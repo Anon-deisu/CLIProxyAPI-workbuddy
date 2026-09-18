@@ -309,9 +309,6 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 }
 
 func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
-	if auth != nil && auth.PrismRoute {
-		return candidates
-	}
 	if len(candidates) == 0 {
 		return nil
 	}

@@ -1905,10 +1905,6 @@ func (m *Manager) SelectHomeAuthByKind(ctx context.Context, provider string, mod
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	opts.EnsureMetadata()
-	delete(opts.Metadata, cliproxyexecutor.PrismRouteMetadataKey)
-	if provider == "codex" && m.prismEnabled() {
-		return m.pickPrism(ctx, opts, tried)
-	}
 	if m.HomeEnabled() {
 		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts, tried)
 		return auth, exec, err
@@ -2093,15 +2089,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.EnsureMetadata()
-	delete(opts.Metadata, cliproxyexecutor.PrismRouteMetadataKey)
-	if m.prismEnabled() {
-		for _, provider := range providers {
-			if provider == "codex" {
-				auth, exec, err := m.pickPrism(ctx, opts, tried)
-				return auth, exec, "codex", err
-			}
-		}
-	}
 	if m.HomeEnabled() {
 		return m.pickNextViaHome(ctx, model, opts, tried)
 	}

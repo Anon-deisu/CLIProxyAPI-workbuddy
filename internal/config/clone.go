@@ -18,7 +18,7 @@ func (cfg *Config) CloneForRuntime() *Config {
 }
 
 // CloneForReload returns an independent runtime snapshot, inheriting only missing
-// account, Codex transport, and C2A retry overrides from previous.
+// account, downstream usage, Codex transport, and C2A retry overrides from previous.
 func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if cfg == nil {
 		return nil
@@ -26,6 +26,9 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 	cloned := cfg.CloneForRuntime()
 	if previous == nil {
 		return cloned
+	}
+	if cloned.CacheTokenRewrite == nil && previous.CacheTokenRewrite != nil {
+		cloned.CacheTokenRewrite = cloneRuntimeValue(reflect.ValueOf(previous.CacheTokenRewrite)).Interface().(*CacheTokenRewriteConfig)
 	}
 	if cloned.Routing.AuthConcurrencyLimit == nil && previous.Routing.AuthConcurrencyLimit != nil {
 		value := *previous.Routing.AuthConcurrencyLimit
@@ -38,10 +41,6 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if cloned.Routing.CodexRoutingHint == nil && previous.Routing.CodexRoutingHint != nil {
 		value := *previous.Routing.CodexRoutingHint
 		cloned.Routing.CodexRoutingHint = &value
-	}
-	if cloned.Routing.Prism == nil && previous.Routing.Prism != nil {
-		value := *previous.Routing.Prism
-		cloned.Routing.Prism = &value
 	}
 	if cloned.Routing.DisableCooling == nil && previous.Routing.DisableCooling != nil {
 		value := *previous.Routing.DisableCooling

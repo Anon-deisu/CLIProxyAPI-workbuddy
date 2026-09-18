@@ -349,9 +349,11 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	authConcurrencyLimit := 0
 	codexFingerprintConvergence := false
 	codexRoutingHint := "europe"
-	prism := false
+	cacheTokenRewrite := config.CacheTokenRewriteConfig{}
 	if cfg != nil {
-		prism = cfg.Routing.Prism != nil && *cfg.Routing.Prism
+		if cfg.CacheTokenRewrite != nil {
+			cacheTokenRewrite = *cfg.CacheTokenRewrite
+		}
 		c2aRetryCount = cfg.RequestRetry
 		c2aRetryInterval = cfg.MaxRetryInterval
 		if cfg.Routing.AuthConcurrencyLimit != nil {
@@ -390,7 +392,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"auth-concurrency-limit":        authConcurrencyLimit,
 		"codex-fingerprint-convergence": codexFingerprintConvergence,
 		"codex-routing-hint":            codexRoutingHint,
-		"prism":                         prism,
+		"cache-token-rewrite":           cacheTokenRewrite,
 		"runtime_only":                  true,
 	})
 }
@@ -398,22 +400,28 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 // PutRoutingSettings updates scheduler controls in memory and deliberately skips config.yaml writes.
 func (h *Handler) PutRoutingSettings(c *gin.Context) {
 	var body struct {
-		Strategy                    *string `json:"strategy"`
-		SchedulerMode               *string `json:"scheduler-mode"`
-		AutoDisableUnauthorized     *bool   `json:"auto-disable-unauthorized"`
-		AutoDisableQuota            *bool   `json:"auto-disable-quota"`
-		DisableCooling              *bool   `json:"disable-cooling"`
-		C2AMaxRetryCount            *int    `json:"c2a-max-retry-count"`
-		C2AMaxRetryInterval         *int    `json:"c2a-max-retry-interval"`
-		C2AMaxRetryCredentials      *int    `json:"c2a-max-retry-credentials"`
-		AuthConcurrencyLimit        *int    `json:"auth-concurrency-limit"`
-		CodexFingerprintConvergence *bool   `json:"codex-fingerprint-convergence"`
-		CodexRoutingHint            *string `json:"codex-routing-hint"`
-		Prism                       *bool   `json:"prism"`
+		Strategy                    *string                         `json:"strategy"`
+		SchedulerMode               *string                         `json:"scheduler-mode"`
+		AutoDisableUnauthorized     *bool                           `json:"auto-disable-unauthorized"`
+		AutoDisableQuota            *bool                           `json:"auto-disable-quota"`
+		DisableCooling              *bool                           `json:"disable-cooling"`
+		C2AMaxRetryCount            *int                            `json:"c2a-max-retry-count"`
+		C2AMaxRetryInterval         *int                            `json:"c2a-max-retry-interval"`
+		C2AMaxRetryCredentials      *int                            `json:"c2a-max-retry-credentials"`
+		AuthConcurrencyLimit        *int                            `json:"auth-concurrency-limit"`
+		CodexFingerprintConvergence *bool                           `json:"codex-fingerprint-convergence"`
+		CodexRoutingHint            *string                         `json:"codex-routing-hint"`
+		CacheTokenRewrite           *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
+	}
+	if body.CacheTokenRewrite != nil {
+		if errValidate := body.CacheTokenRewrite.Validate(); errValidate != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+			return
+		}
 	}
 	mode := body.SchedulerMode
 	if mode == nil {
@@ -444,16 +452,12 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth-concurrency-limit must be between 0 and 1000000"})
 		return
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexRoutingHint == nil && body.Prism == nil {
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
 
 	h.applyRuntimeConfig(c, func(cfg *config.Config) error {
-		if body.Prism != nil {
-			value := *body.Prism
-			cfg.Routing.Prism = &value
-		}
 		if mode != nil {
 			cfg.Routing.SchedulerMode = normalizedMode
 		}
@@ -510,6 +514,9 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 				return fmt.Errorf("invalid codex-routing-hint")
 			}
 			cfg.Routing.CodexRoutingHint = &value
+		}
+		if body.CacheTokenRewrite != nil {
+			cfg.CacheTokenRewrite = body.CacheTokenRewrite
 		}
 		return nil
 	})

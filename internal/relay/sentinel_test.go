@@ -46,8 +46,8 @@ func TestDependencyClosure_NoEgressStacks(t *testing.T) {
 	// source level below. Any NEW module package importing crypto/tls here means an
 	// egress-capable stack crept into the invoke closure: fail the build.
 	allowedTLSImporters := map[string]bool{
-		modulePath + "/sdk/proxyutil":  true,
-		modulePath + "/internal/home":  true,
+		modulePath + "/sdk/proxyutil": true,
+		modulePath + "/internal/home": true,
 	}
 	for pkg, imports := range graph {
 		if !strings.HasPrefix(pkg, modulePath) {

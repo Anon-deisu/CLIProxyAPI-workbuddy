@@ -486,12 +486,38 @@ const runtimeSchedulerInlineScript = `
     fingerprintConvergence.title = '仅 Codex OAuth/SetupToken 生效，每个账号固定使用独立身份';
     fingerprintLabel.appendChild(fingerprintConvergence);
     fingerprintLabel.appendChild(document.createTextNode('Codex 账号指纹收敛'));
-    var prismLabel = make('label', 'cpa-runtime-scheduler-check');
-    var prism = document.createElement('input');
-    prism.type = 'checkbox';
-    prism.title = '使用已启用的 Plus 账号，不受原 Codex 额度限制；仅 Prism 将 max 映射为 xhigh';
-    prismLabel.appendChild(prism);
-    prismLabel.appendChild(document.createTextNode('Prism'));
+    var cacheRewriteLabel = make('label', 'cpa-runtime-scheduler-check');
+    var cacheRewrite = document.createElement('input');
+    cacheRewrite.type = 'checkbox';
+    cacheRewriteLabel.appendChild(cacheRewrite);
+    cacheRewriteLabel.appendChild(document.createTextNode('自定义复写 token 数'));
+    var cacheMinLabel = make('label', 'cpa-runtime-scheduler-number');
+    cacheMinLabel.appendChild(document.createTextNode('缓存比例 / 下限 (%)'));
+    var cacheMin = document.createElement('input');
+    cacheMin.type = 'number';
+    cacheMin.min = '0';
+    cacheMin.max = '100';
+    cacheMin.step = 'any';
+    cacheMin.placeholder = '0–100';
+    cacheMinLabel.appendChild(cacheMin);
+    var cacheMaxLabel = make('label', 'cpa-runtime-scheduler-number');
+    cacheMaxLabel.appendChild(document.createTextNode('随机上限 (%)'));
+    var cacheMax = document.createElement('input');
+    cacheMax.type = 'number';
+    cacheMax.min = '0';
+    cacheMax.max = '100';
+    cacheMax.step = 'any';
+    cacheMax.placeholder = '可选';
+    cacheMaxLabel.appendChild(cacheMax);
+    function updateCacheRewriteInputs() {
+      cacheMin.disabled = !cacheRewrite.checked;
+      cacheMax.disabled = !cacheRewrite.checked;
+      cacheMin.required = cacheRewrite.checked;
+      cacheMax.min = cacheMin.value || '0';
+    }
+    cacheRewrite.addEventListener('change', updateCacheRewriteInputs);
+    cacheMin.addEventListener('input', updateCacheRewriteInputs);
+    updateCacheRewriteInputs();
     var routingLabel = make('label', 'cpa-runtime-scheduler-number');
     routingLabel.appendChild(document.createTextNode('Codex 路由提示'));
     var routingHint = document.createElement('select');
@@ -515,7 +541,9 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(quotaLabel);
     form.appendChild(disableCoolingLabel);
     form.appendChild(fingerprintLabel);
-    form.appendChild(prismLabel);
+    form.appendChild(cacheRewriteLabel);
+    form.appendChild(cacheMinLabel);
+    form.appendChild(cacheMaxLabel);
     form.appendChild(routingLabel);
     form.appendChild(save);
     form.appendChild(status);
@@ -658,7 +686,11 @@ const runtimeSchedulerInlineScript = `
         quota.checked = !!data['auto-disable-quota'];
         disableCooling.checked = !!data['disable-cooling'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
-        prism.checked = !!data['prism'];
+        var rewrite = data['cache-token-rewrite'] || {};
+        cacheRewrite.checked = !!rewrite.enabled;
+        cacheMin.value = rewrite['min-percent'] == null ? '' : String(rewrite['min-percent']);
+        cacheMax.value = rewrite['max-percent'] == null ? '' : String(rewrite['max-percent']);
+        updateCacheRewriteInputs();
         routingHint.value = data['codex-routing-hint'] == null ? 'europe' : String(data['codex-routing-hint']);
         status.textContent = '';
         save.disabled = false;
@@ -699,6 +731,7 @@ const runtimeSchedulerInlineScript = `
     }
 
     save.addEventListener('click', function () {
+      if (cacheRewrite.checked && (!cacheMin.reportValidity() || !cacheMax.reportValidity())) return;
       save.disabled = true;
       status.textContent = '应用中...';
       request('PATCH', 'routing/settings', {
@@ -710,7 +743,11 @@ const runtimeSchedulerInlineScript = `
          'auto-disable-quota': quota.checked,
          'disable-cooling': disableCooling.checked,
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
-        'prism': prism.checked,
+        'cache-token-rewrite': {
+          enabled: cacheRewrite.checked,
+          'min-percent': cacheMin.value === '' ? null : Number(cacheMin.value),
+          'max-percent': cacheMax.value === '' ? null : Number(cacheMax.value)
+        },
         'codex-routing-hint': routingHint.value
       }).then(function () {
         status.textContent = '已应用';

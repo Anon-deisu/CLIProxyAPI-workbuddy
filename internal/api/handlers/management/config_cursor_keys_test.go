@@ -31,6 +31,7 @@ func performCursorKeyHandlerRequest(t *testing.T, method, path, body string, han
 	handler(ctx)
 	return rec
 }
+
 // against a handler with an isolated temp auth dir (beyond the seeded records).
 func cursorKeyHandler(t *testing.T) (*Handler, *cursor.APIKeyStore) {
 	t.Helper()

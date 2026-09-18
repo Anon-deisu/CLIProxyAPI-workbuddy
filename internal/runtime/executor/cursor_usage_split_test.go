@@ -82,9 +82,9 @@ func TestSplitPayloadSurvivesTheClaudeTranslator(t *testing.T) {
 
 func TestSplitCursorInputBothShapes(t *testing.T) {
 	cases := []struct {
-		name                string
-		input, read, write  int64
-		wantUncached        int64
+		name               string
+		input, read, write int64
+		wantUncached       int64
 	}{
 		{"inclusive input, buckets inside it", 25249, 25117, 130, 2},
 		{"inclusive, exactly equal buckets", 250, 200, 50, 0},

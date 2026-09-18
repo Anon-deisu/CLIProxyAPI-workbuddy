@@ -692,6 +692,7 @@ type websocketDirectCaptureExecutor struct {
 	mu                        sync.Mutex
 	provider                  string
 	failStatus                int
+	responsePayload           []byte
 	authIDs                   []string
 	models                    []string
 	payloads                  [][]byte
@@ -816,7 +817,11 @@ func (e *websocketDirectCaptureExecutor) ExecuteStream(ctx context.Context, auth
 		return &coreexecutor.StreamResult{Chunks: chunks}, nil
 	}
 	responseID := fmt.Sprintf("resp-%d", count)
-	chunks <- coreexecutor.StreamChunk{Payload: []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"output":[{"type":"message","id":"out-%d"}]}}`, responseID, count))}
+	responsePayload := []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"output":[{"type":"message","id":"out-%d"}]}}`, responseID, count))
+	if len(e.responsePayload) > 0 {
+		responsePayload = bytes.Clone(e.responsePayload)
+	}
+	chunks <- coreexecutor.StreamChunk{Payload: responsePayload}
 	close(chunks)
 	if count >= 2 && e.done != nil {
 		e.doneOnce.Do(func() {
@@ -3401,6 +3406,67 @@ func TestResponsesWebsocketCodexWebsocketPassthroughPassesCompactedRequestWithou
 	authIDs := executor.AuthIDs()
 	if len(authIDs) != 2 || authIDs[0] != "auth-ws" || authIDs[1] != "auth-ws" {
 		t.Fatalf("passthrough auth IDs = %v, want [auth-ws auth-ws]", authIDs)
+	}
+}
+
+func TestResponsesWebsocketRewritesCacheTokenUsageDownstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	modelName := "cache-rewrite-websocket-model"
+	minimum := 95.0
+	executor := &websocketDirectCaptureExecutor{
+		provider:        "codex",
+		responsePayload: []byte(`{"type":"response.completed","response":{"id":"resp-cache","output":[],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":12,"cache_write_tokens":7}}}}`),
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{
+		ID:         "auth-cache-rewrite-websocket",
+		Provider:   "codex",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: modelName}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		CacheTokenRewrite: &sdkconfig.CacheTokenRewriteConfig{Enabled: true, MinPercent: &minimum},
+	}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	request := []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, modelName))
+	if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+		t.Fatalf("write websocket request: %v", errWrite)
+	}
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read websocket response: %v", errRead)
+	}
+	usage := gjson.GetBytes(payload, "response.usage")
+	if got := usage.Get("input_tokens_details.cached_tokens").Int(); got != 95 {
+		t.Fatalf("downstream cached tokens = %d, want 95: %s", got, payload)
+	}
+	if got := usage.Get("input_tokens").Int(); got != 100 {
+		t.Fatalf("downstream input tokens = %d, want 100: %s", got, payload)
+	}
+	if got := usage.Get("input_tokens_details.cache_write_tokens").Int(); got != 0 {
+		t.Fatalf("downstream cache write tokens = %d, want 0: %s", got, payload)
 	}
 }
 

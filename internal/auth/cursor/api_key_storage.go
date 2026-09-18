@@ -137,7 +137,7 @@ func apiKeyDigest(apiKey, baseURL string) string {
 	if strings.TrimSpace(apiKey) == "" {
 		return ""
 	}
-	return shortHex(sha256sum(baseURL+"\x00"+apiKey))
+	return shortHex(sha256sum(baseURL + "\x00" + apiKey))
 }
 
 // sanitizeFileNameComponent strips characters that are unsafe on common
