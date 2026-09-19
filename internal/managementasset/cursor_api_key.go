@@ -265,6 +265,7 @@ const runtimeSchedulerInlineScript = `
   var authFiles = new Map();
   var authFilesRefreshPending = false;
   var resetTurnStateView = function () {};
+  var accountStatePending = new Set();
   var nativeFetch = window.fetch;
 
   function clearManagementSession() {
@@ -274,8 +275,10 @@ const runtimeSchedulerInlineScript = `
     managementReady = false;
     authFilesRefreshPending = false;
     authFiles.clear();
+    accountStatePending.clear();
     resetTurnStateView();
     renderQuotaCosts();
+    renderAccountStateControls();
   }
 
   function observeManagementRequest(method, url, headers) {
@@ -308,8 +311,9 @@ const runtimeSchedulerInlineScript = `
     if (info.readsAuthFiles && info.files === authFilesGeneration) {
       authFiles = new Map(data.files.map(function (item) { return [item.name, item]; }));
       renderQuotaCosts();
+      renderAccountStateControls();
     }
-    if (info.endpoint === 'reset-quota' || (info.endpoint === 'api-call' && document.querySelector('[class*="QuotaPage-module__page"]'))) {
+    if (info.endpoint === 'reset-quota' || info.endpoint === 'auth-files/status' || (info.endpoint === 'api-call' && document.querySelector('[class*="QuotaPage-module__page"]'))) {
       refreshAuthFiles();
     }
   }
@@ -330,7 +334,7 @@ const runtimeSchedulerInlineScript = `
     var options = { method: method, headers: { 'Content-Type': 'application/json', 'Authorization': managementAuthorization } };
     if (body !== undefined) options.body = JSON.stringify(body);
     return window.fetch(managementBase + path, options).then(function (response) {
-      if (!response.ok) throw new Error('http ' + response.status);
+      if (!response.ok) return response.json().then(function (data) { throw new Error(data.error || ('http ' + response.status)); });
       return response;
     });
   }
@@ -397,6 +401,88 @@ const runtimeSchedulerInlineScript = `
     return node;
   }
 
+  function accountSchedulingState(item) {
+    return item.disabled ? 'disabled' : (item.degraded ? 'degraded' : 'normal');
+  }
+
+  function makeAccountStateControl(item, afterUpdate) {
+    var group = make('div', 'cpa-account-state');
+    group.setAttribute('data-cpa-auth-state', item.name);
+    group.setAttribute('role', 'group');
+    group.setAttribute('aria-label', '账号调度状态');
+    group.account = item;
+    var error = make('span', 'cpa-account-state-error');
+    [['normal', '正常'], ['degraded', '降级'], ['disabled', '停用']].forEach(function (option) {
+      var button = make('button', 'cpa-account-state-choice', option[1]);
+      button.type = 'button';
+      button.value = option[0];
+      button.addEventListener('click', function (event) {
+        event.stopPropagation();
+        var current = group.account;
+        var key = current.id || current.name;
+        if (accountStatePending.has(key) || accountSchedulingState(current) === option[0]) return;
+        accountStatePending.add(key);
+        updateAccountStateControl(group, current);
+        error.textContent = '';
+        var generation = sessionGeneration;
+        request('PATCH', 'auth-files/status', {name:current.name, auth_index:current.auth_index, scheduling_state:option[0]}).then(function () {
+          if (generation !== sessionGeneration) return;
+          current.disabled = option[0] === 'disabled';
+          current.degraded = option[0] === 'degraded';
+          current.auto_disabled = false;
+          current.scheduling_state = option[0];
+          authFiles.set(current.name, current);
+          renderAccountStateControls();
+          afterUpdate();
+        }).catch(function (err) {
+          if (generation === sessionGeneration) error.textContent = err.message;
+        }).finally(function () {
+          if (generation !== sessionGeneration) return;
+          accountStatePending.delete(key);
+          updateAccountStateControl(group, group.account);
+          renderAccountStateControls();
+        });
+      });
+      group.appendChild(button);
+    });
+    group.appendChild(error);
+    updateAccountStateControl(group, item);
+    return group;
+  }
+
+  function updateAccountStateControl(group, item) {
+    group.account = item;
+    var state = accountSchedulingState(item);
+    group.querySelectorAll('button').forEach(function (button) {
+      button.setAttribute('aria-pressed', String(button.value === state));
+      button.disabled = !managementReady || accountStatePending.has(item.id || item.name);
+    });
+  }
+
+  function renderAccountStateControls() {
+    document.querySelectorAll('[class*="AuthFileCard-module__card___"]').forEach(function (card) {
+      var nameNode = card.querySelector('[class*="AuthFileCard-module__fileName"]');
+      var nativeToggle = card.querySelector('[class*="AuthFileCard-module__toggleWrap"]');
+      if (!nameNode || !nativeToggle) return;
+      var item = authFiles.get(nameNode.getAttribute('title') || nameNode.textContent.trim());
+      var control = card.querySelector('[data-cpa-auth-state]');
+      if (!item || item.runtime_only) {
+        if (control) control.remove();
+        nativeToggle.classList.remove('cpa-native-status-hidden');
+        card.classList.remove('cpa-account-managed');
+        return;
+      }
+      if (!control) {
+        control = makeAccountStateControl(item, refreshAuthFiles);
+        nativeToggle.insertAdjacentElement('afterend', control);
+      }
+      nativeToggle.classList.add('cpa-native-status-hidden');
+      card.classList.add('cpa-account-managed');
+      card.setAttribute('data-cpa-scheduling-state', accountSchedulingState(item));
+      updateAccountStateControl(control, item);
+    });
+  }
+
   function renderQuotaCosts() {
     var cards = document.querySelectorAll('article[class*="QuotaCard-module__card"]');
     for (var i = 0; i < cards.length; i += 1) {
@@ -428,9 +514,18 @@ const runtimeSchedulerInlineScript = `
     panel.id = 'cpa-runtime-scheduler-panel';
     panel.hidden = true;
     var title = make('div', 'cpa-runtime-scheduler-title', '账号调度设置');
-    var hint = make('div', 'cpa-runtime-scheduler-hint', '仅当前进程生效，重启后恢复默认值');
+    var hint = make('div', 'cpa-runtime-scheduler-hint', '全局设置与端口仅当前进程生效；账号状态会保存');
     var form = make('div', 'cpa-runtime-scheduler-form');
     var strategyLabel = make('div', 'cpa-runtime-scheduler-default', '调度方式：Codex2API 默认（round-robin）');
+    var degradedPortLabel = make('label', 'cpa-runtime-scheduler-number');
+    degradedPortLabel.appendChild(document.createTextNode('降级账号 API 端口'));
+    var degradedPort = document.createElement('input');
+    degradedPort.type = 'number';
+    degradedPort.min = '0';
+    degradedPort.max = '65535';
+    degradedPort.step = '1';
+    degradedPort.title = '0 表示关闭；与主端口共用 API Key';
+    degradedPortLabel.appendChild(degradedPort);
     var c2aRetryCountLabel = make('label', 'cpa-runtime-scheduler-number');
     c2aRetryCountLabel.appendChild(document.createTextNode('C2A 最大重试次数'));
     var c2aRetryCount = document.createElement('input');
@@ -599,6 +694,7 @@ const runtimeSchedulerInlineScript = `
     save.disabled = true;
     var status = make('span', 'cpa-runtime-scheduler-status');
     form.appendChild(strategyLabel);
+    form.appendChild(degradedPortLabel);
     form.appendChild(c2aRetryCountLabel);
     form.appendChild(c2aRetryIntervalLabel);
     form.appendChild(c2aRetryCredentialsLabel);
@@ -751,6 +847,7 @@ const runtimeSchedulerInlineScript = `
         c2aRetryInterval.value = String(data['c2a-max-retry-interval'] == null ? 0 : data['c2a-max-retry-interval']);
         c2aRetryCredentials.value = String(data['c2a-max-retry-credentials'] == null ? 0 : data['c2a-max-retry-credentials']);
         concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
+        degradedPort.value = String(data['degraded-port'] || 0);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
         disableCooling.checked = !!data['disable-cooling'];
@@ -782,7 +879,7 @@ const runtimeSchedulerInlineScript = `
         files.forEach(function (item) {
           var row = make('div', 'cpa-runtime-scheduler-disabled-row');
           row.appendChild(make('strong', '', item.name || item.email || item.id || '未知认证'));
-          var accountStatus = '状态正常';
+          var accountStatus = item.degraded ? '降级账号池' : '状态正常';
           if (item.auto_disabled) {
             accountStatus = '自动禁用原因：' + (item.status_message || item.auto_disable_reason || '未知');
           } else if (item.disabled) {
@@ -793,6 +890,7 @@ const runtimeSchedulerInlineScript = `
             accountStatus = item.status_message || '暂不可用';
           }
           row.appendChild(make('span', '', accountStatus));
+          row.appendChild(makeAccountStateControl(item, loadAuthStatus));
           statusList.appendChild(row);
         });
       }).catch(function () {
@@ -801,10 +899,12 @@ const runtimeSchedulerInlineScript = `
     }
 
     save.addEventListener('click', function () {
+      if (!degradedPort.reportValidity()) return;
       if (cacheRewrite.checked && (!cacheMin.reportValidity() || !cacheMax.reportValidity())) return;
       save.disabled = true;
       status.textContent = '应用中...';
       request('PATCH', 'routing/settings', {
+        'degraded-port': Number(degradedPort.value || '0'),
         'c2a-max-retry-count': Math.max(0, Math.min(1000000, parseInt(c2aRetryCount.value || '0', 10) || 0)),
          'c2a-max-retry-interval': Math.max(0, Math.min(1000000, parseInt(c2aRetryInterval.value || '0', 10) || 0)),
          'c2a-max-retry-credentials': Math.max(0, Math.min(1000000, parseInt(c2aRetryCredentials.value || '0', 10) || 0)),
@@ -823,16 +923,17 @@ const runtimeSchedulerInlineScript = `
       }).then(function () {
         status.textContent = '已应用';
         loadTurnStates();
-      }).catch(function () {
-        status.textContent = '应用失败';
+      }).catch(function (err) {
+        status.textContent = '应用失败：' + err.message;
       }).finally(function () {
         save.disabled = false;
       });
     });
-    new MutationObserver(renderQuotaCosts).observe(document.body, { childList: true, subtree: true });
+    new MutationObserver(function () { renderQuotaCosts(); renderAccountStateControls(); }).observe(document.body, { childList: true, subtree: true });
     setInterval(function () { if (!panel.hidden) loadTurnStates(); }, 5000);
     setInterval(function () { if (!panel.hidden) renderTurnStates(); }, 1000);
     renderQuotaCosts();
+    renderAccountStateControls();
   }
 
   var style = document.createElement('style');
@@ -841,6 +942,7 @@ const runtimeSchedulerInlineScript = `
      '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
   style.textContent += '.cpa-runtime-scheduler-turn-states{font-size:12px;color:#57606a;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;letter-spacing:0}.cpa-runtime-scheduler-turn-state-row{display:grid;gap:3px;padding:6px 0;border-bottom:1px solid #d8dee4}.cpa-runtime-scheduler-turn-state-error{color:#b42318}';
+  style.textContent += '.cpa-native-status-hidden,.cpa-account-managed [class*="AuthFileCard-module__stateBadge"]{display:none!important}.cpa-account-state{display:flex;flex-wrap:wrap;gap:0;max-width:100%;font-size:12px;letter-spacing:0}.cpa-account-state-choice{min-width:48px;padding:5px 8px;border:1px solid var(--border-color,#d0d7de);background:var(--bg-primary,#fff);color:var(--text-secondary,#57606a);cursor:pointer}.cpa-account-state-choice:first-child{border-radius:6px 0 0 6px}.cpa-account-state-choice:nth-child(3){border-radius:0 6px 6px 0}.cpa-account-state-choice[aria-pressed="true"]{background:#2563eb;color:#fff}.cpa-account-state-choice[value="degraded"][aria-pressed="true"]{background:#b45309}.cpa-account-state-choice[value="disabled"][aria-pressed="true"]{background:#6b7280}.cpa-account-state-choice:disabled{cursor:wait;opacity:.6}.cpa-account-state-error{flex-basis:100%;color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-disabled-row strong{overflow-wrap:anywhere}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mount, { once: true });

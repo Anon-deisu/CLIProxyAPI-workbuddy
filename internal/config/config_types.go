@@ -264,6 +264,9 @@ type RoutingConfig struct {
 	// It is deliberately not read from or written to config.yaml.
 	SchedulerMode string `yaml:"-" json:"scheduler-mode,omitempty"`
 
+	// DegradedPort is a runtime-only model API listener for degraded accounts; zero disables it.
+	DegradedPort *int `yaml:"-" json:"degraded-port,omitempty"`
+
 	// AutoDisableUnauthorized excludes credentials after an upstream 401 once
 	// request-scoped errors and OAuth refresh recovery have been ruled out.
 	AutoDisableUnauthorized bool `yaml:"-" json:"auto-disable-unauthorized"`

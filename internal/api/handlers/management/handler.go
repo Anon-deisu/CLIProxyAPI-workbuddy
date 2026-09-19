@@ -57,6 +57,7 @@ type Handler struct {
 	pluginHost              *pluginhost.Host
 	configReloadHook        func(context.Context, *config.Config)
 	runtimeConfigHook       func(context.Context, *config.Config)
+	degradedPortController  func(int) error
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
@@ -168,6 +169,13 @@ func (h *Handler) SetRuntimeConfigHook(hook func(context.Context, *config.Config
 	}
 	h.mu.Lock()
 	h.runtimeConfigHook = hook
+	h.mu.Unlock()
+}
+
+// SetDegradedPortController installs the server-owned listener controller.
+func (h *Handler) SetDegradedPortController(controller func(int) error) {
+	h.mu.Lock()
+	h.degradedPortController = controller
 	h.mu.Unlock()
 }
 

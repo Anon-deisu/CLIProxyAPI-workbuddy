@@ -39,6 +39,22 @@ func TestGetContextWithCancelCapturesClientRequestMetadata(t *testing.T) {
 	}
 }
 
+func TestDegradedRoutingSurvivesHandlerContext(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Request = c.Request.WithContext(coreexecutor.WithDegradedRouting(c.Request.Context(), true))
+	c.Set("userApiKey", "shared-key")
+	h := &BaseAPIHandler{Cfg: &config.SDKConfig{}}
+	ctx, cancel := h.GetContextWithCancel(nil, c, context.Background())
+	defer cancel()
+	if !coreexecutor.DegradedRouting(ctx) {
+		t.Fatal("pool marker lost when handler used a background context")
+	}
+	if requestCallerScope(c) == coresession.CallerScope("shared-key") {
+		t.Fatal("degraded caller reused normal affinity namespace")
+	}
+}
+
 func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t *testing.T) {
 	ctx := WithExecutionSessionID(context.Background(), "session-1")
 

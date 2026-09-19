@@ -29,9 +29,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	var req struct {
-		Name      string `json:"name"`
-		AuthIndex string `json:"auth_index"`
-		Disabled  *bool  `json:"disabled"`
+		Name            string  `json:"name"`
+		AuthIndex       string  `json:"auth_index"`
+		Disabled        *bool   `json:"disabled"`
+		SchedulingState *string `json:"scheduling_state"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -43,6 +44,22 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
+	}
+	degraded := false
+	if req.SchedulingState != nil {
+		if req.Disabled != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "supply scheduling_state or disabled, not both"})
+			return
+		}
+		switch *req.SchedulingState {
+		case "normal", "degraded", "disabled":
+			disabled := *req.SchedulingState == "disabled"
+			req.Disabled = &disabled
+			degraded = *req.SchedulingState == "degraded"
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "scheduling_state must be normal, degraded or disabled"})
+			return
+		}
 	}
 	if req.Disabled == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
@@ -63,7 +80,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 			return
 		}
-		if errPatch := h.patchPluginVirtualSourceStatus(ctx, targetAuth, *req.Disabled); errPatch != nil {
+		if errPatch := h.patchPluginVirtualSourceStatus(ctx, targetAuth, *req.Disabled, degraded); errPatch != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(errPatch, errAuthFileNotFound) || os.IsNotExist(errPatch) {
 				status = http.StatusNotFound
@@ -76,6 +93,10 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	if coreauth.IsConfigAPIKeyAuth(targetAuth) {
+		if degraded {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "degraded scheduling requires a stored account file"})
+			return
+		}
 		h.mu.Lock()
 		handled, errToggle := toggleConfigAPIKeyExcludedAll(h.cfg, targetAuth, *req.Disabled)
 		if errToggle != nil {
@@ -108,6 +129,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 
 	wasAutoDisabled := targetAuth.AutoDisabled
 	applyAuthDisabledState(targetAuth, *req.Disabled)
+	targetAuth.Metadata["degraded"] = degraded
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
@@ -119,12 +141,12 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled, "degraded": degraded, "scheduling_state": targetAuth.SchedulingState()})
 }
 
 // patchPluginVirtualSourceStatus toggles disabled on a plugin multi-auth source file and all
 // runtime auths expanded from it. Virtual project children cannot be toggled independently.
-func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool) error {
+func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool, degraded ...bool) error {
 	if h == nil || h.authManager == nil || targetAuth == nil {
 		return fmt.Errorf("core auth manager unavailable")
 	}
@@ -135,7 +157,7 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 	if sourcePath == "" {
 		return errPluginVirtualAuth
 	}
-	if errWrite := setSourceAuthFileDisabled(sourcePath, disabled); errWrite != nil {
+	if errWrite := setSourceAuthFileDisabled(sourcePath, disabled, degraded...); errWrite != nil {
 		if os.IsNotExist(errWrite) {
 			return errAuthFileNotFound
 		}
@@ -152,6 +174,7 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 		}
 		wasAutoDisabled := auth.AutoDisabled
 		applyAuthDisabledState(auth, disabled)
+		auth.Metadata["degraded"] = len(degraded) > 0 && degraded[0]
 		auth.UpdatedAt = now
 		if _, errUpdate := h.authManager.Update(ctx, auth); errUpdate != nil {
 			return fmt.Errorf("failed to update auth %s: %w", auth.ID, errUpdate)
@@ -165,7 +188,7 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 	return nil
 }
 
-func setSourceAuthFileDisabled(path string, disabled bool) error {
+func setSourceAuthFileDisabled(path string, disabled bool, degraded ...bool) error {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return fmt.Errorf("source auth path is empty")
@@ -185,6 +208,7 @@ func setSourceAuthFileDisabled(path string, disabled bool) error {
 	}
 	coreauth.NormalizeCredentialMetadata(metadata)
 	metadata["disabled"] = disabled
+	metadata["degraded"] = len(degraded) > 0 && degraded[0]
 	raw, errMarshal := json.Marshal(metadata)
 	if errMarshal != nil {
 		return fmt.Errorf("marshal auth file: %w", errMarshal)

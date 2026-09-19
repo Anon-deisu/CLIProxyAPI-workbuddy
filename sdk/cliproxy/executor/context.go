@@ -8,6 +8,29 @@ import (
 type downstreamWebsocketContextKey struct{}
 type requireUpstreamWebsocketContextKey struct{}
 type upstreamAttemptTrackerContextKey struct{}
+type degradedRoutingContextKey struct{}
+
+// DegradedRoutingMetadataKey scopes session affinity within the selected account pool.
+const DegradedRoutingMetadataKey = "degraded_routing"
+
+// WithDegradedRouting selects a credential pool using a server-owned context value.
+func WithDegradedRouting(ctx context.Context, degraded bool) context.Context {
+	return context.WithValue(ctx, degradedRoutingContextKey{}, degraded)
+}
+
+// DegradedRouting is false on the normal listener and for existing SDK callers.
+func DegradedRouting(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	degraded, _ := ctx.Value(degradedRoutingContextKey{}).(bool)
+	return degraded
+}
+
+// HasRoutingPool reports whether the caller is a pool-scoped model request.
+func HasRoutingPool(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(degradedRoutingContextKey{}) != nil
+}
 
 type upstreamAttemptTracker struct {
 	attempted atomic.Bool

@@ -127,6 +127,26 @@ type authDispatchState struct {
 	initialized bool
 }
 
+// IsDegraded identifies the persistent, separate scheduling pool for this account.
+func (a *Auth) IsDegraded() bool {
+	if a == nil {
+		return false
+	}
+	degraded, _ := a.Metadata["degraded"].(bool)
+	return degraded
+}
+
+// SchedulingState separates operator routing choices from transient upstream errors.
+func (a *Auth) SchedulingState() string {
+	if a.Disabled || a.AutoDisabled || a.Status == StatusDisabled {
+		return "disabled"
+	}
+	if a.IsDegraded() {
+		return "degraded"
+	}
+	return "normal"
+}
+
 func (a *Auth) ensureDispatchState() *authDispatchState {
 	if a == nil {
 		return nil

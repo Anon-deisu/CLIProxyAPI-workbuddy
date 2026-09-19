@@ -34,6 +34,10 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 		value := *previous.Routing.AuthConcurrencyLimit
 		cloned.Routing.AuthConcurrencyLimit = &value
 	}
+	if cloned.Routing.DegradedPort == nil && previous.Routing.DegradedPort != nil {
+		value := *previous.Routing.DegradedPort
+		cloned.Routing.DegradedPort = &value
+	}
 	if cloned.Routing.CodexFingerprintConvergence == nil && previous.Routing.CodexFingerprintConvergence != nil {
 		value := *previous.Routing.CodexFingerprintConvergence
 		cloned.Routing.CodexFingerprintConvergence = &value

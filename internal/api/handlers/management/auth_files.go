@@ -249,6 +249,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				degraded := gjson.GetBytes(data, "degraded").Bool()
+				disabled := gjson.GetBytes(data, "disabled").Bool()
+				fileData["degraded"] = degraded
+				fileData["disabled"] = disabled
+				fileData["scheduling_state"] = (&coreauth.Auth{Disabled: disabled, Metadata: map[string]any{"degraded": degraded}}).SchedulingState()
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -339,6 +344,8 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		"status_message":    auth.StatusMessage,
 		"disabled":          auth.Disabled || auth.AutoDisabled,
 		"manual_disabled":   auth.Disabled,
+		"degraded":          auth.IsDegraded(),
+		"scheduling_state":  auth.SchedulingState(),
 		"auto_disabled":     auth.AutoDisabled,
 		"concurrency_limit": auth.EffectiveConcurrencyLimit(),
 		"active_requests":   auth.ActiveDispatchRequests(),

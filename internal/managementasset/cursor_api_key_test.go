@@ -183,12 +183,14 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const nodes = [], timers = [], listeners = {};
 class Element {
-  constructor(tag) { this.tagName = tag; this.children = []; this.style = {}; this.listeners = {}; this._text = ''; this.hidden = false; this.value = ''; nodes.push(this); }
+  constructor(tag) { this.tagName = tag; this.children = []; this.style = {}; this.listeners = {}; this.attributes = {}; this._text = ''; this.hidden = false; this.value = ''; nodes.push(this); }
   set textContent(value) { this._text = value; this.children = []; }
   get textContent() { return this._text + this.children.map(node => node.textContent).join(''); }
   appendChild(child) { this.children.push(child); return child; }
   addEventListener(type, callback) { this.listeners[type] = callback; }
-  click() { if (this.listeners.click) this.listeners.click(); }
+  click() { if (this.listeners.click) this.listeners.click({stopPropagation() {}}); }
+  setAttribute(key, value) { this.attributes[key] = value; }
+  querySelectorAll(tag) { return this.children.filter(child => child.tagName === tag); }
   contains(node) { return this.children.includes(node); }
   getBoundingClientRect() { return {left:10,top:10,width:320,height:500,right:330,bottom:510}; }
   reportValidity() { return true; }
@@ -210,7 +212,8 @@ globalThis.XMLHttpRequest = class { open() {} setRequestHeader() {} send() {} };
 globalThis.setInterval = (callback, interval) => { timers.push({callback,interval}); };
 let now = 0;
 Object.defineProperty(globalThis, 'performance', {value:{now: () => now}});
-let enabled = false, patch = null, failStatus = false, lateResolve;
+let enabled = false, patch = null, failStatus = false, lateResolve, statePatch;
+const account = {id:'account-a',name:'account-a.json',auth_index:'a',disabled:false,degraded:false};
 let delayStatus = false;
 window.fetch = async (url, options = {}) => {
   if (url.endsWith('routing/settings')) {
@@ -218,9 +221,15 @@ window.fetch = async (url, options = {}) => {
       patch = JSON.parse(options.body); enabled = patch['codex-turn-state-enabled'];
       return new Response('{}');
     }
-    return new Response(JSON.stringify({'codex-turn-state-enabled':enabled}));
+    return new Response(JSON.stringify({'codex-turn-state-enabled':enabled,'degraded-port':18888}));
   }
-  if (url.endsWith('auth-files')) return new Response('{"files":[]}');
+  if (url.endsWith('auth-files')) return new Response(JSON.stringify({files:[account]}));
+  if (url.endsWith('auth-files/status')) {
+    statePatch = JSON.parse(options.body);
+    account.disabled = statePatch.scheduling_state === 'disabled';
+    account.degraded = statePatch.scheduling_state === 'degraded';
+    return new Response('{}');
+  }
   if (url.endsWith('routing/codex-turn-state')) {
     if (delayStatus) return new Promise(resolve => {lateResolve = resolve;});
     if (failStatus) return new Response('{}', {status:500});
@@ -240,10 +249,18 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   const checkbox = nodes.find(node => node.tagName === 'label' && node.textContent === 'Codex 292/332 state 自动续期').children[0];
   const save = nodes.find(node => node.className === 'cpa-runtime-scheduler-save');
   toggle.click(); await flush();
+  const portInput = nodes.find(node => node.tagName === 'label' && node.textContent === '降级账号 API 端口').children[1];
+  assert.equal(portInput.value, '18888');
+  const stateControl = nodes.findLast(node => node.className === 'cpa-account-state');
+  stateControl.children[1].click(); await flush();
+  assert.equal(statePatch.scheduling_state, 'degraded');
+  assert.equal(statePatch.auth_index, 'a');
+  assert.equal(account.degraded, true);
   assert.equal(checkbox.checked, false);
   assert.equal(list.textContent, '未开启');
   checkbox.checked = true; save.click(); await flush();
   assert.equal(patch['codex-turn-state-enabled'], true);
+  assert.equal(patch['degraded-port'], 18888);
   assert.match(list.textContent, /account-a.*292 剩余.*5:30.*account-b.*332 剩余.*2:05.*续期中/);
   now += 2000;
   timers.find(timer => timer.interval === 1000).callback();
@@ -291,7 +308,7 @@ globalThis.document = {
   readyState: 'loading',
   documentElement: {appendChild() {}},
   addEventListener() {},
-  querySelectorAll: () => cards,
+  querySelectorAll: selector => selector.includes('QuotaCard') ? cards : [],
   querySelector: () => ({}),
   createElement: () => ({setAttribute() {}, textContent: ''})
 };

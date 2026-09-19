@@ -267,6 +267,12 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 					continue
 				}
 				cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
+				if degraded, ok := metadata["degraded"].(bool); ok {
+					if auth.Metadata == nil {
+						auth.Metadata = make(map[string]any)
+					}
+					auth.Metadata["degraded"] = degraded
+				}
 				if len(auths) > 1 {
 					cliproxyauth.MarkPluginVirtualAuth(auth, path, index)
 				}

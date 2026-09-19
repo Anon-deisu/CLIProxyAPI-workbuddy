@@ -295,7 +295,11 @@ func requestCallerScope(ginCtx *gin.Context) string {
 	if !exists || value == nil {
 		return ""
 	}
-	return coresession.CallerScope(fmt.Sprint(value))
+	scope := fmt.Sprint(value)
+	if ginCtx.Request != nil && coreexecutor.DegradedRouting(ginCtx.Request.Context()) {
+		scope = "degraded\x00" + scope
+	}
+	return coresession.CallerScope(scope)
 }
 
 func addAuthSelectionModelMetadata(meta map[string]any, model string) {
@@ -478,6 +482,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	var requestCtx context.Context
 	if c != nil && c.Request != nil {
 		requestCtx = c.Request.Context()
+		parentCtx = coreexecutor.WithDegradedRouting(parentCtx, coreexecutor.DegradedRouting(requestCtx))
 	}
 
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {

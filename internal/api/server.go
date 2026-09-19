@@ -44,6 +44,16 @@ type Server struct {
 	// server is the underlying HTTP server.
 	server *http.Server
 
+	degradedMu          sync.Mutex
+	degradedListener    *degradedAPIListener
+	degradedPort        int
+	degradedStopped     bool
+	degradedRoutes      map[string]struct{}
+	degradedHost        string
+	degradedTLS         config.TLSConfig
+	degradedMainPort    int
+	degradedHomeEnabled bool
+
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	muxBaseListener net.Listener
 
@@ -181,6 +191,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
 		pluginHost:          optionState.pluginHost,
+		degradedHost:        cfg.Host,
+		degradedTLS:         cfg.TLS,
+		degradedMainPort:    cfg.Port,
+		degradedHomeEnabled: cfg.Home.Enabled,
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
@@ -220,6 +234,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	s.mgmt.SetRuntimeConfigHook(optionState.runtimeConfigHook)
+	s.mgmt.SetDegradedPortController(s.setDegradedPort)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -235,11 +250,18 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the
 	// subscribe-config heartbeat connection is healthy.
+	engine.Use(s.degradedPoolMiddleware())
 	engine.Use(s.homeHeartbeatMiddleware())
 	engine.Use(s.exampleAPIKeySafeModeMiddleware())
 
 	// Setup routes
 	s.setupRoutes()
+	s.degradedRoutes = make(map[string]struct{})
+	for _, route := range engine.Routes() {
+		if strings.HasPrefix(route.Path, "/v1/") || strings.HasPrefix(route.Path, "/v1beta/") || strings.HasPrefix(route.Path, "/backend-api/codex/") || strings.HasPrefix(route.Path, "/openai/v1/") {
+			s.degradedRoutes[route.Method+" "+route.Path] = struct{}{}
+		}
+	}
 
 	// Apply additional router configurators from options
 	if optionState.routerConfigurator != nil {
@@ -384,6 +406,7 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	degradedErr := s.stopDegradedListener()
 
 	if s.keepAliveEnabled {
 		select {
@@ -411,5 +434,5 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 
 	log.Debug("API server stopped")
-	return nil
+	return degradedErr
 }

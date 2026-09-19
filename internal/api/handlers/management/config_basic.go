@@ -348,11 +348,15 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	c2aRetryInterval := 0
 	c2aRetryCredentials := 0
 	authConcurrencyLimit := 0
+	degradedPort := 0
 	codexFingerprintConvergence := false
 	codexTurnStateEnabled := false
 	codexRoutingHint := "europe"
 	cacheTokenRewrite := config.CacheTokenRewriteConfig{}
 	if cfg != nil {
+		if cfg.Routing.DegradedPort != nil {
+			degradedPort = *cfg.Routing.DegradedPort
+		}
 		if cfg.CacheTokenRewrite != nil {
 			cacheTokenRewrite = *cfg.CacheTokenRewrite
 		}
@@ -395,6 +399,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"c2a-max-retry-interval":        c2aRetryInterval,
 		"c2a-max-retry-credentials":     c2aRetryCredentials,
 		"auth-concurrency-limit":        authConcurrencyLimit,
+		"degraded-port":                 degradedPort,
 		"codex-fingerprint-convergence": codexFingerprintConvergence,
 		"codex-turn-state-enabled":      codexTurnStateEnabled,
 		"codex-routing-hint":            codexRoutingHint,
@@ -437,6 +442,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		C2AMaxRetryInterval         *int                            `json:"c2a-max-retry-interval"`
 		C2AMaxRetryCredentials      *int                            `json:"c2a-max-retry-credentials"`
 		AuthConcurrencyLimit        *int                            `json:"auth-concurrency-limit"`
+		DegradedPort                *int                            `json:"degraded-port"`
 		CodexFingerprintConvergence *bool                           `json:"codex-fingerprint-convergence"`
 		CodexTurnStateEnabled       *bool                           `json:"codex-turn-state-enabled"`
 		CodexRoutingHint            *string                         `json:"codex-routing-hint"`
@@ -481,12 +487,38 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "auth-concurrency-limit must be between 0 and 1000000"})
 		return
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
+	if body.DegradedPort != nil && (*body.DegradedPort < 0 || *body.DegradedPort > 65535) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "degraded-port must be between 0 and 65535"})
+		return
+	}
+	if body.CodexRoutingHint != nil {
+		value := strings.ToLower(strings.TrimSpace(*body.CodexRoutingHint))
+		switch value {
+		case "off", "none", "disabled":
+			value = ""
+		case "", "europe", "north-america", "asia-pacific":
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid codex-routing-hint"})
+			return
+		}
+		body.CodexRoutingHint = &value
+	}
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
 
 	h.applyRuntimeConfig(c, func(cfg *config.Config) error {
+		if body.DegradedPort != nil {
+			if h.degradedPortController == nil {
+				return fmt.Errorf("degraded listener controller unavailable")
+			}
+			if errPort := h.degradedPortController(*body.DegradedPort); errPort != nil {
+				return errPort
+			}
+			value := *body.DegradedPort
+			cfg.Routing.DegradedPort = &value
+		}
 		if mode != nil {
 			cfg.Routing.SchedulerMode = normalizedMode
 		}
@@ -537,15 +569,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 			cfg.Routing.CodexTurnStateEnabled = &value
 		}
 		if body.CodexRoutingHint != nil {
-			value := strings.ToLower(strings.TrimSpace(*body.CodexRoutingHint))
-			switch value {
-			case "", "off", "none", "disabled", "europe", "north-america", "asia-pacific":
-				if value == "off" || value == "none" || value == "disabled" {
-					value = ""
-				}
-			default:
-				return fmt.Errorf("invalid codex-routing-hint")
-			}
+			value := *body.CodexRoutingHint
 			cfg.Routing.CodexRoutingHint = &value
 		}
 		if body.CacheTokenRewrite != nil {

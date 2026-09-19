@@ -1248,6 +1248,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 	opts.Metadata[cliproxyexecutor.SessionAffinityProviderMetadataKey] = provider
 	opts.Metadata[cliproxyexecutor.SessionAffinityModelMetadataKey] = model
+	opts.Metadata[cliproxyexecutor.DegradedRoutingMetadataKey] = cliproxyexecutor.DegradedRouting(ctx)
 
 	// Explicit harness identities are absolute authority. The LCP matcher is only
 	// consulted when no header, body, or execution-session identity is present.
@@ -1305,7 +1306,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	fallbackAuths := highestPriorityAuths(available)
 
 	modelKey := canonicalModelKey(model)
-	cacheKey := provider + "::" + primaryID + "::" + modelKey
+	cacheProvider := affinityPoolNamespace(provider, opts.Metadata)
+	cacheKey := cacheProvider + "::" + primaryID + "::" + modelKey
 	isFork := false
 	if opts.Metadata != nil {
 		if forkFlag, ok := opts.Metadata[cliproxyexecutor.IsForkMetadataKey].(bool); ok && forkFlag {
@@ -1315,7 +1317,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	isSubagent := !isFork && isSubagentSession(primaryID, fallbackID)
 	fallbackKey := ""
 	if fallbackID != "" && fallbackID != primaryID {
-		fallbackKey = provider + "::" + fallbackID + "::" + modelKey
+		fallbackKey = cacheProvider + "::" + fallbackID + "::" + modelKey
 	}
 	bind := func(authID string) {
 		if fallbackKey != "" && !isSubagent && !isFork {
@@ -1488,6 +1490,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 
 func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	provider = affinityPoolNamespace(provider, metadata)
 	model = canonicalModelKey(model)
 	callerScope := sessionMetadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey)
 	if provider == "" || callerScope == "" {
@@ -1512,6 +1515,13 @@ func parseLCPNamespace(ns string) (provider, model, callerScope string, ok bool)
 	nsModel := rest[:lastIdx]
 	nsCallerScope := rest[lastIdx+2:]
 	return nsProvider, nsModel, nsCallerScope, true
+}
+
+func affinityPoolNamespace(provider string, metadata map[string]any) string {
+	if degraded, _ := metadata[cliproxyexecutor.DegradedRoutingMetadataKey].(bool); degraded {
+		return "degraded/" + provider
+	}
+	return provider
 }
 
 func lcpFingerprintsFromMetadata(metadata map[string]any) ([]string, int) {
@@ -1767,10 +1777,11 @@ func (s *SessionAffinitySelector) OnResult(res Result) {
 		fallbackID = cliproxysession.BoundSessionIdentity(fallbackID)
 	}
 
-	cacheKey := ns + "::" + primaryID + "::" + nsModel
+	cacheProvider := affinityPoolNamespace(ns, res.Options.Metadata)
+	cacheKey := cacheProvider + "::" + primaryID + "::" + nsModel
 	var fallbackKey string
 	if fallbackID != "" && fallbackID != primaryID && !isSubagentSession(primaryID, fallbackID) {
-		fallbackKey = ns + "::" + fallbackID + "::" + nsModel
+		fallbackKey = cacheProvider + "::" + fallbackID + "::" + nsModel
 	}
 	if res.Success {
 		s.cache.Touch(cacheKey, res.AuthID)

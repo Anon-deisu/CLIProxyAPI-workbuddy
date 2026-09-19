@@ -1973,6 +1973,9 @@ func (m *Manager) PrepareHttpRequest(ctx context.Context, auth *Auth, req *http.
 	if req == nil {
 		return &Error{Code: "invalid_request", Message: "http request is nil"}
 	}
+	if errPool := m.validateRequestRoutingPool(ctx, auth); errPool != nil {
+		return errPool
+	}
 	if ctx != nil {
 		*req = *req.WithContext(ctx)
 	}
@@ -2028,6 +2031,9 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 	if req == nil {
 		return nil, &Error{Code: "invalid_request", Message: "http request is nil"}
 	}
+	if errPool := m.validateRequestRoutingPool(ctx, auth); errPool != nil {
+		return nil, errPool
+	}
 	providerKey := executorKeyFromAuth(auth)
 	if providerKey == "" {
 		return nil, &Error{Code: "provider_not_found", Message: "auth provider is empty"}
@@ -2037,6 +2043,19 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
 	}
 	return exec.HttpRequest(ctx, auth, req)
+}
+
+func (m *Manager) validateRequestRoutingPool(ctx context.Context, account *Auth) error {
+	if !cliproxyexecutor.HasRoutingPool(ctx) {
+		return nil
+	}
+	if current, ok := m.GetByID(account.ID); ok {
+		account = current
+	}
+	if account.IsDegraded() != cliproxyexecutor.DegradedRouting(ctx) || account.IsDispatchDisabled() {
+		return &Error{Code: "auth_not_found", Message: "account is not available in this scheduling pool", HTTPStatus: http.StatusServiceUnavailable}
+	}
+	return nil
 }
 
 func ensureCanonicalSessionMetadata(metadata map[string]any, headers http.Header, payload []byte) map[string]any {

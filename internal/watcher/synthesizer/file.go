@@ -116,6 +116,12 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 					continue
 				}
 				coreauth.NormalizeCredentialMetadata(auth.Metadata)
+				if degraded, ok := metadata["degraded"].(bool); ok {
+					if auth.Metadata == nil {
+						auth.Metadata = make(map[string]any)
+					}
+					auth.Metadata["degraded"] = degraded
+				}
 				if len(auths) > 1 {
 					coreauth.MarkPluginVirtualAuth(auth, fullPath, index)
 				}
