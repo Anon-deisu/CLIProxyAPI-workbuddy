@@ -115,6 +115,7 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("codex-fingerprint-convergence"),
 		[]byte("codex-routing-hint"),
 		[]byte("codex-auto-degrade"),
+		[]byte("codex-state-cliproxy"),
 		[]byte("cacheRewrite.checked = !!rewrite.enabled"),
 		[]byte("'cache-token-rewrite': {"),
 		[]byte("document.createTextNode('自定义复写 token 数')"),
@@ -214,6 +215,8 @@ globalThis.setInterval = (callback, interval) => { timers.push({callback,interva
 let now = 0;
 Object.defineProperty(globalThis, 'performance', {value:{now: () => now}});
 let enabled = false, automatic = false, badState = false, patch = null, failStatus = false, lateResolve, statePatch;
+let proxySettings = {enabled:false,gateway:'',username:'','password-configured':false};
+let degradedPort = 0, degradedPortConfigured = false;
 const account = {id:'account-a',name:'account-a.json',auth_index:'a',provider:'codex',disabled:false,degraded:false};
 const other = {id:'account-b',name:'account-b.json',auth_index:'b',provider:'codex',disabled:false,degraded:false};
 let delayStatus = false;
@@ -221,9 +224,12 @@ window.fetch = async (url, options = {}) => {
   if (url.endsWith('routing/settings')) {
     if (options.method === 'PATCH') {
       patch = JSON.parse(options.body); enabled = patch['codex-turn-state-enabled']; automatic = patch['codex-auto-degrade'];
+      degradedPort = patch['degraded-port']; degradedPortConfigured = true;
+      const proxy = patch['codex-state-cliproxy'];
+      proxySettings = {enabled:proxy.enabled,gateway:proxy.gateway,username:proxy.username,'password-configured':!!proxy.password || proxySettings['password-configured']};
       return new Response('{}');
     }
-    return new Response(JSON.stringify({'codex-turn-state-enabled':enabled,'codex-auto-degrade':automatic,'degraded-port':18888}));
+    return new Response(JSON.stringify({'codex-turn-state-enabled':enabled,'codex-auto-degrade':automatic,'codex-state-cliproxy':proxySettings,'degraded-port':degradedPort,'degraded-port-configured':degradedPortConfigured}));
   }
   if (url.endsWith('auth-files')) return new Response(JSON.stringify({files:[account,other]}));
   if (url.endsWith('auth-files/status')) {
@@ -254,7 +260,9 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   const save = nodes.find(node => node.className === 'cpa-runtime-scheduler-save');
   toggle.click(); await flush();
   const portInput = nodes.find(node => node.tagName === 'label' && node.textContent === '降级账号 API 端口').children[1];
-  assert.equal(portInput.value, '18888');
+  assert.equal(portInput.value, '9444');
+  assert.equal(patch, null, 'prefilling the port must not apply settings');
+  portInput.value = '18888';
   const stateControl = nodes.findLast(node => node.className === 'cpa-account-state' && node.account.id === account.id);
   stateControl.children[1].click(); await flush();
   assert.equal(statePatch.scheduling_state, 'degraded');
@@ -269,6 +277,38 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   assert.equal(patch['codex-turn-state-enabled'], true);
   assert.equal(patch['codex-auto-degrade'], true);
   assert.equal(patch['degraded-port'], 18888);
+  const proxyCheckbox = nodes.find(node => node.tagName === 'label' && node.textContent === 'Cliproxy 动态代理采集 state').children[0];
+  const proxyFields = nodes.find(node => node.className === 'cpa-runtime-scheduler-proxy-fields');
+  const proxyGateway = document.getElementById('cpa-runtime-scheduler-cliproxy-gateway');
+  const proxyUsername = document.getElementById('cpa-runtime-scheduler-cliproxy-username');
+  const proxyPassword = document.getElementById('cpa-runtime-scheduler-cliproxy-password');
+  assert.equal(proxyFields.hidden, true);
+  proxyCheckbox.checked = true; proxyCheckbox.listeners.change();
+  assert.equal(proxyFields.hidden, false);
+  assert.equal(proxyGateway.type, 'text', 'bare host:port must be accepted');
+  assert.equal(proxyPassword.type, 'password');
+  assert.equal(proxyPassword.required, true);
+  proxyGateway.value = 'us.arxlabs.io:3010'; proxyUsername.value = 'test-region-US'; proxyPassword.value = 'synthetic-secret';
+  save.click(); await flush();
+  assert.equal(patch['codex-state-cliproxy'].gateway, 'us.arxlabs.io:3010');
+  assert.equal(patch['codex-state-cliproxy'].password, 'synthetic-secret');
+  assert.equal(proxyPassword.value, '');
+  assert.equal(proxyPassword.required, false);
+  toggle.click(); toggle.click(); await flush();
+  assert.equal(proxyCheckbox.checked, true);
+  assert.equal(proxyGateway.value, 'us.arxlabs.io:3010');
+  assert.equal(proxyPassword.value, '');
+  save.click(); await flush();
+  assert.equal(Object.hasOwn(patch['codex-state-cliproxy'], 'password'), false, 'blank password must preserve the stored credential');
+  assert.equal(portInput.value, '18888', 'existing custom port must be preserved');
+  portInput.value = '0'; save.click(); await flush();
+  toggle.click(); toggle.click(); await flush();
+  assert.equal(portInput.value, '0', 'explicitly disabled port must stay disabled');
+  proxyCheckbox.checked = false; proxyCheckbox.listeners.change(); save.click(); await flush();
+  assert.equal(patch['codex-state-cliproxy'].enabled, false);
+  assert.equal(proxyFields.hidden, true);
+  assert.equal(proxyGateway.disabled, true);
+  proxyCheckbox.checked = true; proxyCheckbox.listeners.change();
   assert.match(list.textContent, /account-a.*292 剩余.*5:30.*account-b.*332 剩余.*2:05.*续期中/);
   assert.equal(list.children.length, 2);
   assert.equal((list.textContent.match(/account-a.json/g) || []).length, 1, 'one row per account');
@@ -299,7 +339,11 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   assert.equal(list.textContent, '未连接管理接口');
   assert.equal(checkbox.checked, false);
   assert.equal(automaticCheckbox.checked, false);
-  console.log('merged account rows, automatic degradation toggle, countdown and logout checks passed');
+  assert.equal(proxyCheckbox.checked, false);
+  assert.equal(proxyGateway.value, '');
+  assert.equal(proxyUsername.value, '');
+  assert.equal(proxyPassword.value, '');
+  console.log('merged account rows, state automation, Cliproxy credentials, countdown and logout checks passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `
 

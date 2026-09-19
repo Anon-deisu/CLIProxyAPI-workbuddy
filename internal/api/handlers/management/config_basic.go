@@ -349,14 +349,17 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	c2aRetryCredentials := 0
 	authConcurrencyLimit := 0
 	degradedPort := 0
+	degradedPortConfigured := false
 	codexFingerprintConvergence := false
 	codexTurnStateEnabled := false
 	codexAutoDegrade := false
+	cliproxy := config.CliproxyConfig{}
 	codexRoutingHint := "europe"
 	cacheTokenRewrite := config.CacheTokenRewriteConfig{}
 	if cfg != nil {
 		if cfg.Routing.DegradedPort != nil {
 			degradedPort = *cfg.Routing.DegradedPort
+			degradedPortConfigured = true
 		}
 		if cfg.CacheTokenRewrite != nil {
 			cacheTokenRewrite = *cfg.CacheTokenRewrite
@@ -374,6 +377,9 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		}
 		if cfg.Routing.CodexAutoDegrade != nil {
 			codexAutoDegrade = *cfg.Routing.CodexAutoDegrade
+		}
+		if cfg.Routing.CodexStateCliproxy != nil {
+			cliproxy = *cfg.Routing.CodexStateCliproxy
 		}
 		if cfg.Routing.CodexRoutingHint != nil {
 			codexRoutingHint = strings.TrimSpace(*cfg.Routing.CodexRoutingHint)
@@ -393,6 +399,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		}
 	}
 	h.mu.Unlock()
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{
 		"strategy":                      strategy,
 		"scheduler-mode":                strategy,
@@ -404,12 +411,17 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"c2a-max-retry-credentials":     c2aRetryCredentials,
 		"auth-concurrency-limit":        authConcurrencyLimit,
 		"degraded-port":                 degradedPort,
+		"degraded-port-configured":      degradedPortConfigured,
 		"codex-fingerprint-convergence": codexFingerprintConvergence,
 		"codex-turn-state-enabled":      codexTurnStateEnabled,
 		"codex-auto-degrade":            codexAutoDegrade,
-		"codex-routing-hint":            codexRoutingHint,
-		"cache-token-rewrite":           cacheTokenRewrite,
-		"runtime_only":                  true,
+		"codex-state-cliproxy": gin.H{
+			"enabled": cliproxy.Enabled, "gateway": cliproxy.Gateway,
+			"username": cliproxy.Username, "password-configured": cliproxy.Password != "",
+		},
+		"codex-routing-hint":  codexRoutingHint,
+		"cache-token-rewrite": cacheTokenRewrite,
+		"runtime_only":        true,
 	})
 }
 
@@ -438,21 +450,27 @@ func (h *Handler) GetCodexTurnStateStatus(c *gin.Context) {
 // PutRoutingSettings updates scheduler controls in memory and deliberately skips config.yaml writes.
 func (h *Handler) PutRoutingSettings(c *gin.Context) {
 	var body struct {
-		Strategy                    *string                         `json:"strategy"`
-		SchedulerMode               *string                         `json:"scheduler-mode"`
-		AutoDisableUnauthorized     *bool                           `json:"auto-disable-unauthorized"`
-		AutoDisableQuota            *bool                           `json:"auto-disable-quota"`
-		DisableCooling              *bool                           `json:"disable-cooling"`
-		C2AMaxRetryCount            *int                            `json:"c2a-max-retry-count"`
-		C2AMaxRetryInterval         *int                            `json:"c2a-max-retry-interval"`
-		C2AMaxRetryCredentials      *int                            `json:"c2a-max-retry-credentials"`
-		AuthConcurrencyLimit        *int                            `json:"auth-concurrency-limit"`
-		DegradedPort                *int                            `json:"degraded-port"`
-		CodexFingerprintConvergence *bool                           `json:"codex-fingerprint-convergence"`
-		CodexTurnStateEnabled       *bool                           `json:"codex-turn-state-enabled"`
-		CodexAutoDegrade            *bool                           `json:"codex-auto-degrade"`
-		CodexRoutingHint            *string                         `json:"codex-routing-hint"`
-		CacheTokenRewrite           *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
+		Strategy                    *string `json:"strategy"`
+		SchedulerMode               *string `json:"scheduler-mode"`
+		AutoDisableUnauthorized     *bool   `json:"auto-disable-unauthorized"`
+		AutoDisableQuota            *bool   `json:"auto-disable-quota"`
+		DisableCooling              *bool   `json:"disable-cooling"`
+		C2AMaxRetryCount            *int    `json:"c2a-max-retry-count"`
+		C2AMaxRetryInterval         *int    `json:"c2a-max-retry-interval"`
+		C2AMaxRetryCredentials      *int    `json:"c2a-max-retry-credentials"`
+		AuthConcurrencyLimit        *int    `json:"auth-concurrency-limit"`
+		DegradedPort                *int    `json:"degraded-port"`
+		CodexFingerprintConvergence *bool   `json:"codex-fingerprint-convergence"`
+		CodexTurnStateEnabled       *bool   `json:"codex-turn-state-enabled"`
+		CodexAutoDegrade            *bool   `json:"codex-auto-degrade"`
+		CodexStateCliproxy          *struct {
+			Enabled  *bool   `json:"enabled"`
+			Gateway  *string `json:"gateway"`
+			Username *string `json:"username"`
+			Password *string `json:"password"`
+		} `json:"codex-state-cliproxy"`
+		CodexRoutingHint  *string                         `json:"codex-routing-hint"`
+		CacheTokenRewrite *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -509,12 +527,34 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		}
 		body.CodexRoutingHint = &value
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexAutoDegrade == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexAutoDegrade == nil && body.CodexStateCliproxy == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
 
 	h.applyRuntimeConfig(c, func(cfg *config.Config) error {
+		var cliproxy *config.CliproxyConfig
+		if patch := body.CodexStateCliproxy; patch != nil {
+			cliproxy = &config.CliproxyConfig{}
+			if cfg.Routing.CodexStateCliproxy != nil {
+				*cliproxy = *cfg.Routing.CodexStateCliproxy
+			}
+			if patch.Enabled != nil {
+				cliproxy.Enabled = *patch.Enabled
+			}
+			if patch.Gateway != nil {
+				cliproxy.Gateway = strings.TrimSpace(*patch.Gateway)
+			}
+			if patch.Username != nil {
+				cliproxy.Username = strings.TrimSpace(*patch.Username)
+			}
+			if patch.Password != nil {
+				cliproxy.Password = *patch.Password
+			}
+			if _, errProxy := cliproxy.ProxyURL(); errProxy != nil {
+				return errProxy
+			}
+		}
 		if body.DegradedPort != nil {
 			if h.degradedPortController == nil {
 				return fmt.Errorf("degraded listener controller unavailable")
@@ -524,6 +564,9 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 			}
 			value := *body.DegradedPort
 			cfg.Routing.DegradedPort = &value
+		}
+		if cliproxy != nil {
+			cfg.Routing.CodexStateCliproxy = cliproxy
 		}
 		if mode != nil {
 			cfg.Routing.SchedulerMode = normalizedMode

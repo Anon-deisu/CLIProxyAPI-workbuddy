@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -101,6 +102,7 @@ func (k *CodexTurnStateKeeper) Configure(cfg *config.Config) {
 	if k.closed {
 		return
 	}
+	proxyChanged := codexTurnStateCliproxy(k.cfg) != codexTurnStateCliproxy(cfg)
 	k.cfg = cfg.CloneForRuntime()
 	enabled := cfg != nil && cfg.Routing.CodexTurnStateEnabled != nil && *cfg.Routing.CodexTurnStateEnabled
 	if !enabled {
@@ -129,6 +131,17 @@ func (k *CodexTurnStateKeeper) Configure(cfg *config.Config) {
 				}
 			}
 		}()
+	} else if proxyChanged {
+		for id, previous := range k.entries {
+			if previous.cancel != nil {
+				previous.cancel()
+			}
+			// Preserve usable state while invalidating probes from the previous route.
+			entry := *previous
+			entry.refreshing, entry.cancel, entry.lastError = false, nil, ""
+			k.entries[id] = &entry
+			k.refreshLocked(&entry)
+		}
 	}
 }
 
@@ -415,7 +428,19 @@ func codexTurnStateTokenExpiry(token string, now time.Time) (time.Time, error) {
 	return expires, nil
 }
 
+func codexTurnStateCliproxy(cfg *config.Config) config.CliproxyConfig {
+	if cfg != nil && cfg.Routing.CodexStateCliproxy != nil && cfg.Routing.CodexStateCliproxy.Enabled {
+		return *cfg.Routing.CodexStateCliproxy
+	}
+	return config.CliproxyConfig{}
+}
+
 func fetchCodexTurnState(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (string, error) {
+	cliproxy := codexTurnStateCliproxy(cfg)
+	proxyURL, errProxy := cliproxy.ProxyURL()
+	if errProxy != nil {
+		return "", errProxy
+	}
 	model := codexTurnStateProbeModel
 	if cfg != nil && strings.TrimSpace(cfg.Codex.TurnStateProbeModel) != "" {
 		model = strings.TrimSpace(cfg.Codex.TurnStateProbeModel)
@@ -432,18 +457,26 @@ func fetchCodexTurnState(ctx context.Context, cfg *config.Config, auth *cliproxy
 		return "", fmt.Errorf("create turn-state probe: %w", errRequest)
 	}
 	token, _ := auth.Metadata["access_token"].(string)
+	redact := func(message string) string {
+		for _, secret := range []string{token, cliproxy.Password, url.QueryEscape(cliproxy.Password)} {
+			if secret != "" {
+				message = strings.ReplaceAll(message, secret, "[REDACTED]")
+			}
+		}
+		return message
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("ChatGPT-Account-ID", codexTurnStateAccountID(auth))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
-	// Collection is explicitly direct, including when a process-wide proxy is configured.
-	directAuth := auth.Clone()
-	directAuth.ProxyURL = "direct"
-	client := NewCodexHTTPClient(ctx, nil, directAuth, 0)
+	// Collection has its own route; the account and inference proxy remain unchanged.
+	probeAuth := auth.Clone()
+	probeAuth.ProxyURL = proxyURL
+	client := NewCodexHTTPClient(ctx, nil, probeAuth, 0)
 	response, errDo := client.Do(req)
 	if errDo != nil {
-		return "", fmt.Errorf("turn-state probe connection failed: %w", errDo)
+		return "", fmt.Errorf("turn-state probe connection failed: %s", redact(errDo.Error()))
 	}
 	defer func() {
 		if errClose := response.Body.Close(); errClose != nil {
@@ -465,9 +498,7 @@ func fetchCodexTurnState(ctx context.Context, cfg *config.Config, auth *cliproxy
 		if detail == "" {
 			detail = failure.Error.Message
 		}
-		if token != "" {
-			detail = strings.ReplaceAll(detail, token, "[REDACTED]")
-		}
+		detail = redact(detail)
 		if detail != "" {
 			return "", fmt.Errorf("turn-state probe returned HTTP %d: %s", response.StatusCode, detail)
 		}

@@ -2,9 +2,14 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -285,6 +290,8 @@ type RoutingConfig struct {
 	CodexTurnStateEnabled *bool `yaml:"-" json:"codex-turn-state-enabled,omitempty"`
 	// CodexAutoDegrade follows collected turn-state quality when collection is enabled.
 	CodexAutoDegrade *bool `yaml:"-" json:"codex-auto-degrade,omitempty"`
+	// CodexStateCliproxy selects a dedicated rotating proxy for turn-state acquisition.
+	CodexStateCliproxy *CliproxyConfig `yaml:"-" json:"codex-state-cliproxy,omitempty"`
 	// CodexRoutingHint is a runtime-only upstream routing hint for Codex OAuth requests.
 	// An empty value disables the hint; omitted values use the default "europe" hint.
 	CodexRoutingHint *string `yaml:"-" json:"codex-routing-hint,omitempty"`
@@ -319,6 +326,43 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+}
+
+// CliproxyConfig holds runtime-only credentials for Cliproxy's rotating gateway.
+type CliproxyConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Gateway  string `json:"gateway"`
+	Username string `json:"username"`
+	Password string `yaml:"-" json:"-"`
+}
+
+// ProxyURL validates gateway settings and encodes credentials without logging them.
+func (cfg CliproxyConfig) ProxyURL() (string, error) {
+	if !cfg.Enabled {
+		return "direct", nil
+	}
+	gatewayURL := strings.TrimSpace(cfg.Gateway)
+	if !strings.Contains(gatewayURL, "://") {
+		gatewayURL = "socks5://" + gatewayURL
+	}
+	setting, errParse := proxyutil.Parse(gatewayURL)
+	if errParse != nil || setting.Mode != proxyutil.ModeProxy {
+		return "", fmt.Errorf("Cliproxy gateway must be an HTTP(S) or SOCKS5 URL")
+	}
+	gateway := setting.URL
+	host, port, errPort := net.SplitHostPort(gateway.Host)
+	portNumber, errNumber := strconv.Atoi(port)
+	if errPort != nil || host == "" || errNumber != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("Cliproxy gateway must include a host and port between 1 and 65535")
+	}
+	if gateway.User != nil || gateway.Path != "" || gateway.RawQuery != "" || gateway.Fragment != "" {
+		return "", fmt.Errorf("Cliproxy gateway must contain only scheme, host and port; supply credentials separately")
+	}
+	if strings.TrimSpace(cfg.Username) == "" || cfg.Password == "" {
+		return "", fmt.Errorf("Cliproxy username and password are required when enabled")
+	}
+	gateway.User = url.UserPassword(cfg.Username, cfg.Password)
+	return gateway.String(), nil
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

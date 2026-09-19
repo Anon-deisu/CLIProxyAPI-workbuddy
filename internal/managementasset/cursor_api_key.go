@@ -598,6 +598,46 @@ const runtimeSchedulerInlineScript = `
     autoDegradeLabel.appendChild(autoDegradeEnabled);
     autoDegradeLabel.appendChild(document.createTextNode('Codex 自动降级'));
     turnStateEnabled.addEventListener('change', function () { autoDegradeEnabled.disabled = !turnStateEnabled.checked; });
+    var cliproxyLabel = make('label', 'cpa-runtime-scheduler-check');
+    var cliproxyEnabled = document.createElement('input');
+    cliproxyEnabled.type = 'checkbox';
+    cliproxyLabel.appendChild(cliproxyEnabled);
+    cliproxyLabel.appendChild(document.createTextNode('Cliproxy 动态代理采集 state'));
+    var cliproxyFields = make('div', 'cpa-runtime-scheduler-proxy-fields');
+    var cliproxyGatewayLabel = make('label', 'cpa-runtime-scheduler-text', '代理网关（默认 SOCKS5）');
+    var cliproxyGateway = document.createElement('input');
+    cliproxyGateway.id = 'cpa-runtime-scheduler-cliproxy-gateway';
+    cliproxyGateway.type = 'text';
+    cliproxyGateway.placeholder = 'us.arxlabs.io:3010';
+    cliproxyGateway.autocomplete = 'off';
+    cliproxyGatewayLabel.appendChild(cliproxyGateway);
+    var cliproxyUsernameLabel = make('label', 'cpa-runtime-scheduler-text', '动态代理用户名');
+    var cliproxyUsername = document.createElement('input');
+    cliproxyUsername.id = 'cpa-runtime-scheduler-cliproxy-username';
+    cliproxyUsername.type = 'text';
+    cliproxyUsername.placeholder = 'username-region-US';
+    cliproxyUsername.autocomplete = 'off';
+    cliproxyUsernameLabel.appendChild(cliproxyUsername);
+    var cliproxyPasswordLabel = make('label', 'cpa-runtime-scheduler-text', '代理密码');
+    var cliproxyPassword = document.createElement('input');
+    cliproxyPassword.id = 'cpa-runtime-scheduler-cliproxy-password';
+    cliproxyPassword.type = 'password';
+    cliproxyPassword.autocomplete = 'new-password';
+    cliproxyPasswordLabel.appendChild(cliproxyPassword);
+    cliproxyFields.appendChild(cliproxyGatewayLabel);
+    cliproxyFields.appendChild(cliproxyUsernameLabel);
+    cliproxyFields.appendChild(cliproxyPasswordLabel);
+    var cliproxyPasswordConfigured = false;
+    function updateCliproxyInputs() {
+      cliproxyFields.hidden = !cliproxyEnabled.checked;
+      [cliproxyGateway, cliproxyUsername, cliproxyPassword].forEach(function (input) { input.disabled = !cliproxyEnabled.checked; });
+      cliproxyGateway.required = cliproxyEnabled.checked;
+      cliproxyUsername.required = cliproxyEnabled.checked;
+      cliproxyPassword.required = cliproxyEnabled.checked && !cliproxyPasswordConfigured;
+      cliproxyPassword.placeholder = cliproxyPasswordConfigured ? '已设置，留空保留' : '代理密码';
+    }
+    cliproxyEnabled.addEventListener('change', updateCliproxyInputs);
+    updateCliproxyInputs();
     var turnStateData = null;
     var turnStateLoadedAt = 0;
     var turnStatePending = false;
@@ -610,6 +650,12 @@ const runtimeSchedulerInlineScript = `
       turnStateEnabled.checked = false;
       autoDegradeEnabled.checked = false;
       autoDegradeEnabled.disabled = true;
+      cliproxyEnabled.checked = false;
+      cliproxyGateway.value = '';
+      cliproxyUsername.value = '';
+      cliproxyPassword.value = '';
+      cliproxyPasswordConfigured = false;
+      updateCliproxyInputs();
       accountStatusNodes.clear();
       statusList.textContent = '未连接管理接口';
     };
@@ -725,6 +771,8 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(fingerprintLabel);
     form.appendChild(turnStateLabel);
     form.appendChild(autoDegradeLabel);
+    form.appendChild(cliproxyLabel);
+    form.appendChild(cliproxyFields);
     form.appendChild(cacheRewriteLabel);
     form.appendChild(cacheMinLabel);
     form.appendChild(cacheMaxLabel);
@@ -858,15 +906,17 @@ const runtimeSchedulerInlineScript = `
     window.addEventListener('resize', avoidManagementSaveButton);
 
     function loadSettings() {
+      var generation = sessionGeneration;
       save.disabled = true;
       request('GET', 'routing/settings').then(function (response) {
         return response.json();
       }).then(function (data) {
+        if (generation !== sessionGeneration) return;
         c2aRetryCount.value = String(data['c2a-max-retry-count'] == null ? 0 : data['c2a-max-retry-count']);
         c2aRetryInterval.value = String(data['c2a-max-retry-interval'] == null ? 0 : data['c2a-max-retry-interval']);
         c2aRetryCredentials.value = String(data['c2a-max-retry-credentials'] == null ? 0 : data['c2a-max-retry-credentials']);
         concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
-        degradedPort.value = String(data['degraded-port'] || 0);
+        degradedPort.value = data['degraded-port-configured'] === false ? '9444' : String(data['degraded-port'] || 0);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
         disableCooling.checked = !!data['disable-cooling'];
@@ -874,6 +924,13 @@ const runtimeSchedulerInlineScript = `
         turnStateEnabled.checked = !!data['codex-turn-state-enabled'];
         autoDegradeEnabled.checked = !!data['codex-auto-degrade'];
         autoDegradeEnabled.disabled = !turnStateEnabled.checked;
+        var cliproxy = data['codex-state-cliproxy'] || {};
+        cliproxyEnabled.checked = !!cliproxy.enabled;
+        cliproxyGateway.value = cliproxy.gateway || '';
+        cliproxyUsername.value = cliproxy.username || '';
+        cliproxyPassword.value = '';
+        cliproxyPasswordConfigured = !!cliproxy['password-configured'];
+        updateCliproxyInputs();
         var rewrite = data['cache-token-rewrite'] || {};
         cacheRewrite.checked = !!rewrite.enabled;
         cacheMin.value = rewrite['min-percent'] == null ? '' : String(rewrite['min-percent']);
@@ -934,6 +991,11 @@ const runtimeSchedulerInlineScript = `
     save.addEventListener('click', function () {
       if (!degradedPort.reportValidity()) return;
       if (cacheRewrite.checked && (!cacheMin.reportValidity() || !cacheMax.reportValidity())) return;
+      if (cliproxyEnabled.checked && (!cliproxyGateway.reportValidity() || !cliproxyUsername.reportValidity() || !cliproxyPassword.reportValidity())) return;
+      var generation = sessionGeneration;
+      var cliproxySettings = {enabled:cliproxyEnabled.checked, gateway:cliproxyGateway.value.trim(), username:cliproxyUsername.value.trim()};
+      var cliproxyPasswordSubmitted = cliproxyPassword.value !== '';
+      if (cliproxyPasswordSubmitted) cliproxySettings.password = cliproxyPassword.value;
       save.disabled = true;
       status.textContent = '应用中...';
       request('PATCH', 'routing/settings', {
@@ -948,6 +1010,7 @@ const runtimeSchedulerInlineScript = `
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
         'codex-turn-state-enabled': turnStateEnabled.checked,
         'codex-auto-degrade': autoDegradeEnabled.checked,
+        'codex-state-cliproxy': cliproxySettings,
         'cache-token-rewrite': {
           enabled: cacheRewrite.checked,
           'min-percent': cacheMin.value === '' ? null : Number(cacheMin.value),
@@ -955,12 +1018,17 @@ const runtimeSchedulerInlineScript = `
         },
         'codex-routing-hint': routingHint.value
       }).then(function () {
+        if (generation !== sessionGeneration) return;
+        cliproxyPasswordConfigured = cliproxyPasswordConfigured || cliproxyPasswordSubmitted;
+        cliproxyPassword.value = '';
+        updateCliproxyInputs();
         status.textContent = '已应用';
         loadTurnStates();
       }).catch(function (err) {
+        if (generation !== sessionGeneration) return;
         status.textContent = '应用失败：' + err.message;
       }).finally(function () {
-        save.disabled = false;
+        if (generation === sessionGeneration) save.disabled = false;
       });
     });
     new MutationObserver(function () { renderQuotaCosts(); renderAccountStateControls(); }).observe(document.body, { childList: true, subtree: true });
@@ -976,6 +1044,7 @@ const runtimeSchedulerInlineScript = `
      '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
   style.textContent += '.cpa-runtime-scheduler-account-state{color:#57606a;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;letter-spacing:0}.cpa-runtime-scheduler-turn-state-error{color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-turn-state-error:empty{display:none}';
+  style.textContent += '.cpa-runtime-scheduler-proxy-fields{display:grid;gap:8px;min-width:0}.cpa-runtime-scheduler-proxy-fields[hidden]{display:none}.cpa-runtime-scheduler-text{display:grid;gap:4px;min-width:0;color:#57606a;font-size:12px}.cpa-runtime-scheduler-text input{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;border:1px solid #d0d7de;border-radius:5px;font:inherit;letter-spacing:0}';
   style.textContent += '.cpa-native-status-hidden,.cpa-account-managed [class*="AuthFileCard-module__stateBadge"]{display:none!important}.cpa-account-state{display:flex;flex-wrap:wrap;gap:0;max-width:100%;font-size:12px;letter-spacing:0}.cpa-account-state-choice{min-width:48px;padding:5px 8px;border:1px solid var(--border-color,#d0d7de);background:var(--bg-primary,#fff);color:var(--text-secondary,#57606a);cursor:pointer}.cpa-account-state-choice:first-child{border-radius:6px 0 0 6px}.cpa-account-state-choice:nth-child(3){border-radius:0 6px 6px 0}.cpa-account-state-choice[aria-pressed="true"]{background:#2563eb;color:#fff}.cpa-account-state-choice[value="degraded"][aria-pressed="true"]{background:#b45309}.cpa-account-state-choice[value="disabled"][aria-pressed="true"]{background:#6b7280}.cpa-account-state-choice:disabled{cursor:wait;opacity:.6}.cpa-account-state-error{flex-basis:100%;color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-disabled-row strong{overflow-wrap:anywhere}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {

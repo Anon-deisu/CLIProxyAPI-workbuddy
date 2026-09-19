@@ -1,14 +1,18 @@
 package helps
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -306,6 +310,216 @@ func TestFetchCodexTurnStateUsesAccountCredentials(t *testing.T) {
 	if err != nil || got != token {
 		t.Fatalf("fetch failed: %v", err)
 	}
+}
+
+func TestFetchCodexTurnStateCliproxySOCKS5(t *testing.T) {
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatal(errListen)
+	}
+	defer func() { _ = listener.Close() }()
+	state := testTurnState(time.Now(), false, 1)
+	proxyResult := make(chan error, 1)
+	const username, password = "test-region-US", "p@ss:word /+"
+	go func() {
+		proxyResult <- func() error {
+			conn, errAccept := listener.Accept()
+			if errAccept != nil {
+				return errAccept
+			}
+			defer func() { _ = conn.Close() }()
+			header := make([]byte, 2)
+			if _, errRead := io.ReadFull(conn, header); errRead != nil {
+				return errRead
+			}
+			if header[0] != 5 {
+				return fmt.Errorf("expected SOCKS5 handshake")
+			}
+			if _, errCopy := io.CopyN(io.Discard, conn, int64(header[1])); errCopy != nil {
+				return errCopy
+			}
+			if _, errWrite := conn.Write([]byte{5, 2}); errWrite != nil {
+				return errWrite
+			}
+			if _, errRead := io.ReadFull(conn, header); errRead != nil {
+				return errRead
+			}
+			userBytes := make([]byte, int(header[1]))
+			if _, errRead := io.ReadFull(conn, userBytes); errRead != nil {
+				return errRead
+			}
+			if _, errRead := io.ReadFull(conn, header[:1]); errRead != nil {
+				return errRead
+			}
+			passwordBytes := make([]byte, int(header[0]))
+			if _, errRead := io.ReadFull(conn, passwordBytes); errRead != nil {
+				return errRead
+			}
+			if string(userBytes) != username || string(passwordBytes) != password {
+				return fmt.Errorf("proxy credentials were not transmitted correctly")
+			}
+			if _, errWrite := conn.Write([]byte{1, 0}); errWrite != nil {
+				return errWrite
+			}
+			connect := make([]byte, 5)
+			if _, errRead := io.ReadFull(conn, connect); errRead != nil {
+				return errRead
+			}
+			if connect[1] != 1 || connect[3] != 3 {
+				return fmt.Errorf("expected CONNECT with proxy-side hostname resolution")
+			}
+			if _, errCopy := io.CopyN(io.Discard, conn, int64(connect[4])+2); errCopy != nil {
+				return errCopy
+			}
+			if _, errWrite := conn.Write([]byte{5, 0, 0, 1, 127, 0, 0, 1, 0, 0}); errWrite != nil {
+				return errWrite
+			}
+			request, errRead := http.ReadRequest(bufio.NewReader(conn))
+			if errRead != nil {
+				return errRead
+			}
+			defer func() { _ = request.Body.Close() }()
+			if request.Header.Get("Authorization") != "Bearer access-a" || request.Header.Get("ChatGPT-Account-ID") != "account-a" || request.URL.Path != "/responses" {
+				return fmt.Errorf("incorrect account or request through SOCKS5")
+			}
+			_, errWrite := fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nX-Codex-Turn-State: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", state)
+			return errWrite
+		}()
+	}()
+	auth := turnStateTestAuth("a")
+	auth.Attributes = map[string]string{"base_url": "http://upstream.test"}
+	auth.ProxyURL = "http://inference.test:8080"
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexStateCliproxy: &config.CliproxyConfig{
+		Enabled: true, Gateway: listener.Addr().String(), Username: username, Password: password,
+	}}}
+	got, errFetch := fetchCodexTurnState(t.Context(), cfg, auth)
+	if errFetch != nil || got != state {
+		t.Fatalf("SOCKS5 state collection failed: %v", errFetch)
+	}
+	if errProxy := <-proxyResult; errProxy != nil {
+		t.Fatal(errProxy)
+	}
+	if auth.ProxyURL != "http://inference.test:8080" {
+		t.Fatal("collection changed the account's inference proxy")
+	}
+}
+
+func TestFetchCodexTurnStateCliproxyIsolationAndErrors(t *testing.T) {
+	state := testTurnState(time.Now(), false, 1)
+	var directCalls, proxyCalls, inferenceCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directCalls.Add(1)
+		w.Header().Set(CodexTurnStateHeader, state)
+	}))
+	defer upstream.Close()
+	inference := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inferenceCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer inference.Close()
+	const password = "test-secret@/+"
+	var fail atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		if r.Header.Get("Proxy-Authorization") != "Basic "+base64.StdEncoding.EncodeToString([]byte("test-region-US:"+password)) {
+			t.Error("missing proxy credentials")
+		}
+		if fail.Load() {
+			w.WriteHeader(http.StatusProxyAuthRequired)
+			_ = json.NewEncoder(w).Encode(map[string]string{"detail": password + " " + url.QueryEscape(password) + " access-a"})
+			return
+		}
+		w.Header().Set(CodexTurnStateHeader, state)
+	}))
+	defer proxy.Close()
+	auth := turnStateTestAuth("a")
+	auth.Attributes = map[string]string{"base_url": upstream.URL}
+	auth.ProxyURL = inference.URL
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://127.0.0.1:1"}, Routing: config.RoutingConfig{
+		CodexStateCliproxy: &config.CliproxyConfig{Enabled: true, Gateway: proxy.URL, Username: "test-region-US", Password: password},
+	}}
+	for range 2 {
+		got, errFetch := fetchCodexTurnState(t.Context(), cfg, auth)
+		if errFetch != nil || got != state {
+			t.Fatalf("proxy state collection failed: %v", errFetch)
+		}
+	}
+	if proxyCalls.Load() != 2 || directCalls.Load() != 0 || inferenceCalls.Load() != 0 {
+		t.Fatal("collection used the wrong route")
+	}
+	response, errGet := NewCodexHTTPClient(t.Context(), cfg, auth, 0).Get(upstream.URL)
+	if errGet != nil {
+		t.Fatal(errGet)
+	}
+	_ = response.Body.Close()
+	if inferenceCalls.Load() != 1 {
+		t.Fatal("inference stopped using the account proxy")
+	}
+	fail.Store(true)
+	_, errFetch := fetchCodexTurnState(t.Context(), cfg, auth)
+	if errFetch == nil || !strings.Contains(errFetch.Error(), "407") || strings.Contains(errFetch.Error(), password) || strings.Contains(errFetch.Error(), url.QueryEscape(password)) || strings.Contains(errFetch.Error(), "access-a") {
+		t.Fatal("proxy failure did not preserve status or redact credentials")
+	}
+	if directCalls.Load() != 0 {
+		t.Fatal("proxy failure silently fell back to direct")
+	}
+	cfg.Routing.CodexStateCliproxy.Enabled = false
+	if _, errFetch = fetchCodexTurnState(t.Context(), cfg, auth); errFetch != nil || directCalls.Load() != 1 {
+		t.Fatalf("disabling the state proxy did not restore direct collection: %v", errFetch)
+	}
+}
+
+func TestCodexTurnStateCliproxyReconfigure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		auth := turnStateTestAuth("a")
+		keeper := NewCodexTurnStateKeeper(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{auth} })
+		defer keeper.Close()
+		var calls atomic.Int32
+		cancelled, release := make(chan struct{}), make(chan struct{})
+		keeper.fetch = func(ctx context.Context, cfg *config.Config, _ *cliproxyauth.Auth) (string, error) {
+			n := calls.Add(1)
+			if n == 2 {
+				<-ctx.Done()
+				close(cancelled)
+				<-release
+			}
+			return testTurnState(time.Now(), false, byte(n)), nil
+		}
+		cfg := &config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true)}}
+		keeper.Configure(cfg)
+		synctest.Wait()
+		original, _ := keeper.Token(auth)
+		cfg.Routing.CodexStateCliproxy = &config.CliproxyConfig{Enabled: true, Gateway: "proxy.test:1080", Username: "test-region-US", Password: "secret"}
+		keeper.Configure(cfg)
+		synctest.Wait()
+		if token, _ := keeper.Token(auth); token != original || calls.Load() != 2 {
+			t.Fatal("proxy change must immediately collect while preserving usable state")
+		}
+		cfg.Routing.CodexStateCliproxy.Username = "test-region-JP"
+		keeper.Configure(cfg)
+		<-cancelled
+		synctest.Wait()
+		latest, _ := keeper.Token(auth)
+		if latest == original || calls.Load() != 3 {
+			t.Fatal("changed route did not cancel and replace its pending collection")
+		}
+		close(release)
+		synctest.Wait()
+		if token, _ := keeper.Token(auth); token != latest {
+			t.Fatal("late state from an old route replaced the latest state")
+		}
+		keeper.Configure(cfg.CloneForRuntime())
+		synctest.Wait()
+		if calls.Load() != 3 {
+			t.Fatal("unchanged proxy settings caused an unnecessary collection")
+		}
+		cfg.Routing.CodexStateCliproxy.Enabled = false
+		keeper.Configure(cfg)
+		synctest.Wait()
+		if calls.Load() != 4 {
+			t.Fatal("disabling the proxy did not immediately refresh the route")
+		}
+	})
 }
 
 // Opt-in smoke test: credentials are read only from the explicitly supplied file.

@@ -132,6 +132,82 @@ func TestRoutingSettingsCodexAutoDegradeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRoutingSettingsCliproxyRoundTrip(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	patch := func(body string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(body))
+		h.PutRoutingSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	patch(`{"codex-state-cliproxy":{"enabled":true,"gateway":"proxy.test:1080","username":"test-region-US","password":"test-secret"}}`)
+	for _, enabled := range []bool{true, false, true} {
+		body, _ := json.Marshal(map[string]any{"codex-state-cliproxy": map[string]any{"enabled": enabled}})
+		patch(string(body))
+		h.SetConfig(&config.Config{})
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		h.GetRoutingSettings(ctx)
+		var settings map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]any{"enabled": enabled, "gateway": "proxy.test:1080", "username": "test-region-US", "password-configured": true}
+		if !reflect.DeepEqual(settings["codex-state-cliproxy"], want) {
+			t.Fatalf("Cliproxy settings after reload = %v", settings["codex-state-cliproxy"])
+		}
+		if rec.Header().Get("Cache-Control") != "no-store" || strings.Contains(rec.Body.String(), "test-secret") {
+			t.Fatal("settings response leaked or cached proxy credentials")
+		}
+		encoded, _ := yaml.Marshal(h.cfg)
+		if strings.Contains(string(encoded), "cliproxy") || strings.Contains(string(encoded), "test-secret") {
+			t.Fatal("runtime proxy settings were persisted to YAML")
+		}
+		encoded, _ = json.Marshal(h.cfg)
+		if strings.Contains(string(encoded), "test-secret") {
+			t.Fatal("config JSON exposed the proxy password")
+		}
+		if h.cfg.Routing.CodexTurnStateEnabled != nil || h.cfg.ProxyURL != "" {
+			t.Fatal("state proxy settings changed collection toggle or inference proxy")
+		}
+		proxyURL, errProxy := h.cfg.Routing.CodexStateCliproxy.ProxyURL()
+		wantProxy := "direct"
+		if enabled {
+			wantProxy = "socks5://test-region-US:test-secret@proxy.test:1080"
+		}
+		if errProxy != nil || proxyURL != wantProxy {
+			t.Fatal("bare gateway did not use SOCKS5 or password was lost across reload")
+		}
+	}
+}
+
+func TestRoutingSettingsCliproxyValidation(t *testing.T) {
+	for _, proxy := range []string{
+		`{"enabled":true}`,
+		`{"enabled":true,"gateway":"direct","username":"test-region-US","password":"secret"}`,
+		`{"enabled":true,"gateway":"ftp://proxy.test:1080","username":"test-region-US","password":"secret"}`,
+		`{"enabled":true,"gateway":"socks5://proxy.test:70000","username":"test-region-US","password":"secret"}`,
+		`{"enabled":true,"gateway":"socks5://user:secret@proxy.test:1080","username":"test-region-US","password":"secret"}`,
+		`{"enabled":true,"gateway":"socks5://proxy.test:1080","username":"","password":"secret"}`,
+	} {
+		h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"auto-disable-quota":true,"codex-state-cliproxy":`+proxy+`}`))
+		h.PutRoutingSettings(ctx)
+		if rec.Code != http.StatusBadRequest || h.cfg.Routing.AutoDisableQuota {
+			t.Fatalf("invalid proxy settings mutated config: status=%d", rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), "secret") {
+			t.Fatal("validation error exposed proxy credentials")
+		}
+	}
+}
+
 func TestPutRoutingSettingsUpdatesCodexRoutingHint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{}
