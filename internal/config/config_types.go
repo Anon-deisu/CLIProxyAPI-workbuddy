@@ -283,6 +283,8 @@ type RoutingConfig struct {
 	CodexFingerprintConvergence *bool `yaml:"-" json:"codex-fingerprint-convergence,omitempty"`
 	// CodexTurnStateEnabled enables the runtime-only, account-scoped turn-state keeper.
 	CodexTurnStateEnabled *bool `yaml:"-" json:"codex-turn-state-enabled,omitempty"`
+	// CodexAutoDegrade follows collected turn-state quality when collection is enabled.
+	CodexAutoDegrade *bool `yaml:"-" json:"codex-auto-degrade,omitempty"`
 	// CodexRoutingHint is a runtime-only upstream routing hint for Codex OAuth requests.
 	// An empty value disables the hint; omitted values use the default "europe" hint.
 	CodexRoutingHint *string `yaml:"-" json:"codex-routing-hint,omitempty"`

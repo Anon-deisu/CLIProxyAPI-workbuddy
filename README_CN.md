@@ -18,6 +18,10 @@ CLIProxyAPI 是一个为 CLI 提供 OpenAI/Gemini/Claude/Codex/Grok 兼容 API �
 
 “292 / 312 / 332”是字符串长度分类，不是 HTTP 状态码或模型能力保证。实现参考 [codex-state-kit](https://github.com/DouDOU-start/codex-state-kit/blob/fe12b67b17e6040a2ef026a5ec1442b6a2955cea/docs/turn-state-notes.md) 的协议位置；默认使用 `gpt-6-astra` 发送最小探测，可通过 `codex.turn-state-probe-model` 调整。采集会发起真实上游请求，仅缓存到内存；开关默认关闭，热重载保留，关闭会停止采集并清空缓存，重启后恢复关闭。
 
+同时开启 **Codex 自动降级** 和 state 采集后，采集到时间戳有效、但不符合该账号 292/332 类规则的 state（如 312、356）会自动将账号切换到降级池；后续采集到符合规则的有效 state 会自动恢复正常池。降级账号继续每 45 秒巡检，即使降级端口未开启也会检查恢复情况。网络失败、缺失或无效/过期 state 不改变账号档位，停用账号不会被自动启用。自动切换只修改并保存账号的 `degraded` 标记，不清除额度暂停或修改其他账号设置；关闭任一开关停止自动切换，保留当前档位。自动降级开关仅当前进程生效，默认关闭，热重载保留。
+
+悬浮窗底部的 **账号状态** 统一显示三态控件、state 剩余有效期、最近采集长度和采集错误，不再单独列出另一份 state 账号列表。账号状态每 5 秒刷新，倒计时每秒更新。
+
 您可以通过任何与 OpenAI（包括 Responses）、Gemini（包括 Interactions）或 Claude 兼容的客户端或 SDK，以本地方式或多 CLI 账户访问以下提供商。
 
 <table>

@@ -351,6 +351,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	degradedPort := 0
 	codexFingerprintConvergence := false
 	codexTurnStateEnabled := false
+	codexAutoDegrade := false
 	codexRoutingHint := "europe"
 	cacheTokenRewrite := config.CacheTokenRewriteConfig{}
 	if cfg != nil {
@@ -370,6 +371,9 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		}
 		if cfg.Routing.CodexTurnStateEnabled != nil {
 			codexTurnStateEnabled = *cfg.Routing.CodexTurnStateEnabled
+		}
+		if cfg.Routing.CodexAutoDegrade != nil {
+			codexAutoDegrade = *cfg.Routing.CodexAutoDegrade
 		}
 		if cfg.Routing.CodexRoutingHint != nil {
 			codexRoutingHint = strings.TrimSpace(*cfg.Routing.CodexRoutingHint)
@@ -402,6 +406,7 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		"degraded-port":                 degradedPort,
 		"codex-fingerprint-convergence": codexFingerprintConvergence,
 		"codex-turn-state-enabled":      codexTurnStateEnabled,
+		"codex-auto-degrade":            codexAutoDegrade,
 		"codex-routing-hint":            codexRoutingHint,
 		"cache-token-rewrite":           cacheTokenRewrite,
 		"runtime_only":                  true,
@@ -445,6 +450,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		DegradedPort                *int                            `json:"degraded-port"`
 		CodexFingerprintConvergence *bool                           `json:"codex-fingerprint-convergence"`
 		CodexTurnStateEnabled       *bool                           `json:"codex-turn-state-enabled"`
+		CodexAutoDegrade            *bool                           `json:"codex-auto-degrade"`
 		CodexRoutingHint            *string                         `json:"codex-routing-hint"`
 		CacheTokenRewrite           *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
 	}
@@ -503,7 +509,7 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		}
 		body.CodexRoutingHint = &value
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
+	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexAutoDegrade == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
@@ -567,6 +573,10 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		if body.CodexTurnStateEnabled != nil {
 			value := *body.CodexTurnStateEnabled
 			cfg.Routing.CodexTurnStateEnabled = &value
+		}
+		if body.CodexAutoDegrade != nil {
+			value := *body.CodexAutoDegrade
+			cfg.Routing.CodexAutoDegrade = &value
 		}
 		if body.CodexRoutingHint != nil {
 			value := *body.CodexRoutingHint

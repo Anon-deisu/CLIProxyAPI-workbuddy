@@ -267,6 +267,7 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	if strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
 		if s.codexTurnStates == nil {
 			s.codexTurnStates = helps.NewCodexTurnStateKeeper(s.coreManager.List)
+			s.codexTurnStates.SetSchedulingUpdater(s.coreManager.ApplyCodexStateScheduling)
 		}
 		s.codexTurnStates.Configure(cfg)
 		if !forceReplace {

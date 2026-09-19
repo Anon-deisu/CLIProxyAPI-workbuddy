@@ -45,31 +45,34 @@ type CodexTurnStateStatus struct {
 	Refreshing       bool       `json:"refreshing"`
 	LastError        string     `json:"last_error,omitempty"`
 	TokenLength      int        `json:"token_length,omitempty"`
+	ObservedLength   int        `json:"observed_length,omitempty"`
 }
 
 type codexTurnStateEntry struct {
-	auth        *cliproxyauth.Auth
-	scope       string
-	token       string
-	expires     time.Time
-	lastAttempt time.Time
-	lastError   string
-	refreshing  bool
-	cancel      context.CancelFunc
+	auth           *cliproxyauth.Auth
+	scope          string
+	token          string
+	expires        time.Time
+	lastAttempt    time.Time
+	lastError      string
+	observedLength int
+	refreshing     bool
+	cancel         context.CancelFunc
 }
 
 // CodexTurnStateKeeper owns one in-memory state per auth record. It survives executor reloads.
 type CodexTurnStateKeeper struct {
-	mu      sync.Mutex
-	source  func() []*cliproxyauth.Auth
-	fetch   func(context.Context, *config.Config, *cliproxyauth.Auth) (string, error)
-	cfg     *config.Config
-	entries map[string]*codexTurnStateEntry
-	ctx     context.Context
-	cancel  context.CancelFunc
-	closed  bool
-	wg      sync.WaitGroup
-	slots   chan struct{}
+	mu               sync.Mutex
+	source           func() []*cliproxyauth.Auth
+	fetch            func(context.Context, *config.Config, *cliproxyauth.Auth) (string, error)
+	updateScheduling func(context.Context, *cliproxyauth.Auth, bool) error
+	cfg              *config.Config
+	entries          map[string]*codexTurnStateEntry
+	ctx              context.Context
+	cancel           context.CancelFunc
+	closed           bool
+	wg               sync.WaitGroup
+	slots            chan struct{}
 }
 
 func NewCodexTurnStateKeeper(source func() []*cliproxyauth.Auth) *CodexTurnStateKeeper {
@@ -78,6 +81,17 @@ func NewCodexTurnStateKeeper(source func() []*cliproxyauth.Auth) *CodexTurnState
 		entries: make(map[string]*codexTurnStateEntry),
 		slots:   make(chan struct{}, codexTurnStateProbeConcurrency),
 	}
+}
+
+// SetSchedulingUpdater connects observations to the service's credential manager.
+func (k *CodexTurnStateKeeper) SetSchedulingUpdater(update func(context.Context, *cliproxyauth.Auth, bool) error) {
+	k.mu.Lock()
+	k.updateScheduling = update
+	k.mu.Unlock()
+}
+
+func (k *CodexTurnStateKeeper) autoDegradeEnabledLocked() bool {
+	return k.ctx != nil && k.cfg.Routing.CodexAutoDegrade != nil && *k.cfg.Routing.CodexAutoDegrade
 }
 
 // Configure starts or stops collection independently of inference requests.
@@ -216,7 +230,7 @@ func (k *CodexTurnStateKeeper) sweep(ctx context.Context) {
 		}
 		active[auth.ID] = true
 		entry := k.entryLocked(auth)
-		if entry.expires.Sub(now) < CodexTurnStateRefreshBefore {
+		if entry.expires.Sub(now) < CodexTurnStateRefreshBefore || (k.autoDegradeEnabledLocked() && auth.IsDegraded()) {
 			k.refreshLocked(entry)
 		}
 	}
@@ -272,9 +286,34 @@ func (k *CodexTurnStateKeeper) refreshLocked(entry *codexTurnStateEntry) {
 		defer func() { <-k.slots }()
 		token, errFetch := k.fetch(ctx, cfg, auth)
 		var expires time.Time
+		observedState := false
 		if errFetch == nil {
 			token = strings.TrimSpace(token)
+			_, errTimestamp := codexTurnStateTokenExpiry(token, time.Now())
+			observedState = errTimestamp == nil
 			expires, errFetch = codexTurnStateExpiry(auth, token, time.Now())
+		}
+		k.mu.Lock()
+		if ctx.Err() != nil || k.entries[auth.ID] != entry {
+			k.mu.Unlock()
+			return
+		}
+		entry.observedLength = len(token)
+		degraded := errFetch != nil
+		if errFetch != nil {
+			entry.lastError = errFetch.Error()
+			if observedState {
+				entry.token, entry.expires = "", time.Time{}
+			}
+		} else {
+			entry.token, entry.expires, entry.lastError = token, expires, ""
+		}
+		update := k.updateScheduling
+		automatic := k.autoDegradeEnabledLocked() && observedState && update != nil
+		k.mu.Unlock()
+		var errUpdate error
+		if automatic {
+			errUpdate = update(ctx, auth, degraded)
 		}
 		k.mu.Lock()
 		defer k.mu.Unlock()
@@ -283,18 +322,19 @@ func (k *CodexTurnStateKeeper) refreshLocked(entry *codexTurnStateEntry) {
 		}
 		entry.refreshing = false
 		entry.cancel = nil
-		if errFetch != nil {
-			entry.lastError = errFetch.Error()
-			return
+		if errUpdate != nil {
+			entry.lastError = fmt.Sprintf("automatic scheduling update failed: %v", errUpdate)
 		}
-		entry.token, entry.expires, entry.lastError = token, expires, ""
 	}()
 }
 
-// Observe treats the reference implementation's 308-316 character state as a renewal signal.
+// Observe renews on a fresh state outside the account's expected length class.
 // A late rejection of an older state cannot invalidate a newer account state.
 func (k *CodexTurnStateKeeper) Observe(auth *cliproxyauth.Auth, usedToken, receivedToken string) {
-	if k == nil || !codexTurnStateEligible(auth) || !codexTurnStateDegraded(receivedToken) {
+	if k == nil || !codexTurnStateEligible(auth) || !strings.HasPrefix(receivedToken, "gAAAAA") {
+		return
+	}
+	if _, errTimestamp := codexTurnStateTokenExpiry(receivedToken, time.Now()); errTimestamp != nil || codexTurnStateMatchesLength(auth, receivedToken) {
 		return
 	}
 	k.mu.Lock()
@@ -317,7 +357,7 @@ func (k *CodexTurnStateKeeper) Snapshot() []CodexTurnStateStatus {
 	result := make([]CodexTurnStateStatus, 0, len(k.entries))
 	now := time.Now()
 	for id, entry := range k.entries {
-		status := CodexTurnStateStatus{AuthID: id, Name: entry.auth.FileName, Status: "empty", Refreshing: entry.refreshing, LastError: entry.lastError}
+		status := CodexTurnStateStatus{AuthID: id, Name: entry.auth.FileName, Status: "empty", Refreshing: entry.refreshing, LastError: entry.lastError, ObservedLength: entry.observedLength}
 		if status.Name == "" {
 			status.Name = id
 		}
@@ -348,8 +388,20 @@ func codexTurnStateExpiry(auth *cliproxyauth.Auth, token string, now time.Time) 
 		return time.Time{}, fmt.Errorf("upstream returned a 312-length turn state")
 	}
 	expectedLength := codexTurnStateExpectedLength(auth)
-	if len(token) < expectedLength-codexTurnStateLengthTolerance || len(token) > expectedLength+codexTurnStateLengthTolerance || !strings.HasPrefix(token, "gAAAAA") {
+	if !codexTurnStateMatchesLength(auth, token) {
 		return time.Time{}, fmt.Errorf("upstream did not return a %d-length turn state for this account (received length %d)", expectedLength, len(token))
+	}
+	return codexTurnStateTokenExpiry(token, now)
+}
+
+func codexTurnStateMatchesLength(auth *cliproxyauth.Auth, token string) bool {
+	expected := codexTurnStateExpectedLength(auth)
+	return strings.HasPrefix(token, "gAAAAA") && len(token) >= expected-codexTurnStateLengthTolerance && len(token) <= expected+codexTurnStateLengthTolerance
+}
+
+func codexTurnStateTokenExpiry(token string, now time.Time) (time.Time, error) {
+	if !strings.HasPrefix(token, "gAAAAA") {
+		return time.Time{}, fmt.Errorf("invalid turn-state prefix")
 	}
 	raw, errDecode := base64.RawURLEncoding.DecodeString(strings.TrimRight(token, "="))
 	if errDecode != nil || len(raw) < 9 || raw[0] != 0x80 {

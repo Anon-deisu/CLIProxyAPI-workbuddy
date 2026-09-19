@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -47,6 +48,50 @@ func TestAccountSchedulingStatePersists(t *testing.T) {
 		if entry["scheduling_state"] != state {
 			t.Fatalf("entry state=%v", entry["scheduling_state"])
 		}
+	}
+}
+
+func TestCodexStateAutomaticSchedulingPersistsAndPreservesAccount(t *testing.T) {
+	store := sdkauth.NewFileTokenStore()
+	store.SetBaseDir(t.TempDir())
+	manager := coreauth.NewManager(store, nil, nil)
+	cfg := &config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true), CodexAutoDegrade: new(true)}}
+	manager.SetConfig(cfg)
+	observed, err := manager.Register(t.Context(), &coreauth.Auth{ID: "auto.json", FileName: "auto.json", Provider: "codex", CodexQuotaResumeAt: time.Now().Add(time.Hour), Metadata: map[string]any{"type": "codex", "account_id": "workspace-a", "access_token": "synthetic"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := observed.Clone()
+	current.Metadata["note"] = "keep concurrent metadata"
+	current.CodexQuotaResumeAt = time.Now().Add(time.Hour)
+	if _, err := manager.Update(t.Context(), current); err != nil {
+		t.Fatal(err)
+	}
+	for _, degraded := range []bool{true, false} {
+		if err := manager.ApplyCodexStateScheduling(t.Context(), observed, degraded); err != nil {
+			t.Fatal(err)
+		}
+		current, _ = manager.GetByID(observed.ID)
+		if current.IsDegraded() != degraded || current.Disabled || current.Metadata["note"] != "keep concurrent metadata" || current.CodexQuotaResumeAt.IsZero() {
+			t.Fatal("automatic pool update changed unrelated account state")
+		}
+		loaded, err := store.List(t.Context())
+		if err != nil || len(loaded) != 1 || loaded[0].IsDegraded() != degraded {
+			t.Fatalf("persistent automatic state: %v", err)
+		}
+		observed = current
+	}
+	current.Disabled = true
+	current.Status = coreauth.StatusDisabled
+	if _, err := manager.Update(t.Context(), current); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ApplyCodexStateScheduling(t.Context(), observed, true); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = manager.GetByID(observed.ID)
+	if !current.Disabled || current.IsDegraded() {
+		t.Fatal("late observation modified a disabled account")
 	}
 }
 

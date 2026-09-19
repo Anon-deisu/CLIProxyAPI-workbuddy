@@ -265,6 +265,7 @@ const runtimeSchedulerInlineScript = `
   var authFiles = new Map();
   var authFilesRefreshPending = false;
   var resetTurnStateView = function () {};
+  var renderSchedulerAccounts = function () {};
   var accountStatePending = new Set();
   var nativeFetch = window.fetch;
 
@@ -312,6 +313,7 @@ const runtimeSchedulerInlineScript = `
       authFiles = new Map(data.files.map(function (item) { return [item.name, item]; }));
       renderQuotaCosts();
       renderAccountStateControls();
+      renderSchedulerAccounts(data.files);
     }
     if (info.endpoint === 'reset-quota' || info.endpoint === 'auth-files/status' || (info.endpoint === 'api-call' && document.querySelector('[class*="QuotaPage-module__page"]'))) {
       refreshAuthFiles();
@@ -588,44 +590,58 @@ const runtimeSchedulerInlineScript = `
     turnStateEnabled.type = 'checkbox';
     turnStateLabel.appendChild(turnStateEnabled);
     turnStateLabel.appendChild(document.createTextNode('Codex 292/332 state 自动续期'));
-    var turnStateList = make('div', 'cpa-runtime-scheduler-turn-states', '未开启');
+    var autoDegradeLabel = make('label', 'cpa-runtime-scheduler-check');
+    var autoDegradeEnabled = document.createElement('input');
+    autoDegradeEnabled.type = 'checkbox';
+    autoDegradeEnabled.title = '随 state 采集结果自动切换正常或降级档位，不改变停用账号';
+    autoDegradeEnabled.disabled = true;
+    autoDegradeLabel.appendChild(autoDegradeEnabled);
+    autoDegradeLabel.appendChild(document.createTextNode('Codex 自动降级'));
+    turnStateEnabled.addEventListener('change', function () { autoDegradeEnabled.disabled = !turnStateEnabled.checked; });
     var turnStateData = null;
     var turnStateLoadedAt = 0;
     var turnStatePending = false;
+    var turnStateViewError = '';
+    var accountStatusNodes = new Map();
     resetTurnStateView = function () {
       turnStateData = null;
       turnStatePending = false;
+      turnStateViewError = '';
       turnStateEnabled.checked = false;
-      turnStateList.textContent = '未连接管理接口';
+      autoDegradeEnabled.checked = false;
+      autoDegradeEnabled.disabled = true;
+      accountStatusNodes.clear();
+      statusList.textContent = '未连接管理接口';
     };
     function renderTurnStates() {
-      if (!turnStateData) return;
-      turnStateList.textContent = '';
-      if (!turnStateData.enabled) {
-        turnStateList.textContent = '未开启';
-        return;
-      }
-      if (!turnStateData.accounts.length) {
-        turnStateList.textContent = '等待可用 Codex 账号';
-        return;
-      }
+      var states = new Map(turnStateData ? turnStateData.accounts.map(function (item) { return [item.auth_id, item]; }) : []);
       var elapsed = Math.floor((performance.now() - turnStateLoadedAt) / 1000);
-      turnStateData.accounts.forEach(function (item) {
-        var row = make('div', 'cpa-runtime-scheduler-turn-state-row');
-        row.appendChild(make('strong', '', item.name));
-        var remaining = Math.max(0, item.remaining_seconds - elapsed);
-        var text = item.refreshing ? '正在采集...' : (item.last_error ? '采集失败 · 等待重试' : '等待采集');
-        if (remaining > 0) {
-          var minutes = Math.floor(remaining / 60);
-          var seconds = String(remaining % 60).padStart(2, '0');
-          text = item.token_length + ' 剩余（估算）：' + minutes + ':' + seconds;
-          if (item.refreshing) text += ' · 续期中';
-        } else if (item.status === 'active') {
-          text = item.refreshing ? '已到期 · 续期中' : '已到期 · 等待续期';
+      accountStatusNodes.forEach(function (view, authID) {
+        var item = states.get(authID);
+        var text = '等待采集';
+        var error = '';
+        if (view.account.disabled) {
+          text = '采集已暂停';
+        } else if (turnStateViewError) {
+          text = turnStateViewError;
+        } else if (turnStateData && !turnStateData.enabled) {
+          text = 'state 采集未开启';
+        } else if (item) {
+          var remaining = Math.max(0, item.remaining_seconds - elapsed);
+          text = item.refreshing ? '正在采集...' : (item.last_error ? '采集失败 · 等待重试' : '等待采集');
+          if (remaining > 0) {
+            var minutes = Math.floor(remaining / 60);
+            var seconds = String(remaining % 60).padStart(2, '0');
+            text = item.token_length + ' 剩余（估算）：' + minutes + ':' + seconds;
+            if (item.refreshing) text += ' · 续期中';
+          } else if (item.status === 'active') {
+            text = item.refreshing ? '已到期 · 续期中' : '已到期 · 等待续期';
+          }
+          if (item.observed_length && item.observed_length !== item.token_length) text += ' · 最近采集：' + item.observed_length;
+          error = item.last_error || '';
         }
-        row.appendChild(make('span', '', text));
-        if (item.last_error) row.appendChild(make('span', 'cpa-runtime-scheduler-turn-state-error', item.last_error));
-        turnStateList.appendChild(row);
+        if (view.state.textContent !== text) view.state.textContent = text;
+        if (view.error.textContent !== error) view.error.textContent = error;
       });
     }
     function loadTurnStates() {
@@ -637,12 +653,16 @@ const runtimeSchedulerInlineScript = `
       }).then(function (data) {
         if (generation !== sessionGeneration) return;
         turnStateData = data;
+        turnStateViewError = '';
         turnStateLoadedAt = performance.now();
         renderTurnStates();
+        return loadAuthStatus();
       }).catch(function () {
         if (generation !== sessionGeneration) return;
         turnStateData = null;
-        turnStateList.textContent = '读取 state 状态失败';
+        turnStateViewError = '读取 state 状态失败';
+        renderTurnStates();
+        return loadAuthStatus();
       }).finally(function () {
         if (generation === sessionGeneration) turnStatePending = false;
       });
@@ -704,7 +724,7 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(disableCoolingLabel);
     form.appendChild(fingerprintLabel);
     form.appendChild(turnStateLabel);
-    form.appendChild(turnStateList);
+    form.appendChild(autoDegradeLabel);
     form.appendChild(cacheRewriteLabel);
     form.appendChild(cacheMinLabel);
     form.appendChild(cacheMaxLabel);
@@ -832,7 +852,6 @@ const runtimeSchedulerInlineScript = `
       if (!panel.hidden) {
         setTimeout(avoidManagementSaveButton, 0);
         loadSettings();
-        loadAuthStatus();
         loadTurnStates();
       }
     });
@@ -853,6 +872,8 @@ const runtimeSchedulerInlineScript = `
         disableCooling.checked = !!data['disable-cooling'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
         turnStateEnabled.checked = !!data['codex-turn-state-enabled'];
+        autoDegradeEnabled.checked = !!data['codex-auto-degrade'];
+        autoDegradeEnabled.disabled = !turnStateEnabled.checked;
         var rewrite = data['cache-token-rewrite'] || {};
         cacheRewrite.checked = !!rewrite.enabled;
         cacheMin.value = rewrite['min-percent'] == null ? '' : String(rewrite['min-percent']);
@@ -866,12 +887,10 @@ const runtimeSchedulerInlineScript = `
       });
     }
 
-    function loadAuthStatus() {
-      request('GET', 'auth-files').then(function (response) {
-        return response.json();
-      }).then(function (data) {
-        var files = (data && data.files || []).filter(function (item) { return item && item.runtime_only !== true; });
+    renderSchedulerAccounts = function (accounts) {
+        var files = accounts.filter(function (item) { return item && item.runtime_only !== true; });
         statusList.textContent = '';
+        accountStatusNodes.clear();
         if (!files.length) {
           statusList.appendChild(make('div', 'cpa-runtime-scheduler-empty', '暂无认证文件'));
           return;
@@ -890,10 +909,24 @@ const runtimeSchedulerInlineScript = `
             accountStatus = item.status_message || '暂不可用';
           }
           row.appendChild(make('span', '', accountStatus));
+          if (String(item.provider || item.type).toLowerCase() === 'codex') {
+            var stateLine = make('span', 'cpa-runtime-scheduler-account-state');
+            var stateError = make('span', 'cpa-runtime-scheduler-turn-state-error');
+            row.appendChild(stateLine);
+            row.appendChild(stateError);
+            accountStatusNodes.set(item.id, {account:item, state:stateLine, error:stateError});
+          }
           row.appendChild(makeAccountStateControl(item, loadAuthStatus));
           statusList.appendChild(row);
         });
-      }).catch(function () {
+        renderTurnStates();
+    };
+
+    function loadAuthStatus() {
+      var generation = sessionGeneration;
+      return request('GET', 'auth-files').catch(function () {
+        if (generation !== sessionGeneration) return;
+        accountStatusNodes.clear();
         statusList.textContent = '读取认证文件状态失败';
       });
     }
@@ -914,6 +947,7 @@ const runtimeSchedulerInlineScript = `
          'disable-cooling': disableCooling.checked,
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
         'codex-turn-state-enabled': turnStateEnabled.checked,
+        'codex-auto-degrade': autoDegradeEnabled.checked,
         'cache-token-rewrite': {
           enabled: cacheRewrite.checked,
           'min-percent': cacheMin.value === '' ? null : Number(cacheMin.value),
@@ -941,7 +975,7 @@ const runtimeSchedulerInlineScript = `
      '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:min(340px,calc(100vw - 16px));max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
      '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
-  style.textContent += '.cpa-runtime-scheduler-turn-states{font-size:12px;color:#57606a;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;letter-spacing:0}.cpa-runtime-scheduler-turn-state-row{display:grid;gap:3px;padding:6px 0;border-bottom:1px solid #d8dee4}.cpa-runtime-scheduler-turn-state-error{color:#b42318}';
+  style.textContent += '.cpa-runtime-scheduler-account-state{color:#57606a;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;letter-spacing:0}.cpa-runtime-scheduler-turn-state-error{color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-turn-state-error:empty{display:none}';
   style.textContent += '.cpa-native-status-hidden,.cpa-account-managed [class*="AuthFileCard-module__stateBadge"]{display:none!important}.cpa-account-state{display:flex;flex-wrap:wrap;gap:0;max-width:100%;font-size:12px;letter-spacing:0}.cpa-account-state-choice{min-width:48px;padding:5px 8px;border:1px solid var(--border-color,#d0d7de);background:var(--bg-primary,#fff);color:var(--text-secondary,#57606a);cursor:pointer}.cpa-account-state-choice:first-child{border-radius:6px 0 0 6px}.cpa-account-state-choice:nth-child(3){border-radius:0 6px 6px 0}.cpa-account-state-choice[aria-pressed="true"]{background:#2563eb;color:#fff}.cpa-account-state-choice[value="degraded"][aria-pressed="true"]{background:#b45309}.cpa-account-state-choice[value="disabled"][aria-pressed="true"]{background:#6b7280}.cpa-account-state-choice:disabled{cursor:wait;opacity:.6}.cpa-account-state-error{flex-basis:100%;color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-disabled-row strong{overflow-wrap:anywhere}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {

@@ -114,6 +114,7 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("auth-concurrency-limit"),
 		[]byte("codex-fingerprint-convergence"),
 		[]byte("codex-routing-hint"),
+		[]byte("codex-auto-degrade"),
 		[]byte("cacheRewrite.checked = !!rewrite.enabled"),
 		[]byte("'cache-token-rewrite': {"),
 		[]byte("document.createTextNode('自定义复写 token 数')"),
@@ -137,7 +138,7 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 			t.Fatalf("runtime scheduler injection missing %q", want)
 		}
 	}
-	for _, removed := range []string{"cpa-runtime-scheduler-account-estimate", "cpa-runtime-scheduler-account-concurrency", "auth-files/fields", "formatQuota"} {
+	for _, removed := range []string{"cpa-runtime-scheduler-account-estimate", "cpa-runtime-scheduler-account-concurrency", "auth-files/fields", "formatQuota", "cpa-runtime-scheduler-turn-states", "cpa-runtime-scheduler-turn-state-row"} {
 		if bytes.Contains(got, []byte(removed)) {
 			t.Fatalf("runtime panel still contains misplaced quota/account controls: %s", removed)
 		}
@@ -212,18 +213,19 @@ globalThis.XMLHttpRequest = class { open() {} setRequestHeader() {} send() {} };
 globalThis.setInterval = (callback, interval) => { timers.push({callback,interval}); };
 let now = 0;
 Object.defineProperty(globalThis, 'performance', {value:{now: () => now}});
-let enabled = false, patch = null, failStatus = false, lateResolve, statePatch;
-const account = {id:'account-a',name:'account-a.json',auth_index:'a',disabled:false,degraded:false};
+let enabled = false, automatic = false, badState = false, patch = null, failStatus = false, lateResolve, statePatch;
+const account = {id:'account-a',name:'account-a.json',auth_index:'a',provider:'codex',disabled:false,degraded:false};
+const other = {id:'account-b',name:'account-b.json',auth_index:'b',provider:'codex',disabled:false,degraded:false};
 let delayStatus = false;
 window.fetch = async (url, options = {}) => {
   if (url.endsWith('routing/settings')) {
     if (options.method === 'PATCH') {
-      patch = JSON.parse(options.body); enabled = patch['codex-turn-state-enabled'];
+      patch = JSON.parse(options.body); enabled = patch['codex-turn-state-enabled']; automatic = patch['codex-auto-degrade'];
       return new Response('{}');
     }
-    return new Response(JSON.stringify({'codex-turn-state-enabled':enabled,'degraded-port':18888}));
+    return new Response(JSON.stringify({'codex-turn-state-enabled':enabled,'codex-auto-degrade':automatic,'degraded-port':18888}));
   }
-  if (url.endsWith('auth-files')) return new Response(JSON.stringify({files:[account]}));
+  if (url.endsWith('auth-files')) return new Response(JSON.stringify({files:[account,other]}));
   if (url.endsWith('auth-files/status')) {
     statePatch = JSON.parse(options.body);
     account.disabled = statePatch.scheduling_state === 'disabled';
@@ -234,8 +236,8 @@ window.fetch = async (url, options = {}) => {
     if (delayStatus) return new Promise(resolve => {lateResolve = resolve;});
     if (failStatus) return new Response('{}', {status:500});
     return new Response(JSON.stringify({enabled, accounts:[
-      {auth_id:'a',name:'account-a',status:'active',remaining_seconds:330,token_length:292},
-      {auth_id:'b',name:'account-b',status:'active',remaining_seconds:125,refreshing:true,token_length:332}
+      badState ? {auth_id:'account-a',status:'error',remaining_seconds:0,observed_length:356,last_error:'non-quality state'} : {auth_id:'account-a',status:'active',remaining_seconds:330,token_length:292},
+      {auth_id:'account-b',status:'active',remaining_seconds:125,refreshing:true,token_length:332}
     ]}));
   }
   throw new Error('unexpected request ' + url);
@@ -245,23 +247,39 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
 (async () => {
   await window.fetch('https://panel.test/v0/management/routing/settings', {headers:{Authorization:'Bearer synthetic-key'}});
   const toggle = nodes.find(node => node.className === 'cpa-runtime-scheduler-toggle');
-  const list = nodes.find(node => node.className === 'cpa-runtime-scheduler-turn-states');
+  const list = nodes.find(node => node.className === 'cpa-runtime-scheduler-disabled-list');
+  assert.equal(nodes.some(node => node.className === 'cpa-runtime-scheduler-turn-states'), false, 'state must not use a separate account list');
   const checkbox = nodes.find(node => node.tagName === 'label' && node.textContent === 'Codex 292/332 state 自动续期').children[0];
+  const automaticCheckbox = nodes.find(node => node.tagName === 'label' && node.textContent === 'Codex 自动降级').children[0];
   const save = nodes.find(node => node.className === 'cpa-runtime-scheduler-save');
   toggle.click(); await flush();
   const portInput = nodes.find(node => node.tagName === 'label' && node.textContent === '降级账号 API 端口').children[1];
   assert.equal(portInput.value, '18888');
-  const stateControl = nodes.findLast(node => node.className === 'cpa-account-state');
+  const stateControl = nodes.findLast(node => node.className === 'cpa-account-state' && node.account.id === account.id);
   stateControl.children[1].click(); await flush();
   assert.equal(statePatch.scheduling_state, 'degraded');
   assert.equal(statePatch.auth_index, 'a');
   assert.equal(account.degraded, true);
   assert.equal(checkbox.checked, false);
-  assert.equal(list.textContent, '未开启');
-  checkbox.checked = true; save.click(); await flush();
+  assert.equal(automaticCheckbox.disabled, true);
+  assert.match(list.textContent, /state 采集未开启/);
+  checkbox.checked = true; checkbox.listeners.change();
+  assert.equal(automaticCheckbox.disabled, false);
+  automaticCheckbox.checked = true; save.click(); await flush();
   assert.equal(patch['codex-turn-state-enabled'], true);
+  assert.equal(patch['codex-auto-degrade'], true);
   assert.equal(patch['degraded-port'], 18888);
   assert.match(list.textContent, /account-a.*292 剩余.*5:30.*account-b.*332 剩余.*2:05.*续期中/);
+  assert.equal(list.children.length, 2);
+  assert.equal((list.textContent.match(/account-a.json/g) || []).length, 1, 'one row per account');
+  badState = true; account.degraded = true;
+  timers.find(timer => timer.interval === 5000).callback(); await flush();
+  assert.match(list.children[0].textContent, /降级账号池.*最近采集：356.*non-quality state/);
+  assert.equal(list.children[0].children.find(node => node.className === 'cpa-account-state').children[1].attributes['aria-pressed'], 'true');
+  badState = false; account.degraded = false;
+  timers.find(timer => timer.interval === 5000).callback(); await flush();
+  assert.match(list.children[0].textContent, /状态正常.*292 剩余/);
+  assert.equal(list.children[0].children.find(node => node.className === 'cpa-account-state').children[0].attributes['aria-pressed'], 'true');
   now += 2000;
   timers.find(timer => timer.interval === 1000).callback();
   assert.match(list.textContent, /5:28.*2:03/);
@@ -271,7 +289,8 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   assert.doesNotMatch(list.textContent, /-\d+:/);
   failStatus = true;
   timers.find(timer => timer.interval === 5000).callback(); await flush();
-  assert.equal(list.textContent, '读取 state 状态失败');
+  assert.match(list.textContent, /读取 state 状态失败/);
+  assert.equal(list.children.length, 2, 'status errors must not remove account controls');
   failStatus = false; delayStatus = true;
   timers.find(timer => timer.interval === 5000).callback(); await flush();
   listeners.unauthorized();
@@ -279,7 +298,8 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   await flush();
   assert.equal(list.textContent, '未连接管理接口');
   assert.equal(checkbox.checked, false);
-  console.log('turn-state toggle, per-account countdown, expiry and logout checks passed');
+  assert.equal(automaticCheckbox.checked, false);
+  console.log('merged account rows, automatic degradation toggle, countdown and logout checks passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 `
 

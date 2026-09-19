@@ -100,6 +100,38 @@ func TestRoutingSettingsCodexTurnStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRoutingSettingsCodexAutoDegradeRoundTrip(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	for _, enabled := range []bool{true, false} {
+		body, _ := json.Marshal(map[string]any{"codex-auto-degrade": enabled})
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+		h.PutRoutingSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH: %s", rec.Body.String())
+		}
+		h.SetConfig(&config.Config{})
+		rec = httptest.NewRecorder()
+		ctx, _ = gin.CreateTestContext(rec)
+		h.GetRoutingSettings(ctx)
+		var settings map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
+			t.Fatal(err)
+		}
+		if settings["codex-auto-degrade"] != enabled {
+			t.Fatal("automatic degradation toggle lost across reload")
+		}
+		encoded, _ := yaml.Marshal(h.cfg)
+		if strings.Contains(string(encoded), "codex-auto-degrade") {
+			t.Fatal("runtime automation toggle was persisted")
+		}
+		if h.cfg.Routing.CodexTurnStateEnabled != nil {
+			t.Fatal("automation toggle implicitly enabled collection")
+		}
+	}
+}
+
 func TestPutRoutingSettingsUpdatesCodexRoutingHint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{}

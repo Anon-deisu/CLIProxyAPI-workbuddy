@@ -201,6 +201,52 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return m.updateInternal(ctx, nil, auth, updateModeReplace)
 }
 
+// ApplyCodexStateScheduling changes only pool membership on the latest credential snapshot.
+// Disabled/replaced accounts and observations superseded by a manual pool change are ignored.
+func (m *Manager) ApplyCodexStateScheduling(ctx context.Context, observed *Auth, degraded bool) error {
+	m.mu.Lock()
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if ctx.Err() != nil || cfg == nil || cfg.Home.Enabled || cfg.Routing.CodexTurnStateEnabled == nil || !*cfg.Routing.CodexTurnStateEnabled || cfg.Routing.CodexAutoDegrade == nil || !*cfg.Routing.CodexAutoDegrade {
+		m.mu.Unlock()
+		return nil
+	}
+	current := m.auths[observed.ID]
+	if current == nil || current.IsDispatchDisabled() || current.Provider != "codex" || current.AuthKind() != AuthKindOAuth || current.RegistrationEpoch != observed.RegistrationEpoch || current.IsDegraded() != observed.IsDegraded() {
+		m.mu.Unlock()
+		return nil
+	}
+	for _, key := range []string{"account_id", "chatgpt_account_id", "access_token", "plan_type", "chatgpt_plan_type"} {
+		if authMetadataString(current, key) != authMetadataString(observed, key) {
+			m.mu.Unlock()
+			return nil
+		}
+	}
+	if authAttribute(current, "base_url") != authAttribute(observed, "base_url") || authAttribute(current, "plan_type") != authAttribute(observed, "plan_type") {
+		m.mu.Unlock()
+		return nil
+	}
+	updated := current.Clone()
+	changed := current.IsDegraded() != degraded
+	if changed {
+		updated.Metadata["degraded"] = degraded
+		updated.Generation++
+		updated.UpdatedAt = time.Now()
+		m.auths[updated.ID] = updated.Clone()
+	}
+	m.mu.Unlock()
+	if changed {
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(updated.Clone())
+		}
+		m.invalidateSessionAffinity(updated.ID)
+		m.hook.OnAuthUpdated(ctx, updated.Clone())
+	}
+	if errPersist := m.persist(ctx, updated); errPersist != nil {
+		return fmt.Errorf("persist automatic account pool: %w", errPersist)
+	}
+	return nil
+}
+
 func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode updateAuthMode) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil

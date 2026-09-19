@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -525,6 +526,113 @@ func TestCodexTurnStateAccountReplacementAndRemoval(t *testing.T) {
 		synctest.Wait()
 		if len(keeper.Snapshot()) != 0 {
 			t.Fatal("removed account is still being maintained")
+		}
+	})
+}
+
+func TestCodexTurnStateAutoDegradeAndRecover(t *testing.T) {
+	for _, team := range []bool{false, true} {
+		t.Run(strconv.FormatBool(team), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				manager := cliproxyauth.NewManager(nil, nil, nil)
+				auth := turnStateTestAuth("a")
+				badSize, goodSize := 233, 217
+				if team {
+					auth.Metadata["plan_type"] = "business"
+					badSize, goodSize = 265, 249
+				}
+				if _, err := manager.Register(t.Context(), auth); err != nil {
+					t.Fatal(err)
+				}
+				cfg := &config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true), CodexAutoDegrade: new(true)}}
+				manager.SetConfig(cfg)
+				keeper := NewCodexTurnStateKeeper(manager.List)
+				keeper.SetSchedulingUpdater(manager.ApplyCodexStateScheduling)
+				defer keeper.Close()
+				var calls atomic.Int32
+				keeper.fetch = func(_ context.Context, _ *config.Config, _ *cliproxyauth.Auth) (string, error) {
+					size := badSize
+					if calls.Add(1) > 1 {
+						size = goodSize
+					}
+					return testTurnStateBytes(time.Now(), size, 1), nil
+				}
+				keeper.Configure(cfg)
+				synctest.Wait()
+				current, _ := manager.GetByID(auth.ID)
+				if !current.IsDegraded() || current.Disabled {
+					t.Fatal("non-quality state must move only this account to the degraded pool")
+				}
+				if got := keeper.Snapshot()[0].ObservedLength; got != len(testTurnStateBytes(time.Now(), badSize, 1)) {
+					t.Fatalf("observed length = %d", got)
+				}
+				time.Sleep(CodexTurnStateCheckInterval)
+				synctest.Wait()
+				current, _ = manager.GetByID(auth.ID)
+				if current.IsDegraded() || calls.Load() != 2 {
+					t.Fatal("degraded account was not probed and restored")
+				}
+				if token, _ := keeper.Token(current); len(token) != len(testTurnStateBytes(time.Now(), goodSize, 1)) {
+					t.Fatal("restored account did not retain its good state")
+				}
+			})
+		})
+	}
+}
+
+func TestCodexTurnStateAutoDegradeRequiresBothSwitchesAndState(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		enabled, automatic bool
+		state              string
+		err                error
+	}{
+		{name: "collector disabled", automatic: true},
+		{name: "automation disabled", enabled: true},
+		{name: "network error", enabled: true, automatic: true, err: errors.New("connection failed")},
+		{name: "missing state", enabled: true, automatic: true, state: ""},
+		{name: "invalid state", enabled: true, automatic: true, state: "not-a-state"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				keeper := NewCodexTurnStateKeeper(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{turnStateTestAuth("a")} })
+				defer keeper.Close()
+				var updates atomic.Int32
+				keeper.SetSchedulingUpdater(func(context.Context, *cliproxyauth.Auth, bool) error { updates.Add(1); return nil })
+				keeper.fetch = func(context.Context, *config.Config, *cliproxyauth.Auth) (string, error) {
+					if !tc.enabled || !tc.automatic {
+						return testTurnState(time.Now(), true, 1), nil
+					}
+					return tc.state, tc.err
+				}
+				keeper.Configure(&config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(tc.enabled), CodexAutoDegrade: new(tc.automatic)}})
+				synctest.Wait()
+				if updates.Load() != 0 {
+					t.Fatal("account changed without both switches and a usable observation")
+				}
+			})
+		})
+	}
+}
+
+func TestCodexTurnStateAutoDegradeDisableDuringProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		keeper := NewCodexTurnStateKeeper(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{turnStateTestAuth("a")} })
+		defer keeper.Close()
+		release := make(chan struct{})
+		var updates atomic.Int32
+		keeper.SetSchedulingUpdater(func(context.Context, *cliproxyauth.Auth, bool) error { updates.Add(1); return nil })
+		keeper.fetch = func(context.Context, *config.Config, *cliproxyauth.Auth) (string, error) {
+			<-release
+			return testTurnState(time.Now(), true, 1), nil
+		}
+		keeper.Configure(&config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true), CodexAutoDegrade: new(true)}})
+		synctest.Wait()
+		keeper.Configure(&config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true), CodexAutoDegrade: new(false)}})
+		close(release)
+		synctest.Wait()
+		if updates.Load() != 0 {
+			t.Fatal("late probe applied a disabled automation policy")
 		}
 	})
 }
