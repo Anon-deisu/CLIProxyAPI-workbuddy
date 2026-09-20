@@ -3,6 +3,8 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +19,7 @@ import (
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
@@ -25,6 +28,102 @@ import (
 )
 
 var benchmarkBuildCodexWebsocketRequestBodyOutput []byte
+
+func TestCodexWebsocketHandshakePreservesValidTurnState(t *testing.T) {
+	for _, mode := range []string{"execute", "stream", "buffered-stream"} {
+		t.Run(mode, func(t *testing.T) {
+			makeState := func(size int) string {
+				raw := make([]byte, size)
+				raw[0] = 0x80
+				binary.BigEndian.PutUint64(raw[1:9], uint64(time.Now().Unix()))
+				return base64.URLEncoding.EncodeToString(raw)
+			}
+			goodState, handshakeState := makeState(249), makeState(265)
+			var probes atomic.Int32
+			stopProbes := make(chan struct{})
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !websocket.IsWebSocketUpgrade(r) {
+					if probes.Add(1) > 1 {
+						select {
+						case <-r.Context().Done():
+						case <-stopProbes:
+						}
+						return
+					}
+					w.Header().Set(helps.CodexTurnStateHeader, goodState)
+					return
+				}
+				if r.Header.Get(helps.CodexTurnStateHeader) != "" {
+					t.Error("cached state must only be sent in websocket messages")
+				}
+				headers := http.Header{}
+				headers.Set(helps.CodexTurnStateHeader, handshakeState)
+				conn, errUpgrade := upgrader.Upgrade(w, r, headers)
+				if errUpgrade != nil {
+					t.Error(errUpgrade)
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				_, payload, errRead := conn.ReadMessage()
+				if errRead != nil {
+					t.Error(errRead)
+					return
+				}
+				if gjson.GetBytes(payload, "client_metadata.x-codex-turn-state").String() != goodState {
+					t.Error("response.create did not use the cached 332 state")
+				}
+				completed := []byte(`{"type":"response.completed","response":{"id":"resp-state","model":"gpt-6-astra","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+				if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+					t.Error(errWrite)
+				}
+			}))
+			defer func() {
+				close(stopProbes)
+				server.Close()
+			}()
+			auth := &cliproxyauth.Auth{ID: "state-test", Provider: "codex", ProxyURL: "direct",
+				Attributes: map[string]string{"base_url": server.URL},
+				Metadata:   map[string]any{"access_token": "test-access", "account_id": "test-account", "plan_type": "business"},
+			}
+			cfg := &config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true), CodexAutoDegrade: new(true)}}
+			cfg.Codex.StreamBootstrapBuffering = mode == "buffered-stream"
+			keeper := helps.NewCodexTurnStateKeeper(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{auth} })
+			defer keeper.Close()
+			ready := make(chan struct{})
+			keeper.SetSchedulingUpdater(func(context.Context, *cliproxyauth.Auth, bool) error { close(ready); return nil })
+			keeper.Configure(cfg)
+			<-ready
+			exec := NewCodexWebsocketsExecutor(cfg)
+			exec.turnStates = keeper
+			req := cliproxyexecutor.Request{Model: "gpt-6-astra", Payload: []byte(`{"model":"gpt-6-astra","input":[{"role":"user","content":"OK"}]}`)}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+			for range 3 {
+				if mode == "execute" {
+					if _, errExecute := exec.Execute(t.Context(), auth, req, opts); errExecute != nil {
+						t.Fatal(errExecute)
+					}
+				} else {
+					stream, errExecute := exec.ExecuteStream(t.Context(), auth, req, opts)
+					if errExecute != nil {
+						t.Fatal(errExecute)
+					}
+					for chunk := range stream.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+					}
+				}
+				if token, _ := keeper.Token(auth); token != goodState {
+					t.Fatal("handshake state invalidated a valid 332 before it was sent in response.create")
+				}
+			}
+			if probes.Load() != 1 {
+				t.Fatalf("normal account with valid 332 was collected %d times", probes.Load())
+			}
+		})
+	}
+}
 
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)

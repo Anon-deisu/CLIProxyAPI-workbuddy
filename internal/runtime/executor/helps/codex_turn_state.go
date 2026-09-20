@@ -132,6 +132,7 @@ func (k *CodexTurnStateKeeper) Configure(cfg *config.Config) {
 			}
 		}()
 	} else if proxyChanged {
+		now := time.Now()
 		for id, previous := range k.entries {
 			if previous.cancel != nil {
 				previous.cancel()
@@ -140,7 +141,9 @@ func (k *CodexTurnStateKeeper) Configure(cfg *config.Config) {
 			entry := *previous
 			entry.refreshing, entry.cancel, entry.lastError = false, nil, ""
 			k.entries[id] = &entry
-			k.refreshLocked(&entry)
+			if entry.expires.Sub(now) < CodexTurnStateRefreshBefore {
+				k.refreshLocked(&entry)
+			}
 		}
 	}
 }
@@ -231,10 +234,16 @@ func (k *CodexTurnStateKeeper) entryLocked(auth *cliproxyauth.Auth) *codexTurnSt
 func (k *CodexTurnStateKeeper) sweep(ctx context.Context) {
 	auths := k.source()
 	k.mu.Lock()
-	defer k.mu.Unlock()
 	if ctx.Err() != nil || k.ctx != ctx {
+		k.mu.Unlock()
 		return
 	}
+	type recovery struct {
+		entry *codexTurnStateEntry
+		auth  *cliproxyauth.Auth
+	}
+	var recoveries []recovery
+	update := k.updateScheduling
 	active := make(map[string]bool, len(auths))
 	now := time.Now()
 	for _, auth := range auths {
@@ -243,8 +252,10 @@ func (k *CodexTurnStateKeeper) sweep(ctx context.Context) {
 		}
 		active[auth.ID] = true
 		entry := k.entryLocked(auth)
-		if entry.expires.Sub(now) < CodexTurnStateRefreshBefore || (k.autoDegradeEnabledLocked() && auth.IsDegraded()) {
+		if entry.expires.Sub(now) < CodexTurnStateRefreshBefore {
 			k.refreshLocked(entry)
+		} else if !entry.refreshing && k.autoDegradeEnabledLocked() && auth.IsDegraded() && update != nil {
+			recoveries = append(recoveries, recovery{entry: entry, auth: auth.Clone()})
 		}
 	}
 	for id, entry := range k.entries {
@@ -254,6 +265,18 @@ func (k *CodexTurnStateKeeper) sweep(ctx context.Context) {
 			}
 			delete(k.entries, id)
 		}
+	}
+	k.mu.Unlock()
+	for _, recovery := range recoveries {
+		errUpdate := update(ctx, recovery.auth, false)
+		k.mu.Lock()
+		if ctx.Err() == nil && k.entries[recovery.auth.ID] == recovery.entry {
+			recovery.entry.lastError = ""
+			if errUpdate != nil {
+				recovery.entry.lastError = fmt.Sprintf("automatic scheduling update failed: %v", errUpdate)
+			}
+		}
+		k.mu.Unlock()
 	}
 }
 
@@ -356,7 +379,7 @@ func (k *CodexTurnStateKeeper) Observe(auth *cliproxyauth.Auth, usedToken, recei
 	if k.ctx == nil || entry == nil || entry.scope != codexTurnStateScope(auth) {
 		return
 	}
-	if entry.token != "" && usedToken != entry.token {
+	if usedToken == "" || usedToken != entry.token {
 		return
 	}
 	entry.auth = auth.Clone()

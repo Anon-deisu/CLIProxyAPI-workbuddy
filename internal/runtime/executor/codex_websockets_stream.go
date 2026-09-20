@@ -142,7 +142,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 	var upstreamHeaders http.Header
 	if respHS != nil {
-		e.turnStates.Observe(auth, usedTurnState, respHS.Header.Get(helps.CodexTurnStateHeader))
+		// The cached state is sent in response.create, after this handshake.
 		upstreamHeaders = respHS.Header.Clone()
 	}
 	if errDial != nil {

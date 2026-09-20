@@ -259,6 +259,91 @@ func TestCodexTurnStateTimerAndDisable(t *testing.T) {
 	})
 }
 
+func TestCodexTurnStateCached332RestoresSchedulingWithoutRefetch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		manager := cliproxyauth.NewManager(nil, nil, nil)
+		auth := turnStateTestAuth("team")
+		auth.Metadata["plan_type"] = "business"
+		auth.Metadata["degraded"] = true
+		if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+		cfg := &config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true), CodexAutoDegrade: new(false)}}
+		manager.SetConfig(cfg)
+		keeper := NewCodexTurnStateKeeper(manager.List)
+		keeper.SetSchedulingUpdater(manager.ApplyCodexStateScheduling)
+		defer keeper.Close()
+		var calls atomic.Int32
+		keeper.fetch = func(context.Context, *config.Config, *cliproxyauth.Auth) (string, error) {
+			return testTurnStateBytes(time.Now(), 249, byte(calls.Add(1))), nil
+		}
+		keeper.Configure(cfg)
+		synctest.Wait()
+		cached, _ := keeper.Token(auth)
+		cfg.Routing.CodexAutoDegrade = new(true)
+		manager.SetConfig(cfg)
+		keeper.Configure(cfg)
+		time.Sleep(CodexTurnStateCheckInterval)
+		synctest.Wait()
+		current, _ := manager.GetByID(auth.ID)
+		if current.IsDegraded() {
+			t.Fatal("cached valid state must restore scheduling after enabling automation")
+		}
+		if token, _ := keeper.Token(current); token != cached || calls.Load() != 1 {
+			t.Fatal("restoring scheduling unnecessarily collected another 332 state")
+		}
+		for range 3 {
+			keeper.Configure(cfg.CloneForRuntime())
+			keeper.Observe(current, cached, testTurnStateBytes(time.Now(), 249, 7))
+			_ = keeper.Snapshot()
+			time.Sleep(15 * time.Minute)
+			synctest.Wait()
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("normal account with valid 332 was collected %d times", calls.Load())
+		}
+		time.Sleep(11 * time.Minute)
+		synctest.Wait()
+		if calls.Load() != 2 {
+			t.Fatal("state was not renewed when approaching expiry")
+		}
+	})
+}
+
+func TestCodexTurnStateIgnoresUnsentState(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		auth := turnStateTestAuth("team")
+		auth.Metadata["plan_type"] = "business"
+		keeper := NewCodexTurnStateKeeper(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{auth} })
+		defer keeper.Close()
+		var calls atomic.Int32
+		keeper.fetch = func(context.Context, *config.Config, *cliproxyauth.Auth) (string, error) {
+			size := 249
+			if calls.Add(1) == 1 {
+				size = 265
+			}
+			return testTurnStateBytes(time.Now(), size, 1), nil
+		}
+		keeper.Configure(&config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true)}})
+		synctest.Wait()
+		for range 3 {
+			keeper.Observe(auth, "", testTurnStateBytes(time.Now(), 265, 2))
+			synctest.Wait()
+		}
+		if calls.Load() != 1 {
+			t.Fatal("requests without a cached state triggered extra collection")
+		}
+		time.Sleep(CodexTurnStateCheckInterval)
+		synctest.Wait()
+		cached, _ := keeper.Token(auth)
+		keeper.Observe(auth, "", testTurnStateBytes(time.Now(), 265, 2))
+		synctest.Wait()
+		if token, _ := keeper.Token(auth); token != cached || calls.Load() != 2 {
+			t.Fatal("an unstamped request invalidated an unrelated cached state")
+		}
+	})
+}
+
 func TestCodexTurnStateDisableCancelsInflightFetch(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a := turnStateTestAuth("a")
@@ -476,6 +561,9 @@ func TestCodexTurnStateCliproxyReconfigure(t *testing.T) {
 		defer keeper.Close()
 		var calls atomic.Int32
 		cancelled, release := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		releaseProbe := func() { releaseOnce.Do(func() { close(release) }) }
+		defer releaseProbe()
 		keeper.fetch = func(ctx context.Context, cfg *config.Config, _ *cliproxyauth.Auth) (string, error) {
 			n := calls.Add(1)
 			if n == 2 {
@@ -492,8 +580,13 @@ func TestCodexTurnStateCliproxyReconfigure(t *testing.T) {
 		cfg.Routing.CodexStateCliproxy = &config.CliproxyConfig{Enabled: true, Gateway: "proxy.test:1080", Username: "test-region-US", Password: "secret"}
 		keeper.Configure(cfg)
 		synctest.Wait()
+		if token, _ := keeper.Token(auth); token != original || calls.Load() != 1 {
+			t.Fatal("proxy change must retain a healthy cached state without collecting again")
+		}
+		time.Sleep(56 * time.Minute)
+		synctest.Wait()
 		if token, _ := keeper.Token(auth); token != original || calls.Load() != 2 {
-			t.Fatal("proxy change must immediately collect while preserving usable state")
+			t.Fatal("renewal must preserve usable state while collection is pending")
 		}
 		cfg.Routing.CodexStateCliproxy.Username = "test-region-JP"
 		keeper.Configure(cfg)
@@ -503,7 +596,7 @@ func TestCodexTurnStateCliproxyReconfigure(t *testing.T) {
 		if latest == original || calls.Load() != 3 {
 			t.Fatal("changed route did not cancel and replace its pending collection")
 		}
-		close(release)
+		releaseProbe()
 		synctest.Wait()
 		if token, _ := keeper.Token(auth); token != latest {
 			t.Fatal("late state from an old route replaced the latest state")
@@ -516,8 +609,8 @@ func TestCodexTurnStateCliproxyReconfigure(t *testing.T) {
 		cfg.Routing.CodexStateCliproxy.Enabled = false
 		keeper.Configure(cfg)
 		synctest.Wait()
-		if calls.Load() != 4 {
-			t.Fatal("disabling the proxy did not immediately refresh the route")
+		if calls.Load() != 3 {
+			t.Fatal("disabling the proxy unnecessarily replaced valid cached state")
 		}
 	})
 }

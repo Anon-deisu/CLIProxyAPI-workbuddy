@@ -145,7 +145,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
 		if respHS != nil {
-			e.turnStates.Observe(auth, usedTurnState, respHS.Header.Get(helps.CodexTurnStateHeader))
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
@@ -171,9 +170,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		closeWebsocketAfterBindFailure(sess, conn, closer)
 		return resp, errBind
 	}
-	if respHS != nil {
-		e.turnStates.Observe(auth, usedTurnState, respHS.Header.Get(helps.CodexTurnStateHeader))
-	}
+	// The cached state is sent in response.create, so handshake headers cannot reject it.
 	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	reporter.StartResponseTTFT()
 	if sess == nil {
