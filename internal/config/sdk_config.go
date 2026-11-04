@@ -22,6 +22,21 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// TLSHandshakeTimeoutSeconds bounds upstream TLS handshakes made by the
+	// shared uTLS client, in seconds. It applies to both the Claude Code
+	// Anthropic transport and the Chrome ChatGPT/Codex transport; the
+	// standard fallback transport is unaffected. It starts after TCP or
+	// proxy connection establishment returns and does not bound dialing or
+	// proxy CONNECT. Those uTLS paths use custom TLS dialing, for which Go
+	// ignores http.Transport.TLSHandshakeTimeout, so a peer that accepts the
+	// connection but never answers the ClientHello would otherwise block the
+	// request indefinitely and request-retry could never engage. The bound
+	// applies only during the TLS handshake and is removed once it succeeds,
+	// so inference and long-running streams are unaffected. The default 0
+	// disables the bound (previous behavior); negative values are treated as
+	// 0, and values beyond the representable duration range saturate.
+	TLSHandshakeTimeoutSeconds int `yaml:"tls-handshake-timeout-seconds" json:"tls-handshake-timeout-seconds"`
+
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//
 	// Supported values:
@@ -54,9 +69,6 @@ type SDKConfig struct {
 
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
-
-	// CodexOptimizeMultiAgentV2 mirrors the provider-wide runtime setting for API handlers.
-	CodexOptimizeMultiAgentV2 bool `yaml:"-" json:"-"`
 
 	// CodexOrphanDelegationCompatibility mirrors the provider-wide runtime setting for API handlers.
 	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
@@ -119,4 +131,8 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// SendKeepAliveBeforeFT controls whether SSE heartbeats are sent before the first token arrives
+	// when KeepAliveSeconds > 0. Default is false.
+	SendKeepAliveBeforeFT bool `yaml:"send-keepalive-before-ft,omitempty" json:"send-keepalive-before-ft,omitempty"`
 }

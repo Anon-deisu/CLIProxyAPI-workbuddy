@@ -35,11 +35,17 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.WebsocketAuth = true
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
+	cfg.Discovery.Enabled = false
+	cfg.Discovery.ServiceType = DefaultDiscoveryServiceType
+	cfg.Discovery.Subtypes = []string{"_chat-completions", "_responses", "_messages", "_generate-content", "_interactions"}
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config payload: %w", err)
+	}
+	if errValidate := validateTrustedProxies(cfg.TrustedProxies); errValidate != nil {
+		return nil, errValidate
 	}
 
 	if errRestore := cfg.restoreAccountScheduling(); errRestore != nil {
@@ -95,6 +101,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	}
 
 	cfg.NormalizePluginsConfig()
+	cfg.NormalizeClaudeConfig()
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {
 		return nil, errResolvePluginsDir
 	}
@@ -113,6 +120,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeOpenAICompatibility()
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 	cfg.SanitizeOAuthModelAlias()
+	cfg.SanitizeOAuthSettings()
 	cfg.SanitizeOAuthRequestScopedErrors()
 	cfg.SanitizeOAuthSettings()
 	cfg.SanitizePayloadRules()

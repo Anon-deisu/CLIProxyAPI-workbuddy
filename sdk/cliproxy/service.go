@@ -40,8 +40,16 @@ type Service struct {
 	// configRuntimeMu orders side-effecting runtime application after config commits.
 	configRuntimeMu        sync.Mutex
 	executorRegistrationMu sync.Mutex
+	authUpdateMu           sync.Mutex
+	authRevisions          map[string]uint64
+	authRegWaitMu          sync.Mutex
+	authRegWaiters         map[string]chan struct{}
 	configSequence         uint64
 	appliedRoutingState    *routingRuntimeState
+
+	// proxyPoolPublisher scopes connection-pool fencing to this service, so a reload
+	// here never retires config snapshots served by another service.
+	proxyPoolPublisher uint64
 
 	// configPath is the path to the configuration file.
 	configPath string
@@ -66,6 +74,9 @@ type Service struct {
 
 	// pprofServer manages the optional pprof HTTP debug server.
 	pprofServer *pprofServer
+
+	// discoveryManager manages local network mDNS / DNS-SD service advertising.
+	discoveryManager *discoveryAdvertiserManager
 
 	// serverErr channel for server startup/shutdown errors.
 	serverErr chan error
@@ -136,4 +147,31 @@ type Service struct {
 	homePluginSyncFetch          func(context.Context, sdkpluginstore.PluginSyncRequest) (sdkpluginstore.PluginSyncResponse, error)
 	homePluginDeleteTask         func(context.Context, *config.Config, home.PluginTask) homeplugins.SyncReport
 	antigravityProbeWg           sync.WaitGroup
+	// antigravityContext is protected by cfgMu and owns background model probes.
+	antigravityContext       context.Context
+	antigravityProbeMu       sync.Mutex
+	antigravityAccountProbes map[string]map[*antigravityAccountProbe]struct{}
+	antigravityRefreshWake   chan struct{}
+	// antigravityRefreshPending is protected by antigravityProbeMu. Each entry
+	// owns one worker and at most one queued snapshot shared by all probe entry
+	// points. A nil value means the worker is running without a queued successor.
+	antigravityRefreshPending map[string]*antigravityModelRefreshRequest
+	antigravityPersistPending map[string]*antigravityHintPersistRequest
+	antigravityPersistActive  map[string]*antigravityHintPersistRequest
+}
+
+// SetResultPolicy sets an execution result policy on the underlying core auth manager.
+func (s *Service) SetResultPolicy(policy coreauth.ResultPolicy) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	s.coreManager.SetResultPolicy(policy)
+}
+
+// ResultPolicy returns the execution result policy configured on the core auth manager.
+func (s *Service) ResultPolicy() coreauth.ResultPolicy {
+	if s == nil || s.coreManager == nil {
+		return nil
+	}
+	return s.coreManager.ResultPolicy()
 }

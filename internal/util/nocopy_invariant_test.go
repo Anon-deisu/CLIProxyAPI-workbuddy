@@ -57,7 +57,7 @@ func forEachSourceFile(t *testing.T, root string, visit func(rel string, data []
 // TestNoInPlaceSJSONWrites protects the invariant that request payload buffers
 // stay immutable for their whole lifetime.
 //
-// GetGJSONBytesNoCopy and ParseGJSONBytesNoCopy hand out gjson.Result values
+// GetGJSONBytesNoCopy and ParseGJSONBytesNoCopy hand out ojson.Result values
 // whose Raw and Str alias the caller's []byte. Go strings must never change,
 // so any in-place mutation of that buffer turns already-derived results into
 // silently wrong data: re-parsing sees the new bytes, and strings that were

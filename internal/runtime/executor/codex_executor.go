@@ -41,3 +41,6 @@ func (e *CodexExecutor) bindEgress(auth *cliproxyauth.Auth) (*cliproxyauth.Auth,
 func (e *CodexExecutor) modelLevelCooling() bool {
 	return e != nil && e.cfg != nil && e.cfg.Codex.ModelLevelCooling
 }
+
+// SupportsApplyPatch reports the actual executor contract, independent of its provider name.
+func (e *CodexExecutor) SupportsApplyPatch() bool { return e != nil }

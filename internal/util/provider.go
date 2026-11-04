@@ -7,8 +7,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -67,6 +67,11 @@ func GetProviderName(modelName string) []string {
 			return
 		}
 		for _, provider := range registry.GetGlobalRegistry().GetModelProviders(id) {
+			appendProvider(provider)
+		}
+	}
+	if len(providers) == 0 && strings.ToLower(modelName) != modelName {
+		for _, provider := range registry.GetGlobalRegistry().GetModelProviders(strings.ToLower(modelName)) {
 			appendProvider(provider)
 		}
 	}
@@ -292,7 +297,9 @@ func shouldMaskQueryParam(key string) bool {
 		return false
 	}
 	key = strings.TrimSuffix(key, "[]")
-	if key == "key" || strings.Contains(key, "api-key") || strings.Contains(key, "apikey") || strings.Contains(key, "api_key") {
+	// The management API deletes a client API key by ?value=<key>, so a plain
+	// "value" parameter can carry a full secret into the request log.
+	if key == "key" || key == "value" || strings.Contains(key, "api-key") || strings.Contains(key, "apikey") || strings.Contains(key, "api_key") {
 		return true
 	}
 	if strings.Contains(key, "token") || strings.Contains(key, "secret") {

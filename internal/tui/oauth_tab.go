@@ -359,6 +359,8 @@ func (m oauthTabModel) submitCallback(callbackURL string) tea.Cmd {
 					providerKey = "antigravity"
 				case "kimi-auth-url":
 					providerKey = "kimi"
+				case "kimi-ai-auth-url":
+					providerKey = "kimi-ai"
 				case "xai-auth-url":
 					providerKey = "xai"
 				case "cursor-auth-url":

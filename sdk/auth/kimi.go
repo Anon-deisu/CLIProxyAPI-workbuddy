@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/browser"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/browser"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -22,7 +22,7 @@ type KimiAuthenticator struct {
 	provider string
 }
 
-// NewKimiAuthenticator constructs a new Kimi authenticator.
+// NewKimiAuthenticator constructs a new Kimi authenticator for kimi.com.
 func NewKimiAuthenticator() Authenticator {
 	return &KimiAuthenticator{domain: kimi.KimiDefaultDomain, provider: "kimi"}
 }
@@ -65,7 +65,7 @@ func (a KimiAuthenticator) Login(ctx context.Context, cfg *config.Config, opts *
 	authSvc := kimi.NewKimiAuthWithDomain(cfg, domain)
 
 	// Start the device flow
-	fmt.Println("Starting Kimi authentication...")
+	fmt.Printf("Starting %s authentication...\n", displayName)
 	deviceCode, err := authSvc.StartDeviceFlow(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("kimi: failed to start device flow: %w", err)
@@ -106,6 +106,9 @@ func (a KimiAuthenticator) Login(ctx context.Context, cfg *config.Config, opts *
 
 	// Create the token storage
 	tokenStorage := authSvc.CreateTokenStorage(authBundle)
+	if isAI {
+		tokenStorage.Type = providerKey
+	}
 
 	// Build metadata with token information
 	metadata := map[string]any{
@@ -130,7 +133,7 @@ func (a KimiAuthenticator) Login(ctx context.Context, cfg *config.Config, opts *
 	// Generate a unique filename
 	fileName := fmt.Sprintf("%s-%d.json", provider, time.Now().UnixMilli())
 
-	fmt.Println("\nKimi authentication successful!")
+	fmt.Printf("\n%s authentication successful!\n", displayName)
 
 	return &coreauth.Auth{
 		ID:         fileName,

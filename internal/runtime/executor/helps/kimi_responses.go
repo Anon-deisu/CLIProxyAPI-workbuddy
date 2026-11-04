@@ -1,10 +1,13 @@
 package helps
 
 import (
+	"fmt"
 	"strings"
 
-	kimiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/MoeForge/moego/ojson"
+	kimiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // ResolveKimiBaseURL respects explicit endpoints before selecting the domain default.

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -39,7 +39,7 @@ func doKimiLogin(cfg *config.Config, options *LoginOptions, provider string) {
 
 	record, savedPath, err := manager.Login(context.Background(), provider, cfg, authOpts)
 	if err != nil {
-		log.Errorf("Kimi authentication failed: %v", err)
+		log.Errorf("%s authentication failed: %v", displayName, err)
 		return
 	}
 
@@ -49,5 +49,5 @@ func doKimiLogin(cfg *config.Config, options *LoginOptions, provider string) {
 	if record != nil && record.Label != "" {
 		fmt.Printf("Authenticated as %s\n", record.Label)
 	}
-	fmt.Println("Kimi authentication successful!")
+	fmt.Printf("%s authentication successful!\n", displayName)
 }

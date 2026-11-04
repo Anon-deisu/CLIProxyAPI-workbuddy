@@ -42,6 +42,7 @@ type Handler struct {
 	cfg                     *config.Config
 	configFilePath          string
 	mu                      sync.Mutex
+	authStatusMu            sync.Mutex
 	reloadMu                sync.Mutex
 	reloadGeneration        uint64
 	appliedReloadGeneration uint64
@@ -79,7 +80,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg,
+		cfg:                 cfg.CloneForRuntime(),
 		configFilePath:      configFilePath,
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
@@ -132,6 +133,7 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 	if h == nil {
 		return
 	}
+	cloned := cfg.CloneForRuntime()
 	h.mu.Lock()
 	h.cfg = cfg.CloneForReload(h.cfg)
 	h.mu.Unlock()
@@ -143,7 +145,9 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 		return
 	}
 	h.mu.Lock()
-	h.authManager = manager
+	if h.authManager != manager {
+		h.authManager = manager
+	}
 	h.mu.Unlock()
 }
 
@@ -153,7 +157,9 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 		return
 	}
 	h.mu.Lock()
-	h.pluginHost = host
+	if h.pluginHost != host {
+		h.pluginHost = host
+	}
 	h.mu.Unlock()
 }
 
@@ -397,6 +403,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		return false, http.StatusForbidden, "remote management disabled"
 	}
 
+	h.mu.Lock()
 	cfg := h.cfg
 	var (
 		allowRemote bool
@@ -406,6 +413,7 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		allowRemote = cfg.RemoteManagement.AllowRemote
 		secretHash = cfg.RemoteManagement.SecretKey
 	}
+	h.mu.Unlock()
 	if h.allowRemoteOverride {
 		allowRemote = true
 	}
@@ -488,13 +496,6 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	return true, 0, ""
 }
 
-// persist saves the current in-memory config to disk.
-func (h *Handler) persist(c *gin.Context) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.persistLocked(c)
-}
-
 // persistLocked saves the current in-memory config to disk.
 // It expects the caller to hold h.mu.
 func (h *Handler) persistLocked(c *gin.Context) bool {
@@ -513,7 +514,8 @@ func (h *Handler) persistLocked(c *gin.Context) bool {
 	return true
 }
 
-// Helper methods for simple types
+// Helper methods for simple types. The setter and the save run under h.mu, so a
+// reload publishing h.cfg cannot replace it between the change and the save.
 func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 	var body struct {
 		Value *bool `json:"value"`
@@ -522,8 +524,10 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
@@ -534,8 +538,10 @@ func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
@@ -546,6 +552,8 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	set(*body.Value)
-	h.persist(c)
+	h.persistLocked(c)
 }

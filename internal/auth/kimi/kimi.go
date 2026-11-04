@@ -15,9 +15,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -25,14 +26,29 @@ import (
 const (
 	// kimiClientID is Kimi Code's OAuth client ID.
 	kimiClientID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-	// kimiOAuthHost is the OAuth server endpoint.
-	kimiOAuthHost = "https://auth.kimi.com"
-	// kimiDeviceCodeURL is the endpoint for requesting device codes.
+
+	// KimiDefaultDomain is the default domain for Kimi (.com).
+	KimiDefaultDomain = "kimi.com"
+	// KimiAIDomain is the domain for Kimi.ai.
+	KimiAIDomain = "kimi.ai"
+
+	// KimiOAuthHost is the OAuth server endpoint for Kimi (.com).
+	KimiOAuthHost = "https://auth.kimi.com"
+	// KimiAIOAuthHost is the OAuth server endpoint for Kimi.ai.
+	KimiAIOAuthHost = "https://auth.kimi.ai"
+
+	// kimiOAuthHost is kept for internal backward compatibility.
+	kimiOAuthHost = KimiOAuthHost
+	// kimiDeviceCodeURL is the endpoint for requesting device codes for Kimi (.com).
 	kimiDeviceCodeURL = kimiOAuthHost + "/api/oauth/device_authorization"
-	// kimiTokenURL is the endpoint for exchanging device codes for tokens.
+	// kimiTokenURL is the endpoint for exchanging device codes for tokens for Kimi (.com).
 	kimiTokenURL = kimiOAuthHost + "/api/oauth/token"
-	// KimiAPIBaseURL is the base URL for Kimi API requests.
+
+	// KimiAPIBaseURL is the base URL for Kimi (.com) API requests.
 	KimiAPIBaseURL = "https://api.kimi.com/coding"
+	// KimiAIAPIBaseURL is the base URL for Kimi.ai API requests.
+	KimiAIAPIBaseURL = "https://api.kimi.ai/coding"
+
 	// defaultPollInterval is the default interval for polling token endpoint.
 	defaultPollInterval = 5 * time.Second
 	// maxPollDuration is the maximum time to wait for user authorization.
@@ -43,6 +59,163 @@ const (
 
 var kimiRefreshGroup singleflight.Group
 
+// IsKimiAIDomain checks whether a domain or provider string represents kimi.ai.
+func IsKimiAIDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	return d == "kimi.ai" || d == "ai" || d == "kimi-ai" || strings.HasSuffix(d, ".kimi.ai")
+}
+
+// IsKimiComDomain checks whether a domain or provider string represents kimi.com.
+func IsKimiComDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	return d == "kimi.com" || d == "com" || d == "kimi" || strings.HasSuffix(d, ".kimi.com")
+}
+
+func isKimiAIHost(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return host == "kimi.ai" || host == "api.kimi.ai" || host == "auth.kimi.ai" || strings.HasSuffix(host, ".kimi.ai")
+}
+
+func isKimiComHost(rawURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	return host == "kimi.com" || host == "api.kimi.com" || host == "auth.kimi.com" || strings.HasSuffix(host, ".kimi.com")
+}
+
+// NormalizeKimiDomain canonicalizes a domain string to "kimi.ai" or "kimi.com".
+func NormalizeKimiDomain(domain string) string {
+	if IsKimiAIDomain(domain) {
+		return KimiAIDomain
+	}
+	return KimiDefaultDomain
+}
+
+// ResolveKimiOAuthHost returns the OAuth host for the given domain.
+func ResolveKimiOAuthHost(domain string) string {
+	if IsKimiAIDomain(domain) {
+		return KimiAIOAuthHost
+	}
+	return KimiOAuthHost
+}
+
+// ResolveKimiAPIBaseURL returns the API base URL for the given domain.
+func ResolveKimiAPIBaseURL(domain string) string {
+	if IsKimiAIDomain(domain) {
+		return KimiAIAPIBaseURL
+	}
+	return KimiAPIBaseURL
+}
+
+// ResolveKimiDomainFromAuth detects whether an Auth represents kimi.ai or kimi.com.
+// Explicit configurations (domain, base_url, type) take precedence over file names.
+func ResolveKimiDomainFromAuth(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return KimiDefaultDomain
+	}
+	// 1. Attributes
+	if auth.Attributes != nil {
+		if dom := auth.Attributes["domain"]; dom != "" {
+			if IsKimiAIDomain(dom) {
+				return KimiAIDomain
+			}
+			if IsKimiComDomain(dom) {
+				return KimiDefaultDomain
+			}
+		}
+		if bu := auth.Attributes["base_url"]; bu != "" {
+			if isKimiAIHost(bu) {
+				return KimiAIDomain
+			}
+			if isKimiComHost(bu) {
+				return KimiDefaultDomain
+			}
+		}
+	}
+	// 2. Metadata
+	if auth.Metadata != nil {
+		if dom, ok := auth.Metadata["domain"].(string); ok && strings.TrimSpace(dom) != "" {
+			if IsKimiAIDomain(dom) {
+				return KimiAIDomain
+			}
+			if IsKimiComDomain(dom) {
+				return KimiDefaultDomain
+			}
+		}
+		if bu, ok := auth.Metadata["base_url"].(string); ok && strings.TrimSpace(bu) != "" {
+			if isKimiAIHost(bu) {
+				return KimiAIDomain
+			}
+			if isKimiComHost(bu) {
+				return KimiDefaultDomain
+			}
+		}
+		if t, ok := auth.Metadata["type"].(string); ok && strings.TrimSpace(t) != "" {
+			if IsKimiAIDomain(t) {
+				return KimiAIDomain
+			}
+			if IsKimiComDomain(t) {
+				return KimiDefaultDomain
+			}
+		}
+	}
+	// 3. Storage
+	if storage, ok := auth.Storage.(*KimiTokenStorage); ok && storage != nil {
+		if storage.Domain != "" {
+			if IsKimiAIDomain(storage.Domain) {
+				return KimiAIDomain
+			}
+			if IsKimiComDomain(storage.Domain) {
+				return KimiDefaultDomain
+			}
+		}
+		if storage.BaseURL != "" {
+			if isKimiAIHost(storage.BaseURL) {
+				return KimiAIDomain
+			}
+			if isKimiComHost(storage.BaseURL) {
+				return KimiDefaultDomain
+			}
+		}
+		if storage.Type != "" {
+			if IsKimiAIDomain(storage.Type) {
+				return KimiAIDomain
+			}
+			if IsKimiComDomain(storage.Type) {
+				return KimiDefaultDomain
+			}
+		}
+	}
+	// 4. Provider
+	if auth.Provider != "" {
+		if IsKimiAIDomain(auth.Provider) {
+			return KimiAIDomain
+		}
+		if IsKimiComDomain(auth.Provider) {
+			return KimiDefaultDomain
+		}
+	}
+	// 5. File name fallback when no explicit domain information is present
+	id := strings.ToLower(auth.ID)
+	fileName := strings.ToLower(auth.FileName)
+	if strings.Contains(id, "kimi-ai") || strings.Contains(id, "kimi.ai") ||
+		strings.Contains(fileName, "kimi-ai") || strings.Contains(fileName, "kimi.ai") {
+		return KimiAIDomain
+	}
+	return KimiDefaultDomain
+}
+
+// IsKimiAIAuth reports whether the provided auth targets kimi.ai.
+func IsKimiAIAuth(auth *cliproxyauth.Auth) bool {
+	return IsKimiAIDomain(ResolveKimiDomainFromAuth(auth))
+}
+
 // KimiAuth handles Kimi authentication flow.
 type KimiAuth struct {
 	deviceClient *DeviceFlowClient
@@ -50,7 +223,7 @@ type KimiAuth struct {
 	domain       string
 }
 
-// NewKimiAuth creates a new KimiAuth service instance.
+// NewKimiAuth creates a new KimiAuth service instance for kimi.com.
 func NewKimiAuth(cfg *config.Config) *KimiAuth {
 	return NewKimiAuthWithDomain(cfg, KimiDefaultDomain)
 }
@@ -122,12 +295,17 @@ type DeviceFlowClient struct {
 
 // NewDeviceFlowClient creates a new device flow client.
 func NewDeviceFlowClient(cfg *config.Config) *DeviceFlowClient {
-	return NewDeviceFlowClientWithDeviceID(cfg, "")
+	return NewDeviceFlowClientWithDomain(cfg, KimiDefaultDomain)
+}
+
+// NewDeviceFlowClientWithDomain creates a new device flow client for the specified domain.
+func NewDeviceFlowClientWithDomain(cfg *config.Config, domain string) *DeviceFlowClient {
+	return NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg, domain, "", "")
 }
 
 // NewDeviceFlowClientWithDeviceID creates a new device flow client with the specified device ID.
 func NewDeviceFlowClientWithDeviceID(cfg *config.Config, deviceID string) *DeviceFlowClient {
-	return NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg, deviceID, "")
+	return NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg, KimiDefaultDomain, deviceID, "")
 }
 
 // NewDeviceFlowClientWithDeviceIDAndProxyURL creates a new device flow client with a proxy override.
@@ -159,6 +337,8 @@ func NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg *config.Config, domain
 	if resolvedDeviceID == "" {
 		resolvedDeviceID = getOrCreateDeviceID()
 	}
+	normDomain := NormalizeKimiDomain(domain)
+	oauthHost := ResolveKimiOAuthHost(normDomain)
 	return &DeviceFlowClient{
 		httpClient: client,
 		cfg:        cfg,
@@ -404,6 +584,7 @@ func (c *DeviceFlowClient) RefreshToken(ctx context.Context, refreshToken string
 		ctx = context.Background()
 	}
 	refreshToken = strings.TrimSpace(refreshToken)
+	flightKey := c.tokenURL() + ":" + refreshToken
 
 	result, err, _ := kimiRefreshGroup.Do(c.tokenURL()+":"+refreshToken, func() (interface{}, error) {
 		return c.refreshTokenSingleFlight(context.WithoutCancel(ctx), refreshToken)

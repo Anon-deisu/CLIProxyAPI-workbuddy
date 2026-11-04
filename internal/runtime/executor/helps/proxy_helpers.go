@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -15,9 +16,10 @@ import (
 )
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
-// 1. Use auth.ProxyURL if configured (highest priority)
-// 2. Use cfg.ProxyURL if auth proxy is not configured
-// 3. Use RoundTripper from context if neither are configured
+// 1. Use the execution-scoped request proxy if configured (highest priority)
+// 2. Use auth.ProxyURL if configured
+// 3. Use cfg.ProxyURL if auth proxy is not configured
+// 4. Use RoundTripper from context if none are configured
 //
 // Parameters:
 //   - ctx: The context containing optional RoundTripper
@@ -27,17 +29,15 @@ import (
 //
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
-func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (clientOut *http.Client) {
+	defer func() { clientOut = httptransport.Decorate(ctx, clientOut) }()
 	httpClient := &http.Client{}
 	if timeout > 0 {
 		httpClient.Timeout = timeout
 	}
 
-	// Priority 1: Use auth.ProxyURL if configured
-	var proxyURL string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
+	// Priority: request override, then auth.ProxyURL, then cfg.ProxyURL.
+	proxyURL := effectiveProxyURL(ctx, cfg, auth)
 
 	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
 	if proxyURL == "" && cfg != nil {
@@ -49,8 +49,7 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
-		if transport != nil {
+		if transport := pooledProxyTransport(proxyURL, cfg, auth); transport != nil {
 			httpClient.Transport = transport
 			return httpClient
 		}
@@ -59,8 +58,18 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
-	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
-		httpClient.Transport = rt
+	if ctx != nil {
+		if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
+			httpClient.Transport = rt
+			return httpClient
+		}
+	}
+
+	// Priority 4: A credential may opt into pooling without an explicit proxy-url.
+	// With an empty proxy-url the pooled transport keeps the inherited
+	// environment-proxy behavior while isolating the credential's pool.
+	if transport := pooledProxyTransport("", cfg, auth); transport != nil {
+		httpClient.Transport = transport
 	}
 
 	return httpClient
