@@ -100,8 +100,8 @@ type Service struct {
 	relayExecutor *relay.Executor
 	relayMu       sync.Mutex
 
-	// codexTurnStates survives executor replacement and is stopped with the service.
-	codexTurnStates *helps.CodexTurnStateKeeper
+	// codexEgress preserves fixed proxy bindings across executor replacement.
+	codexEgress *helps.CodexEgressManager
 
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host

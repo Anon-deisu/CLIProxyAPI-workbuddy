@@ -114,6 +114,45 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 	cfg.OAuthModelAlias = out
 }
 
+// SanitizeOAuthSettings normalizes and deduplicates global OAuth model settings.
+func (cfg *Config) SanitizeOAuthSettings() {
+	if cfg == nil || len(cfg.OAuthSettings) == 0 {
+		return
+	}
+	out := make(map[string][]OAuthModelSetting, len(cfg.OAuthSettings))
+	for rawChannel, settings := range cfg.OAuthSettings {
+		channel := strings.ToLower(strings.TrimSpace(rawChannel))
+		if channel == "" || len(settings) == 0 {
+			continue
+		}
+		seen := make(map[string]struct{}, len(settings))
+		reversed := make([]OAuthModelSetting, 0, len(settings))
+		for i := len(settings) - 1; i >= 0; i-- {
+			entry := settings[i]
+			name := strings.TrimSpace(entry.Name)
+			if name == "" {
+				continue
+			}
+			alias := strings.TrimSpace(entry.Alias)
+			key := strings.ToLower(name) + "->" + strings.ToLower(alias)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			reversed = append(reversed, OAuthModelSetting{Name: name, Alias: alias, MaxContextLength: entry.MaxContextLength})
+		}
+		if len(reversed) == 0 {
+			continue
+		}
+		clean := make([]OAuthModelSetting, len(reversed))
+		for i := range reversed {
+			clean[len(reversed)-1-i] = reversed[i]
+		}
+		out[channel] = clean
+	}
+	cfg.OAuthSettings = out
+}
+
 // SanitizeOAuthRequestScopedErrors normalizes and validates global OAuth request-scoped error rules.
 // It trims whitespace, normalizes channel keys to lower-case, validates status/action, and drops invalid rules.
 func (cfg *Config) SanitizeOAuthRequestScopedErrors() {
@@ -204,6 +243,30 @@ func (cfg *Config) SanitizeXAIKeys() {
 	for i := range cfg.XAIKey {
 		cfg.XAIKey[i].AlphaSearch = false
 	}
+}
+
+// SanitizeMetaKeys normalizes Meta API-key entries and supplies its default endpoint.
+func (cfg *Config) SanitizeMetaKeys() {
+	if cfg == nil || len(cfg.MetaKey) == 0 {
+		return
+	}
+	out := make([]MetaKey, 0, len(cfg.MetaKey))
+	for _, entry := range cfg.MetaKey {
+		entry.APIKey = strings.TrimSpace(entry.APIKey)
+		if entry.APIKey == "" || strings.HasPrefix(entry.APIKey, "dca:") {
+			continue
+		}
+		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+		if entry.BaseURL == "" {
+			entry.BaseURL = "https://api.meta.ai/v1"
+		}
+		entry.Headers = NormalizeHeaders(entry.Headers)
+		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		entry.AlphaSearch = false
+		out = append(out, entry)
+	}
+	cfg.MetaKey = out
 }
 
 func sanitizeCodexKeyEntries(entries []CodexKey) []CodexKey {

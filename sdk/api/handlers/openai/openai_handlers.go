@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
@@ -472,7 +473,6 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -480,12 +480,37 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	stopKeepAlive := h.StartStreamingKeepAlive(cliCtx, func() {
+		setSSEHeaders()
+		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+		flusher.Flush()
+	})
+	defer stopKeepAlive()
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
+	stopKeepAlive()
+	if c.Writer.Written() {
+		h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+		return
+	}
 
-	// Peek at the first chunk to determine success or failure before setting headers
+	var keepAliveC <-chan time.Time
+	if interval := handlers.StreamingKeepAliveInterval(h.Cfg); interval > 0 {
+		keepAlive := time.NewTimer(interval)
+		defer keepAlive.Stop()
+		keepAliveC = keepAlive.C
+	}
+
+	// Preserve HTTP errors until either model output or a configured heartbeat commits SSE.
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
+			return
+		case <-keepAliveC:
+			setSSEHeaders()
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		case errMsg, ok := <-errChan:
 			if !ok {

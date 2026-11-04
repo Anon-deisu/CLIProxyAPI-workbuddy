@@ -3209,6 +3209,7 @@ func TestXAIExecutorExecuteNormalizesReasoningOutputForNonStreamTranslation(t *t
 
 func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.T) {
 	const requestedModel = "grok-imagine-image-quality"
+	const responseDelay = 35 * time.Millisecond
 
 	var gotPath string
 	var gotAuth string
@@ -3228,6 +3229,9 @@ func TestXAIExecutorExecuteImagesUsesImagesEndpointAndPublishesUsage(t *testing.
 			t.Fatalf("read body: %v", errRead)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// Deliberate upstream latency makes a positive TTFT observable even with
+		// coarse Windows clocks, rather than assuming loopback I/O takes one tick.
+		<-time.After(responseDelay)
 		_, _ = w.Write([]byte(`{"created":123,"data":[{"b64_json":"AA=="}],"usage":{"cost_in_usd_ticks":250000}}`))
 	}))
 	defer server.Close()
@@ -3600,6 +3604,7 @@ func TestXAIExecutorExecuteVideosCreate(t *testing.T) {
 		if errRead != nil {
 			t.Fatalf("read body: %v", errRead)
 		}
+		time.Sleep(35 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"request_id":"vid_123"}`))
 	}))

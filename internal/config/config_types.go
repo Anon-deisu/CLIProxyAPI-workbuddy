@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
@@ -142,6 +144,11 @@ type XAIConfig struct {
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
 }
 
+// DevinConfig configures provider-wide Devin request behavior.
+type DevinConfig struct {
+	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+}
+
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
@@ -169,8 +176,8 @@ type AntigravityConnectionPoolConfig struct {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
-	// TurnStateProbeModel selects the lightweight keeper probe model; empty uses the built-in default.
-	TurnStateProbeModel string `yaml:"turn-state-probe-model,omitempty" json:"turn-state-probe-model,omitempty"`
+	// QuotaRefresh keeps local account quota weights current without manual probes.
+	QuotaRefresh CodexQuotaRefreshConfig `yaml:"quota-refresh,omitempty" json:"quota-refresh"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
 	DisableCodexCloaking bool `yaml:"disable-codex-cloaking" json:"disable-codex-cloaking"`
 	// StreamBootstrapBuffering holds back initial handshake events (response.created,
@@ -190,6 +197,41 @@ type CodexConfig struct {
 	ModelLevelCooling bool `yaml:"model-level-cooling" json:"model-level-cooling"`
 	// LiveMediaRelay terminates and relays Codex Live WebRTC media in this process.
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
+	// ResponseSteering enables full-duplex Codex WebSocket steering for OAuth credentials.
+	ResponseSteering bool `yaml:"response-steering" json:"response-steering"`
+}
+
+// CodexQuotaRefreshConfig controls periodic usage-window observations, not token refresh.
+type CodexQuotaRefreshConfig struct {
+	Enabled     *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Interval    string `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Concurrency int    `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
+}
+
+func (c CodexQuotaRefreshConfig) Effective() (bool, time.Duration, int) {
+	enabled := c.Enabled == nil || *c.Enabled
+	interval := 5 * time.Minute
+	if value := strings.TrimSpace(c.Interval); value != "" {
+		interval, _ = time.ParseDuration(value)
+	}
+	concurrency := c.Concurrency
+	if concurrency == 0 {
+		concurrency = 2
+	}
+	return enabled, interval, concurrency
+}
+
+func (c CodexQuotaRefreshConfig) Validate() error {
+	if value := strings.TrimSpace(c.Interval); value != "" {
+		interval, err := time.ParseDuration(value)
+		if err != nil || interval <= 0 {
+			return fmt.Errorf("codex.quota-refresh.interval must be a positive duration")
+		}
+	}
+	if c.Concurrency < 0 {
+		return fmt.Errorf("codex.quota-refresh.concurrency must not be negative")
+	}
+	return nil
 }
 
 // CodexLiveMediaRelayConfig configures the in-process Codex Live WebRTC gateway.
@@ -261,16 +303,20 @@ type QuotaExceeded struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	// PersistSettings opts management-panel changes into saving an independent snapshot.
+	PersistSettings *bool `yaml:"-" json:"persist-settings,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first", "remaining-quota".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 
 	// SchedulerMode is a runtime-only override used by the management panel.
-	// It is deliberately not read from or written to config.yaml.
+	// It is saved only through the optional AccountScheduling snapshot.
 	SchedulerMode string `yaml:"-" json:"scheduler-mode,omitempty"`
 
 	// DegradedPort is a runtime-only model API listener for degraded accounts; zero disables it.
 	DegradedPort *int `yaml:"-" json:"degraded-port,omitempty"`
+	// ExoFreePort exposes OpenCode Free models on a separate listener; the config key is kept for compatibility.
+	ExoFreePort *int `yaml:"-" json:"exo-free-port,omitempty"`
 
 	// AutoDisableUnauthorized excludes credentials after an upstream 401 once
 	// request-scoped errors and OAuth refresh recovery have been ruled out.
@@ -286,12 +332,11 @@ type RoutingConfig struct {
 	// OAuth/SetupToken identity convergence. Nil retains the current setting across
 	// config reloads; false explicitly restores native request identity behavior.
 	CodexFingerprintConvergence *bool `yaml:"-" json:"codex-fingerprint-convergence,omitempty"`
-	// CodexTurnStateEnabled enables the runtime-only, account-scoped turn-state keeper.
-	CodexTurnStateEnabled *bool `yaml:"-" json:"codex-turn-state-enabled,omitempty"`
-	// CodexAutoDegrade follows collected turn-state quality when collection is enabled.
-	CodexAutoDegrade *bool `yaml:"-" json:"codex-auto-degrade,omitempty"`
-	// CodexStateCliproxy selects a dedicated rotating proxy for turn-state acquisition.
-	CodexStateCliproxy *CliproxyConfig `yaml:"-" json:"codex-state-cliproxy,omitempty"`
+	// WorkBuddyFingerprintConvergence pins WorkBuddy conversation identity per account.
+	// Nil inherits across reloads; false restores caller-owned conversation headers.
+	WorkBuddyFingerprintConvergence *bool `yaml:"-" json:"workbuddy-fingerprint-convergence,omitempty"`
+	// CodexStaticISP pins inference to a fixed per-account proxy.
+	CodexStaticISP *CodexStaticISPConfig `yaml:"-" json:"codex-static-isp,omitempty"`
 	// CodexRoutingHint is a runtime-only upstream routing hint for Codex OAuth requests.
 	// An empty value disables the hint; omitted values use the default "europe" hint.
 	CodexRoutingHint *string `yaml:"-" json:"codex-routing-hint,omitempty"`
@@ -326,43 +371,248 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+	// FakeModels are runtime-only fixed responses owned by the account scheduling panel.
+	FakeModels []FakeModelConfig `yaml:"-" json:"fake-models,omitempty"`
 }
 
-// CliproxyConfig holds runtime-only credentials for Cliproxy's rotating gateway.
-type CliproxyConfig struct {
-	Enabled  bool   `json:"enabled"`
-	Gateway  string `json:"gateway"`
-	Username string `json:"username"`
-	Password string `yaml:"-" json:"-"`
+// FakeModelConfig defines one synthetic OpenAI-compatible model and its reported usage.
+type FakeModelConfig struct {
+	Name             string   `yaml:"name" json:"name"`
+	Content          string   `yaml:"content,omitempty" json:"content,omitempty"`
+	Responses        []string `yaml:"responses,omitempty" json:"responses,omitempty"`
+	InputTokens      int      `yaml:"input-tokens" json:"input-tokens"`
+	OutputTokens     int      `yaml:"output-tokens" json:"output-tokens"`
+	CacheReadTokens  int      `yaml:"cache-read-tokens" json:"cache-read-tokens"`
+	CacheWriteTokens int      `yaml:"cache-write-tokens" json:"cache-write-tokens"`
+	CharsPerSecond   int      `yaml:"chars-per-second,omitempty" json:"chars-per-second,omitempty"`
 }
 
-// ProxyURL validates gateway settings and encodes credentials without logging them.
-func (cfg CliproxyConfig) ProxyURL() (string, error) {
-	if !cfg.Enabled {
-		return "direct", nil
+func (model *FakeModelConfig) UnmarshalYAML(node *yaml.Node) error {
+	type plain FakeModelConfig
+	if errDecode := node.Decode((*plain)(model)); errDecode != nil {
+		return errDecode
 	}
-	gatewayURL := strings.TrimSpace(cfg.Gateway)
-	if !strings.Contains(gatewayURL, "://") {
-		gatewayURL = "socks5://" + gatewayURL
+	// yaml.v3 otherwise truncates fractional numbers when decoding into int fields.
+	node = expandConfigAliases(node)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		switch key {
+		case "input-tokens", "output-tokens", "cache-read-tokens", "cache-write-tokens", "chars-per-second":
+			if tag := value.ShortTag(); tag != "!!int" && tag != "!!null" {
+				return fmt.Errorf("fake-models %s must be an integer", key)
+			}
+		}
 	}
-	setting, errParse := proxyutil.Parse(gatewayURL)
-	if errParse != nil || setting.Mode != proxyutil.ModeProxy {
-		return "", fmt.Errorf("Cliproxy gateway must be an HTTP(S) or SOCKS5 URL")
+	return nil
+}
+
+// FixedResponses returns the configured response pool, including the legacy single content field.
+func (model FakeModelConfig) FixedResponses() []string {
+	if model.Responses != nil {
+		return model.Responses
 	}
-	gateway := setting.URL
-	host, port, errPort := net.SplitHostPort(gateway.Host)
-	portNumber, errNumber := strconv.Atoi(port)
-	if errPort != nil || host == "" || errNumber != nil || portNumber < 1 || portNumber > 65535 {
-		return "", fmt.Errorf("Cliproxy gateway must include a host and port between 1 and 65535")
+	if model.Content != "" {
+		return []string{model.Content}
 	}
-	if gateway.User != nil || gateway.Path != "" || gateway.RawQuery != "" || gateway.Fragment != "" {
-		return "", fmt.Errorf("Cliproxy gateway must contain only scheme, host and port; supply credentials separately")
+	return nil
+}
+
+// CloneFakeModels keeps response pools independent across runtime snapshots.
+func CloneFakeModels(models []FakeModelConfig) []FakeModelConfig {
+	if models == nil {
+		return nil
 	}
-	if strings.TrimSpace(cfg.Username) == "" || cfg.Password == "" {
-		return "", fmt.Errorf("Cliproxy username and password are required when enabled")
+	cloned := make([]FakeModelConfig, len(models))
+	copy(cloned, models)
+	for i := range cloned {
+		if models[i].Responses != nil {
+			cloned[i].Responses = append([]string{}, models[i].Responses...)
+		}
 	}
-	gateway.User = url.UserPassword(cfg.Username, cfg.Password)
-	return gateway.String(), nil
+	return cloned
+}
+
+func ValidateFakeModels(models []FakeModelConfig) error {
+	names := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		responses := model.FixedResponses()
+		if model.Name == "" || strings.TrimSpace(model.Name) != model.Name || len(responses) == 0 {
+			return fmt.Errorf("fake-models require a model name and at least one fixed response")
+		}
+		for _, response := range responses {
+			if strings.TrimSpace(response) == "" {
+				return fmt.Errorf("fake-models fixed responses must not be empty")
+			}
+		}
+		if _, exists := names[model.Name]; exists {
+			return fmt.Errorf("duplicate fake model %q", model.Name)
+		}
+		names[model.Name] = struct{}{}
+		if model.InputTokens < 0 || model.OutputTokens < 0 || model.CacheReadTokens < 0 || model.CacheWriteTokens < 0 {
+			return fmt.Errorf("fake-models token counts must be non-negative")
+		}
+		const maxSafeInteger = 1<<53 - 1
+		if model.CharsPerSecond < 0 || int64(model.CharsPerSecond) > maxSafeInteger {
+			return fmt.Errorf("fake-models chars-per-second must be between 0 and %d", int64(maxSafeInteger))
+		}
+		if int64(model.InputTokens) > maxSafeInteger-int64(model.OutputTokens) || int64(model.CacheReadTokens) > maxSafeInteger || int64(model.CacheWriteTokens) > maxSafeInteger {
+			return fmt.Errorf("fake-models token counts and input/output total must not exceed %d", int64(maxSafeInteger))
+		}
+	}
+	return nil
+}
+
+// AccountSchedulingConfig contains only settings owned by the account scheduling panel.
+type AccountSchedulingConfig struct {
+	PersistSettings                 bool                     `yaml:"persist-settings"`
+	SchedulerMode                   string                   `yaml:"scheduler-mode"`
+	DegradedPort                    *int                     `yaml:"degraded-port"`
+	ExoFreePort                     *int                     `yaml:"exo-free-port"`
+	AutoDisableUnauthorized         bool                     `yaml:"auto-disable-unauthorized"`
+	AutoDisableQuota                bool                     `yaml:"auto-disable-quota"`
+	AuthConcurrencyLimit            *int                     `yaml:"auth-concurrency-limit"`
+	DisableCooling                  *bool                    `yaml:"disable-cooling"`
+	C2AMaxRetryCount                *int                     `yaml:"c2a-max-retry-count"`
+	C2AMaxRetryInterval             *int                     `yaml:"c2a-max-retry-interval"`
+	C2AMaxRetryCredentials          *int                     `yaml:"c2a-max-retry-credentials"`
+	CodexFingerprintConvergence     *bool                    `yaml:"codex-fingerprint-convergence"`
+	WorkBuddyFingerprintConvergence *bool                    `yaml:"workbuddy-fingerprint-convergence"`
+	CodexRoutingHint                *string                  `yaml:"codex-routing-hint"`
+	CodexStaticISP                  *CodexStaticISPConfig    `yaml:"codex-static-isp"`
+	CacheTokenRewrite               *CacheTokenRewriteConfig `yaml:"cache-token-rewrite"`
+	FakeModels                      []FakeModelConfig        `yaml:"fake-models"`
+}
+
+func (cfg *Config) AccountSchedulingSnapshot() *AccountSchedulingConfig {
+	cloned := cfg.CloneForRuntime()
+	routing := cloned.Routing
+	return &AccountSchedulingConfig{
+		PersistSettings: routing.PersistSettings != nil && *routing.PersistSettings,
+		SchedulerMode:   routing.SchedulerMode, DegradedPort: routing.DegradedPort, ExoFreePort: routing.ExoFreePort,
+		AutoDisableUnauthorized: routing.AutoDisableUnauthorized, AutoDisableQuota: routing.AutoDisableQuota,
+		AuthConcurrencyLimit: routing.AuthConcurrencyLimit, DisableCooling: routing.DisableCooling,
+		C2AMaxRetryCount: routing.C2AMaxRetryCount, C2AMaxRetryInterval: routing.C2AMaxRetryInterval, C2AMaxRetryCredentials: routing.C2AMaxRetryCredentials,
+		CodexFingerprintConvergence:     routing.CodexFingerprintConvergence,
+		WorkBuddyFingerprintConvergence: routing.WorkBuddyFingerprintConvergence,
+		CodexRoutingHint:                routing.CodexRoutingHint,
+		CodexStaticISP:                  routing.CodexStaticISP, CacheTokenRewrite: cloned.CacheTokenRewrite,
+		FakeModels: routing.FakeModels,
+	}
+}
+
+func (settings *AccountSchedulingConfig) apply(cfg *Config) {
+	settings = cloneRuntimeValue(reflect.ValueOf(settings)).Interface().(*AccountSchedulingConfig)
+	cfg.Routing.PersistSettings = &settings.PersistSettings
+	cfg.Routing.SchedulerMode = settings.SchedulerMode
+	cfg.Routing.DegradedPort = settings.DegradedPort
+	cfg.Routing.ExoFreePort = settings.ExoFreePort
+	cfg.Routing.AutoDisableUnauthorized = settings.AutoDisableUnauthorized
+	cfg.Routing.AutoDisableQuota = settings.AutoDisableQuota
+	cfg.Routing.AuthConcurrencyLimit = settings.AuthConcurrencyLimit
+	cfg.Routing.DisableCooling = settings.DisableCooling
+	cfg.Routing.C2AMaxRetryCount = settings.C2AMaxRetryCount
+	cfg.Routing.C2AMaxRetryInterval = settings.C2AMaxRetryInterval
+	cfg.Routing.C2AMaxRetryCredentials = settings.C2AMaxRetryCredentials
+	cfg.Routing.CodexFingerprintConvergence = settings.CodexFingerprintConvergence
+	cfg.Routing.WorkBuddyFingerprintConvergence = settings.WorkBuddyFingerprintConvergence
+	cfg.Routing.CodexRoutingHint = settings.CodexRoutingHint
+	cfg.Routing.CodexStaticISP = settings.CodexStaticISP
+	cfg.CacheTokenRewrite = settings.CacheTokenRewrite
+	cfg.Routing.FakeModels = settings.FakeModels
+}
+
+func (cfg *Config) restoreAccountScheduling() error {
+	settings := cfg.AccountScheduling
+	if settings == nil {
+		return nil
+	}
+	for _, limit := range []struct {
+		name    string
+		value   *int
+		maximum int
+	}{
+		{"degraded-port", settings.DegradedPort, 65535},
+		{"exo-free-port", settings.ExoFreePort, 65535},
+		{"auth-concurrency-limit", settings.AuthConcurrencyLimit, 1000000},
+		{"c2a-max-retry-count", settings.C2AMaxRetryCount, 1000000},
+		{"c2a-max-retry-credentials", settings.C2AMaxRetryCredentials, 1000000},
+	} {
+		if limit.value != nil && (*limit.value < 0 || *limit.value > limit.maximum) {
+			return fmt.Errorf("account-scheduling.%s must be between 0 and %d", limit.name, limit.maximum)
+		}
+	}
+	if settings.C2AMaxRetryInterval != nil && *settings.C2AMaxRetryInterval < 0 {
+		return fmt.Errorf("account-scheduling.c2a-max-retry-interval must be non-negative")
+	}
+	if settings.CacheTokenRewrite != nil {
+		if errValidate := settings.CacheTokenRewrite.Validate(); errValidate != nil {
+			return errValidate
+		}
+	}
+	if errValidate := ValidateFakeModels(settings.FakeModels); errValidate != nil {
+		return fmt.Errorf("account-scheduling: %w", errValidate)
+	}
+	settings.apply(cfg)
+	if cfg.Routing.CodexStaticISP != nil {
+		return cfg.Routing.CodexStaticISP.Validate()
+	}
+	return nil
+}
+
+// CodexStaticISPConfig is an opt-in pool of fixed, credentialed proxy endpoints.
+type CodexStaticISPConfig struct {
+	Enabled bool            `yaml:"enabled" json:"enabled"`
+	Nodes   []StaticISPNode `yaml:"nodes" json:"nodes"`
+}
+
+type StaticISPNode struct {
+	ID       string `yaml:"id" json:"id"`
+	Scheme   string `yaml:"scheme,omitempty" json:"scheme,omitempty"`
+	Host     string `yaml:"host" json:"host"`
+	Port     int    `yaml:"port" json:"port"`
+	Username string `yaml:"username" json:"username"`
+	Password string `yaml:"password" json:"-"`
+}
+
+func (cfg *CodexStaticISPConfig) Validate() error {
+	ids := make(map[string]bool, len(cfg.Nodes))
+	for i, node := range cfg.Nodes {
+		if node.ID == "" || strings.TrimSpace(node.ID) != node.ID || ids[node.ID] {
+			return fmt.Errorf("static ISP node %d requires a unique, non-empty ID", i+1)
+		}
+		ids[node.ID] = true
+		if _, errProxy := node.ProxyURL(); errProxy != nil {
+			return fmt.Errorf("static ISP node %d: %w", i+1, errProxy)
+		}
+	}
+	return nil
+}
+
+func (node StaticISPNode) ProxyURL() (string, error) {
+	scheme := strings.ToLower(strings.TrimSpace(node.Scheme))
+	if scheme == "" {
+		scheme = "socks5"
+	}
+	switch scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return "", fmt.Errorf("scheme must be HTTP(S) or SOCKS5")
+	}
+	host := strings.TrimSpace(node.Host)
+	if host == "" || strings.ContainsAny(host, "/@?#[]\\ \t\r\n") || (strings.Contains(host, ":") && net.ParseIP(host) == nil) {
+		return "", fmt.Errorf("host must be an IP address or hostname without credentials, scheme or port")
+	}
+	if node.Port < 1 || node.Port > 65535 {
+		return "", fmt.Errorf("port must be between 1 and 65535")
+	}
+	if strings.TrimSpace(node.Username) == "" || node.Password == "" {
+		return "", fmt.Errorf("username and password are required")
+	}
+	u := url.URL{Scheme: scheme, Host: net.JoinHostPort(host, strconv.Itoa(node.Port)), User: url.UserPassword(node.Username, node.Password)}
+	if _, _, errBuild := proxyutil.BuildDialer(u.String()); errBuild != nil {
+		return "", fmt.Errorf("invalid proxy endpoint")
+	}
+	return u.String(), nil
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -378,6 +628,44 @@ type OAuthModelAlias struct {
 	DisplayName string `yaml:"display-name,omitempty" json:"display-name,omitempty"`
 
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
+}
+
+// OAuthModelSetting defines provider/channel model settings for OAuth credentials.
+type OAuthModelSetting struct {
+	Name             string `yaml:"name" json:"name"`
+	Alias            string `yaml:"alias,omitempty" json:"alias,omitempty"`
+	MaxContextLength int    `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
+}
+
+// GetMaxContextLength returns the configured context-window override.
+func (s OAuthModelSetting) GetMaxContextLength() int { return s.MaxContextLength }
+
+// ResolveOAuthModelSetting finds the last matching setting, preferring an alias match.
+func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID, metadataModelID, modelName string) *OAuthModelSetting {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	metadataID := strings.ToLower(strings.TrimSpace(metadataModelID))
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	var aliasMatch *OAuthModelSetting
+	var nameMatch *OAuthModelSetting
+	for i := range settings {
+		entry := &settings[i]
+		entryName := strings.ToLower(strings.TrimSpace(entry.Name))
+		if entryName == "" {
+			continue
+		}
+		entryAlias := strings.ToLower(strings.TrimSpace(entry.Alias))
+		if entryAlias != "" && entryAlias == id {
+			aliasMatch = entry
+			continue
+		}
+		if (entryAlias == "" || entryAlias == id) && (entryName == id || entryName == metadataID || entryName == name) {
+			nameMatch = entry
+		}
+	}
+	if aliasMatch != nil {
+		return aliasMatch
+	}
+	return nameMatch
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
@@ -673,6 +961,12 @@ type XAIKey = CodexKey
 
 // XAIModel uses the Codex model mapping structure for xAI models.
 type XAIModel = CodexModel
+
+// MetaKey uses the Codex API key structure for native Meta execution.
+type MetaKey = CodexKey
+
+// MetaModel uses the Codex model mapping structure for Meta models.
+type MetaModel = CodexModel
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.

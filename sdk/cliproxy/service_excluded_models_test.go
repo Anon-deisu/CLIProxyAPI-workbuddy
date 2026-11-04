@@ -12,6 +12,54 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
+func TestRegisterModelsForAuth_MetaConfigModelsAndExclusions(t *testing.T) {
+	auth := &coreauth.Auth{ID: t.Name(), Provider: "meta", Prefix: "team", Attributes: map[string]string{
+		coreauth.AttributeSource: "config:meta:test", coreauth.AttributeConfigIndex: "0", coreauth.AttributeAPIKey: "meta-test-key",
+	}}
+	service := &Service{cfg: &config.Config{SDKConfig: config.SDKConfig{ForceModelPrefix: true}, MetaKey: []config.MetaKey{{
+		APIKey: "meta-test-key", Models: []config.MetaModel{{Name: "muse-spark-1.3", Alias: "keep", MaxContextLength: 8192}, {Name: "muse-spark-1.4", Alias: "exclude"}},
+		ExcludedModels: []string{"exclude"},
+	}}}}
+	registry := GlobalModelRegistry()
+	t.Cleanup(func() { registry.UnregisterClient(auth.ID) })
+	service.registerModelsForAuth(t.Context(), auth)
+	models := registry.GetModelsForClient(auth.ID)
+	if len(models) != 1 || models[0].ID != "team/keep" || models[0].MaxContextLength != 8192 {
+		t.Fatalf("Meta configured model registration = %#v", models)
+	}
+}
+
+func TestRegisterModelsForAuth_OAuthSettingsSurviveAlias(t *testing.T) {
+	for _, aliasSpecific := range []bool{false, true} {
+		name := "general"
+		want := 8192
+		settings := []config.OAuthModelSetting{{Name: "muse-spark-1.3", MaxContextLength: want}}
+		if aliasSpecific {
+			name, want = "alias", 16384
+			settings = append(settings, config.OAuthModelSetting{Name: "muse-spark-1.3", Alias: "public", MaxContextLength: want})
+		}
+		t.Run(name, func(t *testing.T) {
+			auth := &coreauth.Auth{ID: t.Name(), Provider: "meta", Metadata: map[string]any{"type": "meta", "auth_kind": "oauth", "access_token": "LLM|test"}}
+			service := &Service{cfg: &config.Config{
+				OAuthModelAlias: map[string][]config.OAuthModelAlias{"meta": {{Name: "muse-spark-1.3", Alias: "public"}}},
+				OAuthSettings:   map[string][]config.OAuthModelSetting{"meta": settings},
+			}}
+			registry := GlobalModelRegistry()
+			t.Cleanup(func() { registry.UnregisterClient(auth.ID) })
+			service.registerModelsForAuth(t.Context(), auth)
+			for _, model := range registry.GetModelsForClient(auth.ID) {
+				if model.ID == "public" {
+					if model.MaxContextLength != want || model.ContextLength != want {
+						t.Fatalf("aliased OAuth context length = %d/%d, want %d", model.ContextLength, model.MaxContextLength, want)
+					}
+					return
+				}
+			}
+			t.Fatal("OAuth alias not registered")
+		})
+	}
+}
+
 func TestRegisterModelsForAuth_UsesPreMergedExcludedModelsAttribute(t *testing.T) {
 	service := &Service{
 		cfg: &config.Config{

@@ -100,12 +100,18 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	nameFilter := strings.TrimSpace(c.Query("name"))
 	authIndexFilter := strings.TrimSpace(c.Query("auth_index"))
 	auths := h.authManager.List()
+	observedAt := time.Now().UTC()
+	cooldownsKnown := !h.authManager.HomeEnabled()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) {
 			continue
 		}
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			entry["cooldowns"] = nil
+			if cooldownsKnown {
+				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
+			}
 			files = append(files, entry)
 		}
 	}
@@ -114,7 +120,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(200, gin.H{"files": files})
+	c.JSON(200, gin.H{"observed_at": observedAt, "files": files})
 }
 
 func lockedAuthIndex(auth *coreauth.Auth) string {
@@ -224,6 +230,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		return
 	}
 	files := make([]gin.H, 0)
+	observedAt := time.Now().UTC()
 	if authIndexFilter != "" {
 		c.JSON(200, gin.H{"files": files})
 		return
@@ -240,7 +247,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			continue
 		}
 		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
+			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime(), "cooldowns": nil}
 
 			// Read file to get type field
 			full := filepath.Join(h.cfg.AuthDir, name)
@@ -249,6 +256,22 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if typeValue == "qoder" || typeValue == "qoder-cn" {
+					for _, key := range []string{"label", "nickname", "uid", "realm", "organization_id", "organization_name"} {
+						if value := gjson.GetBytes(data, key).String(); value != "" {
+							fileData[key] = value
+						}
+					}
+					fileData["qoder_auto_checkin"] = gjson.GetBytes(data, "qoder_auto_checkin").Bool()
+					for _, key := range []string{"qoder_checkin_last_attempt", "qoder_checkin_last_success", "qoder_checkin_next_attempt"} {
+						if value := gjson.GetBytes(data, key); value.Exists() {
+							fileData[key] = value.Value()
+						}
+					}
+					if value := gjson.GetBytes(data, "qoder_checkin_last_result"); value.Exists() {
+						fileData["qoder_checkin_last_result"] = value.Value()
+					}
+				}
 				degraded := gjson.GetBytes(data, "degraded").Bool()
 				disabled := gjson.GetBytes(data, "disabled").Bool()
 				fileData["degraded"] = degraded
@@ -306,7 +329,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			files = append(files, fileData)
 		}
 	}
-	c.JSON(200, gin.H{"files": files})
+	c.JSON(200, gin.H{"observed_at": observedAt, "files": files})
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
@@ -367,7 +390,11 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	}
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
-	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	now := time.Now()
+	recentRequests := auth.RecentRequestsSnapshot(now)
+	modelCosts := coreusage.AuthModelCostBuckets(auth.ID, now)
+	entry["recent_requests"] = mergeRecentRequestModelCosts(recentRequests, modelCosts)
+	entry["model_token_usage"] = coreusage.AuthModelTokens(auth.ID)
 	cost := coreusage.AuthCost(auth.ID)
 	entry["estimated_cost_usd"] = cost.EstimatedCostUSD
 	entry["estimated_cost_cycle_date"] = cost.CycleDate
@@ -381,6 +408,19 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
+	}
+	if auth.Provider == "qoder" || auth.Provider == "qoder-cn" {
+		for _, key := range []string{"nickname", "uid", "realm", "organization_id", "organization_name"} {
+			if value := stringValue(auth.Metadata, key); value != "" {
+				entry[key] = value
+			}
+		}
+		entry["qoder_auto_checkin"] = auth.Metadata["qoder_auto_checkin"] == true
+		for _, key := range []string{"qoder_checkin_last_attempt", "qoder_checkin_last_success", "qoder_checkin_next_attempt", "qoder_checkin_last_result"} {
+			if value, exists := auth.Metadata[key]; exists {
+				entry[key] = value
+			}
+		}
 	}
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
@@ -466,6 +506,41 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth) gin.H {
 		entry["request_retry"] = requestRetry
 	}
 	return entry
+}
+
+func mergeRecentRequestModelCosts(buckets []coreauth.RecentRequestBucket, costs []coreusage.AuthModelCostBucket) []coreauth.RecentRequestBucket {
+	if len(buckets) == 0 || len(costs) == 0 {
+		return buckets
+	}
+	for _, cost := range costs {
+		for bucketIndex := range buckets {
+			bucket := &buckets[bucketIndex]
+			if bucket.BucketID != cost.BucketID {
+				continue
+			}
+			modelKey := coreusage.NormalizeModelName(cost.Model)
+			if modelKey == "" {
+				break
+			}
+			modelIndex := -1
+			for index := range bucket.Models {
+				if coreusage.NormalizeModelName(bucket.Models[index].Model) == modelKey {
+					modelIndex = index
+					break
+				}
+			}
+			if modelIndex < 0 {
+				bucket.Models = append(bucket.Models, coreauth.RecentRequestModelBucket{Model: cost.Model})
+				modelIndex = len(bucket.Models) - 1
+			}
+			bucket.Models[modelIndex].EstimatedCostUSD += cost.EstimatedCostUSD
+			sort.Slice(bucket.Models, func(i, j int) bool {
+				return bucket.Models[i].Model < bucket.Models[j].Model
+			})
+			break
+		}
+	}
+	return buckets
 }
 
 func authFileRequestRetryFromJSON(data []byte) (int, bool) {

@@ -3,10 +3,17 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -513,5 +520,225 @@ func TestCodexExecutorCacheHelper_ClaudeAgentScopeUsesResolvedModelAcrossHTTPAnd
 	}
 	if websocketKey := gjson.GetBytes(websocketBody, "prompt_cache_key").String(); websocketKey != childKey {
 		t.Fatalf("HTTP/WebSocket prompt keys differ: http=%q websocket=%q", childKey, websocketKey)
+	}
+}
+
+const codexQuotaUsageTestPayload = `{"plan_type":"pro","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_after_seconds":60}}}`
+
+func TestCodexExecutorFetchQuotaRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		baseURL string
+		apiKey  bool
+		wantURL string
+	}{
+		{"default", "", false, "https://chatgpt.com/backend-api/wham/usage"},
+		{"custom origin", "https://quota.example.test:8443/custom/codex/responses?secret=ignored#fragment", false, "https://quota.example.test:8443/backend-api/wham/usage"},
+		{"API key uses usage endpoint", "http://quota.example.test/v1", true, "http://quota.example.test/backend-api/wham/usage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Routing: config.RoutingConfig{CodexFingerprintConvergence: new(true)}}
+			auth := &cliproxyauth.Auth{
+				ID: "quota-test", Provider: "codex",
+				Metadata:   map[string]any{"access_token": "oauth-secret", "account_id": "acct-quota"},
+				Attributes: map[string]string{"base_url": tc.baseURL, "header:X-Quota-Test": "custom"},
+			}
+			if tc.apiKey {
+				auth.Attributes["api_key"] = "api-secret"
+			}
+			token, _ := codexCreds(auth)
+			expected := httptest.NewRequest(http.MethodGet, tc.wantURL, nil)
+			applyCodexHeaders(expected, auth, token, false, cfg)
+			calls := 0
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Method != http.MethodGet || req.URL.String() != tc.wantURL || req.Body != nil || req.ContentLength != 0 {
+					t.Fatalf("unexpected quota request: method=%s URL=%s length=%d", req.Method, req.URL, req.ContentLength)
+				}
+				for _, key := range []string{"Authorization", "User-Agent", "Originator", "Chatgpt-Account-Id", "Accept", "X-Codex-Routing-Hint", "X-Quota-Test"} {
+					if got, want := req.Header.Get(key), expected.Header.Get(key); got != want {
+						t.Errorf("quota header %s differs from normal Codex request", key)
+					}
+				}
+				if req.Context().Done() != t.Context().Done() {
+					t.Error("quota request introduced another timeout context")
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(codexQuotaUsageTestPayload))}, nil
+			}))
+			headers, err := NewCodexExecutor(cfg).FetchQuota(ctx, auth)
+			if err != nil || headers.Get("X-Codex-Primary-Used-Percent") != "25" || headers.Get("X-Codex-Primary-Window-Minutes") != "300" || calls != 1 {
+				t.Fatalf("FetchQuota() = %#v, %v; requests=%d", headers, err, calls)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorFetchQuotaHTTPProxyAndStaticISP(t *testing.T) {
+	for _, route := range []string{"direct", "auth proxy", "static ISP"} {
+		t.Run(route, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodGet || r.URL.Path != "/backend-api/wham/usage" || r.URL.RawQuery != "" {
+					t.Errorf("unexpected quota HTTP request: %s %s", r.Method, r.URL)
+				}
+				if r.Header.Get("Authorization") != "Bearer quota-token" || r.Header.Get("Chatgpt-Account-Id") != "quota-account" {
+					t.Error("quota credentials missing")
+				}
+				if route != "direct" && (r.URL.Host != "quota.invalid" || r.Header.Get("Proxy-Authorization") == "") {
+					t.Error("quota request did not use the authenticated proxy")
+				}
+				_, _ = io.WriteString(w, codexQuotaUsageTestPayload)
+			}))
+			t.Cleanup(server.Close)
+			auth := &cliproxyauth.Auth{ID: "quota-egress", Provider: "codex",
+				Attributes: map[string]string{"base_url": server.URL + "/custom/responses?discard=true"},
+				Metadata:   map[string]any{"access_token": "quota-token", "account_id": "quota-account"}}
+			cfg := &config.Config{}
+			if route != "direct" {
+				auth.Attributes["base_url"] = "http://quota.invalid/custom/responses"
+				proxyURL, errParse := url.Parse(server.URL)
+				if errParse != nil {
+					t.Fatal(errParse)
+				}
+				proxyURL.User = url.UserPassword("proxy-user", "proxy-password")
+				auth.ProxyURL = proxyURL.String()
+				cfg.ProxyURL = "http://unused.invalid:1"
+				if route == "static ISP" {
+					port, errPort := strconv.Atoi(proxyURL.Port())
+					if errPort != nil {
+						t.Fatal(errPort)
+					}
+					cfg.Routing.CodexStaticISP = &config.CodexStaticISPConfig{Enabled: true, Nodes: []config.StaticISPNode{{ID: "quota-isp", Scheme: "http", Host: proxyURL.Hostname(), Port: port, Username: "proxy-user", Password: "proxy-password"}}}
+					auth.ProxyURL = "http://unused-auth.invalid:1"
+				}
+			}
+			exec := NewCodexExecutor(cfg)
+			if route == "static ISP" {
+				keeper := helps.NewCodexEgressManager(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{auth} })
+				t.Cleanup(keeper.Close)
+				if errConfigure := keeper.Configure(cfg); errConfigure != nil {
+					t.Fatal(errConfigure)
+				}
+				exec.egress = keeper
+			}
+			original := auth.Clone()
+			headers, err := exec.FetchQuota(t.Context(), auth)
+			if err != nil || headers.Get("X-Codex-Primary-Used-Percent") != "25" || calls.Load() != 1 {
+				t.Fatalf("FetchQuota() = %#v, %v; requests=%d", headers, err, calls.Load())
+			}
+			if auth.ProxyURL != original.ProxyURL || auth.Runtime != original.Runtime || !reflect.DeepEqual(auth.Attributes, original.Attributes) {
+				t.Fatal("FetchQuota mutated credential egress")
+			}
+		})
+	}
+}
+
+type codexQuotaTestBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *codexQuotaTestBody) Close() error {
+	b.closed = true
+	return errors.New("close-secret")
+}
+
+func TestCodexExecutorFetchQuotaPreservesHTTPStatusAndRedactsErrors(t *testing.T) {
+	for _, status := range []int{http.StatusMovedPermanently, http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		for _, readFails := range []bool{false, true} {
+			t.Run(strconv.Itoa(status)+"/readFails="+strconv.FormatBool(readFails), func(t *testing.T) {
+				body := &codexQuotaTestBody{Reader: strings.NewReader(`{"error":{"code":"usage_limit_reached","message":"body-secret oauth-secret"}}`)}
+				if readFails {
+					body.Reader = iotest.ErrReader(errors.New("read-secret oauth-secret"))
+				}
+				calls := 0
+				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+					calls++
+					return &http.Response{StatusCode: status, Header: http.Header{"Location": []string{"https://chatgpt.com/backend-api/codex/responses"}}, Body: body}, nil
+				}))
+				headers, err := NewCodexExecutor(&config.Config{}).FetchQuota(ctx, &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "oauth-secret"}})
+				var statusErr interface{ StatusCode() int }
+				if headers != nil || !errors.As(err, &statusErr) || statusErr.StatusCode() != status || !body.closed || calls != 1 {
+					t.Fatalf("FetchQuota() = %#v, %v; closed=%v calls=%d", headers, err, body.closed, calls)
+				}
+				if strings.Contains(err.Error(), "secret") {
+					t.Fatalf("quota error leaked upstream content: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestCodexExecutorFetchQuotaInvalidPayloadKeepsOldQuota(t *testing.T) {
+	for _, payload := range []string{`null`, `{}`, `{"plan_type":"pro","credits":{"balance":"0"}}`, `{"rate_limit":{"allowed":true,"primary_window":null}}`, `{"rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":18000,"reset_after_seconds":60}}`} {
+		body := &codexQuotaTestBody{Reader: strings.NewReader(payload)}
+		ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"X-Codex-Primary-Used-Percent": []string{"0"}}, Body: body}, nil
+		}))
+		auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"access_token": "oauth-secret"}}
+		auth.Quota.Signals = map[string]string{"X-Codex-Primary-Used-Percent": "70"}
+		headers, err := NewCodexExecutor(&config.Config{}).FetchQuota(ctx, auth)
+		if headers != nil || err == nil || err.Error() != "codex quota: usage response contains no valid quota windows" || !body.closed {
+			t.Fatalf("invalid payload FetchQuota() = %#v, %v; closed=%v", headers, err, body.closed)
+		}
+		if auth.Quota.Signals["X-Codex-Primary-Used-Percent"] != "70" {
+			t.Fatal("invalid usage response replaced old quota")
+		}
+	}
+}
+
+func TestCodexExecutorFetchQuotaTransportAndReadErrors(t *testing.T) {
+	for _, tc := range []string{"transport", "body read", "canceled"} {
+		t.Run(tc, func(t *testing.T) {
+			body := &codexQuotaTestBody{Reader: iotest.ErrReader(errors.New("read-secret"))}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			ctx = context.WithValue(ctx, "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				if tc == "transport" {
+					return nil, errors.New("transport-secret")
+				}
+				if tc == "canceled" {
+					cancel()
+					return nil, context.Canceled
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+			}))
+			headers, err := NewCodexExecutor(&config.Config{}).FetchQuota(ctx, &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "oauth-secret"}})
+			if headers != nil || err == nil || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("unexpected quota failure: %#v, %v", headers, err)
+			}
+			if tc == "body read" && !body.closed {
+				t.Fatal("failed quota response was not closed")
+			}
+			if tc == "canceled" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("context cancellation lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorFetchQuotaRejectsInvalidSetup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  *config.Config
+		auth *cliproxyauth.Auth
+	}{
+		{"nil auth", &config.Config{}, nil},
+		{"missing token", &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}},
+		{"invalid URL", &config.Config{}, &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "secret", "base_url": "https://user:secret@%zz"}}},
+		{"relative URL", &config.Config{}, &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "secret", "base_url": "/secret"}}},
+		{"static ISP keeper missing", &config.Config{Routing: config.RoutingConfig{CodexStaticISP: &config.CodexStaticISPConfig{Enabled: true, Nodes: []config.StaticISPNode{{ID: "quota-isp", Scheme: "http", Host: "proxy.invalid", Port: 1234}}}}}, &cliproxyauth.Auth{ID: "quota-static", Provider: "codex", Metadata: map[string]any{"access_token": "secret"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				t.Error("invalid quota setup made a network request")
+				return nil, errors.New("unexpected network request")
+			}))
+			headers, err := NewCodexExecutor(tc.cfg).FetchQuota(ctx, tc.auth)
+			if headers != nil || err == nil || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("invalid setup FetchQuota() = %#v, %v", headers, err)
+			}
+		})
 	}
 }

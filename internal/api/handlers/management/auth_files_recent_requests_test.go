@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
@@ -46,6 +47,9 @@ func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
 	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
 		t.Fatalf("failed to register auth record: %v", errRegister)
 	}
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID: "runtime-only-auth-1", Provider: "codex", Model: "gpt-5", Success: true,
+	})
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
 	h.tokenStore = &memoryAuthStore{}
@@ -131,5 +135,67 @@ func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
 		if _, ok := bucket["failed"].(float64); !ok {
 			t.Fatalf("expected bucket failed number at %d, got %#v", idx, bucket["failed"])
 		}
+	}
+	newest, ok := recentRaw[len(recentRaw)-1].(map[string]any)
+	if !ok {
+		t.Fatalf("expected newest bucket object, got %#v", recentRaw[len(recentRaw)-1])
+	}
+	models, ok := newest["models"].([]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("expected one newest model entry, got %#v", newest["models"])
+	}
+	model, ok := models[0].(map[string]any)
+	if !ok || model["model"] != "gpt-5" || model["success"] != float64(1) || model["failed"] != float64(0) {
+		t.Fatalf("unexpected newest model entry: %#v", models[0])
+	}
+}
+
+func TestMergeRecentRequestModelCosts(t *testing.T) {
+	buckets := []coreauth.RecentRequestBucket{
+		{BucketID: 10, Models: []coreauth.RecentRequestModelBucket{{Model: "gpt-5", Success: 2}}},
+		{BucketID: 11},
+	}
+	costs := []coreusage.AuthModelCostBucket{
+		{BucketID: 10, Model: "openai/gpt-5(max)", EstimatedCostUSD: 0.1234},
+		{BucketID: 11, Model: "claude-4", EstimatedCostUSD: 0.5},
+	}
+
+	got := mergeRecentRequestModelCosts(buckets, costs)
+	if got[0].Models[0].EstimatedCostUSD != 0.1234 {
+		t.Fatalf("merged gpt-5 cost = %.4f, want 0.1234", got[0].Models[0].EstimatedCostUSD)
+	}
+	if len(got[1].Models) != 1 || got[1].Models[0].Model != "claude-4" || got[1].Models[0].EstimatedCostUSD != 0.5 {
+		t.Fatalf("merged new model = %+v, want claude-4 $0.5", got[1].Models)
+	}
+}
+
+func TestAuthFileModelTokenUsageIsCumulativeAndResetsByAccount(t *testing.T) {
+	id := t.Name()
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth, err := manager.Register(t.Context(), &coreauth.Auth{ID: id, Provider: "openai", Attributes: map[string]string{"runtime_only": "true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { coreusage.ResetAuthCost(id); coreusage.ResetAuthCost(id + "-other") })
+	for range 2 {
+		coreusage.PublishRecord(t.Context(), coreusage.Record{AuthID: id, Provider: "openai", Model: "unpriced-model", Detail: coreusage.Detail{InputTokens: 100, CacheReadTokens: 25, OutputTokens: 10}})
+	}
+	coreusage.PublishRecord(t.Context(), coreusage.Record{AuthID: id, Model: "failed-model", Failed: true})
+	coreusage.PublishRecord(t.Context(), coreusage.Record{AuthID: id + "-other", Model: "unrelated", Detail: coreusage.Detail{InputTokens: 7}})
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	entry := h.buildAuthFileEntry(auth)
+	models := entry["model_token_usage"].([]coreusage.AuthModelTokenUsage)
+	if len(models) != 2 || models[0] != (coreusage.AuthModelTokenUsage{Model: "unpriced-model", InputTokens: 200, CachedInputTokens: 50, OutputTokens: 20}) || models[1].Model != "failed-model" {
+		t.Fatalf("account model token totals = %+v", models)
+	}
+	if _, _, errReset := manager.ResetQuota(t.Context(), auth.ID); errReset != nil {
+		t.Fatal(errReset)
+	}
+	entry = h.buildAuthFileEntry(auth)
+	if models := entry["model_token_usage"].([]coreusage.AuthModelTokenUsage); len(models) != 0 {
+		t.Fatalf("manual reset retained models: %+v", models)
+	}
+	if models := coreusage.AuthModelTokens(id + "-other"); len(models) != 1 || models[0].InputTokens != 7 {
+		t.Fatalf("manual reset changed another account: %+v", models)
 	}
 }

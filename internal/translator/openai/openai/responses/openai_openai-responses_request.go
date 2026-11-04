@@ -33,6 +33,13 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	out := []byte(`{"model":"","messages":[],"stream":false}`)
 
 	root := gjson.ParseBytes(rawJSON)
+	var toolIndex *responsesToolIdentityIndex
+	canonicalToolName := func(name string) string {
+		if toolIndex == nil {
+			toolIndex = newResponsesToolIdentityIndex(root)
+		}
+		return toolIndex.canonical(name)
+	}
 
 	messages := make([][]byte, 0)
 	appendMessage := func(message []byte) {
@@ -247,7 +254,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					if namespace := strings.TrimSpace(item.Get("namespace").String()); namespace != "" {
 						functionName = qualifyResponsesNamespaceToolName(namespace, functionName)
 					} else {
-						functionName = canonicalResponsesToolName(inputRawJSON, functionName)
+						functionName = canonicalToolName(functionName)
 					}
 				}
 				if functionName != "" {
@@ -291,7 +298,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if namespace := item.Get("namespace").String(); namespace != "" {
 					functionName = qualifyResponsesNamespaceToolName(namespace, functionName)
 				} else {
-					functionName = canonicalResponsesToolName(inputRawJSON, functionName)
+					functionName = canonicalToolName(functionName)
 				}
 				toolCall, _ = sjson.SetBytes(toolCall, "function.name", functionName)
 				wrappedArgs, _ := sjson.SetBytes([]byte(`{"input":""}`), "input", item.Get("input").String())

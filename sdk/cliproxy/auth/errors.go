@@ -23,6 +23,19 @@ const connectionLifecycleErrorCode = ErrorCodeConnectionLifecycle
 // ErrorCodeForceCooldown marks failures that must enforce credential cooldown.
 const ErrorCodeForceCooldown = "force_cooldown"
 
+// ErrorCodeWorkBuddyRateLimit identifies WorkBuddy's account-wide 6004 usage limit.
+const ErrorCodeWorkBuddyRateLimit = "workbuddy_rate_limit"
+
+// ErrorCodeWorkBuddyAccountBanned identifies WorkBuddy's 11140 account ban.
+const ErrorCodeWorkBuddyAccountBanned = "workbuddy_account_banned"
+
+// ErrorCodeWorkBuddyModelRateLimit identifies WorkBuddy's per-model 6000 usage limit.
+const ErrorCodeWorkBuddyModelRateLimit = "workbuddy_model_rate_limit"
+
+func isWorkBuddyRateLimitError(err *Error) bool {
+	return err != nil && (err.Code == ErrorCodeWorkBuddyRateLimit || err.Code == ErrorCodeWorkBuddyModelRateLimit)
+}
+
 // ErrorCodeConcurrencyLimit identifies a request rejected because every eligible
 // credential has reached its runtime concurrency limit.
 const ErrorCodeConcurrencyLimit = "auth_concurrency_limit"

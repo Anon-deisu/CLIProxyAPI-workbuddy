@@ -1,8 +1,12 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"gopkg.in/yaml.v3"
@@ -15,6 +19,219 @@ func TestCloneForRuntimeNil(t *testing.T) {
 	}
 	if got := cfg.CloneForReload(&Config{}); got != nil {
 		t.Fatalf("CloneForReload() = %#v, want nil", got)
+	}
+}
+
+func TestCodexQuotaRefreshSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw   string
+		enabled     bool
+		interval    time.Duration
+		concurrency int
+	}{
+		{"defaults", "port: 8317\n", true, 5 * time.Minute, 2},
+		{"configured", "codex:\n  quota-refresh: {enabled: true, interval: 2m, concurrency: 4}\n", true, 2 * time.Minute, 4},
+		{"disabled", "codex:\n  quota-refresh: {enabled: false}\n", false, 5 * time.Minute, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := ParseConfigBytes([]byte(tc.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			enabled, interval, concurrency := cfg.Codex.QuotaRefresh.Effective()
+			if enabled != tc.enabled || interval != tc.interval || concurrency != tc.concurrency {
+				t.Fatalf("settings = %v, %s, %d", enabled, interval, concurrency)
+			}
+			cloned := cfg.CloneForRuntime()
+			if cfg.Codex.QuotaRefresh.Enabled != nil {
+				*cloned.Codex.QuotaRefresh.Enabled = !*cloned.Codex.QuotaRefresh.Enabled
+				if *cloned.Codex.QuotaRefresh.Enabled == *cfg.Codex.QuotaRefresh.Enabled {
+					t.Fatal("clone shares enabled pointer")
+				}
+			}
+		})
+	}
+	for _, setting := range []string{"interval: invalid", "interval: 0s", "interval: -1s", "concurrency: -1"} {
+		if _, err := ParseConfigBytes([]byte("codex:\n  quota-refresh: {" + setting + "}\n")); err == nil {
+			t.Fatalf("accepted invalid quota refresh setting: %s", setting)
+		}
+	}
+}
+
+func TestAccountSchedulingSnapshotAndParsing(t *testing.T) {
+	cfg := &Config{Routing: RoutingConfig{PersistSettings: new(true), AuthConcurrencyLimit: new(2), ExoFreePort: new(18888), CodexStaticISP: &CodexStaticISPConfig{Nodes: []StaticISPNode{{ID: "isp", Host: "proxy.test", Port: 1080, Username: "user", Password: "saved-secret"}}}}}
+	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
+	cfg.AccountScheduling = cfg.AccountSchedulingSnapshot()
+	*cfg.Routing.AuthConcurrencyLimit = 9
+	*cfg.Routing.ExoFreePort = 18889
+	cfg.Routing.CodexStaticISP.Nodes[0].Password = "runtime-secret"
+	if *cfg.AccountScheduling.AuthConcurrencyLimit != 2 || *cfg.AccountScheduling.ExoFreePort != 18888 || cfg.AccountScheduling.CodexStaticISP.Nodes[0].Password != "saved-secret" {
+		t.Fatal("runtime changes mutated the last saved snapshot")
+	}
+	raw, errMarshal := yaml.Marshal(cfg)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	parsed, errParse := ParseConfigBytes(raw)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if *parsed.Routing.AuthConcurrencyLimit != 2 || *parsed.Routing.ExoFreePort != 18888 || parsed.Routing.CodexStaticISP.Nodes[0].Password != "saved-secret" || !*parsed.Routing.PersistSettings {
+		t.Fatal("parsing did not restore the saved snapshot")
+	}
+	*parsed.Routing.AuthConcurrencyLimit = 4
+	*parsed.Routing.ExoFreePort = 18890
+	if *parsed.AccountScheduling.AuthConcurrencyLimit != 2 || *parsed.AccountScheduling.ExoFreePort != 18888 {
+		t.Fatal("restored runtime fields share pointers with saved settings")
+	}
+	previous := parsed.CloneForRuntime()
+	parsed.Routing.PersistSettings = new(false)
+	parsed.Routing.AuthConcurrencyLimit = new(7)
+	parsed.Routing.ExoFreePort = new(0)
+	updated := parsed.CloneForReload(previous)
+	if *updated.Routing.AuthConcurrencyLimit != 7 || *updated.Routing.ExoFreePort != 0 || *updated.Routing.PersistSettings {
+		t.Fatal("runtime config commit replaced explicitly supplied panel changes")
+	}
+}
+
+func TestAccountSchedulingRejectsInvalidSavedSettings(t *testing.T) {
+	for _, setting := range []string{
+		"degraded-port: 65536", "exo-free-port: -1", "exo-free-port: 65536", "auth-concurrency-limit: -1", "c2a-max-retry-count: -1",
+		"c2a-max-retry-interval: -1", "c2a-max-retry-credentials: 1000001",
+		"cache-token-rewrite: {enabled: true, min-percent: 101}",
+	} {
+		if _, errParse := ParseConfigBytes([]byte("account-scheduling:\n  persist-settings: true\n  " + setting + "\n")); errParse == nil {
+			t.Fatalf("invalid saved settings accepted: %s", setting)
+		}
+	}
+}
+
+func TestAccountSchedulingIgnoresRemovedCodexSettings(t *testing.T) {
+	raw := []byte(`codex:
+  turn-state-probe-model: obsolete-probe
+account-scheduling:
+  persist-settings: true
+  auth-concurrency-limit: 3
+  codex-turn-state-enabled: true
+  codex-auto-degrade: true
+  codex-excel-routing-enabled: true
+  codex-excel-disable-fallback: true
+  codex-state-cliproxy: {enabled: true, gateway: invalid}
+`)
+	cfg, errParse := ParseConfigBytes(raw)
+	if errParse != nil {
+		t.Fatalf("obsolete settings must not prevent startup: %v", errParse)
+	}
+	if cfg.Routing.AuthConcurrencyLimit == nil || *cfg.Routing.AuthConcurrencyLimit != 3 {
+		t.Fatal("supported settings were lost")
+	}
+	encoded, errMarshal := yaml.Marshal(cfg)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	for _, key := range []string{"turn-state-probe-model", "codex-turn-state-enabled", "codex-auto-degrade", "codex-excel-routing-enabled", "codex-excel-disable-fallback", "codex-state-cliproxy"} {
+		if strings.Contains(string(encoded), key) {
+			t.Errorf("removed setting is still serialized: %s", key)
+		}
+	}
+}
+
+func TestSavingConfigRemovesRetiredCodexSettings(t *testing.T) {
+	raw := []byte(`# keep this deployment comment
+codex:
+  turn-state-probe-model: obsolete-probe
+  identity-confuse: true
+account-scheduling:
+  persist-settings: true
+  auth-concurrency-limit: 3
+  codex-turn-state-enabled: true
+  codex-auto-degrade: true
+  codex-excel-routing-enabled: true
+  codex-excel-disable-fallback: true
+  codex-state-cliproxy: {enabled: true, password: retired-secret}
+  custom-field: keep-me
+`)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(path, raw, 0600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	cfg, errLoad := LoadConfig(path)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if errSave := SaveConfigPreserveComments(path, cfg); errSave != nil {
+		t.Fatal(errSave)
+	}
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	for _, key := range []string{"turn-state-probe-model", "codex-turn-state-enabled", "codex-auto-degrade", "codex-excel-routing-enabled", "codex-excel-disable-fallback", "codex-state-cliproxy", "retired-secret"} {
+		if strings.Contains(string(saved), key) {
+			t.Errorf("retired setting survived save: %s", key)
+		}
+	}
+	for _, want := range []string{"# keep this deployment comment", "custom-field: keep-me", "auth-concurrency-limit: 3", "identity-confuse: true"} {
+		if !strings.Contains(string(saved), want) {
+			t.Errorf("unrelated setting or comment was removed: %s", want)
+		}
+	}
+}
+
+func TestAccountSchedulingFakeModelsRoundTrip(t *testing.T) {
+	models := []FakeModelConfig{{Name: "fake-a", Responses: []string{"fixed A", "alternative A"}, InputTokens: 114514, OutputTokens: 1919810, CacheReadTokens: 325, CacheWriteTokens: 799, CharsPerSecond: 25}, {Name: "fake-b", Content: "fixed B", InputTokens: 1}}
+	cfg := &Config{Routing: RoutingConfig{FakeModels: CloneFakeModels(models)}}
+	cfg.CredentialInFlight = DefaultCredentialInFlightConfig()
+	cfg.AccountScheduling = cfg.AccountSchedulingSnapshot()
+	cfg.Routing.FakeModels[0].Responses[0] = "changed"
+	if cfg.AccountScheduling.FakeModels[0].Responses[0] != "fixed A" {
+		t.Fatal("snapshot shares fake model content with runtime")
+	}
+	raw, errMarshal := yaml.Marshal(cfg)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	parsed, errParse := ParseConfigBytes(raw)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if !reflect.DeepEqual(parsed.Routing.FakeModels, models) {
+		t.Fatalf("restored fake models = %#v, want %#v", parsed.Routing.FakeModels, models)
+	}
+	previous := parsed.CloneForRuntime()
+	updated := (&Config{}).CloneForReload(previous)
+	if !reflect.DeepEqual(updated.Routing.FakeModels, models) {
+		t.Fatal("config reload discarded runtime fake models")
+	}
+	updated.Routing.FakeModels[0].Responses[0] = "changed after reload"
+	if previous.Routing.FakeModels[0].Responses[0] != "fixed A" {
+		t.Fatal("config reload shares response pools with previous config")
+	}
+	parsed.Routing.FakeModels = []FakeModelConfig{}
+	cleared := parsed.CloneForReload(previous)
+	if len(cleared.Routing.FakeModels) != 0 {
+		t.Fatal("explicit empty list did not remove fake models")
+	}
+}
+
+func TestAccountSchedulingRejectsInvalidFakeModels(t *testing.T) {
+	for _, raw := range []string{
+		"- {name: '', content: fixed, input-tokens: 1}",
+		"- {name: fake, content: ' ', input-tokens: 1}",
+		"- {name: fake, content: fixed, input-tokens: -1}",
+		"- {name: fake, content: fixed, cache-read-tokens: -1}",
+		"- {name: fake, content: fixed, cache-write-tokens: -1}",
+		"- {name: fake, responses: []}",
+		"- {name: fake, content: legacy, responses: []}",
+		"- {name: fake, responses: ['A', ' ']}",
+		"- {name: fake, responses: ['A'], chars-per-second: -1}",
+		"- {name: fake, responses: ['A'], chars-per-second: 1.5}",
+		"- {name: fake, responses: ['A'], input-tokens: 9007199254740991, output-tokens: 1}",
+		"- {name: fake, content: fixed}\n    - {name: fake, content: other}",
+	} {
+		if _, errParse := ParseConfigBytes([]byte("account-scheduling:\n  fake-models:\n    " + raw + "\n")); errParse == nil {
+			t.Fatalf("invalid fake models accepted: %s", raw)
+		}
 	}
 }
 
@@ -217,6 +434,43 @@ func TestCloneForRuntimeDoesNotShareReferenceFields(t *testing.T) {
 	clone := cfg.CloneForRuntime()
 
 	assertNoSharedRuntimeReferences(t, reflect.ValueOf(cfg), reflect.ValueOf(clone), "Config")
+}
+
+func TestWorkBuddyFingerprintConfigSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		previous, value, want *bool
+	}{
+		{name: "default-off"},
+		{name: "enable", value: new(true), want: new(true)},
+		{name: "inherit", previous: new(true), want: new(true)},
+		{name: "disable", previous: new(true), value: new(false), want: new(false)},
+		{name: "inherit-disabled", previous: new(false), want: new(false)},
+		{name: "reenable", previous: new(false), value: new(true), want: new(true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			previous := &Config{Routing: RoutingConfig{WorkBuddyFingerprintConvergence: tc.previous}}
+			current := &Config{Routing: RoutingConfig{WorkBuddyFingerprintConvergence: tc.value}}
+			cloned := current.CloneForReload(previous)
+			if !reflect.DeepEqual(cloned.Routing.WorkBuddyFingerprintConvergence, tc.want) {
+				t.Fatalf("unexpected convergence snapshot: %+v", cloned.Routing)
+			}
+			assertNoSharedRuntimeReferences(t, reflect.ValueOf(previous), reflect.ValueOf(cloned), "Config")
+			assertNoSharedRuntimeReferences(t, reflect.ValueOf(current), reflect.ValueOf(cloned), "Config")
+			snapshot := cloned.AccountSchedulingSnapshot()
+			restored := &Config{}
+			snapshot.apply(restored)
+			if !reflect.DeepEqual(restored.Routing.WorkBuddyFingerprintConvergence, tc.want) || restored.Routing.CodexFingerprintConvergence != nil {
+				t.Fatal("account scheduling snapshot lost WorkBuddy state or changed Codex")
+			}
+			if tc.want != nil {
+				*snapshot.WorkBuddyFingerprintConvergence = !*tc.want
+				if *restored.Routing.WorkBuddyFingerprintConvergence != *tc.want || *cloned.Routing.WorkBuddyFingerprintConvergence != *tc.want {
+					t.Fatal("saved settings share mutable pointers with runtime configs")
+				}
+			}
+		})
+	}
 }
 
 func sampleCloneRuntimeConfig() *Config {

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -10,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func TestQuotaStateObserveResponseHeadersKeepsProviderScopedSignals(t *testing.T) {
@@ -681,5 +685,255 @@ func TestObserveResponseHeadersKeepsPrimaryWhenTruncatingAdditional(t *testing.T
 	}
 	if len(quota.Signals) != maxQuotaSignalHeaders {
 		t.Fatalf("snapshot size = %d, want %d", len(quota.Signals), maxQuotaSignalHeaders)
+	}
+}
+
+func quotaRefreshTestAuth(id string) *Auth {
+	return &Auth{
+		ID: id, Provider: "codex", Status: StatusActive,
+		Metadata: map[string]any{"access_token": "access-" + id, "account_id": "account-" + id},
+		Quota:    QuotaState{ObservedAt: time.Unix(10, 0), Signals: map[string]string{"X-Codex-Primary-Used-Percent": "10"}},
+		Success:  11, Failed: 3,
+	}
+}
+
+type quotaRefreshTestHook struct {
+	NoopHook
+	results int
+}
+
+func (h *quotaRefreshTestHook) OnResult(context.Context, Result) { h.results++ }
+
+func TestManagerApplyQuotaRefreshUpdatesEveryModelWithoutRequestAccounting(t *testing.T) {
+	store := &quotaRefreshTestStore{memoryAuthTestStore: newMemoryAuthTestStore()}
+	hook := &quotaRefreshTestHook{}
+	m := NewManager(store, &Codex2APIDefaultSelector{}, hook)
+	auth := quotaRefreshTestAuth(t.Name())
+	auth.recordRecentRequest(time.Unix(10, 0), true)
+	auth.recordRecentRequest(time.Unix(10, 0), false)
+	models := []*registry.ModelInfo{{ID: "quota-model-a"}, {ID: "quota-model-b"}}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", models)
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+	observed, err := m.Register(WithSkipPersist(t.Context()), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range models {
+		picked, errPick := m.scheduler.pickSingle(t.Context(), "codex", model.ID, cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatal(errPick)
+		}
+		picked.ReleaseDispatchSlot()
+	}
+	startedAt := time.Unix(20, 0)
+	if !m.ApplyQuotaRefresh(t.Context(), observed, startedAt, http.Header{"X-Codex-Primary-Used-Percent": {"70"}}, nil) {
+		t.Fatal("fresh quota probe was rejected")
+	}
+	updated, _ := m.GetByID(auth.ID)
+	if updated.Quota.Signals["X-Codex-Primary-Used-Percent"] != "70" || updated.Quota.ObservedAt.Before(startedAt) {
+		t.Fatalf("observation not replaced: %+v", updated.Quota)
+	}
+	if updated.Generation != observed.Generation+1 || updated.UpdatedAt.Before(observed.UpdatedAt) {
+		t.Fatal("quota observation did not advance generation and update time")
+	}
+	if updated.Success != observed.Success || updated.Failed != observed.Failed || updated.recentRequests != observed.recentRequests || hook.results != 0 || store.saves.Load() != 0 {
+		t.Fatal("quota polling changed request accounting, emitted a result, or persisted auth")
+	}
+	stored, errList := store.List(t.Context())
+	if errList != nil || len(stored) != 0 {
+		t.Fatal("quota observation wrote a credential to the store")
+	}
+	want := observed.Clone()
+	want.Quota, want.Generation, want.UpdatedAt = updated.Quota, updated.Generation, updated.UpdatedAt
+	if !reflect.DeepEqual(want, updated) {
+		t.Fatal("observation-only commit changed unrelated auth state")
+	}
+	m.scheduler.mu.Lock()
+	defer m.scheduler.mu.Unlock()
+	for _, model := range models {
+		entry := m.scheduler.providers["codex"].modelShards[model.ID].entries[auth.ID]
+		if entry.auth.Generation != updated.Generation || codex2APIQuotaWeight(entry.auth) != 3000 {
+			t.Fatalf("model %s retained stale quota/weight: %+v", model.ID, entry.auth.Quota)
+		}
+	}
+}
+
+func TestManagerApplyQuotaRefreshRejectsStaleIdentityAndNewerObservation(t *testing.T) {
+	for _, mutation := range []string{"removed", "reregistered", "token", "refresh-token", "account", "provider", "apikey", "disabled", "auto-disabled", "status-disabled", "newer-observation", "home", "config-disabled", "canceled"} {
+		for _, unauthorized := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/unauthorized=%t", mutation, unauthorized), func(t *testing.T) {
+				m := NewManager(nil, nil, nil)
+				cfg := &internalconfig.Config{}
+				cfg.Routing.AutoDisableUnauthorized = true
+				m.runtimeConfig.Store(cfg)
+				observed, err := m.Register(t.Context(), quotaRefreshTestAuth(t.Name()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				startedAt := time.Unix(20, 0)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				m.mu.Lock()
+				current := m.auths[observed.ID]
+				switch mutation {
+				case "removed":
+					delete(m.auths, observed.ID)
+				case "reregistered":
+					current.RegistrationEpoch++
+				case "token":
+					current.Metadata["access_token"] = "replacement"
+				case "refresh-token":
+					current.Metadata["refresh_token"] = "replacement"
+				case "account":
+					current.Metadata["account_id"] = "replacement"
+				case "provider":
+					current.Provider = "claude"
+				case "apikey":
+					current.Attributes = map[string]string{AttributeAPIKey: "key"}
+				case "disabled":
+					current.Disabled = true
+				case "auto-disabled":
+					current.AutoDisabled, current.AutoDisableReason = true, AutoDisableReasonUnauthorized
+				case "status-disabled":
+					current.Status = StatusDisabled
+				case "newer-observation":
+					current.Quota.ObservedAt = startedAt.Add(time.Nanosecond)
+				case "home":
+					next := *cfg
+					next.Home.Enabled = true
+					m.runtimeConfig.Store(&next)
+				case "config-disabled":
+					next := *cfg
+					next.Codex.QuotaRefresh.Enabled = new(false)
+					m.runtimeConfig.Store(&next)
+				case "canceled":
+					cancel()
+				}
+				before := m.auths[observed.ID].Clone()
+				m.mu.Unlock()
+				var probeErr error
+				if unauthorized {
+					probeErr = &Error{HTTPStatus: http.StatusUnauthorized}
+				}
+				if m.ApplyQuotaRefresh(ctx, observed, startedAt, http.Header{"X-Codex-Primary-Used-Percent": {"100"}}, probeErr) {
+					t.Fatal("stale or ineligible quota probe was accepted")
+				}
+				after, _ := m.GetByID(observed.ID)
+				if !reflect.DeepEqual(before, after) {
+					t.Fatal("rejected quota probe changed current auth")
+				}
+			})
+		}
+	}
+}
+
+func TestManagerApplyQuotaRefreshPreservesQuotaOnProbeFailure(t *testing.T) {
+	for _, probeErr := range []error{
+		errors.New("network failure"), errors.New("invalid JSON"), context.Canceled,
+		&Error{HTTPStatus: 403}, &Error{HTTPStatus: 429}, &Error{HTTPStatus: 500}, &Error{HTTPStatus: 503},
+	} {
+		t.Run(probeErr.Error(), func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			cfg := &internalconfig.Config{}
+			cfg.Routing.AutoDisableUnauthorized, cfg.Routing.AutoDisableQuota = true, true
+			m.runtimeConfig.Store(cfg)
+			before, err := m.Register(t.Context(), quotaRefreshTestAuth(t.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if m.ApplyQuotaRefresh(t.Context(), before, time.Unix(20, 0), http.Header{"X-Codex-Primary-Used-Percent": {"100"}}, probeErr) {
+				t.Fatal("failed probe committed its response headers")
+			}
+			after, _ := m.GetByID(before.ID)
+			if !reflect.DeepEqual(before, after) {
+				t.Fatal("failed probe changed auth/quota state")
+			}
+		})
+	}
+}
+
+func TestManagerApplyQuotaRefreshQuotaPolicies(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, minutes := range []int{300, 10080} {
+			t.Run(fmt.Sprintf("enabled=%t/window=%d", enabled, minutes), func(t *testing.T) {
+				m := NewManager(nil, nil, nil)
+				cfg := &internalconfig.Config{}
+				cfg.Routing.AutoDisableQuota = enabled
+				m.runtimeConfig.Store(cfg)
+				observed, err := m.Register(t.Context(), quotaRefreshTestAuth(t.Name()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				resetAt := time.Now().Add(time.Hour).Truncate(time.Second)
+				headers := http.Header{
+					"X-Codex-Primary-Used-Percent": {"100"}, "X-Codex-Primary-Window-Minutes": {strconv.Itoa(minutes)},
+					"X-Codex-Primary-Reset-At": {strconv.FormatInt(resetAt.Unix(), 10)},
+				}
+				if !m.ApplyQuotaRefresh(t.Context(), observed, time.Now(), headers, nil) {
+					t.Fatal("quota probe not committed")
+				}
+				updated, _ := m.GetByID(observed.ID)
+				if updated.AutoDisabled != (enabled && minutes == 10080) {
+					t.Fatal("unexpected automatic quota disable")
+				}
+				if enabled && minutes == 300 && !updated.CodexQuotaResumeAt.Equal(resetAt) {
+					t.Fatal("5H observation did not set temporary pause")
+				}
+				if !enabled && !updated.CodexQuotaResumeAt.IsZero() {
+					t.Fatal("quota policy changed state while disabled")
+				}
+				if updated.Success != observed.Success || updated.Failed != observed.Failed {
+					t.Fatal("quota policy changed request counts")
+				}
+			})
+		}
+	}
+}
+
+func TestManagerApplyQuotaRefreshPreservesSnapshotWithoutQuotaSignals(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	before, err := m.Register(t.Context(), quotaRefreshTestAuth(t.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, headers := range []http.Header{nil, {"Content-Type": {"application/json"}}, {"X-Codex-Primary-Used-Percent": {""}}} {
+		if m.ApplyQuotaRefresh(t.Context(), before, time.Unix(20, 0), headers, nil) {
+			t.Fatal("signal-free quota probe reported a change")
+		}
+	}
+	after, _ := m.GetByID(before.ID)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("signal-free probe disturbed existing quota")
+	}
+}
+
+func TestManagerApplyQuotaRefreshMergesIntoLatestGeneration(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	observed, err := m.Register(t.Context(), quotaRefreshTestAuth(t.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now()
+	m.mu.Lock()
+	current := m.auths[observed.ID]
+	current.Generation++
+	current.Failed++
+	current.recordRecentRequest(startedAt, false)
+	current.Unavailable, current.Status = true, StatusError
+	current.LastError = &Error{HTTPStatus: 503, Message: "concurrent request failure"}
+	current.NextRetryAfter = startedAt.Add(time.Minute)
+	current.Metadata["degraded"] = true
+	want := current.Clone()
+	m.mu.Unlock()
+	if !m.ApplyQuotaRefresh(t.Context(), observed, startedAt, http.Header{"X-Codex-Primary-Used-Percent": {"30"}}, nil) {
+		t.Fatal("unrelated generation update incorrectly rejected the probe")
+	}
+	got, _ := m.GetByID(observed.ID)
+	if got.Generation != want.Generation+1 {
+		t.Fatal("commit did not advance the latest generation")
+	}
+	want.Quota, want.Generation, want.UpdatedAt = got.Quota, got.Generation, got.UpdatedAt
+	if !reflect.DeepEqual(got, want) {
+		t.Fatal("quota success erased a concurrent request failure or operator change")
 	}
 }

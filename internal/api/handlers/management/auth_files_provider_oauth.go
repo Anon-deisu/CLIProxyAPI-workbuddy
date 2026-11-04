@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
+	metaauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/meta"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -623,15 +624,134 @@ func (h *Handler) RequestXAIToken(c *gin.Context) {
 	c.JSON(200, response)
 }
 
+func (h *Handler) RequestMetaToken(c *gin.Context) {
+	ctx := PopulateAuthContext(context.Background(), c)
+	state := fmt.Sprintf("meta-%d", time.Now().UnixNano())
+	authSvc := metaauth.NewMetaAuth(h.cfg)
+	deviceFlow, errStart := authSvc.StartDeviceFlow(ctx)
+	if errStart != nil {
+		log.Errorf("Failed to start Meta device flow: %v", errStart)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start device authorization flow"})
+		return
+	}
+	authURL := strings.TrimSpace(deviceFlow.VerificationURIComplete)
+	if authURL == "" {
+		authURL = strings.TrimSpace(deviceFlow.VerificationURI)
+	}
+	RegisterOAuthSession(state, "meta")
+	go func() {
+		pollCtx, cancelPoll := context.WithCancel(ctx)
+		defer cancelPoll()
+		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "meta")
+		bundle, errWait := authSvc.WaitForAuthorization(pollCtx, deviceFlow)
+		if errWait != nil {
+			if IsOAuthSessionPending(state, "meta") {
+				SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWait))
+			}
+			return
+		}
+		if !IsOAuthSessionPending(state, "meta") {
+			return
+		}
+		storage := authSvc.CreateTokenStorage(bundle)
+		if storage == nil || strings.TrimSpace(storage.AccessToken) == "" {
+			SetOAuthSessionError(state, "Failed to exchange token")
+			return
+		}
+		record := buildMetaAuthRecord(bundle, storage)
+		if errGuard := guardOAuthSessionPendingForSave(state, "meta"); errGuard != nil {
+			return
+		}
+		if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
+			SetOAuthSessionError(state, "Failed to save token to file")
+			return
+		}
+		CompleteOAuthSession(state)
+	}()
+	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}
+	if code := strings.TrimSpace(deviceFlow.UserCode); code != "" {
+		response["user_code"] = code
+	}
+	if deviceFlow.ExpiresIn > 0 {
+		response["expires_in"] = deviceFlow.ExpiresIn
+	} else {
+		response["expires_in"] = int(metaauth.MaxPollDuration / time.Second)
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func buildMetaAuthRecord(bundle *metaauth.MetaAuthBundle, storage *metaauth.MetaTokenStorage) *coreauth.Auth {
+	fileName := metaauth.CredentialFileName(storage.Email, storage.DCAToken)
+	label := strings.TrimSpace(storage.Email)
+	if label == "" {
+		label = "Meta"
+	}
+	metadata := map[string]any{
+		"type": "meta", "access_token": storage.AccessToken, "token_type": storage.TokenType,
+		"expires_in": storage.ExpiresIn, "expired": storage.Expired, "last_refresh": storage.LastRefresh,
+		"base_url": storage.BaseURL, "auth_kind": "oauth",
+	}
+	if storage.DCAExpired != "" {
+		metadata["dca_expired"] = storage.DCAExpired
+	}
+	if storage.DCAExpiresAt > 0 {
+		metadata["dca_expires_at"] = storage.DCAExpiresAt
+	}
+	if storage.APIKey != "" {
+		metadata["api_key"] = storage.APIKey
+	}
+	if storage.DCAToken != "" {
+		metadata["dca_token"] = storage.DCAToken
+	}
+	if storage.Email != "" {
+		metadata["email"] = storage.Email
+	}
+	if storage.Name != "" {
+		metadata["name"] = storage.Name
+	}
+	if bundle != nil && bundle.MintedKey != nil {
+		metadata["subs_tier_name"] = bundle.MintedKey.SubsTierName
+		metadata["subs_tier_id"] = bundle.MintedKey.SubsTierID
+		metadata["is_subs_active"] = bundle.MintedKey.IsSubsActive
+		metadata["has_payment_method"] = bundle.MintedKey.HasPaymentMethod
+	}
+	attrs := map[string]string{"auth_kind": "oauth", "base_url": storage.BaseURL}
+	if storage.APIKey != "" {
+		attrs["api_key"] = storage.APIKey
+	}
+	if storage.DCAToken != "" {
+		attrs["dca_token"] = storage.DCAToken
+	}
+	if storage.Email != "" {
+		attrs["email"] = storage.Email
+	}
+	return &coreauth.Auth{ID: fileName, Provider: "meta", FileName: fileName, Label: label, Storage: storage, Metadata: metadata, Attributes: attrs}
+}
+
 func (h *Handler) RequestKimiToken(c *gin.Context) {
+	domain := kimi.KimiDefaultDomain
+	if value := strings.TrimSpace(c.Query("domain")); value != "" {
+		domain = value
+	} else if value := strings.TrimSpace(c.Query("channel")); value != "" {
+		domain = value
+	}
+	h.requestKimiTokenWithDomain(c, domain)
+}
+
+func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
+	domain = kimi.NormalizeKimiDomain(domain)
+	provider := "kimi"
+	if kimi.IsKimiAIDomain(domain) {
+		provider = "kimi-ai"
+	}
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
 	fmt.Println("Initializing Kimi authentication...")
 
-	state := fmt.Sprintf("kmi-%d", time.Now().UnixNano())
+	state := fmt.Sprintf("%s-%d", provider, time.Now().UnixNano())
 	// Initialize Kimi auth service
-	kimiAuth := kimi.NewKimiAuth(h.cfg)
+	kimiAuth := kimi.NewKimiAuthWithDomain(h.cfg, domain)
 
 	// Generate authorization URL
 	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
@@ -645,24 +765,24 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		authURL = deviceFlow.VerificationURI
 	}
 
-	RegisterOAuthSession(state, "kimi")
+	RegisterOAuthSession(state, provider)
 
 	go func() {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
-		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "kimi")
+		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, provider)
 
 		fmt.Println("Waiting for authentication...")
 		authBundle, errWaitForAuthorization := kimiAuth.WaitForAuthorization(pollCtx, deviceFlow)
 		if errWaitForAuthorization != nil {
-			if !IsOAuthSessionPending(state, "kimi") {
+			if !IsOAuthSessionPending(state, provider) {
 				return
 			}
 			SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization))
 			fmt.Printf("Authentication failed: %v\n", errWaitForAuthorization)
 			return
 		}
-		if !IsOAuthSessionPending(state, "kimi") {
+		if !IsOAuthSessionPending(state, provider) {
 			return
 		}
 
@@ -670,12 +790,14 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		tokenStorage := kimiAuth.CreateTokenStorage(authBundle)
 
 		metadata := map[string]any{
-			"type":          "kimi",
+			"type":          provider,
 			"access_token":  authBundle.TokenData.AccessToken,
 			"refresh_token": authBundle.TokenData.RefreshToken,
 			"token_type":    authBundle.TokenData.TokenType,
 			"scope":         authBundle.TokenData.Scope,
 			"timestamp":     time.Now().UnixMilli(),
+			"domain":        domain,
+			"base_url":      kimi.ResolveKimiAPIBaseURL(domain),
 		}
 		if authBundle.TokenData.ExpiresAt > 0 {
 			expired := time.Unix(authBundle.TokenData.ExpiresAt, 0).UTC().Format(time.RFC3339)
@@ -685,16 +807,17 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			metadata["device_id"] = strings.TrimSpace(authBundle.DeviceID)
 		}
 
-		fileName := fmt.Sprintf("kimi-%d.json", time.Now().UnixMilli())
+		fileName := fmt.Sprintf("%s-%d.json", provider, time.Now().UnixMilli())
 		record := &coreauth.Auth{
-			ID:       fileName,
-			Provider: "kimi",
-			FileName: fileName,
-			Label:    "Kimi User",
-			Storage:  tokenStorage,
-			Metadata: metadata,
+			ID:         fileName,
+			Provider:   provider,
+			FileName:   fileName,
+			Label:      "Kimi User",
+			Storage:    tokenStorage,
+			Metadata:   metadata,
+			Attributes: map[string]string{"domain": domain, "base_url": kimi.ResolveKimiAPIBaseURL(domain)},
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, "kimi"); errGuard != nil {
+		if errGuard := guardOAuthSessionPendingForSave(state, provider); errGuard != nil {
 			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
@@ -717,6 +840,11 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		response["expires_in"] = deviceFlow.ExpiresIn
 	}
 	c.JSON(200, response)
+}
+
+// RequestKimiAIToken starts a domain-isolated Kimi.ai device authorization flow.
+func (h *Handler) RequestKimiAIToken(c *gin.Context) {
+	h.requestKimiTokenWithDomain(c, kimi.KimiAIDomain)
 }
 
 // watchOAuthSessionCancel cancels pollCtx once the OAuth session is no longer pending.

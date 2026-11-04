@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -58,10 +59,13 @@ type Handler struct {
 	configReloadHook        func(context.Context, *config.Config)
 	runtimeConfigHook       func(context.Context, *config.Config)
 	degradedPortController  func(int) error
+	exoFreePortController   func(int) error
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
 	pluginStoreRateLimiter  *pluginstore.GitHubRateLimiter
 	pluginReleases          pluginReleaseCache
+	autoOAuthJobsMu         sync.Mutex
+	autoOAuthJobs           map[string]*codexAutoOAuthJob
 }
 
 type configReloadSnapshot struct {
@@ -82,6 +86,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		autoOAuthJobs:       make(map[string]*codexAutoOAuthJob),
 	}
 	h.startAttemptCleanup()
 	return h
@@ -179,7 +184,14 @@ func (h *Handler) SetDegradedPortController(controller func(int) error) {
 	h.mu.Unlock()
 }
 
-// applyRuntimeConfig applies an in-memory config mutation without writing config.yaml.
+// SetExoFreePortController installs the dedicated streaming listener controller.
+func (h *Handler) SetExoFreePortController(controller func(int) error) {
+	h.mu.Lock()
+	h.exoFreePortController = controller
+	h.mu.Unlock()
+}
+
+// applyRuntimeConfig applies panel changes even if their optional file write fails.
 func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config) error) bool {
 	if h == nil || mutate == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "management handler unavailable"})
@@ -197,6 +209,17 @@ func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config)
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMutate.Error()})
 		return false
 	}
+	persisted := false
+	var errSave error
+	if h.cfg.Routing.PersistSettings != nil && *h.cfg.Routing.PersistSettings {
+		persistCfg := h.cfg.CloneForRuntime()
+		persistCfg.AccountScheduling = h.cfg.AccountSchedulingSnapshot()
+		errSave = config.SaveConfigPreserveComments(h.configFilePath, persistCfg)
+		if errSave == nil {
+			h.cfg.AccountScheduling = persistCfg.AccountScheduling
+			persisted = true
+		}
+	}
 	snapshot := h.cfg.CloneForRuntime()
 	hook := h.runtimeConfigHook
 	manager := h.authManager
@@ -207,7 +230,25 @@ func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config)
 	} else if manager != nil {
 		manager.SetConfig(snapshot)
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "runtime_only": true})
+	if manager != nil && snapshot.Routing.CodexStaticISP != nil && snapshot.Routing.CodexStaticISP.Enabled {
+		if executor, ok := manager.Executor("codex"); ok {
+			if source, ok := executor.(interface {
+				CodexEgressManager() *helps.CodexEgressManager
+			}); ok {
+				if keeper := source.CodexEgressManager(); keeper != nil {
+					if message := keeper.StaticISPError(); message != "" {
+						c.JSON(http.StatusServiceUnavailable, gin.H{"error": "static ISP configuration is saved in memory but unavailable: " + message, "applied": true, "persisted": persisted, "runtime_only": !persisted, "runtime_error": true})
+						return false
+					}
+				}
+			}
+		}
+	}
+	if errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save account scheduling: %v", errSave), "applied": true, "persisted": false, "runtime_only": true})
+		return false
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "applied": true, "persisted": persisted, "runtime_only": !persisted})
 	return true
 }
 
@@ -227,7 +268,7 @@ func (h *Handler) reloadSnapshotConfigLocked() configReloadSnapshot {
 // saveConfigAndSnapshotLocked saves h.cfg and returns a full runtime config snapshot.
 // Callers must hold h.mu.
 func (h *Handler) saveConfigAndSnapshotLocked(c *gin.Context) (configReloadSnapshot, bool) {
-	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
+	if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); errSave != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errSave)})
 		return configReloadSnapshot{}, false
 	}
@@ -458,7 +499,7 @@ func (h *Handler) persist(c *gin.Context) bool {
 // It expects the caller to hold h.mu.
 func (h *Handler) persistLocked(c *gin.Context) bool {
 	// Preserve comments when writing
-	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
+	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}

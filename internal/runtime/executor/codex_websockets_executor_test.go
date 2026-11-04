@@ -3,9 +3,8 @@ package executor
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -29,36 +29,27 @@ import (
 
 var benchmarkBuildCodexWebsocketRequestBodyOutput []byte
 
-func TestCodexWebsocketHandshakePreservesValidTurnState(t *testing.T) {
+func TestCodexWebsocketPassesClientStateWithoutProbes(t *testing.T) {
 	for _, mode := range []string{"execute", "stream", "buffered-stream"} {
 		t.Run(mode, func(t *testing.T) {
-			makeState := func(size int) string {
-				raw := make([]byte, size)
-				raw[0] = 0x80
-				binary.BigEndian.PutUint64(raw[1:9], uint64(time.Now().Unix()))
-				return base64.URLEncoding.EncodeToString(raw)
-			}
-			goodState, handshakeState := makeState(249), makeState(265)
+			clientState := "gAAAAA-client-provided"
 			var probes atomic.Int32
-			stopProbes := make(chan struct{})
 			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if !websocket.IsWebSocketUpgrade(r) {
-					if probes.Add(1) > 1 {
-						select {
-						case <-r.Context().Done():
-						case <-stopProbes:
-						}
-						return
-					}
-					w.Header().Set(helps.CodexTurnStateHeader, goodState)
+					probes.Add(1)
+					w.WriteHeader(http.StatusBadRequest)
 					return
 				}
 				if r.Header.Get(helps.CodexTurnStateHeader) != "" {
-					t.Error("cached state must only be sent in websocket messages")
+					t.Error("proxy injected a state header")
+				}
+				if r.Header.Get("Cookie") != "" {
+					t.Error("proxy retained collection cookies")
 				}
 				headers := http.Header{}
-				headers.Set(helps.CodexTurnStateHeader, handshakeState)
+				headers.Set(helps.CodexTurnStateHeader, "gAAAAA-upstream-state")
+				headers.Add("Set-Cookie", "__oailb=handshake-cookie; Path=/; HttpOnly")
 				conn, errUpgrade := upgrader.Upgrade(w, r, headers)
 				if errUpgrade != nil {
 					t.Error(errUpgrade)
@@ -70,33 +61,29 @@ func TestCodexWebsocketHandshakePreservesValidTurnState(t *testing.T) {
 					t.Error(errRead)
 					return
 				}
-				if gjson.GetBytes(payload, "client_metadata.x-codex-turn-state").String() != goodState {
-					t.Error("response.create did not use the cached 332 state")
+				if gjson.GetBytes(payload, "client_metadata.x-codex-turn-state").String() != clientState {
+					t.Error("native client state was changed")
 				}
 				completed := []byte(`{"type":"response.completed","response":{"id":"resp-state","model":"gpt-6-astra","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
 				if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
 					t.Error(errWrite)
 				}
 			}))
-			defer func() {
-				close(stopProbes)
-				server.Close()
-			}()
+			defer server.Close()
 			auth := &cliproxyauth.Auth{ID: "state-test", Provider: "codex", ProxyURL: "direct",
 				Attributes: map[string]string{"base_url": server.URL},
 				Metadata:   map[string]any{"access_token": "test-access", "account_id": "test-account", "plan_type": "business"},
 			}
-			cfg := &config.Config{Routing: config.RoutingConfig{CodexTurnStateEnabled: new(true), CodexAutoDegrade: new(true)}}
+			cfg := &config.Config{}
 			cfg.Codex.StreamBootstrapBuffering = mode == "buffered-stream"
-			keeper := helps.NewCodexTurnStateKeeper(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{auth} })
+			keeper := helps.NewCodexEgressManager(func() []*cliproxyauth.Auth { return []*cliproxyauth.Auth{auth} })
 			defer keeper.Close()
-			ready := make(chan struct{})
-			keeper.SetSchedulingUpdater(func(context.Context, *cliproxyauth.Auth, bool) error { close(ready); return nil })
-			keeper.Configure(cfg)
-			<-ready
+			if errConfigure := keeper.Configure(cfg); errConfigure != nil {
+				t.Fatal(errConfigure)
+			}
 			exec := NewCodexWebsocketsExecutor(cfg)
-			exec.turnStates = keeper
-			req := cliproxyexecutor.Request{Model: "gpt-6-astra", Payload: []byte(`{"model":"gpt-6-astra","input":[{"role":"user","content":"OK"}]}`)}
+			exec.egress = keeper
+			req := cliproxyexecutor.Request{Model: "gpt-6-astra", Payload: []byte(`{"model":"gpt-6-astra","input":[{"role":"user","content":"OK"}],"client_metadata":{"x-codex-turn-state":"gAAAAA-client-provided"}}`)}
 			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
 			for range 3 {
 				if mode == "execute" {
@@ -114,12 +101,9 @@ func TestCodexWebsocketHandshakePreservesValidTurnState(t *testing.T) {
 						}
 					}
 				}
-				if token, _ := keeper.Token(auth); token != goodState {
-					t.Fatal("handshake state invalidated a valid 332 before it was sent in response.create")
-				}
 			}
-			if probes.Load() != 1 {
-				t.Fatalf("normal account with valid 332 was collected %d times", probes.Load())
+			if probes.Load() != 0 {
+				t.Fatalf("unexpected state collection requests: %d", probes.Load())
 			}
 		})
 	}
@@ -586,6 +570,104 @@ func TestCodexWebsocketsExecuteStreamHandshakeErrorReturnsWithoutLockingSession(
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatalf("attempt %d timed out; execution session remained locked", i+1)
+		}
+	}
+}
+
+func TestCodexWebsocketSendRetryPreservesHandshakeStatus(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, status := range []int{http.StatusUnauthorized, http.StatusBadRequest, http.StatusBadGateway} {
+			t.Run(fmt.Sprintf("stream=%t/status=%d", stream, status), func(t *testing.T) {
+				var handshakes atomic.Int32
+				release := make(chan struct{})
+				upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if handshakes.Add(1) > 1 {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(status)
+						_, _ = w.Write([]byte(`{"error":{"message":"Retry handshake rejected."}}`))
+						return
+					}
+					conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+					if errUpgrade != nil {
+						t.Errorf("initial upgrade: %v", errUpgrade)
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					<-release
+				}))
+				defer func() {
+					close(release)
+					server.Close()
+				}()
+
+				wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/responses"
+				conn, respHS, errDial := websocket.DefaultDialer.DialContext(t.Context(), wsURL, nil)
+				closeHTTPResponseBody(respHS, "test: close initial handshake body")
+				if errDial != nil {
+					t.Fatalf("initial dial: %v", errDial)
+				}
+				closer := newWebsocketConnectionCloser(conn)
+				if errClose := closer.Close(); errClose != nil {
+					t.Fatalf("close stale connection: %v", errClose)
+				}
+				exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+				exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+				const sessionID = "send-retry-status"
+				defer exec.CloseExecutionSession(sessionID)
+				auth := &cliproxyauth.Auth{
+					ID: "send-retry-auth", Provider: "codex", ProxyURL: "direct",
+					Attributes: map[string]string{"api_key": "test", "base_url": server.URL},
+				}
+				// Keep a closed socket cached without starting a reader, so the next
+				// request deterministically reaches send failure before invalidation.
+				sess := &codexWebsocketSession{
+					sessionID: sessionID, conn: conn, connCloser: closer, readerConn: conn,
+					authID: auth.ID, wsURL: wsURL, egressFingerprint: helps.CodexEgressFingerprint(auth),
+				}
+				exec.store.sessions[sessionID] = sess
+				ctx := cliproxyexecutor.WithUpstreamAttemptTracker(t.Context())
+				req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`)}
+				opts := cliproxyexecutor.Options{
+					SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: stream,
+					Metadata: map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: sessionID},
+				}
+				var errExecute error
+				if stream {
+					var result *cliproxyexecutor.StreamResult
+					result, errExecute = exec.ExecuteStream(ctx, auth, req, opts)
+					if result != nil {
+						t.Fatal("rejected retry handshake unexpectedly returned a stream")
+					}
+				} else {
+					_, errExecute = exec.Execute(ctx, auth, req, opts)
+				}
+				if got := handshakes.Load(); got != 2 {
+					t.Fatalf("handshakes = %d, want initial connection plus one retry", got)
+				}
+				if !sess.reqMu.TryLock() {
+					t.Fatal("retry handshake failure left the session request lock held")
+				}
+				sess.reqMu.Unlock()
+				if active, _ := sess.activeForConn(conn); active != nil {
+					t.Fatal("retry handshake failure left the stale connection active")
+				}
+				if !cliproxyexecutor.UpstreamAttempted(ctx) {
+					t.Fatal("retry handshake was not marked as an upstream attempt")
+				}
+				if got := statusCodeFromTestError(t, errExecute); got != status {
+					t.Fatalf("status code = %d, want %d; err=%v", got, status, errExecute)
+				}
+				if !strings.Contains(errExecute.Error(), "Retry handshake rejected.") {
+					t.Fatalf("error lost retry handshake body: %v", errExecute)
+				}
+				if status == http.StatusUnauthorized {
+					assertCodexErrorCode(t, errExecute.Error(), "authentication_error", "auth_unavailable")
+					if clienterror.IsRequestFault(status, errExecute) {
+						t.Fatalf("authentication failure must not be request-scoped: %v", errExecute)
+					}
+				}
+			})
 		}
 	}
 }
@@ -1843,6 +1925,121 @@ func TestBuildCodexResponsesWebsocketURLRequiresHTTPURL(t *testing.T) {
 	}
 	if _, err := buildCodexResponsesWebsocketURL("https:///responses"); err == nil {
 		t.Fatalf("expected empty host error")
+	}
+}
+
+func TestParseCodexWebsocketErrorNormalizesAuthentication(t *testing.T) {
+	for _, statusField := range []string{`"status":401`, `"status_code":401`, `"status_code":"401"`} {
+		for _, layout := range []struct {
+			name string
+			body string
+		}{
+			{"error", `"error":{%s}`},
+			{"body error", `"body":{"error":{%s}}`},
+		} {
+			for _, failure := range []struct {
+				name   string
+				fields string
+			}{
+				{"status only", `"message":"Credential rejected."`},
+				{"authentication type", `"type":"authentication_error","message":"Credential rejected."`},
+				{"invalid API key", `"type":"invalid_request_error","code":"invalid_api_key","message":"Credential rejected."`},
+			} {
+				for _, modelLevelCooling := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/%s/%s/cooling=%t", statusField, layout.name, failure.name, modelLevelCooling), func(t *testing.T) {
+						payload := []byte(`{"type":"error",` + statusField + `,` + fmt.Sprintf(layout.body, failure.fields) + `,"headers":{"x-request-id":"auth-failure"}}`)
+						err, ok := parseCodexWebsocketErrorWithCooling(payload, modelLevelCooling)
+						if !ok || err == nil {
+							t.Fatal("expected websocket authentication error")
+						}
+						status := statusCodeFromTestError(t, err)
+						if status != http.StatusUnauthorized {
+							t.Errorf("status = %d, want 401; err=%v", status, err)
+						}
+						if clienterror.IsRequestFault(status, err) {
+							t.Errorf("authentication failure must not be request-scoped: %v", err)
+						}
+						assertCodexErrorCode(t, err.Error(), "authentication_error", "auth_unavailable")
+						if got := gjson.Get(err.Error(), "error.message").String(); got != "Credential rejected." {
+							t.Errorf("error message = %q, want upstream message", got)
+						}
+						withHeaders, ok := err.(interface{ Headers() http.Header })
+						if !ok || withHeaders.Headers().Get("X-Request-Id") != "auth-failure" {
+							t.Fatalf("headers = %#v, want authentication request ID", err)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestParseCodexWebsocketErrorPreservesNonAuthenticationFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		payload      string
+		wantStatus   int
+		wantType     string
+		wantCode     string
+		requestFault bool
+	}{
+		{
+			name:         "invalid parameter",
+			payload:      `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid input.","param":"input"}}`,
+			wantStatus:   http.StatusBadRequest,
+			wantType:     "invalid_request_error",
+			wantCode:     "invalid_value",
+			requestFault: true,
+		},
+		{
+			name:         "wrapped invalid parameter",
+			payload:      `{"type":"error","status_code":400,"body":{"error":{"type":"invalid_request_error","code":"invalid_value","message":"Invalid input.","param":"input"}}}`,
+			wantStatus:   http.StatusBadRequest,
+			wantType:     "invalid_request_error",
+			wantCode:     "invalid_value",
+			requestFault: true,
+		},
+		{
+			name:       "server failure",
+			payload:    `{"type":"error","status":503,"error":{"type":"server_error","code":"server_error","message":"Upstream unavailable."}}`,
+			wantStatus: http.StatusServiceUnavailable,
+			wantType:   "server_error",
+			wantCode:   "server_error",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err, ok := parseCodexWebsocketError([]byte(tc.payload))
+			if !ok || err == nil {
+				t.Fatal("expected websocket error")
+			}
+			status := statusCodeFromTestError(t, err)
+			if status != tc.wantStatus {
+				t.Errorf("status = %d, want %d", status, tc.wantStatus)
+			}
+			assertCodexErrorCode(t, err.Error(), tc.wantType, tc.wantCode)
+			if got := clienterror.IsRequestFault(status, err); got != tc.requestFault {
+				t.Errorf("request fault = %t, want %t; err=%v", got, tc.requestFault, err)
+			}
+			if tc.requestFault && gjson.Get(err.Error(), "error.param").String() != "input" {
+				t.Errorf("request parameter was not preserved: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseCodexWebsocketErrorIgnoresNonStatusEvents(t *testing.T) {
+	for _, payload := range []string{
+		``,
+		`unexpected EOF`,
+		`{"type":"response.completed","status":200}`,
+		`{"type":"error","error":{"type":"authentication_error","code":"invalid_api_key"}}`,
+		`{"type":"error","error":{"code":"websocket_connection_limit_reached"}}`,
+	} {
+		t.Run(payload, func(t *testing.T) {
+			if err, ok := parseCodexWebsocketError([]byte(payload)); ok || err != nil {
+				t.Fatalf("non-status event was handled as an HTTP error: %v", err)
+			}
+		})
 	}
 }
 

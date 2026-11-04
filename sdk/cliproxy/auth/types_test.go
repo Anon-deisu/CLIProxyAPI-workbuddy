@@ -230,6 +230,27 @@ func TestRecentRequestsSnapshotIncludesCounts(t *testing.T) {
 	}
 }
 
+func TestRecentRequestsSnapshotIncludesModelCounts(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).In(time.Local)
+	a := &Auth{}
+
+	a.recordRecentRequest(now, true, "gpt-5")
+	a.recordRecentRequest(now, false, "gpt-5")
+	a.recordRecentRequest(now, true, "claude-4")
+
+	got := a.RecentRequestsSnapshot(now)
+	newest := got[len(got)-1]
+	if len(newest.Models) != 2 {
+		t.Fatalf("model bucket count = %d, want 2", len(newest.Models))
+	}
+	if newest.Models[0].Model != "claude-4" || newest.Models[0].Success != 1 || newest.Models[0].Failed != 0 {
+		t.Fatalf("first model bucket = %+v, want claude-4 1/0", newest.Models[0])
+	}
+	if newest.Models[1].Model != "gpt-5" || newest.Models[1].Success != 1 || newest.Models[1].Failed != 1 {
+		t.Fatalf("second model bucket = %+v, want gpt-5 1/1", newest.Models[1])
+	}
+}
+
 func TestRecentRequestsSnapshotBucketAdvanceMovesCounts(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).In(time.Local)
 	next := now.Add(10 * time.Minute)

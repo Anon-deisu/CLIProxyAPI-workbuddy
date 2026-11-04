@@ -25,6 +25,7 @@ type oaiToResponsesState struct {
 	Created          int64
 	Started          bool
 	CompletedEmitted bool
+	RequestJSON      []byte
 	ReasoningID      string
 	ReasoningIndex   int
 	// aggregation buffers for response.output
@@ -51,6 +52,7 @@ type oaiToResponsesState struct {
 	// names of freeform ("custom") tools from the original request; calls to
 	// these are emitted as custom_tool_call items instead of function_call
 	CustomToolNames map[string]struct{}
+	ToolIndex       *responsesToolIdentityIndex
 	FinishReason    string
 	// usage aggregation
 	PromptTokens     int64
@@ -79,7 +81,7 @@ func incompleteByFinishReason(reason string) ([]byte, bool) {
 	}
 }
 
-func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte, nextSeq func() int) []byte {
+func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte, toolIndex *responsesToolIdentityIndex, nextSeq func() int) []byte {
 	eventType := "response.completed"
 	status := "completed"
 	incompleteDetails, isIncomplete := incompleteByFinishReason(st.FinishReason)
@@ -213,7 +215,7 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 				item, _ = sjson.SetBytes(item, "status", toolStatus)
 				item, _ = sjson.SetBytes(item, "input", unwrapCustomToolInput(args))
 				item, _ = sjson.SetBytes(item, "call_id", callID)
-				item = applyResponsesFunctionCallNamespaceFields(item, requestRawJSON, name, "")
+				item = applyResponsesFunctionCallNamespaceFieldsWithIndex(item, toolIndex, name, "")
 				outputItems = append(outputItems, completedOutputItem{index: st.FuncOutputIx[key], raw: item})
 				continue
 			}
@@ -222,7 +224,7 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 			item, _ = sjson.SetBytes(item, "status", toolStatus)
 			item, _ = sjson.SetBytes(item, "arguments", args)
 			item, _ = sjson.SetBytes(item, "call_id", callID)
-			item = applyResponsesFunctionCallNamespaceFields(item, requestRawJSON, name, "")
+			item = applyResponsesFunctionCallNamespaceFieldsWithIndex(item, toolIndex, name, "")
 			outputItems = append(outputItems, completedOutputItem{index: st.FuncOutputIx[key], raw: item})
 		}
 	}
@@ -255,6 +257,9 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &oaiToResponsesState{
+			// The request is invariant across chunks; validate it only once per stream.
+			RequestJSON:     pickRequestJSON(originalRequestRawJSON, requestRawJSON),
+			ToolIndex:       newResponsesToolIdentityIndex(gjson.ParseBytes(pickRequestJSON(originalRequestRawJSON, requestRawJSON))),
 			FuncArgsBuf:     make(map[string]*strings.Builder),
 			FuncNames:       make(map[string]string),
 			FuncCallIDs:     make(map[string]string),
@@ -282,7 +287,10 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 	if len(rawJSON) == 0 {
 		return [][]byte{}
 	}
-	requestForNamespace := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+	requestForNamespace := st.RequestJSON
+	if st.ToolIndex == nil {
+		st.ToolIndex = newResponsesToolIdentityIndex(gjson.ParseBytes(requestForNamespace))
+	}
 	isDone := bytes.Equal(rawJSON, []byte("[DONE]"))
 	if isDone && (!st.Started || st.CompletedEmitted) {
 		return [][]byte{}
@@ -341,13 +349,13 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			return
 		}
 		callID := st.FuncCallIDs[key]
-		name := canonicalResponsesToolName(requestForNamespace, st.FuncNames[key])
+		name := st.ToolIndex.canonical(st.FuncNames[key])
 		st.FuncNames[key] = name
 		if !force && (callID == "" || name == "") {
 			return
 		}
 		if name == "" {
-			if customToolName, ok := responsesSingleCustomToolName(requestForNamespace); ok {
+			if customToolName, ok := st.ToolIndex.singleCustomToolName(); ok {
 				name = customToolName
 				st.FuncNames[key] = customToolName
 			}
@@ -366,7 +374,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			o, _ = sjson.SetBytes(o, "output_index", outputIndex)
 			o, _ = sjson.SetBytes(o, "item.id", fmt.Sprintf("ctc_%s", callID))
 			o, _ = sjson.SetBytes(o, "item.call_id", callID)
-			o = applyResponsesFunctionCallNamespaceFields(o, requestForNamespace, name, "item")
+			o = applyResponsesFunctionCallNamespaceFieldsWithIndex(o, st.ToolIndex, name, "item")
 			out = append(out, emitRespEvent("response.output_item.added", o))
 		} else {
 			o := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`)
@@ -374,7 +382,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			o, _ = sjson.SetBytes(o, "output_index", outputIndex)
 			o, _ = sjson.SetBytes(o, "item.id", fmt.Sprintf("fc_%s", callID))
 			o, _ = sjson.SetBytes(o, "item.call_id", callID)
-			o = applyResponsesFunctionCallNamespaceFields(o, requestForNamespace, name, "item")
+			o = applyResponsesFunctionCallNamespaceFieldsWithIndex(o, st.ToolIndex, name, "item")
 			out = append(out, emitRespEvent("response.output_item.added", o))
 		}
 		st.FuncItemAdded[key] = true
@@ -421,7 +429,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.FuncItemCustom = make(map[string]bool)
 		st.FuncArgsDone = make(map[string]bool)
 		st.FuncItemDone = make(map[string]bool)
-		st.CustomToolNames = responsesCustomToolNames(requestForNamespace)
+		st.CustomToolNames = st.ToolIndex.custom
 		st.PromptTokens = 0
 		st.CachedTokens = 0
 		st.CompletionTokens = 0
@@ -599,7 +607,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 				itemDone, _ = sjson.SetBytes(itemDone, "item.status", toolStatus)
 				itemDone, _ = sjson.SetBytes(itemDone, "item.input", input)
 				itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-				itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForNamespace, st.FuncNames[key], "item")
+				itemDone = applyResponsesFunctionCallNamespaceFieldsWithIndex(itemDone, st.ToolIndex, st.FuncNames[key], "item")
 				out = append(out, emitRespEvent("response.output_item.done", itemDone))
 				st.FuncItemDone[key] = true
 				st.FuncArgsDone[key] = true
@@ -619,7 +627,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			itemDone, _ = sjson.SetBytes(itemDone, "item.status", toolStatus)
 			itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", args)
 			itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
-			itemDone = applyResponsesFunctionCallNamespaceFields(itemDone, requestForNamespace, st.FuncNames[key], "item")
+			itemDone = applyResponsesFunctionCallNamespaceFieldsWithIndex(itemDone, st.ToolIndex, st.FuncNames[key], "item")
 			out = append(out, emitRespEvent("response.output_item.done", itemDone))
 			st.FuncItemDone[key] = true
 			st.FuncArgsDone[key] = true
@@ -642,7 +650,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			return out
 		}
 		st.CompletedEmitted = true
-		out = append(out, buildResponsesCompletedEvent(st, requestForNamespace, nextSeq))
+		out = append(out, buildResponsesCompletedEvent(st, requestForNamespace, st.ToolIndex, nextSeq))
 		return out
 	}
 
@@ -780,6 +788,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	root := gjson.ParseBytes(rawJSON)
 	requestForNamespace := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
+	toolIndex := newResponsesToolIdentityIndex(gjson.ParseBytes(requestForNamespace))
 
 	finishReason := root.Get("choices.0.finish_reason").String()
 	incompleteDetails, isIncomplete := incompleteByFinishReason(finishReason)
@@ -931,7 +940,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 
 				// Function/tool calls
 				if tcs := msg.Get("tool_calls"); tcs.Exists() && tcs.IsArray() {
-					customToolNames := responsesCustomToolNames(requestForNamespace)
+					customToolNames := toolIndex.custom
 					tcs.ForEach(func(tcIndex, tc gjson.Result) bool {
 						callID := tc.Get("id").String()
 						if callID == "" {
@@ -939,7 +948,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 							// function_call item stays usable for Codex round-trips.
 							callID = fmt.Sprintf("call_%s_%d_%d", id, choice.Get("index").Int(), tcIndex.Int())
 						}
-						name := canonicalResponsesToolName(requestForNamespace, tc.Get("function.name").String())
+						name := toolIndex.canonical(tc.Get("function.name").String())
 						args := tc.Get("function.arguments").String()
 						toolStatus := "completed"
 						if isIncomplete {
@@ -951,7 +960,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 							item, _ = sjson.SetBytes(item, "status", toolStatus)
 							item, _ = sjson.SetBytes(item, "input", unwrapCustomToolInput(args))
 							item, _ = sjson.SetBytes(item, "call_id", callID)
-							item = applyResponsesFunctionCallNamespaceFields(item, requestForNamespace, name, "")
+							item = applyResponsesFunctionCallNamespaceFieldsWithIndex(item, toolIndex, name, "")
 							outputItems = append(outputItems, item)
 							return true
 						}
@@ -960,7 +969,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 						item, _ = sjson.SetBytes(item, "status", toolStatus)
 						item, _ = sjson.SetBytes(item, "arguments", args)
 						item, _ = sjson.SetBytes(item, "call_id", callID)
-						item = applyResponsesFunctionCallNamespaceFields(item, requestForNamespace, name, "")
+						item = applyResponsesFunctionCallNamespaceFieldsWithIndex(item, toolIndex, name, "")
 						outputItems = append(outputItems, item)
 						return true
 					})

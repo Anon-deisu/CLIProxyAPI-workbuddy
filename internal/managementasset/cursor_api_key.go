@@ -32,6 +32,15 @@ const cursorAPIKeyInlineScript = `
 
   var capturedManagementKey = '';
   var managementPath = '/v0/management/';
+  var managementBase = managementPath;
+
+  function observeManagementURL(url) {
+    var parsed = new URL(url, window.location.href);
+    var match = parsed.pathname.match(/\/v(?:0|8)\/management\//);
+    if (!match) return false;
+    managementBase = parsed.origin + parsed.pathname.slice(0, match.index) + managementPath;
+    return true;
+  }
 
   function captureAuthorization(value) {
     if (typeof value !== 'string') return;
@@ -42,7 +51,7 @@ const cursorAPIKeyInlineScript = `
   var nativeXHROpen = XMLHttpRequest.prototype.open;
   var nativeXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.open = function (method, url) {
-    this.__cpaCursorManagementRequest = String(url || '').indexOf(managementPath) !== -1;
+    this.__cpaCursorManagementRequest = observeManagementURL(String(url || ''));
     return nativeXHROpen.apply(this, arguments);
   };
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
@@ -55,7 +64,7 @@ const cursorAPIKeyInlineScript = `
   var nativeFetch = window.fetch;
   window.fetch = function (input, init) {
     var url = typeof input === 'string' ? input : (input && input.url) || '';
-    if (String(url).indexOf(managementPath) !== -1) {
+    if (observeManagementURL(String(url))) {
       var headers = new Headers((init && init.headers) || (input && input.headers) || {});
       captureAuthorization(headers.get('authorization') || '');
     }
@@ -105,7 +114,7 @@ const cursorAPIKeyInlineScript = `
       }
     };
     if (body !== undefined) options.body = JSON.stringify(body);
-    var response = await nativeFetch.call(window, path, options);
+    var response = await nativeFetch.call(window, managementBase + path.slice(managementPath.length), options);
     if (!response.ok) {
       throw new Error('http ' + response.status);
     }
@@ -247,10 +256,11 @@ func AddCursorAPIKeyInlineToManagementHTML(data []byte) ([]byte, error) {
 	return data, nil
 }
 
-const runtimeSchedulerInlineMarker = `id="cpa-runtime-scheduler-script"`
+const legacyRuntimeSchedulerInlineMarker = `id="cpa-runtime-scheduler-script"`
+const runtimeSchedulerInlineMarker = `id="cpa-runtime-scheduler-script-v2"`
 
 const runtimeSchedulerInlineScript = `
-<script id="cpa-runtime-scheduler-script">
+<script id="cpa-runtime-scheduler-script-v2">
 (function () {
   'use strict';
   if (window.__cpaRuntimeSchedulerLoaded) return;
@@ -264,6 +274,10 @@ const runtimeSchedulerInlineScript = `
   var authFilesGeneration = 0;
   var authFiles = new Map();
   var authFilesRefreshPending = false;
+  var accountTokenTooltip = null;
+  var accountTokenAnchor = null;
+  var accountTokenHideTimer = null;
+  var accountTokenSignature = '';
   var resetTurnStateView = function () {};
   var renderSchedulerAccounts = function () {};
   var accountStatePending = new Set();
@@ -280,12 +294,14 @@ const runtimeSchedulerInlineScript = `
     resetTurnStateView();
     renderQuotaCosts();
     renderAccountStateControls();
+    renderModelTokenTooltips();
   }
 
   function observeManagementRequest(method, url, headers) {
     var parsed = new URL(url, window.location.href);
-    var index = parsed.pathname.indexOf(managementPath);
-    if (index < 0) return null;
+    var match = parsed.pathname.match(/\/v(?:0|8)\/management\//);
+    if (!match) return null;
+    var index = match.index;
     var authorization = headers.get('authorization');
     if (!authorization && headers.has('x-management-key')) authorization = 'Bearer ' + headers.get('x-management-key');
     if (!authorization) return null;
@@ -295,7 +311,9 @@ const runtimeSchedulerInlineScript = `
       managementBase = base;
       managementAuthorization = authorization;
     }
-    var endpoint = parsed.pathname.slice(index + managementPath.length);
+    var endpoint = parsed.pathname.slice(index + match[0].length);
+    var endpointAliases = {'credentials':'auth-files', 'credentials/status':'auth-files/status', 'routing/cooldown/reset':'reset-quota', 'requests/api-call':'api-call'};
+    endpoint = endpointAliases[endpoint] || endpoint;
     var readsAuthFiles = method.toUpperCase() === 'GET' && endpoint === 'auth-files';
     if (readsAuthFiles) authFilesGeneration += 1;
     return { endpoint: endpoint, readsAuthFiles: readsAuthFiles, session: sessionGeneration, files: authFilesGeneration };
@@ -313,6 +331,7 @@ const runtimeSchedulerInlineScript = `
       authFiles = new Map(data.files.map(function (item) { return [item.name, item]; }));
       renderQuotaCosts();
       renderAccountStateControls();
+      renderModelTokenTooltips();
       renderSchedulerAccounts(data.files);
     }
     if (info.endpoint === 'reset-quota' || info.endpoint === 'auth-files/status' || (info.endpoint === 'api-call' && document.querySelector('[class*="QuotaPage-module__page"]'))) {
@@ -336,7 +355,12 @@ const runtimeSchedulerInlineScript = `
     var options = { method: method, headers: { 'Content-Type': 'application/json', 'Authorization': managementAuthorization } };
     if (body !== undefined) options.body = JSON.stringify(body);
     return window.fetch(managementBase + path, options).then(function (response) {
-      if (!response.ok) return response.json().then(function (data) { throw new Error(data.error || ('http ' + response.status)); });
+      if (!response.ok) return response.json().then(function (data) {
+        var error = new Error(data.error || ('http ' + response.status));
+        error.applied = data.applied === true;
+        error.runtimeError = data.runtime_error === true;
+        throw error;
+      });
       return response;
     });
   }
@@ -393,6 +417,7 @@ const runtimeSchedulerInlineScript = `
   };
   window.addEventListener('unauthorized', clearManagementSession);
   window.addEventListener('hashchange', function () {
+    hideAccountTokenTooltip();
     if (/^#\/login(?:[/?]|$)/.test(window.location.hash)) clearManagementSession();
   });
 
@@ -454,6 +479,7 @@ const runtimeSchedulerInlineScript = `
 
   function updateAccountStateControl(group, item) {
     group.account = item;
+    group.setAttribute('data-cpa-auth-state', item.name);
     var state = accountSchedulingState(item);
     group.querySelectorAll('button').forEach(function (button) {
       button.setAttribute('aria-pressed', String(button.value === state));
@@ -461,17 +487,40 @@ const runtimeSchedulerInlineScript = `
     });
   }
 
+  function findAuthFileForCard(card, nameNode) {
+    var identity = card.getAttribute('data-cpa-auth-name');
+    var candidates = [identity];
+    if (nameNode) candidates.push(nameNode.getAttribute('title'), (nameNode.textContent || '').trim());
+    candidates = candidates.filter(function (value, index, values) { return value && values.indexOf(value) === index; });
+    for (var i = 0; i < candidates.length; i += 1) {
+      var exact = authFiles.get(candidates[i]);
+      if (exact) return exact;
+    }
+    for (var j = 0; j < candidates.length; j += 1) {
+      var aliasMatches = [];
+      authFiles.forEach(function (item) {
+        if (!item) return;
+        var aliases = [item.id, item.name, item.label, item.email, item.nickname];
+        if (aliases.indexOf(candidates[j]) >= 0) aliasMatches.push(item);
+      });
+      if (aliasMatches.length === 1) return aliasMatches[0];
+    }
+    return null;
+  }
+
   function renderAccountStateControls() {
     document.querySelectorAll('[class*="AuthFileCard-module__card___"]').forEach(function (card) {
       var nameNode = card.querySelector('[class*="AuthFileCard-module__fileName"]');
       var nativeToggle = card.querySelector('[class*="AuthFileCard-module__toggleWrap"]');
-      if (!nameNode || !nativeToggle) return;
-      var item = authFiles.get(nameNode.getAttribute('title') || nameNode.textContent.trim());
+      if (!nativeToggle) return;
+      var item = findAuthFileForCard(card, nameNode);
       var control = card.querySelector('[data-cpa-auth-state]');
       if (!item || item.runtime_only) {
         if (control) control.remove();
         nativeToggle.classList.remove('cpa-native-status-hidden');
         card.classList.remove('cpa-account-managed');
+        card.removeAttribute('data-cpa-managed-account');
+        card.removeAttribute('data-cpa-scheduling-state');
         return;
       }
       if (!control) {
@@ -480,6 +529,7 @@ const runtimeSchedulerInlineScript = `
       }
       nativeToggle.classList.add('cpa-native-status-hidden');
       card.classList.add('cpa-account-managed');
+      card.setAttribute('data-cpa-managed-account', 'true');
       card.setAttribute('data-cpa-scheduling-state', accountSchedulingState(item));
       updateAccountStateControl(control, item);
     });
@@ -508,6 +558,131 @@ const runtimeSchedulerInlineScript = `
     }
   }
 
+  function renderModelTokenTooltips() {
+    var cards = document.querySelectorAll('article[class*="AuthFileCard-module__card___"]');
+    for (var i = 0; i < cards.length; i += 1) {
+      var card = cards[i];
+      var counts = card.querySelector('[class*="AuthFileCard-module__healthCounts"]');
+      if (!counts) continue;
+      counts.__cpaTokenFile = card.getAttribute('data-cpa-auth-name');
+      counts.querySelectorAll('span[title]').forEach(function (span) { span.removeAttribute('title'); });
+      if (counts.__cpaTokenBound) continue;
+      counts.__cpaTokenBound = true;
+      counts.tabIndex = 0;
+      counts.setAttribute('aria-describedby', 'cpa-account-token-tooltip');
+      counts.addEventListener('pointerenter', function (event) {
+        if (event.pointerType === 'mouse') showAccountTokenTooltip(event.currentTarget);
+      });
+      counts.addEventListener('pointerleave', scheduleAccountTokenHide);
+      counts.addEventListener('focus', function (event) { showAccountTokenTooltip(event.currentTarget); });
+      counts.addEventListener('blur', scheduleAccountTokenHide);
+      counts.addEventListener('pointerdown', function (event) {
+        if (event.pointerType !== 'touch') return;
+        if (accountTokenAnchor === event.currentTarget) hideAccountTokenTooltip();
+        else showAccountTokenTooltip(event.currentTarget);
+      });
+    }
+    if (accountTokenAnchor) showAccountTokenTooltip(accountTokenAnchor);
+  }
+
+  function scheduleAccountTokenHide() {
+    clearTimeout(accountTokenHideTimer);
+    accountTokenHideTimer = setTimeout(hideAccountTokenTooltip, 150);
+  }
+
+  function hideAccountTokenTooltip() {
+    clearTimeout(accountTokenHideTimer);
+    if (accountTokenTooltip) accountTokenTooltip.hidden = true;
+    accountTokenAnchor = null;
+  }
+
+  function showAccountTokenTooltip(anchor) {
+    var item = authFiles.get(anchor.__cpaTokenFile);
+    if (!anchor.isConnected || !item) {
+      hideAccountTokenTooltip();
+      return;
+    }
+    clearTimeout(accountTokenHideTimer);
+    accountTokenAnchor = anchor;
+    if (!accountTokenTooltip) {
+      accountTokenTooltip = make('div', 'cpa-account-token-tooltip');
+      accountTokenTooltip.id = 'cpa-account-token-tooltip';
+      accountTokenTooltip.setAttribute('data-cpa-model-token-tooltip', 'true');
+      accountTokenTooltip.setAttribute('role', 'tooltip');
+      accountTokenTooltip.setAttribute('aria-label', '账号模型 Token 统计');
+      accountTokenTooltip.tabIndex = 0;
+      accountTokenTooltip.addEventListener('pointerenter', function () { clearTimeout(accountTokenHideTimer); });
+      accountTokenTooltip.addEventListener('pointerleave', scheduleAccountTokenHide);
+      document.body.appendChild(accountTokenTooltip);
+    }
+     var tokenUsage = (item.model_token_usage || []).slice().sort(function (a, b) {
+       var difference = (Number(b.input_tokens) || 0) - (Number(a.input_tokens) || 0);
+       return difference || String(a.model || '').localeCompare(String(b.model || ''));
+     });
+    var signature = item.name + JSON.stringify(tokenUsage);
+    if (accountTokenSignature !== signature) {
+      accountTokenSignature = signature;
+      accountTokenTooltip.textContent = '';
+      accountTokenTooltip.appendChild(make('div', 'cpa-account-token-title', '模型 Token 统计'));
+      if (!tokenUsage.length) {
+        accountTokenTooltip.appendChild(make('div', 'cpa-account-token-empty', '暂无模型 token 统计'));
+      } else {
+        var table = make('table', 'cpa-account-token-table');
+        var head = table.createTHead().insertRow();
+        ['模型 ID', '总输入', '缓存输入', '缓存率', '输出'].forEach(function (label) {
+          var cell = make('th', '', label);
+          cell.scope = 'col';
+          head.appendChild(cell);
+        });
+        var body = table.createTBody();
+        var formatter = new Intl.NumberFormat();
+        tokenUsage.forEach(function (model) {
+          var row = body.insertRow();
+          var modelCell = row.insertCell();
+          modelCell.className = 'cpa-account-token-model';
+          modelCell.textContent = model.model;
+          row.insertCell().textContent = formatter.format(model.input_tokens);
+          row.insertCell().textContent = formatter.format(model.cached_input_tokens);
+          row.insertCell().textContent = model.input_tokens > 0 ? (model.cached_input_tokens * 100 / model.input_tokens).toFixed(1) + '%' : '--';
+          row.insertCell().textContent = formatter.format(model.output_tokens);
+        });
+        accountTokenTooltip.appendChild(table);
+      }
+    }
+    accountTokenTooltip.hidden = false;
+    positionAccountTokenTooltips();
+  }
+
+  function positionModelTooltips() {
+    document.querySelectorAll(modelTooltipSelector).forEach(function (tooltip) {
+      tooltip.style.translate = 'none';
+      var margin = 8;
+      var clip = tooltip.closest('.page-transition').getBoundingClientRect();
+      var left = Math.max(margin, clip.left + margin);
+      var right = Math.min(window.innerWidth - margin, clip.right - margin);
+      tooltip.style.setProperty('--cpa-model-tooltip-width', (right - left) + 'px');
+      var bounds = tooltip.getBoundingClientRect();
+      var shift = Math.max(left - bounds.left, Math.min(0, right - bounds.right));
+      tooltip.style.translate = shift + 'px 0';
+    });
+  }
+
+  function positionAccountTokenTooltips() {
+    if (!accountTokenTooltip || accountTokenTooltip.hidden || !accountTokenAnchor) return;
+    if (!accountTokenAnchor.isConnected) { hideAccountTokenTooltip(); return; }
+    var clipElement = accountTokenAnchor.closest('.page-transition');
+    var clip = clipElement ? clipElement.getBoundingClientRect() : {left:0,right:window.innerWidth};
+    var left = Math.max(8, clip.left + 8);
+    var right = Math.min(window.innerWidth - 8, clip.right - 8);
+    accountTokenTooltip.style.maxWidth = Math.max(0, right-left) + 'px';
+    var anchor = accountTokenAnchor.getBoundingClientRect();
+    var box = accountTokenTooltip.getBoundingClientRect();
+    accountTokenTooltip.style.left = Math.max(left, Math.min(anchor.right-box.width, right-box.width)) + 'px';
+    var top = anchor.top-box.height-8;
+    if (top < 8) top = anchor.bottom+8;
+    accountTokenTooltip.style.top = Math.max(8, Math.min(top, window.innerHeight-box.height-8)) + 'px';
+  }
+
   function mount() {
     if (document.getElementById('cpa-runtime-scheduler-panel')) return;
     var toggle = make('button', 'cpa-runtime-scheduler-toggle', '账号调度');
@@ -516,9 +691,14 @@ const runtimeSchedulerInlineScript = `
     panel.id = 'cpa-runtime-scheduler-panel';
     panel.hidden = true;
     var title = make('div', 'cpa-runtime-scheduler-title', '账号调度设置');
-    var hint = make('div', 'cpa-runtime-scheduler-hint', '全局设置与端口仅当前进程生效；账号状态会保存');
+    var hint = make('div', 'cpa-runtime-scheduler-hint', '账号状态会保存；调度配置可选持久化');
     var form = make('div', 'cpa-runtime-scheduler-form');
-    var strategyLabel = make('div', 'cpa-runtime-scheduler-default', '调度方式：Codex2API 默认（round-robin）');
+    var persistLabel = make('label', 'cpa-runtime-scheduler-check');
+    var persistSettings = document.createElement('input');
+    persistSettings.type = 'checkbox';
+    persistLabel.appendChild(persistSettings);
+    persistLabel.appendChild(document.createTextNode('写入配置文件'));
+    var strategyLabel = make('div', 'cpa-runtime-scheduler-default', '调度方式：Codex2API 默认（额度加权均衡）');
     var degradedPortLabel = make('label', 'cpa-runtime-scheduler-number');
     degradedPortLabel.appendChild(document.createTextNode('降级账号 API 端口'));
     var degradedPort = document.createElement('input');
@@ -528,6 +708,15 @@ const runtimeSchedulerInlineScript = `
     degradedPort.step = '1';
     degradedPort.title = '0 表示关闭；与主端口共用 API Key';
     degradedPortLabel.appendChild(degradedPort);
+    var exoFreePortLabel = make('label', 'cpa-runtime-scheduler-number');
+    exoFreePortLabel.appendChild(document.createTextNode('OpenCode Free API 端口'));
+    var exoFreePort = document.createElement('input');
+    exoFreePort.type = 'number';
+    exoFreePort.min = '0';
+    exoFreePort.max = '65535';
+    exoFreePort.step = '1';
+    exoFreePort.title = '0 表示关闭；OpenCode 免费模型，共用 API Key，支持流式 Chat Completions 和 Responses';
+    exoFreePortLabel.appendChild(exoFreePort);
     var c2aRetryCountLabel = make('label', 'cpa-runtime-scheduler-number');
     c2aRetryCountLabel.appendChild(document.createTextNode('C2A 最大重试次数'));
     var c2aRetryCount = document.createElement('input');
@@ -585,139 +774,251 @@ const runtimeSchedulerInlineScript = `
     fingerprintConvergence.title = '仅 Codex OAuth/SetupToken 生效，每个账号固定使用独立身份';
     fingerprintLabel.appendChild(fingerprintConvergence);
     fingerprintLabel.appendChild(document.createTextNode('Codex 账号指纹收敛'));
-    var turnStateLabel = make('label', 'cpa-runtime-scheduler-check');
-    var turnStateEnabled = document.createElement('input');
-    turnStateEnabled.type = 'checkbox';
-    turnStateLabel.appendChild(turnStateEnabled);
-    turnStateLabel.appendChild(document.createTextNode('Codex 292/332 state 自动续期'));
-    var autoDegradeLabel = make('label', 'cpa-runtime-scheduler-check');
-    var autoDegradeEnabled = document.createElement('input');
-    autoDegradeEnabled.type = 'checkbox';
-    autoDegradeEnabled.title = '随 state 采集结果自动切换正常或降级档位，不改变停用账号';
-    autoDegradeEnabled.disabled = true;
-    autoDegradeLabel.appendChild(autoDegradeEnabled);
-    autoDegradeLabel.appendChild(document.createTextNode('Codex 自动降级'));
-    turnStateEnabled.addEventListener('change', function () { autoDegradeEnabled.disabled = !turnStateEnabled.checked; });
-    var cliproxyLabel = make('label', 'cpa-runtime-scheduler-check');
-    var cliproxyEnabled = document.createElement('input');
-    cliproxyEnabled.type = 'checkbox';
-    cliproxyLabel.appendChild(cliproxyEnabled);
-    cliproxyLabel.appendChild(document.createTextNode('Cliproxy 动态代理采集 state'));
-    var cliproxyFields = make('div', 'cpa-runtime-scheduler-proxy-fields');
-    var cliproxyGatewayLabel = make('label', 'cpa-runtime-scheduler-text', '代理网关（默认 SOCKS5）');
-    var cliproxyGateway = document.createElement('input');
-    cliproxyGateway.id = 'cpa-runtime-scheduler-cliproxy-gateway';
-    cliproxyGateway.type = 'text';
-    cliproxyGateway.placeholder = 'us.arxlabs.io:3010';
-    cliproxyGateway.autocomplete = 'off';
-    cliproxyGatewayLabel.appendChild(cliproxyGateway);
-    var cliproxyUsernameLabel = make('label', 'cpa-runtime-scheduler-text', '动态代理用户名');
-    var cliproxyUsername = document.createElement('input');
-    cliproxyUsername.id = 'cpa-runtime-scheduler-cliproxy-username';
-    cliproxyUsername.type = 'text';
-    cliproxyUsername.placeholder = 'username-region-US';
-    cliproxyUsername.autocomplete = 'off';
-    cliproxyUsernameLabel.appendChild(cliproxyUsername);
-    var cliproxyPasswordLabel = make('label', 'cpa-runtime-scheduler-text', '代理密码');
-    var cliproxyPassword = document.createElement('input');
-    cliproxyPassword.id = 'cpa-runtime-scheduler-cliproxy-password';
-    cliproxyPassword.type = 'password';
-    cliproxyPassword.autocomplete = 'new-password';
-    cliproxyPasswordLabel.appendChild(cliproxyPassword);
-    cliproxyFields.appendChild(cliproxyGatewayLabel);
-    cliproxyFields.appendChild(cliproxyUsernameLabel);
-    cliproxyFields.appendChild(cliproxyPasswordLabel);
-    var cliproxyPasswordConfigured = false;
-    function updateCliproxyInputs() {
-      cliproxyFields.hidden = !cliproxyEnabled.checked;
-      [cliproxyGateway, cliproxyUsername, cliproxyPassword].forEach(function (input) { input.disabled = !cliproxyEnabled.checked; });
-      cliproxyGateway.required = cliproxyEnabled.checked;
-      cliproxyUsername.required = cliproxyEnabled.checked;
-      cliproxyPassword.required = cliproxyEnabled.checked && !cliproxyPasswordConfigured;
-      cliproxyPassword.placeholder = cliproxyPasswordConfigured ? '已设置，留空保留' : '代理密码';
+    var workBuddyFingerprintLabel = make('label', 'cpa-runtime-scheduler-check');
+    var workBuddyFingerprintConvergence = document.createElement('input');
+    workBuddyFingerprintConvergence.type = 'checkbox';
+    workBuddyFingerprintConvergence.title = 'WorkBuddy 国内站与国际站按账号固定身份，刷新 token 后保持一致';
+    workBuddyFingerprintLabel.appendChild(workBuddyFingerprintConvergence);
+    workBuddyFingerprintLabel.appendChild(document.createTextNode('WorkBuddy 账号指纹收敛'));
+    var staticISPLabel = make('label', 'cpa-runtime-scheduler-check');
+    var staticISPEnabled = document.createElement('input');
+    staticISPEnabled.type = 'checkbox';
+    staticISPEnabled.id = 'cpa-runtime-scheduler-static-isp-enabled';
+    staticISPLabel.appendChild(staticISPEnabled);
+    staticISPLabel.appendChild(document.createTextNode('Cliproxy 静态 ISP 固定出口'));
+    var staticISPFields = make('div', 'cpa-runtime-scheduler-proxy-fields');
+    var staticISPList = make('div', 'cpa-static-isp-list');
+    var staticISPRows = [];
+    var addStaticISP = make('button', 'cpa-static-isp-add', '添加 ISP 节点');
+    addStaticISP.type = 'button';
+    addStaticISP.id = 'cpa-static-isp-add';
+    staticISPFields.appendChild(staticISPList);
+    staticISPFields.appendChild(addStaticISP);
+    function updateStaticISPInputs() {
+      staticISPFields.hidden = !staticISPEnabled.checked && staticISPRows.length === 0;
     }
-    cliproxyEnabled.addEventListener('change', updateCliproxyInputs);
-    updateCliproxyInputs();
-    var turnStateData = null;
-    var turnStateLoadedAt = 0;
-    var turnStatePending = false;
-    var turnStateViewError = '';
+    function addStaticISPRow(node) {
+      var row = make('div', 'cpa-static-isp-node');
+      var fields = {};
+      var configured = !!node['password-configured'];
+      [['id', '节点 ID', 'text'], ['scheme', '协议', 'select'], ['host', 'IP / 主机名', 'text'], ['port', '端口', 'number'], ['username', '用户名', 'text'], ['password', '密码', 'password']].forEach(function (spec) {
+        var label = make('label', 'cpa-runtime-scheduler-text', spec[1]);
+        var input = document.createElement(spec[2] === 'select' ? 'select' : 'input');
+        input.setAttribute('data-isp-field', spec[0]);
+        if (spec[2] === 'select') {
+          ['socks5', 'socks5h', 'http', 'https'].forEach(function (scheme) {
+            var option = make('option', '', scheme.toUpperCase());
+            option.value = scheme;
+            input.appendChild(option);
+          });
+          input.value = node.scheme || 'socks5';
+        } else {
+          input.type = spec[2];
+          input.autocomplete = spec[2] === 'password' ? 'new-password' : 'off';
+          input.value = spec[0] === 'password' ? '' : (node[spec[0]] || '');
+          input.required = spec[0] !== 'password' || !configured;
+          if (spec[0] === 'password') input.placeholder = configured ? '已设置，留空保留' : '代理密码';
+          if (spec[0] === 'id') input.readOnly = configured;
+          if (spec[0] === 'port') { input.min = '1'; input.max = '65535'; input.step = '1'; }
+        }
+        fields[spec[0]] = input;
+        label.appendChild(input);
+        row.appendChild(label);
+      });
+      var remove = make('button', 'cpa-static-isp-remove', '×');
+      remove.type = 'button';
+      remove.title = '移除 ISP 节点';
+      remove.setAttribute('aria-label', '移除 ISP 节点');
+      row.appendChild(remove);
+      var view = {element:row, fields:fields};
+      staticISPRows.push(view);
+      staticISPList.appendChild(row);
+      remove.addEventListener('click', function () {
+        fields.password.value = '';
+        staticISPRows = staticISPRows.filter(function (item) { return item !== view; });
+        row.remove();
+        updateStaticISPInputs();
+      });
+      updateStaticISPInputs();
+      return view;
+    }
+    function loadStaticISPNodes(nodes) {
+      staticISPRows.forEach(function (row) { row.fields.password.value = ''; });
+      staticISPRows = [];
+      staticISPList.textContent = '';
+      nodes.forEach(addStaticISPRow);
+      updateStaticISPInputs();
+    }
+    function clearSubmittedISPPasswords() {
+      staticISPRows.forEach(function (row) {
+        if (row.fields.password.value !== '') {
+          row.fields.password.value = '';
+          row.fields.password.required = false;
+          row.fields.password.placeholder = '已设置，留空保留';
+          row.fields.id.readOnly = true;
+        }
+      });
+    }
+    addStaticISP.addEventListener('click', function () {
+      var index = 1;
+      while (staticISPRows.some(function (row) { return row.fields.id.value === 'isp-' + index; })) index++;
+      addStaticISPRow({id:'isp-' + index}).fields.host.focus();
+    });
+    staticISPEnabled.addEventListener('change', updateStaticISPInputs);
+    updateStaticISPInputs();
+    var fakeModelsSection = make('details', 'cpa-runtime-scheduler-section');
+    fakeModelsSection.id = 'cpa-fake-models-section';
+    fakeModelsSection.appendChild(make('summary', 'cpa-runtime-scheduler-section-title', '假模型'));
+    var fakeModelsContent = make('div', 'cpa-runtime-scheduler-section-content');
+    var fakeModelsList = make('div', 'cpa-fake-model-list');
+    var fakeModelRows = [];
+    var addFakeModel = make('button', 'cpa-static-isp-add', '添加假模型');
+    addFakeModel.type = 'button';
+    addFakeModel.id = 'cpa-fake-model-add';
+    function addFakeModelRow(model) {
+      var row = make('div', 'cpa-fake-model-row');
+      var details = document.createElement('details');
+      details.className = 'cpa-fake-model-details';
+      var summary = document.createElement('summary');
+      summary.className = 'cpa-fake-model-summary';
+      summary.textContent = model.name || '未命名假模型';
+      details.appendChild(summary);
+      var editor = make('div', 'cpa-fake-model-editor');
+      details.appendChild(editor);
+      var fields = {};
+      var responseRows = [];
+      var responseList = make('div', 'cpa-fake-response-list');
+      var responses = Array.isArray(model.responses) ? model.responses.slice() : (model.content ? [model.content] : ['']);
+      function syncSummary() { summary.textContent = fields.name && fields.name.value.trim() ? fields.name.value.trim() : '未命名假模型'; }
+      function addFakeResponse(value) {
+        var responseRow = make('div', 'cpa-fake-response-row');
+        var input = document.createElement('textarea');
+        input.setAttribute('data-fake-response', 'true');
+        input.value = value == null ? '' : String(value);
+        input.required = true;
+        input.setAttribute('aria-label', '固定回复');
+        var removeResponse = make('button', 'cpa-static-isp-remove', '×');
+        removeResponse.type = 'button';
+        removeResponse.title = '移除固定回复';
+        removeResponse.setAttribute('aria-label', '移除固定回复');
+        responseRow.appendChild(input);
+        responseRow.appendChild(removeResponse);
+        var view = {element: responseRow, input: input};
+        responseRows.push(view);
+        responseList.appendChild(responseRow);
+        removeResponse.addEventListener('click', function () {
+          responseRows.splice(responseRows.indexOf(view), 1);
+          responseRow.remove();
+        });
+        return input;
+      }
+      [['name', '模型名', 'text'], ['input-tokens', '输入 token', 'number'], ['output-tokens', '输出 token', 'number'], ['cache-read-tokens', '缓存读 token', 'number'], ['cache-write-tokens', '缓存写 token', 'number'], ['chars-per-second', '每秒输出字符数', 'number']].forEach(function (spec) {
+        var label = make('label', 'cpa-runtime-scheduler-text', spec[1]);
+        var input = document.createElement('input');
+        input.setAttribute('data-fake-field', spec[0]);
+        input.type = spec[2];
+        if (spec[2] === 'number') { input.min = '0'; input.max = String(Number.MAX_SAFE_INTEGER); input.step = '1'; }
+        input.value = model[spec[0]] == null ? (spec[2] === 'number' ? '0' : '') : String(model[spec[0]]);
+        input.required = true;
+        if (spec[0] === 'chars-per-second') {
+          input.required = false;
+          input.min = '1';
+          input.value = model[spec[0]] ? String(model[spec[0]]) : '';
+          input.placeholder = '不限速';
+          label.style.gridColumn = '1 / -1';
+        }
+        fields[spec[0]] = input;
+        label.appendChild(input);
+        editor.appendChild(label);
+      });
+      fields.name.addEventListener('input', syncSummary);
+      var responseTitle = make('div', 'cpa-runtime-scheduler-text', '固定回复（随机选择）');
+      editor.appendChild(responseTitle);
+      editor.appendChild(responseList);
+      var addResponse = make('button', 'cpa-static-isp-add', '添加固定回复');
+      addResponse.type = 'button';
+      addResponse.addEventListener('click', function () { addFakeResponse('').focus(); });
+      editor.appendChild(addResponse);
+      responses.forEach(addFakeResponse);
+      details.open = !responses.some(function (value) { return String(value || '').trim() !== ''; });
+      var remove = make('button', 'cpa-static-isp-remove', '×');
+      remove.type = 'button';
+      remove.title = '移除假模型';
+      remove.setAttribute('aria-label', '移除假模型');
+      row.appendChild(details);
+      row.appendChild(remove);
+      var view = {element:row, fields:fields, responseRows:responseRows, details:details};
+      fakeModelRows.push(view);
+      fakeModelsList.appendChild(row);
+      remove.addEventListener('click', function () {
+        fakeModelRows = fakeModelRows.filter(function (item) { return item !== view; });
+        row.remove();
+      });
+      return view;
+    }
+    function loadFakeModels(models) {
+      fakeModelRows = [];
+      fakeModelsList.textContent = '';
+      models.forEach(addFakeModelRow);
+    }
+    addFakeModel.addEventListener('click', function () { fakeModelsSection.open = true; addFakeModelRow({}).fields.name.focus(); });
+    var ispStatusData = null;
+    var ispStatusPending = false;
+    var ispStatusError = '';
     var accountStatusNodes = new Map();
     resetTurnStateView = function () {
-      turnStateData = null;
-      turnStatePending = false;
-      turnStateViewError = '';
-      turnStateEnabled.checked = false;
-      autoDegradeEnabled.checked = false;
-      autoDegradeEnabled.disabled = true;
-      cliproxyEnabled.checked = false;
-      cliproxyGateway.value = '';
-      cliproxyUsername.value = '';
-      cliproxyPassword.value = '';
-      cliproxyPasswordConfigured = false;
-      updateCliproxyInputs();
+      persistSettings.checked = false;
+      ispStatusData = null;
+      ispStatusPending = false;
+      ispStatusError = '';
+      staticISPEnabled.checked = false;
+      loadStaticISPNodes([]);
+      loadFakeModels([]);
+      fakeModelsSection.open = false;
+      cacheRewriteSection.open = false;
       accountStatusNodes.clear();
       statusList.textContent = '未连接管理接口';
     };
-    function renderTurnStates() {
-      var states = new Map(turnStateData ? turnStateData.accounts.map(function (item) { return [item.auth_id, item]; }) : []);
-      var elapsed = Math.floor((performance.now() - turnStateLoadedAt) / 1000);
+    function renderISPBindings() {
+      var ispBindings = new Map(ispStatusData ? (ispStatusData.static_isp_bindings || []).map(function (item) { return [item.auth_id, item.node_id]; }) : []);
       accountStatusNodes.forEach(function (view, authID) {
-        var item = states.get(authID);
-        var text = '等待采集';
-        var error = '';
-        if (view.account.disabled) {
-          text = '采集已暂停';
-        } else if (turnStateViewError) {
-          text = turnStateViewError;
-        } else if (turnStateData && !turnStateData.enabled) {
-          text = 'state 采集未开启';
-        } else if (item) {
-          var remaining = Math.max(0, item.remaining_seconds - elapsed);
-          text = item.refreshing ? '正在采集...' : (item.last_error ? '采集失败 · 等待重试' : '等待采集');
-          if (remaining > 0) {
-            var minutes = Math.floor(remaining / 60);
-            var seconds = String(remaining % 60).padStart(2, '0');
-            text = item.token_length + ' 剩余（估算）：' + minutes + ':' + seconds;
-            if (item.refreshing) text += ' · 续期中';
-          } else if (item.status === 'active') {
-            text = item.refreshing ? '已到期 · 续期中' : '已到期 · 等待续期';
-          }
-          if (item.observed_length && item.observed_length !== item.token_length) text += ' · 最近采集：' + item.observed_length;
-          error = item.last_error || '';
-        }
+        var text = ispBindings.has(authID) ? 'ISP: ' + ispBindings.get(authID) : '';
+        var error = ispStatusError || (ispStatusData && ispStatusData.static_isp_error) || '';
         if (view.state.textContent !== text) view.state.textContent = text;
         if (view.error.textContent !== error) view.error.textContent = error;
       });
     }
-    function loadTurnStates() {
-      if (turnStatePending || !managementReady) return;
-      turnStatePending = true;
+    function loadISPBindings() {
+      if (ispStatusPending || !managementReady) return;
+      ispStatusPending = true;
       var generation = sessionGeneration;
-      request('GET', 'routing/codex-turn-state').then(function (response) {
+      request('GET', 'routing/codex-static-isp').then(function (response) {
         return response.json();
       }).then(function (data) {
         if (generation !== sessionGeneration) return;
-        turnStateData = data;
-        turnStateViewError = '';
-        turnStateLoadedAt = performance.now();
-        renderTurnStates();
+        ispStatusData = data;
+        ispStatusError = '';
+        renderISPBindings();
         return loadAuthStatus();
       }).catch(function () {
         if (generation !== sessionGeneration) return;
-        turnStateData = null;
-        turnStateViewError = '读取 state 状态失败';
-        renderTurnStates();
+        ispStatusData = null;
+        ispStatusError = '读取 ISP 状态失败';
+        renderISPBindings();
         return loadAuthStatus();
       }).finally(function () {
-        if (generation === sessionGeneration) turnStatePending = false;
+        if (generation === sessionGeneration) ispStatusPending = false;
       });
     }
+    var cacheRewriteSection = make('details', 'cpa-runtime-scheduler-section');
+    cacheRewriteSection.id = 'cpa-cache-rewrite-section';
+    cacheRewriteSection.appendChild(make('summary', 'cpa-runtime-scheduler-section-title', '自定义复写 token 数'));
+    var cacheRewriteContent = make('div', 'cpa-runtime-scheduler-section-content');
     var cacheRewriteLabel = make('label', 'cpa-runtime-scheduler-check');
     var cacheRewrite = document.createElement('input');
     cacheRewrite.type = 'checkbox';
     cacheRewriteLabel.appendChild(cacheRewrite);
-    cacheRewriteLabel.appendChild(document.createTextNode('自定义复写 token 数'));
+    cacheRewriteLabel.appendChild(document.createTextNode('启用复写'));
     var cacheMinLabel = make('label', 'cpa-runtime-scheduler-number');
     cacheMinLabel.appendChild(document.createTextNode('缓存比例 / 下限 (%)'));
     var cacheMin = document.createElement('input');
@@ -760,7 +1061,9 @@ const runtimeSchedulerInlineScript = `
     save.disabled = true;
     var status = make('span', 'cpa-runtime-scheduler-status');
     form.appendChild(strategyLabel);
+    form.appendChild(persistLabel);
     form.appendChild(degradedPortLabel);
+    form.appendChild(exoFreePortLabel);
     form.appendChild(c2aRetryCountLabel);
     form.appendChild(c2aRetryIntervalLabel);
     form.appendChild(c2aRetryCredentialsLabel);
@@ -769,13 +1072,18 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(quotaLabel);
     form.appendChild(disableCoolingLabel);
     form.appendChild(fingerprintLabel);
-    form.appendChild(turnStateLabel);
-    form.appendChild(autoDegradeLabel);
-    form.appendChild(cliproxyLabel);
-    form.appendChild(cliproxyFields);
-    form.appendChild(cacheRewriteLabel);
-    form.appendChild(cacheMinLabel);
-    form.appendChild(cacheMaxLabel);
+    form.appendChild(workBuddyFingerprintLabel);
+    form.appendChild(staticISPLabel);
+    form.appendChild(staticISPFields);
+    fakeModelsContent.appendChild(fakeModelsList);
+    fakeModelsContent.appendChild(addFakeModel);
+    fakeModelsSection.appendChild(fakeModelsContent);
+    form.appendChild(fakeModelsSection);
+    cacheRewriteContent.appendChild(cacheRewriteLabel);
+    cacheRewriteContent.appendChild(cacheMinLabel);
+    cacheRewriteContent.appendChild(cacheMaxLabel);
+    cacheRewriteSection.appendChild(cacheRewriteContent);
+    form.appendChild(cacheRewriteSection);
     form.appendChild(routingLabel);
     form.appendChild(save);
     form.appendChild(status);
@@ -900,7 +1208,7 @@ const runtimeSchedulerInlineScript = `
       if (!panel.hidden) {
         setTimeout(avoidManagementSaveButton, 0);
         loadSettings();
-        loadTurnStates();
+        loadISPBindings();
       }
     });
     window.addEventListener('resize', avoidManagementSaveButton);
@@ -912,25 +1220,22 @@ const runtimeSchedulerInlineScript = `
         return response.json();
       }).then(function (data) {
         if (generation !== sessionGeneration) return;
+        persistSettings.checked = !!data['persist-settings'];
         c2aRetryCount.value = String(data['c2a-max-retry-count'] == null ? 0 : data['c2a-max-retry-count']);
         c2aRetryInterval.value = String(data['c2a-max-retry-interval'] == null ? 0 : data['c2a-max-retry-interval']);
         c2aRetryCredentials.value = String(data['c2a-max-retry-credentials'] == null ? 0 : data['c2a-max-retry-credentials']);
         concurrency.value = String(data['auth-concurrency-limit'] == null ? 0 : data['auth-concurrency-limit']);
         degradedPort.value = data['degraded-port-configured'] === false ? '9444' : String(data['degraded-port'] || 0);
+        exoFreePort.value = String(data['exo-free-port'] || 0);
         unauthorized.checked = !!data['auto-disable-unauthorized'];
         quota.checked = !!data['auto-disable-quota'];
         disableCooling.checked = !!data['disable-cooling'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
-        turnStateEnabled.checked = !!data['codex-turn-state-enabled'];
-        autoDegradeEnabled.checked = !!data['codex-auto-degrade'];
-        autoDegradeEnabled.disabled = !turnStateEnabled.checked;
-        var cliproxy = data['codex-state-cliproxy'] || {};
-        cliproxyEnabled.checked = !!cliproxy.enabled;
-        cliproxyGateway.value = cliproxy.gateway || '';
-        cliproxyUsername.value = cliproxy.username || '';
-        cliproxyPassword.value = '';
-        cliproxyPasswordConfigured = !!cliproxy['password-configured'];
-        updateCliproxyInputs();
+        workBuddyFingerprintConvergence.checked = !!data['workbuddy-fingerprint-convergence'];
+        var staticISP = data['codex-static-isp'] || {};
+        staticISPEnabled.checked = !!staticISP.enabled;
+        loadStaticISPNodes(staticISP.nodes || []);
+        loadFakeModels(data['fake-models'] || []);
         var rewrite = data['cache-token-rewrite'] || {};
         cacheRewrite.checked = !!rewrite.enabled;
         cacheMin.value = rewrite['min-percent'] == null ? '' : String(rewrite['min-percent']);
@@ -968,7 +1273,7 @@ const runtimeSchedulerInlineScript = `
           row.appendChild(make('span', '', accountStatus));
           if (String(item.provider || item.type).toLowerCase() === 'codex') {
             var stateLine = make('span', 'cpa-runtime-scheduler-account-state');
-            var stateError = make('span', 'cpa-runtime-scheduler-turn-state-error');
+            var stateError = make('span', 'cpa-runtime-scheduler-isp-error');
             row.appendChild(stateLine);
             row.appendChild(stateError);
             accountStatusNodes.set(item.id, {account:item, state:stateLine, error:stateError});
@@ -976,7 +1281,7 @@ const runtimeSchedulerInlineScript = `
           row.appendChild(makeAccountStateControl(item, loadAuthStatus));
           statusList.appendChild(row);
         });
-        renderTurnStates();
+        renderISPBindings();
     };
 
     function loadAuthStatus() {
@@ -989,17 +1294,37 @@ const runtimeSchedulerInlineScript = `
     }
 
     save.addEventListener('click', function () {
-      if (!degradedPort.reportValidity()) return;
-      if (cacheRewrite.checked && (!cacheMin.reportValidity() || !cacheMax.reportValidity())) return;
-      if (cliproxyEnabled.checked && (!cliproxyGateway.reportValidity() || !cliproxyUsername.reportValidity() || !cliproxyPassword.reportValidity())) return;
+      if (!degradedPort.reportValidity() || !exoFreePort.reportValidity()) return;
+      if (cacheRewrite.checked && (!cacheMin.checkValidity() || !cacheMax.checkValidity())) {
+        cacheRewriteSection.open = true;
+        if (!cacheMin.reportValidity()) return;
+        cacheMax.reportValidity();
+        return;
+      }
+      if (!staticISPRows.every(function (row) { return Object.keys(row.fields).every(function (key) { return row.fields[key].reportValidity(); }); })) return;
+      if (!fakeModelRows.every(function (row) {
+        if (!row.responseRows.length) {
+          fakeModelsSection.open = true;
+          row.details.open = true;
+          status.textContent = '每个假模型至少填写一条固定回复';
+          return false;
+        }
+        var inputs = Object.keys(row.fields).map(function (key) { return row.fields[key]; }).concat(row.responseRows.map(function (response) { return response.input; }));
+        return inputs.every(function (input) {
+          if (input.checkValidity()) return true;
+          fakeModelsSection.open = true;
+          row.details.open = true;
+          input.reportValidity();
+          return false;
+        });
+      })) return;
       var generation = sessionGeneration;
-      var cliproxySettings = {enabled:cliproxyEnabled.checked, gateway:cliproxyGateway.value.trim(), username:cliproxyUsername.value.trim()};
-      var cliproxyPasswordSubmitted = cliproxyPassword.value !== '';
-      if (cliproxyPasswordSubmitted) cliproxySettings.password = cliproxyPassword.value;
       save.disabled = true;
       status.textContent = '应用中...';
       request('PATCH', 'routing/settings', {
+        'persist-settings': persistSettings.checked,
         'degraded-port': Number(degradedPort.value || '0'),
+        'exo-free-port': Number(exoFreePort.value || '0'),
         'c2a-max-retry-count': Math.max(0, Math.min(1000000, parseInt(c2aRetryCount.value || '0', 10) || 0)),
          'c2a-max-retry-interval': Math.max(0, Math.min(1000000, parseInt(c2aRetryInterval.value || '0', 10) || 0)),
          'c2a-max-retry-credentials': Math.max(0, Math.min(1000000, parseInt(c2aRetryCredentials.value || '0', 10) || 0)),
@@ -1008,44 +1333,90 @@ const runtimeSchedulerInlineScript = `
          'auto-disable-quota': quota.checked,
          'disable-cooling': disableCooling.checked,
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
-        'codex-turn-state-enabled': turnStateEnabled.checked,
-        'codex-auto-degrade': autoDegradeEnabled.checked,
-        'codex-state-cliproxy': cliproxySettings,
+        'workbuddy-fingerprint-convergence': workBuddyFingerprintConvergence.checked,
+        'codex-static-isp': {enabled:staticISPEnabled.checked, nodes:staticISPRows.map(function (row) {
+          var node = {};
+          Object.keys(row.fields).forEach(function (key) {
+            var value = row.fields[key].value;
+            if (key === 'password' && value === '') return;
+            node[key] = key === 'port' ? Number(value) : value;
+          });
+          return node;
+        })},
+        'fake-models': fakeModelRows.map(function (row) {
+          var fields = row.fields;
+          return {name:fields.name.value.trim(), responses:row.responseRows.map(function (response) { return response.input.value; }),
+            'chars-per-second':Number(fields['chars-per-second'].value),
+            'input-tokens':Number(fields['input-tokens'].value), 'output-tokens':Number(fields['output-tokens'].value),
+            'cache-read-tokens':Number(fields['cache-read-tokens'].value), 'cache-write-tokens':Number(fields['cache-write-tokens'].value)};
+        }),
         'cache-token-rewrite': {
           enabled: cacheRewrite.checked,
           'min-percent': cacheMin.value === '' ? null : Number(cacheMin.value),
           'max-percent': cacheMax.value === '' ? null : Number(cacheMax.value)
         },
         'codex-routing-hint': routingHint.value
-      }).then(function () {
+      }).then(function (response) {
+        return response.json();
+      }).then(function (result) {
         if (generation !== sessionGeneration) return;
-        cliproxyPasswordConfigured = cliproxyPasswordConfigured || cliproxyPasswordSubmitted;
-        cliproxyPassword.value = '';
-        updateCliproxyInputs();
-        status.textContent = '已应用';
-        loadTurnStates();
+        clearSubmittedISPPasswords();
+        fakeModelRows.forEach(function (row) { row.details.open = false; });
+        status.textContent = result.persisted ? '已应用并写入配置文件' : '已应用（仅当前进程）';
+        loadISPBindings();
       }).catch(function (err) {
         if (generation !== sessionGeneration) return;
-        status.textContent = '应用失败：' + err.message;
+        status.textContent = (err.runtimeError ? '配置已接收，静态 ISP 不可用：' : (err.applied ? '已应用，写入文件失败：' : '应用失败：')) + err.message;
+        if (err.applied) {
+          clearSubmittedISPPasswords();
+          loadISPBindings();
+        }
       }).finally(function () {
         if (generation === sessionGeneration) save.disabled = false;
       });
     });
-    new MutationObserver(function () { renderQuotaCosts(); renderAccountStateControls(); }).observe(document.body, { childList: true, subtree: true });
-    setInterval(function () { if (!panel.hidden) loadTurnStates(); }, 5000);
-    setInterval(function () { if (!panel.hidden) renderTurnStates(); }, 1000);
+    new MutationObserver(function () { renderQuotaCosts(); renderAccountStateControls(); renderModelTokenTooltips(); positionModelTooltips(); positionAccountTokenTooltips(); }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-cpa-auth-name', 'title'] });
+    window.addEventListener('resize', positionModelTooltips);
+    window.addEventListener('resize', positionAccountTokenTooltips);
+    document.addEventListener('scroll', positionAccountTokenTooltips, true);
+    document.addEventListener('keydown', function (event) { if (event.key === 'Escape') hideAccountTokenTooltip(); });
+    document.addEventListener('pointerdown', function (event) {
+      if (accountTokenAnchor && !accountTokenAnchor.contains(event.target) && !accountTokenTooltip.contains(event.target)) hideAccountTokenTooltip();
+    });
+    setInterval(function () { if (!panel.hidden) loadISPBindings(); }, 5000);
     renderQuotaCosts();
     renderAccountStateControls();
   }
 
   var style = document.createElement('style');
-   style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:grab;touch-action:none;user-select:none;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
-     '.cpa-runtime-scheduler-panel{position:fixed;right:20px;bottom:64px;z-index:2147483646;width:min(340px,calc(100vw - 16px));max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
-     '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
+     style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:grab;touch-action:none;user-select:none;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
+      'body:has([role="dialog"][aria-modal="true"]) .cpa-runtime-scheduler-toggle,body:has([role="dialog"][aria-modal="true"]) .cpa-runtime-scheduler-panel{display:none!important}' +
+      '.cpa-runtime-scheduler-panel{box-sizing:border-box;position:fixed;right:20px;bottom:64px;z-index:2147483646;width:min(340px,calc(100vw - 16px));max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
+       '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-section{min-width:0;border-top:1px solid #d8dee4}.cpa-runtime-scheduler-section-title{padding:12px 0;cursor:pointer;font-weight:700;letter-spacing:0}.cpa-runtime-scheduler-section-title:focus-visible{outline:2px solid #2563eb;outline-offset:2px}.cpa-runtime-scheduler-section-content{display:grid;gap:9px;padding:0 0 8px;min-width:0}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
-  style.textContent += '.cpa-runtime-scheduler-account-state{color:#57606a;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;letter-spacing:0}.cpa-runtime-scheduler-turn-state-error{color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-turn-state-error:empty{display:none}';
+  var modelTooltipSelector = ':is([class*="AuthFileCard-module__statusTooltip___"],[class*="providerStatusBar-module__statusTooltip___"]):has(>[class*="__tooltipStats"]>:nth-child(4))';
+   style.textContent += modelTooltipSelector + '{display:grid;grid-template-columns:minmax(0,1fr) max-content max-content max-content;gap:4px 10px;box-sizing:border-box;width:max-content;max-width:min(480px,calc(100vw - 48px),var(--cpa-model-tooltip-width,100vw));letter-spacing:0}' +
+    modelTooltipSelector + '>[class*="__tooltipTime"]{grid-column:1 / -1}' +
+    modelTooltipSelector + '>[class*="__tooltipStats"]{display:grid!important;grid-template-columns:subgrid;grid-column:1 / -1;align-items:baseline;column-gap:inherit}' +
+    modelTooltipSelector + '>[class*="__tooltipStats"]:not(:has(>:nth-child(4))){grid-column:2 / -1}' +
+    modelTooltipSelector + '>[class*="__tooltipStats"]>span{min-width:0;margin-left:0;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}' +
+     modelTooltipSelector + '>[class*="__tooltipStats"]:has(>:nth-child(4))>:first-child{text-align:left;white-space:normal;overflow-wrap:anywhere}';
+   style.textContent += '[class*="AuthFileCard-module__healthCounts___"]{cursor:help}' +
+     '.cpa-account-token-tooltip{position:fixed;z-index:2147483647;box-sizing:border-box;width:max-content;max-width:calc(100vw - 16px);max-height:min(70vh,480px);overflow:auto;overscroll-behavior:contain;padding:8px 10px;border:1px solid var(--border-color);border-radius:8px;background:var(--floating-surface);color:var(--text-primary);box-shadow:var(--floating-shadow);font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums;white-space:nowrap;letter-spacing:0}' +
+     '.cpa-account-token-tooltip[hidden]{display:none}' +
+     '.cpa-account-token-title{margin-bottom:6px;color:var(--text-tertiary);white-space:nowrap}' +
+     '.cpa-account-token-table{width:max-content;border-collapse:separate;border-spacing:0;font:inherit;font-variant-numeric:tabular-nums;white-space:nowrap;letter-spacing:0}' +
+     '.cpa-account-token-table th,.cpa-account-token-table td{padding:2px 0 2px 16px;text-align:right;white-space:nowrap;letter-spacing:0}' +
+     '.cpa-account-token-table th{color:var(--text-tertiary);font-weight:600;border-bottom:1px solid var(--border-color)}' +
+     '.cpa-account-token-table th:first-child,.cpa-account-token-table td:first-child{padding-left:0;text-align:left}' +
+     '.cpa-account-token-empty{color:var(--text-secondary);white-space:nowrap}';
+   style.textContent += '.cpa-runtime-scheduler-account-state{color:#57606a;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;letter-spacing:0}.cpa-runtime-scheduler-account-state:empty{display:none}.cpa-runtime-scheduler-isp-error{color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-isp-error:empty{display:none}';
   style.textContent += '.cpa-runtime-scheduler-proxy-fields{display:grid;gap:8px;min-width:0}.cpa-runtime-scheduler-proxy-fields[hidden]{display:none}.cpa-runtime-scheduler-text{display:grid;gap:4px;min-width:0;color:#57606a;font-size:12px}.cpa-runtime-scheduler-text input{box-sizing:border-box;width:100%;min-width:0;padding:6px 8px;border:1px solid #d0d7de;border-radius:5px;font:inherit;letter-spacing:0}';
+  style.textContent += '.cpa-static-isp-list{display:grid;gap:10px;min-width:0}.cpa-static-isp-node{position:relative;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;padding:10px 0 36px;border-bottom:1px solid #d0d7de;min-width:0;letter-spacing:0}.cpa-static-isp-node select{box-sizing:border-box;width:100%;min-width:0;padding:6px;border:1px solid #d0d7de;border-radius:5px;font:inherit;background:#fff}.cpa-static-isp-remove{position:absolute;right:0;bottom:4px;width:28px;height:28px;padding:0;border:1px solid #d0d7de;border-radius:5px;background:#fff;color:#b42318;font-size:20px;cursor:pointer}.cpa-static-isp-remove:hover{background:#fff1f0}.cpa-static-isp-node input:focus-visible,.cpa-static-isp-node select:focus-visible,.cpa-static-isp-remove:focus-visible{outline:2px solid #2563eb;outline-offset:2px}';
+  style.textContent += '.cpa-runtime-scheduler-panel .cpa-static-isp-add{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;justify-self:start;width:max-content;max-width:100%;min-width:0;height:26px;min-height:0;border:1px solid #d0d7de;border-radius:4px;padding:0 8px;background:transparent;color:#57606a;font:500 12px/1.2 system-ui,sans-serif;cursor:pointer;letter-spacing:0}.cpa-runtime-scheduler-panel .cpa-static-isp-add:hover{background:#f6f8fa;border-color:#afb8c1;color:#24292f}.cpa-runtime-scheduler-panel .cpa-static-isp-add:focus-visible{outline:2px solid #2563eb;outline-offset:2px}';
+  style.textContent += '.cpa-fake-model-list{display:grid;gap:10px;min-width:0}.cpa-fake-model-row{position:relative;min-width:0;border-bottom:1px solid #d0d7de;padding-bottom:8px;letter-spacing:0}.cpa-fake-model-row>.cpa-static-isp-remove{top:0;bottom:auto}.cpa-fake-model-summary{padding:5px 34px 5px 0;overflow-wrap:anywhere;cursor:pointer;font-weight:600}.cpa-fake-model-editor{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px;min-width:0}.cpa-fake-model-editor>:first-child,.cpa-fake-model-editor>div,.cpa-fake-model-editor>button{grid-column:1 / -1}.cpa-fake-response-list{display:grid;gap:8px;min-width:0}.cpa-fake-response-row{display:grid;grid-template-columns:minmax(0,1fr) 28px;align-items:start;gap:6px;min-width:0}.cpa-fake-response-row>.cpa-static-isp-remove{position:static}.cpa-fake-model-row textarea{box-sizing:border-box;width:100%;min-width:0;min-height:72px;resize:vertical;padding:6px 8px;border:1px solid #d0d7de;border-radius:5px;font:inherit;letter-spacing:0}.cpa-fake-model-row input:focus-visible,.cpa-fake-model-row textarea:focus-visible,.cpa-fake-model-summary:focus-visible{outline:2px solid #2563eb;outline-offset:2px}';
   style.textContent += '.cpa-native-status-hidden,.cpa-account-managed [class*="AuthFileCard-module__stateBadge"]{display:none!important}.cpa-account-state{display:flex;flex-wrap:wrap;gap:0;max-width:100%;font-size:12px;letter-spacing:0}.cpa-account-state-choice{min-width:48px;padding:5px 8px;border:1px solid var(--border-color,#d0d7de);background:var(--bg-primary,#fff);color:var(--text-secondary,#57606a);cursor:pointer}.cpa-account-state-choice:first-child{border-radius:6px 0 0 6px}.cpa-account-state-choice:nth-child(3){border-radius:0 6px 6px 0}.cpa-account-state-choice[aria-pressed="true"]{background:#2563eb;color:#fff}.cpa-account-state-choice[value="degraded"][aria-pressed="true"]{background:#b45309}.cpa-account-state-choice[value="disabled"][aria-pressed="true"]{background:#6b7280}.cpa-account-state-choice:disabled{cursor:wait;opacity:.6}.cpa-account-state-error{flex-basis:100%;color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-disabled-row strong{overflow-wrap:anywhere}';
+  style.textContent += '[data-cpa-managed-account="true"] [class*="AuthFileCard-module__toggleWrap"],[data-cpa-managed-account="true"] [class*="AuthFileCard-module__stateBadge"]{display:none!important}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mount, { once: true });
@@ -1057,7 +1428,7 @@ const runtimeSchedulerInlineScript = `
 `
 
 // AddRuntimeSchedulerToManagementHTML injects runtime-only scheduler controls
-// and quota cost labels without modifying the downloaded bundle.
+// and quota cost labels and aligns model statistics without modifying the downloaded bundle.
 func AddRuntimeSchedulerToManagementHTML(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty management html")
@@ -1065,6 +1436,13 @@ func AddRuntimeSchedulerToManagementHTML(data []byte) ([]byte, error) {
 	if bytes.Contains(data, []byte(runtimeSchedulerInlineMarker)) {
 		return data, nil
 	}
+	if legacyStart := bytes.Index(data, []byte("<script "+legacyRuntimeSchedulerInlineMarker+">")); legacyStart >= 0 {
+		if legacyEnd := bytes.Index(data[legacyStart:], []byte("</script>")); legacyEnd >= 0 {
+			legacyEnd += legacyStart + len("</script>")
+			data = bytes.Replace(data, data[legacyStart:legacyEnd], nil, 1)
+		}
+	}
+	data = bytes.Replace(data, []byte("(0,U.jsxs)(`article`,{className:[aA.card,"), []byte("(0,U.jsxs)(`article`,{\"data-cpa-auth-name\":n.name,className:[aA.card,"), 1)
 	lower := bytes.ToLower(data)
 	index := bytes.LastIndex(lower, []byte("</body>"))
 	if index < 0 {

@@ -17,7 +17,15 @@ func newAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewClaudeAuthenticator(),
 		sdkAuth.NewAntigravityAuthenticator(),
 		sdkAuth.NewKimiAuthenticator(),
+		sdkAuth.NewKimiAIAuthenticator(),
+		sdkAuth.NewKimiAIDotAuthenticator(),
 		sdkAuth.NewXAIAuthenticator(),
+		sdkAuth.NewMetaAuthenticator(),
+		sdkAuth.NewDevinAuthenticator(),
+		sdkAuth.NewWorkBuddyAuthenticator("workbuddy"),
+		sdkAuth.NewWorkBuddyAuthenticator("workbuddy-ai"),
+		sdkAuth.NewQoderAuthenticator("qoder"),
+		sdkAuth.NewQoderAuthenticator("qoder-cn"),
 		sdkAuth.NewCursorAuthenticator(),
 	)
 	return manager

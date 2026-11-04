@@ -2,9 +2,12 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -212,5 +215,65 @@ func BenchmarkManagerPickNextAndMarkResult1000(b *testing.B) {
 			b.Fatalf("pickNext failed: auth=%v err=%v", auth, errPick)
 		}
 		manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: "gemini", Model: model, Success: true})
+	}
+}
+
+func BenchmarkManagerPickCodexPool(b *testing.B) {
+	for _, total := range []int{1, 2, 10, 100, 500, 1000} {
+		for _, busy := range []bool{false, true} {
+			name := fmt.Sprintf("accounts=%d/busy=%t", total, busy)
+			b.Run(name, func(b *testing.B) {
+				selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+					Fallback:        &Codex2APIDefaultSelector{},
+					ProviderFilters: []string{"cursor"},
+				})
+				b.Cleanup(selector.Stop)
+				manager := NewManager(nil, selector, nil)
+				manager.RegisterExecutor(schedulerBenchmarkExecutor{id: "codex"})
+				reg := registry.GetGlobalRegistry()
+				const model = "bench-codex-pool"
+				limit := 0
+				if busy {
+					limit = 1
+				}
+				claims := fmt.Sprintf(`{"exp":%d,"padding":"%s"}`, time.Now().Add(24*time.Hour).Unix(), strings.Repeat("x", 1024))
+				token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".signature"
+				for index := 0; index < total; index++ {
+					auth := &Auth{
+						ID:               fmt.Sprintf("bench-codex-pool-%04d", index),
+						Provider:         "codex",
+						Status:           StatusActive,
+						ConcurrencyLimit: limit,
+						Metadata:         map[string]any{"type": "codex", "access_token": token},
+						Quota: QuotaState{Signals: map[string]string{
+							"x-codex-primary-used-percent":   "20",
+							"x-codex-secondary-used-percent": "10",
+						}},
+						ModelStates: map[string]*ModelState{model: {Status: StatusActive}},
+					}
+					auth.EnsureIndex()
+					auth.ensureDispatchState()
+					manager.auths[auth.ID] = auth
+					reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+					b.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+					if busy && index < total-1 {
+						if !auth.TryAcquireDispatchSlot() {
+							b.Fatal("failed to occupy auth")
+						}
+						b.Cleanup(auth.ReleaseDispatchSlot)
+					}
+				}
+				ctx := context.Background()
+				providers := []string{"codex"}
+				b.ReportAllocs()
+				for b.Loop() {
+					selected, _, _, errPick := manager.pickNextMixed(ctx, providers, model, cliproxyexecutor.Options{}, nil)
+					if errPick != nil {
+						b.Fatalf("pickNextMixed: %v", errPick)
+					}
+					selected.ReleaseDispatchSlot()
+				}
+			})
+		}
 	}
 }

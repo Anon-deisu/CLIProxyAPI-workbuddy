@@ -28,8 +28,10 @@ type KimiTokenStorage struct {
 	DeviceID string `json:"device_id,omitempty"`
 	// Expired is the RFC3339 timestamp when the access token expires.
 	Expired string `json:"expired,omitempty"`
-	// Type indicates the authentication provider type, always "kimi" for this storage.
-	Type string `json:"type"`
+	// Type identifies Kimi.com or Kimi.ai credentials.
+	Type    string `json:"type"`
+	Domain  string `json:"domain,omitempty"`
+	BaseURL string `json:"base_url,omitempty"`
 
 	// Metadata holds arbitrary key-value pairs injected via hooks.
 	// It is not exported to JSON directly to allow flattening during serialization.
@@ -82,7 +84,18 @@ type DeviceCodeResponse struct {
 // SaveTokenToFile serializes the Kimi token storage to a JSON file.
 func (ts *KimiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
-	ts.Type = "kimi"
+	if ts.Type == "" {
+		ts.Type = "kimi"
+		if IsKimiAIDomain(ts.Domain) {
+			ts.Type = "kimi-ai"
+		}
+	}
+	if ts.Domain == "" {
+		ts.Domain = NormalizeKimiDomain(ts.Type)
+	}
+	if ts.BaseURL == "" {
+		ts.BaseURL = ResolveKimiAPIBaseURL(ts.Domain)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)

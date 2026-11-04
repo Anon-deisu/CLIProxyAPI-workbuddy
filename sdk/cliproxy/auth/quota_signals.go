@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"sort"
 	"strconv"
@@ -18,6 +19,74 @@ const (
 type codexQuotaWindows struct {
 	fiveHourResetAt   time.Time
 	sevenDayExhausted bool
+}
+
+// ApplyQuotaRefresh commits a background quota probe without recording a request
+// result or persisting runtime observations. observed must be the credential
+// snapshot used by FetchQuota; startedAt is the start of the entire probe,
+// including any unauthorized recovery. The return value reports a state change.
+func (m *Manager) ApplyQuotaRefresh(ctx context.Context, observed *Auth, startedAt time.Time, headers http.Header, probeErr error) bool {
+	if m == nil || observed == nil || startedAt.IsZero() || (ctx != nil && ctx.Err() != nil) {
+		return false
+	}
+	if probeErr != nil && (statusCodeFromError(probeErr) != http.StatusUnauthorized || isRequestScopedError(probeErr)) {
+		return false
+	}
+	m.mu.Lock()
+	current := m.auths[observed.ID]
+	enabled, _, _ := m.quotaRefreshSettings()
+	if !enabled || !quotaRefreshIdentityMatches(current, observed) || current.Quota.ObservedAt.After(startedAt) || (ctx != nil && ctx.Err() != nil) {
+		m.mu.Unlock()
+		return false
+	}
+	now := time.Now()
+	updated := current.Clone()
+	if probeErr != nil {
+		m.maybeAutoDisableAuthLocked(updated, resultErrorFromError(probeErr), false, now)
+		if !updated.AutoDisabled {
+			m.mu.Unlock()
+			return false
+		}
+	} else {
+		if !updated.Quota.ObserveResponseHeadersForProvider("codex", headers, now) {
+			m.mu.Unlock()
+			return false
+		}
+		m.maybeAutoDisableAuthLocked(updated, nil, true, now)
+	}
+	updated.Generation++
+	updated.UpdatedAt = now
+	m.auths[updated.ID] = updated
+	snapshot := updated.Clone()
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		// Quota is credential-wide, so refresh every existing model shard.
+		m.scheduler.upsertAuth(snapshot)
+	}
+	return true
+}
+
+func quotaRefreshAuthEligible(auth *Auth) bool {
+	return auth != nil && !auth.IsDispatchDisabled() && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") &&
+		auth.AuthKind() == AuthKindOAuth && authAccessToken(auth) != "" && authMetadataString(auth, "account_id") != ""
+}
+
+func quotaRefreshIdentityMatches(current, observed *Auth) bool {
+	return quotaRefreshAuthEligible(current) && quotaRefreshAuthEligible(observed) && quotaRefreshCredentialMatches(current, observed)
+}
+
+// Credential identity deliberately excludes enable/disable policy: once OAuth
+// rotation succeeds, the new token must survive a concurrent polling shutdown.
+func quotaRefreshCredentialMatches(current, observed *Auth) bool {
+	return quotaRefreshAccountMatches(current, observed) && current.RegistrationEpoch == observed.RegistrationEpoch &&
+		authAccessToken(current) != "" && authAccessToken(current) == authAccessToken(observed) &&
+		authRefreshToken(current) == authRefreshToken(observed)
+}
+
+func quotaRefreshAccountMatches(current, observed *Auth) bool {
+	return current != nil && observed != nil && current.ID == observed.ID && strings.EqualFold(current.Provider, "codex") &&
+		strings.EqualFold(current.Provider, observed.Provider) && current.AuthKind() == AuthKindOAuth && observed.AuthKind() == AuthKindOAuth &&
+		authMetadataString(current, "account_id") != "" && authMetadataString(current, "account_id") == authMetadataString(observed, "account_id")
 }
 
 // codexAccountQuotaWindows uses durations, not primary/secondary ordering, to

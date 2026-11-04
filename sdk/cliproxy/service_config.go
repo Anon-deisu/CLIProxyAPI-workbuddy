@@ -133,6 +133,10 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 		log.WithError(errValidate).Warn("rejected config update with invalid credential weights")
 		return configCommit{}
 	}
+	if errValidate := newCfg.Codex.QuotaRefresh.Validate(); errValidate != nil {
+		log.WithError(errValidate).Warn("rejected config update with invalid Codex quota refresh settings")
+		return configCommit{}
+	}
 
 	s.cfgMu.Lock()
 	newCfg = newCfg.CloneForReload(s.cfg)
@@ -220,6 +224,9 @@ func (s *Service) applyConfigRuntime(ctx context.Context, commit configCommit, s
 		return false
 	}
 	s.syncPluginModelRuntime(registrationCtx)
+	if s.coreManager != nil {
+		s.coreManager.UpdateQuotaRefresh()
+	}
 	return ctx.Err() == nil
 }
 

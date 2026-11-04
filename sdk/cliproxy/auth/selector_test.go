@@ -94,6 +94,364 @@ func TestWeightedRoundRobinSelectorPick_DistributesAndSkipsNonPositiveWeights(t 
 	}
 }
 
+func TestCodex2APIQuotaWeightedKeepsPriorityAndHealthTiers(t *testing.T) {
+	auths := []*Auth{
+		{ID: "a", Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "10"}}},
+		{ID: "b", Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "40"}}},
+		{ID: "warm", Provider: "codex", Status: StatusError},
+		{ID: "low-priority", Provider: "codex", Status: StatusActive, Attributes: map[string]string{"priority": "-1"}},
+		{ID: "disabled", Provider: "codex", Status: StatusActive, Disabled: true, Attributes: map[string]string{"priority": "10"}},
+	}
+	selector := &Codex2APIDefaultSelector{}
+	counts := map[string]int{}
+	for range 50 {
+		selected, err := selector.Pick(t.Context(), "codex", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[selected.ID]++
+	}
+	if len(counts) != 2 || counts["a"] != 30 || counts["b"] != 20 {
+		t.Fatalf("tier-scoped picks=%v, want a:b=30:20 only", counts)
+	}
+	auths[2].Attributes = map[string]string{"priority": "2"}
+	for range 5 {
+		selected, err := selector.Pick(t.Context(), "codex", "", cliproxyexecutor.Options{}, auths)
+		if err != nil || selected.ID != "warm" {
+			t.Fatalf("higher priority was not preserved: auth=%v error=%v", selected, err)
+		}
+	}
+}
+
+func TestCodex2APISelectorReusesWorkBuddyAfterCredentialCooldown(t *testing.T) {
+	now := time.Now()
+	resetAt := now.Add(time.Minute)
+	quota := QuotaState{Exceeded: true, Reason: "credential_quota", NextRecoverAt: resetAt}
+	limitErr := &Error{Code: ErrorCodeWorkBuddyRateLimit, HTTPStatus: http.StatusTooManyRequests}
+	recovered := &Auth{
+		ID:             "workbuddy-recovered",
+		Provider:       "workbuddy",
+		Status:         StatusError,
+		Unavailable:    true,
+		LastError:      limitErr,
+		NextRetryAfter: resetAt,
+		Quota:          quota,
+		ModelStates: map[string]*ModelState{
+			"deepseek-v4.1-flash": {
+				Status:         StatusError,
+				Unavailable:    true,
+				LastError:      limitErr,
+				NextRetryAfter: resetAt,
+				Quota:          quota,
+			},
+		},
+	}
+	healthy := &Auth{ID: "workbuddy-healthy", Provider: "workbuddy", Status: StatusActive}
+
+	if got := codex2APIHealth(recovered); got != codex2APIRisky {
+		t.Fatalf("active WorkBuddy cooldown health = %v, want risky", got)
+	}
+
+	resetAt = now.Add(-time.Minute)
+	recovered.NextRetryAfter = resetAt
+	recovered.Quota.NextRecoverAt = resetAt
+	recovered.ModelStates["deepseek-v4.1-flash"].NextRetryAfter = resetAt
+	recovered.ModelStates["deepseek-v4.1-flash"].Quota.NextRecoverAt = resetAt
+	if got := codex2APIHealth(recovered); got != codex2APIHealthy {
+		t.Fatalf("expired WorkBuddy cooldown health = %v, want healthy", got)
+	}
+
+	selector := NewSessionAffinitySelector(&Codex2APIDefaultSelector{})
+	t.Cleanup(selector.Stop)
+	seen := make(map[string]bool)
+	for i := 0; i < 20; i++ {
+		picked, errPick := selector.Pick(t.Context(), "mixed", "deepseek-v4.1-flash", cliproxyexecutor.Options{}, []*Auth{healthy, recovered})
+		if errPick != nil {
+			t.Fatalf("Pick() #%d error = %v", i, errPick)
+		}
+		seen[picked.ID] = true
+	}
+	if !seen[recovered.ID] {
+		t.Fatalf("expired WorkBuddy account was never selected: seen=%v", seen)
+	}
+}
+
+func TestCodex2APISelectorReusesWorkBuddyAfterModelCooldown(t *testing.T) {
+	now := time.Now()
+	resetAt := now.Add(time.Minute)
+	limitErr := &Error{Code: ErrorCodeWorkBuddyModelRateLimit, HTTPStatus: http.StatusTooManyRequests}
+	recovered := &Auth{
+		ID:        "workbuddy-model-recovered",
+		Provider:  "workbuddy",
+		Status:    StatusError,
+		LastError: limitErr,
+		Quota:     QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: resetAt},
+		ModelStates: map[string]*ModelState{
+			"deepseek-v4.1-flash": {
+				Status:         StatusError,
+				Unavailable:    true,
+				LastError:      limitErr,
+				NextRetryAfter: resetAt,
+				Quota:          QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: resetAt},
+			},
+		},
+	}
+	if got := codex2APIHealth(recovered); got != codex2APIRisky {
+		t.Fatalf("active WorkBuddy model cooldown health = %v, want risky", got)
+	}
+
+	recovered.ModelStates["deepseek-v4.1-flash"].NextRetryAfter = now.Add(-time.Minute)
+	recovered.ModelStates["deepseek-v4.1-flash"].Quota.NextRecoverAt = now.Add(-time.Minute)
+	recovered.Quota.NextRecoverAt = now.Add(-time.Minute)
+	if got := codex2APIHealth(recovered); got != codex2APIHealthy {
+		t.Fatalf("expired WorkBuddy model cooldown health = %v, want healthy", got)
+	}
+
+	selector := NewSessionAffinitySelector(&Codex2APIDefaultSelector{})
+	t.Cleanup(selector.Stop)
+	healthy := &Auth{ID: "workbuddy-model-healthy", Provider: "workbuddy", Status: StatusActive}
+	seenRecovered := false
+	for i := 0; i < 20; i++ {
+		picked, errPick := selector.Pick(t.Context(), "mixed", "deepseek-v4.1-flash", cliproxyexecutor.Options{}, []*Auth{healthy, recovered})
+		if errPick != nil {
+			t.Fatalf("Pick() #%d error = %v", i, errPick)
+		}
+		seenRecovered = seenRecovered || picked.ID == recovered.ID
+	}
+	if !seenRecovered {
+		t.Fatal("expired WorkBuddy model cooldown was never selected")
+	}
+}
+
+func TestCodex2APIQuotaWeightedConcurrentPicks(t *testing.T) {
+	selector := &Codex2APIDefaultSelector{}
+	auths := []*Auth{
+		{ID: "a", Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "10"}}},
+		{ID: "b", Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "40"}}},
+	}
+	results := make(chan string, 100)
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Go(func() {
+			selected, err := selector.Pick(t.Context(), "codex", "", cliproxyexecutor.Options{}, auths)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			results <- selected.ID
+		})
+	}
+	wg.Wait()
+	close(results)
+	counts := map[string]int{}
+	for id := range results {
+		counts[id]++
+	}
+	if counts["a"] != 60 || counts["b"] != 40 {
+		t.Fatalf("concurrent picks=%v, want 60:40", counts)
+	}
+}
+
+func TestCodex2APIQuotaWeightUsesRemainingWatermark(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		signals map[string]string
+		want    int64
+	}{
+		{"unknown", nil, 10000},
+		{"fractional", map[string]string{"used-percent": "10.25"}, 8975},
+		{"strictest-window", map[string]string{"primary-used-percent": "10", "secondary-used-percent": "40"}, 6000},
+		{"reported-exhausted", map[string]string{"used-percent": "100"}, 1},
+		{"legacy-limit-reached", map[string]string{"limit-reached": "true"}, 1},
+		{"legacy-window-limit-reached", map[string]string{"primary-limit-reached": "true", "secondary-used-percent": "10"}, 1},
+		{"normalized-window", map[string]string{" X_CODEX_SECONDARY_USED_PERCENT ": " 10.25 "}, 8975},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codex2APIQuotaWeight(&Auth{Quota: QuotaState{Signals: tc.signals}}); got != tc.want {
+				t.Fatalf("weight=%d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodex2APIQuotaWeightUsesOnlyMainCredentialWindows(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		signals    map[string]string
+		wantWeight int64
+		wantUsage  float64
+		wantKnown  bool
+		wantHealth codex2APIHealthTier
+	}{
+		{
+			name: "main usage ignores review and additional",
+			signals: map[string]string{
+				"X-Codex-Primary-Used-Percent":                                "10",
+				"X-Codex-Code-Review-Primary-Used-Percent":                    "100",
+				"X-Codex-Additional-GPT-5.3-Codex-Spark-Primary-Used-Percent": "100",
+				"X-Codex-Bengalfox-Secondary-Used-Percent":                    "100",
+			},
+			wantWeight: 9000,
+			wantUsage:  10,
+			wantKnown:  true,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "main usage ignores independent limit flags",
+			signals: map[string]string{
+				"X-Codex-Primary-Used-Percent":                         "10",
+				"X-Codex-Code-Review-Limit-Reached":                    "true",
+				"X-Codex-Additional-GPT-5.3-Codex-Spark-Limit-Reached": "true",
+				"X-Codex-Bengalfox-Limit-Reached":                      "true",
+			},
+			wantWeight: 9000,
+			wantUsage:  10,
+			wantKnown:  true,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "main exhaustion is not softened by review",
+			signals: map[string]string{
+				"X-Codex-Primary-Used-Percent":             "100",
+				"X-Codex-Code-Review-Primary-Used-Percent": "10",
+			},
+			wantWeight: 1,
+			wantUsage:  100,
+			wantKnown:  true,
+			wantHealth: codex2APIWarm,
+		},
+		{
+			name: "strictest main window",
+			signals: map[string]string{
+				"X-Codex-Primary-Used-Percent":             "10",
+				"X-Codex-Secondary-Used-Percent":           "40",
+				"X-Codex-Code-Review-Primary-Used-Percent": "100",
+			},
+			wantWeight: 6000,
+			wantUsage:  40,
+			wantKnown:  true,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "main window takes precedence over credential fallback",
+			signals: map[string]string{
+				"X-Codex-Secondary-Used-Percent": "10",
+				"X-Codex-Used-Percent":           "100",
+				"X-Codex-Limit-Reached":          "true",
+			},
+			wantWeight: 9000,
+			wantUsage:  10,
+			wantKnown:  true,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "additional only is unknown",
+			signals: map[string]string{
+				"X-Codex-Additional-GPT-5.3-Codex-Spark-Primary-Used-Percent": "100",
+			},
+			wantWeight: 10000,
+			wantKnown:  false,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "code review only is unknown",
+			signals: map[string]string{
+				"X-Codex-Code-Review-Primary-Used-Percent": "100",
+				"X-Codex-Code-Review-Limit-Reached":        "true",
+			},
+			wantWeight: 10000,
+			wantKnown:  false,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "additional HTTP namespace only is unknown",
+			signals: map[string]string{
+				"X-Codex-Bengalfox-Primary-Used-Percent": "100",
+				"X-Codex-Bengalfox-Limit-Reached":        "true",
+			},
+			wantWeight: 10000,
+			wantKnown:  false,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "additional fields are not credential fallback",
+			signals: map[string]string{
+				"X-Codex-Additional-Used-Percent":                      "100",
+				"X-Codex-Additional-Limit-Reached":                     "true",
+				"X-Codex-Additional-GPT-5.3-Codex-Spark-Limit-Reached": "true",
+			},
+			wantWeight: 10000,
+			wantKnown:  false,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "credential level fallback",
+			signals: map[string]string{
+				"X-Codex-Used-Percent": "25",
+				"X-Codex-Additional-GPT-5.3-Codex-Spark-Primary-Used-Percent": "100",
+				"X-Codex-Additional-GPT-5.3-Codex-Spark-Limit-Reached":        "true",
+			},
+			wantWeight: 7500,
+			wantUsage:  25,
+			wantKnown:  true,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "invalid main usage allows credential fallback",
+			signals: map[string]string{
+				"X-Codex-Primary-Used-Percent":      "invalid",
+				"X-Codex-Secondary-Window-Minutes":  "10080",
+				"X-Codex-Used-Percent":              "25",
+				"X-Codex-Code-Review-Limit-Reached": "true",
+			},
+			wantWeight: 7500,
+			wantUsage:  25,
+			wantKnown:  true,
+			wantHealth: codex2APIHealthy,
+		},
+		{
+			name: "credential level limit reached fallback",
+			signals: map[string]string{
+				"X-Codex-Limit-Reached": "true",
+				"X-Codex-Additional-GPT-5.3-Codex-Spark-Primary-Used-Percent": "10",
+			},
+			wantWeight: 1,
+			wantUsage:  100,
+			wantKnown:  true,
+			wantHealth: codex2APIWarm,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &Auth{Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: tc.signals}}
+			if got := codex2APIQuotaWeight(auth); got != tc.wantWeight {
+				t.Errorf("weight=%d, want %d", got, tc.wantWeight)
+			}
+			gotUsage, gotKnown := authQuotaUsedPercent(auth)
+			if gotKnown != tc.wantKnown || gotKnown && gotUsage != tc.wantUsage {
+				t.Errorf("usage=(%v, %t), want (%v, %t)", gotUsage, gotKnown, tc.wantUsage, tc.wantKnown)
+			}
+			if got := codex2APIHealth(auth); got != tc.wantHealth {
+				t.Errorf("health=%v, want %v", got, tc.wantHealth)
+			}
+		})
+	}
+}
+
+func TestCodex2APIQuotaWeightedPreservesCreditsAcrossExclusion(t *testing.T) {
+	selector := &Codex2APIDefaultSelector{}
+	a := &Auth{ID: "a", Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "10"}}}
+	b := &Auth{ID: "b", Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "40"}}}
+	for index, candidates := range [][]*Auth{{a, b}, {a}, {a, b}} {
+		selected, err := selector.Pick(t.Context(), "codex", "", cliproxyexecutor.Options{}, candidates)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"a", "a", "b"}[index]; selected.ID != want {
+			t.Fatalf("pick %d=%s, want %s", index, selected.ID, want)
+		}
+	}
+}
+
 func TestWeightedRoundRobinSelectorPick_ResetsCreditsWhenWeightsChange(t *testing.T) {
 	t.Parallel()
 
@@ -209,7 +567,7 @@ func TestPickSmoothWeightedAuth_SaturatesCorruptState(t *testing.T) {
 	t.Parallel()
 
 	current := map[string]int64{"a": math.MaxInt64, "b": math.MinInt64}
-	picked := pickSmoothWeightedAuth([]*Auth{{ID: "a"}, {ID: "b"}}, current)
+	picked := pickSmoothWeightedAuth([]*Auth{{ID: "a"}, {ID: "b"}}, current, map[string]int64{"a": 1, "b": 1}, nil)
 	if picked == nil {
 		t.Fatal("pickSmoothWeightedAuth() returned nil")
 	}

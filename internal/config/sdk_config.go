@@ -11,6 +11,12 @@ import (
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// OAuthOnlyFields records v8 provider settings that apply only to OAuth/file credentials.
+	OAuthOnlyFields map[string]bool `yaml:"-" json:"-"`
+
+	// CodexResponseSteering mirrors the OAuth-only Codex WebSocket steering setting.
+	CodexResponseSteering bool `yaml:"-" json:"-"`
+
 	// CacheTokenRewrite overrides only downstream cache usage. Nil disables it.
 	CacheTokenRewrite *CacheTokenRewriteConfig `yaml:"-" json:"cache-token-rewrite,omitempty"`
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
@@ -74,11 +80,11 @@ type SDKConfig struct {
 }
 
 // CacheTokenRewriteConfig chooses a percentage once per downstream request.
-// An omitted maximum uses a fixed percentage. These controls are runtime-only.
+// An omitted maximum uses a fixed percentage. Persistence is managed by AccountScheduling.
 type CacheTokenRewriteConfig struct {
-	Enabled    bool     `json:"enabled"`
-	MinPercent *float64 `json:"min-percent"`
-	MaxPercent *float64 `json:"max-percent"`
+	Enabled    bool     `yaml:"enabled" json:"enabled"`
+	MinPercent *float64 `yaml:"min-percent" json:"min-percent"`
+	MaxPercent *float64 `yaml:"max-percent" json:"max-percent"`
 }
 
 func (c CacheTokenRewriteConfig) Validate() error {

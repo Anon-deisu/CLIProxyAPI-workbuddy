@@ -1,11 +1,14 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -13,6 +16,125 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
+
+func TestAPICallDevinBodyTokenAndJSONEscaping(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		auth *coreauth.Auth
+		want string
+	}{
+		{name: "metadata_api_key", auth: &coreauth.Auth{Metadata: map[string]any{"api_key": "session-token"}}, want: "session-token"},
+		{name: "metadata_session_token", auth: &coreauth.Auth{Metadata: map[string]any{"session_token": "session-token"}}, want: "session-token"},
+		{name: "attribute_session_token", auth: &coreauth.Auth{Attributes: map[string]string{"session_token": "session-token"}}, want: "session-token"},
+		{name: "escaped_json", auth: &coreauth.Auth{Metadata: map[string]any{"api_key": "session\"\\\n\t\b\f\x01token"}}, want: "session\"\\\n\t\b\f\x01token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := coreauth.NewManager(nil, nil, nil)
+			tc.auth.ID, tc.auth.Provider = tc.name, "devin"
+			auth, err := manager.Register(t.Context(), tc.auth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, errRead := io.ReadAll(r.Body)
+				if errRead != nil {
+					t.Error(errRead)
+				}
+				var data struct {
+					Metadata struct {
+						APIKey string `json:"apiKey"`
+					} `json:"metadata"`
+					Count json.Number `json:"count"`
+				}
+				if errDecode := json.Unmarshal(body, &data); errDecode != nil || data.Metadata.APIKey != tc.want {
+					t.Errorf("Devin metadata token was not resolved: %v", errDecode)
+				}
+				if data.Count.String() != "9007199254740993" {
+					t.Error("token substitution changed JSON number precision")
+				}
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+			defer upstream.Close()
+			h := &Handler{cfg: &config.Config{}, authManager: manager}
+			router := gin.New()
+			router.POST("/", h.APICall)
+			payload, err := json.Marshal(apiCallRequest{
+				AuthIndexCamel: &auth.Index, Method: http.MethodPost, URL: upstream.URL,
+				Header: map[string]string{"Content-Type": "application/json"},
+				Data:   `{"metadata":{"apiKey":"$TOKEN$","ideName":"chisel"},"count":9007199254740993}`,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(payload)))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", recorder.Code)
+			}
+		})
+	}
+}
+
+func TestAPICallMissingBodyCredentialDoesNotReachUpstream(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	h := &Handler{cfg: &config.Config{}, authManager: coreauth.NewManager(nil, nil, nil)}
+	router := gin.New()
+	router.POST("/", h.APICall)
+	missing := "missing-auth-index"
+	payload, err := json.Marshal(apiCallRequest{AuthIndexCamel: &missing, Method: http.MethodPost, URL: upstream.URL, Data: `{"apiKey":"$TOKEN$"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(payload)))
+	if recorder.Code != http.StatusBadRequest || calls.Load() != 0 {
+		t.Fatalf("status = %d, upstream requests = %d; want 400 without sending a placeholder", recorder.Code, calls.Load())
+	}
+}
+
+func TestAPICallMetaMintUsesManagerAndRequestProxy(t *testing.T) {
+	var calls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer dca:test-management" {
+			t.Error("mint must use the DCA token")
+		}
+		_, _ = w.Write([]byte(`{"api_key":"LLM|management-test","base_url":"https://api.meta.ai/v1"}`))
+	}))
+	defer proxy.Close()
+	t.Setenv("META_MINT_URL", "http://meta-mint.invalid/key")
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	auth, err := manager.Register(coreauth.WithSkipPersist(t.Context()), &coreauth.Auth{
+		ID: "meta-mint-test", Provider: "meta", ProxyURL: "http://127.0.0.1:1",
+		Metadata: map[string]any{"access_token": "dca:test-management", "dca_token": "dca:test-management"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: &config.Config{}, authManager: manager, tokenStore: store}
+	for range 2 {
+		token, errToken := h.resolveTokenForAuth(t.Context(), h.authByIndex(auth.Index), proxy.URL)
+		if errToken != nil || token != "LLM|management-test" {
+			t.Fatalf("management did not resolve an LLM token: %v", errToken)
+		}
+	}
+	live, _ := manager.GetByID(auth.ID)
+	saved, err := store.List(t.Context())
+	if err != nil || len(saved) != 1 || live.Metadata["api_key"] != "LLM|management-test" || calls.Load() != 1 {
+		t.Fatalf("mint was not persisted and reused: calls=%d, saved=%d, error=%v", calls.Load(), len(saved), err)
+	}
+	if live.ProxyURL != auth.ProxyURL || saved[0].ProxyURL != auth.ProxyURL {
+		t.Fatal("request proxy override leaked into the credential")
+	}
+}
 
 func TestAPICallUsesRequestProxyURL(t *testing.T) {
 	t.Parallel()

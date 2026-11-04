@@ -29,10 +29,11 @@ func ConvertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON 
 		out, _ = sjson.SetRawBytes(out, "agent_config", []byte(agentConfig.Raw))
 	}
 	forAntigravity := isAntigravityModel(model)
+	forDevin := isDevinModel(model)
 	if input := root.Get("input"); input.Exists() {
 		out = setResponsesInputOnInteractions(out, input, forAntigravity)
 	}
-	out = appendResponsesToolsToInteractions(out, root.Get("tools"), forAntigravity)
+	out = appendResponsesToolsToInteractions(out, root.Get("tools"), forAntigravity, forDevin)
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
 		if forAntigravity && toolChoice.IsObject() {
 			tcRaw := []byte(toolChoice.Raw)
@@ -367,7 +368,7 @@ func interactionsTextStep(stepType, text string) []byte {
 	return step
 }
 
-func appendResponsesToolsToInteractions(out []byte, tools gjson.Result, forAntigravity bool) []byte {
+func appendResponsesToolsToInteractions(out []byte, tools gjson.Result, forAntigravity, forDevin bool) []byte {
 	if !tools.Exists() || !tools.IsArray() {
 		return out
 	}
@@ -375,17 +376,26 @@ func appendResponsesToolsToInteractions(out []byte, tools gjson.Result, forAntig
 	tools.ForEach(func(_, tool gjson.Result) bool {
 		switch tool.Get("type").String() {
 		case "function", "":
-			if converted, ok := functionToolToInteractions(tool, forAntigravity); ok {
+			name := firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String())
+			if forDevin && translatorcommon.IsDevinCodexAppAutomationUpdate("", name) {
+				return true
+			}
+			if converted, ok := functionToolToInteractions(tool, forAntigravity, forDevin); ok {
 				toolItems = append(toolItems, converted)
 			}
 		case "namespace":
+			namespace := firstNonEmpty(tool.Get("name").String(), tool.Get("namespace").String())
 			declarationItems := make([][]byte, 0, 4)
 			children := tool.Get("children")
 			if !children.Exists() {
 				children = tool.Get("tools")
 			}
 			children.ForEach(func(_, child gjson.Result) bool {
-				if converted, ok := functionDeclarationFromTool(child, forAntigravity); ok {
+				name := firstNonEmpty(child.Get("name").String(), child.Get("function.name").String())
+				if forDevin && translatorcommon.IsDevinCodexAppAutomationUpdate(namespace, name) {
+					return true
+				}
+				if converted, ok := functionDeclarationFromTool(child, forAntigravity, forDevin); ok {
 					declarationItems = append(declarationItems, converted)
 				}
 				return true
@@ -404,7 +414,7 @@ func appendResponsesToolsToInteractions(out []byte, tools gjson.Result, forAntig
 	return out
 }
 
-func functionToolToInteractions(tool gjson.Result, forAntigravity bool) ([]byte, bool) {
+func functionToolToInteractions(tool gjson.Result, forAntigravity, forDevin bool) ([]byte, bool) {
 	name := firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String())
 	if name == "" {
 		return nil, false
@@ -414,12 +424,17 @@ func functionToolToInteractions(tool gjson.Result, forAntigravity bool) ([]byte,
 	}
 	out := []byte(`{"type":"function","name":""}`)
 	out, _ = sjson.SetBytes(out, "name", name)
-	copyOptionalString(&out, "description", firstExisting(tool.Get("description"), tool.Get("function.description")))
+	description := firstExisting(tool.Get("description"), tool.Get("function.description"))
+	if description.Exists() && forDevin {
+		out, _ = sjson.SetBytes(out, "description", translatorcommon.SanitizeDevinToolDescription(name, description.String()))
+	} else {
+		copyOptionalString(&out, "description", description)
+	}
 	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
 	return out, true
 }
 
-func functionDeclarationFromTool(tool gjson.Result, forAntigravity bool) ([]byte, bool) {
+func functionDeclarationFromTool(tool gjson.Result, forAntigravity, forDevin bool) ([]byte, bool) {
 	name := firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String())
 	if name == "" {
 		return nil, false
@@ -429,7 +444,12 @@ func functionDeclarationFromTool(tool gjson.Result, forAntigravity bool) ([]byte
 	}
 	out := []byte(`{"name":""}`)
 	out, _ = sjson.SetBytes(out, "name", name)
-	copyOptionalString(&out, "description", firstExisting(tool.Get("description"), tool.Get("function.description")))
+	description := firstExisting(tool.Get("description"), tool.Get("function.description"))
+	if description.Exists() && forDevin {
+		out, _ = sjson.SetBytes(out, "description", translatorcommon.SanitizeDevinToolDescription(name, description.String()))
+	} else {
+		copyOptionalString(&out, "description", description)
+	}
 	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
 	return out, true
 }
@@ -739,6 +759,11 @@ func copyOptionalRaw(out *[]byte, path string, value gjson.Result) {
 
 func isAntigravityModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "antigravity")
+}
+
+func isDevinModel(model string) bool {
+	clean := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(clean, "devin/") || strings.Contains(clean, "devin")
 }
 
 func firstExisting(values ...gjson.Result) gjson.Result {

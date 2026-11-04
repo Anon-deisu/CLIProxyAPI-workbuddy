@@ -237,11 +237,39 @@ routing:
   # Ignored when routing.session-affinity is false.
   session-affinity-subagents: true
 
+# The account scheduling panel can opt into saving its settings here.
+# Turning persistence off stops future writes and retains the last saved snapshot.
+# Static ISP node credentials are included when configured.
+# account-scheduling:
+#   persist-settings: true
+#   degraded-port: 9444
+#   exo-free-port: 0  # OpenCode Free Chat/Responses streaming API; legacy key, 0 disables it.
+#   auth-concurrency-limit: 0
+#   workbuddy-fingerprint-convergence: false # keep WorkBuddy's upstream account identity stable per UID/site
+#   codex-static-isp:
+#     enabled: false
+#     nodes:
+#       - id: isp-us-1
+#         scheme: socks5 # socks5 (default), socks5h, http or https
+#         host: 192.0.2.10
+#         port: 1080
+#         username: your-isp-username
+#         password: your-isp-password
+# A non-empty enabled pool overrides the account/global proxies for Codex
+# OAuth accounts. HTTP and WebSocket share the bound endpoint.
+# Node failures never fall back to direct or another proxy for the same account.
+# Stable assignments are stored in runtime/codex-static-isp-bindings.json beside this config.
+# Provision that runtime directory as service-owned (0700); config.yaml remains protected (0600).
+
 # Codex provider behavior.
 codex:
-  # Probe model for the runtime-only account-scoped turn-state switch in Management.
-  # Collection uses direct connections; no WARP or outbound proxy is required.
-  turn-state-probe-model: "gpt-6-astra"
+  # Refresh active local OAuth accounts immediately and between completed polling rounds.
+  # Updates quota-based scheduling weights; does not generate model requests or bill usage.
+  # Disabled accounts and Home-managed credentials are not probed.
+  quota-refresh:
+    enabled: true
+    interval: 5m
+    concurrency: 2
   # When true, and routing.strategy is fill-first or routing.session-affinity is true,
   # remap Codex prompt_cache_key and installation identity per selected auth.
   # Some superstitious users believe request tracking identifiers can be used
@@ -326,7 +354,9 @@ nonstream-keepalive-interval: 0
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
-#   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   # Responses and Chat Completions also send heartbeats during upstream setup and first-payload waits.
+#   # Once a heartbeat commits HTTP 200, later failures are returned as SSE errors, not HTTP error statuses.
+#   bootstrap-retries: 1    # Default: 0 (disabled). Retries before the first model payload is sent.
 
 # Signature cache validation for thinking blocks (Antigravity/Claude).
 # When true (default), cached signatures are preferred and validated.

@@ -168,6 +168,15 @@ func pluginAuthProviderFromPath(path string) (string, bool) {
 	return provider, true
 }
 
+func pluginAuthProviderFromRequest(c *gin.Context) (string, bool) {
+	if c != nil && c.Request != nil {
+		if provider := strings.ToLower(strings.TrimSpace(c.Query("provider"))); provider != "" {
+			return provider, true
+		}
+	}
+	return pluginAuthProviderFromPath(c.Request.URL.Path)
+}
+
 func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 	if h == nil || c == nil || c.Request == nil || c.Request.URL == nil {
 		return false
@@ -178,13 +187,17 @@ func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 	if host == nil {
 		return false
 	}
-	provider, ok := pluginAuthProviderFromPath(c.Request.URL.Path)
+	provider, ok := pluginAuthProviderFromRequest(c)
 	if !ok || !host.HasAuthProvider(provider) {
 		return false
 	}
 
 	ctx := PopulateAuthContext(context.Background(), c)
-	baseURL, errBaseURL := h.managementCallbackURL("/v0/management/oauth-callback")
+	callbackPath := "/v0/management/oauth-callback"
+	if strings.HasPrefix(c.Request.URL.Path, "/v8/management/") {
+		callbackPath = "/v8/management/oauth/callback"
+	}
+	baseURL, errBaseURL := h.managementCallbackURL(callbackPath)
 	if errBaseURL != nil {
 		log.WithError(errBaseURL).Error("failed to compute plugin auth callback URL")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})

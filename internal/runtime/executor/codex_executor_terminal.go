@@ -175,7 +175,7 @@ func codexTerminalFailureErrWithCooling(eventData []byte, modelLevelCooling bool
 }
 
 func codexTerminalFailureStatus(body []byte) int {
-	for _, path := range []string{"error.status_code", "error.status"} {
+	for _, path := range []string{"error.status_code", "error.status", "status_code", "status"} {
 		if status := int(gjson.GetBytes(body, path).Int()); status >= 400 && status <= 599 {
 			return status
 		}
@@ -220,6 +220,12 @@ func codexTerminalFailureBody(eventData []byte) ([]byte, bool) {
 	}
 	if len(body) == 0 {
 		body = []byte(`{"error":{"message":"upstream stream failed without error details"}}`)
+	}
+	// Preserve envelope statuses when extracting the nested error details.
+	for _, key := range []string{"status", "status_code"} {
+		if status := gjson.GetBytes(eventData, key); status.Exists() {
+			body, _ = sjson.SetRawBytes(body, key, []byte(status.Raw))
+		}
 	}
 	if seq := gjson.GetBytes(eventData, "sequence_number"); seq.Exists() {
 		body, _ = sjson.SetBytes(body, "sequence_number", seq.Int())
@@ -464,9 +470,9 @@ func isCodexHandshakeMetadataEvent(eventType string) bool {
 	}
 }
 
-// observeCodexTokenEvent inspects a stream payload and marks TTFT on the first substantive token event.
+// observeCodexTokenEvent records Codex TTFT on the first non-handshake response event.
 func observeCodexTokenEvent(reporter *helps.UsageReporter, payload []byte) {
-	helps.ObserveResponsesTokenEvent(reporter, payload)
+	helps.ObserveResponsesProgressEvent(reporter, payload)
 }
 
 // newCodexBootstrapOverloadErr reports a buffered overload rejection with its real status.

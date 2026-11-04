@@ -1,10 +1,63 @@
 package codex
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 )
+
+// TokenRefreshError exposes only trusted refresh failure metadata. Provider
+// descriptions, response bodies and transport diagnostics are never formatted.
+type TokenRefreshError struct {
+	status    int
+	code      string
+	operation string
+	cause     error
+}
+
+func (e *TokenRefreshError) Error() string {
+	if e.status != 0 {
+		if e.code != "" {
+			return fmt.Sprintf("token refresh failed with status %d: %s", e.status, e.code)
+		}
+		return fmt.Sprintf("token refresh failed with status %d", e.status)
+	}
+	return "token refresh failed: " + e.operation
+}
+
+func (e *TokenRefreshError) StatusCode() int   { return e.status }
+func (e *TokenRefreshError) ErrorCode() string { return e.code }
+func (e *TokenRefreshError) Unwrap() error     { return e.cause }
+
+func newTokenRefreshHTTPError(status int, body []byte) *TokenRefreshError {
+	failure := &TokenRefreshError{status: status}
+	var payload struct {
+		Error json.RawMessage `json:"error"`
+		Code  string          `json:"code"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return failure
+	}
+	var errorName string
+	var nested struct {
+		Code string `json:"code"`
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(payload.Error, &errorName) != nil {
+		_ = json.Unmarshal(payload.Error, &nested)
+	}
+	for _, code := range []string{nested.Code, payload.Code, errorName, nested.Type} {
+		switch code {
+		case "invalid_grant", "refresh_token_reused", "refresh_token_expired", "refresh_token_invalidated",
+			"invalid_request", "invalid_client", "unauthorized_client", "unsupported_grant_type", "invalid_scope",
+			"server_error", "temporarily_unavailable":
+			failure.code = code
+			return failure
+		}
+	}
+	return failure
+}
 
 // OAuthError represents an OAuth-specific error.
 type OAuthError struct {

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -173,6 +174,16 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	if email, _ := metadata["email"].(string); email != "" {
 		label = email
 	}
+	if provider == "workbuddy" || provider == "workbuddy-ai" || provider == "qoder" || provider == "qoder-cn" {
+		if nickname, _ := metadata["nickname"].(string); nickname != "" {
+			label = nickname
+		} else if uid, _ := metadata["uid"].(string); label == provider && uid != "" {
+			label = uid
+		}
+		if savedLabel, _ := metadata["label"].(string); (provider == "qoder" || provider == "qoder-cn") && savedLabel != "" {
+			label = savedLabel
+		}
+	}
 	// Use relative path under authDir as ID to stay consistent with the file-based token store.
 	id := fullPath
 	if strings.TrimSpace(ctx.AuthDir) != "" {
@@ -224,6 +235,19 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		Metadata:  metadata,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+	if provider == "kimi" || provider == "kimi-ai" || provider == "kimi.ai" {
+		domain := kimi.NormalizeKimiDomain(provider)
+		if rawDomain, ok := metadata["domain"].(string); ok && strings.TrimSpace(rawDomain) != "" {
+			domain = kimi.NormalizeKimiDomain(rawDomain)
+		}
+		a.Provider = provider
+		a.Attributes["domain"] = domain
+		if rawBase, ok := metadata["base_url"].(string); ok && strings.TrimSpace(rawBase) != "" {
+			a.Attributes["base_url"] = strings.TrimSpace(rawBase)
+		} else {
+			a.Attributes["base_url"] = kimi.ResolveKimiAPIBaseURL(domain)
+		}
 	}
 	// Read priority from auth file.
 	if rawPriority, ok := metadata["priority"]; ok {

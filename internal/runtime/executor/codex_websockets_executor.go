@@ -16,12 +16,9 @@ import (
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
-//
-// It preserves the existing CodexExecutor HTTP implementation as a fallback for endpoints
-// not available over WebSocket (e.g. /responses/compact) and for websocket upgrade failures.
+// HTTP remains the fallback for unsupported endpoints and websocket upgrade failures.
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
-
 	store *codexWebsocketSessionStore
 }
 
@@ -32,11 +29,7 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	}
 }
 
-// CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
-//  2. The selected auth enables websockets.
-//
-// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+// CodexAutoExecutor uses WebSocket only when both the downstream and selected auth enable it.
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
@@ -51,14 +44,30 @@ func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
 
-// SetTurnStateKeeper binds the service-owned keeper before publishing this executor.
-func (e *CodexAutoExecutor) SetTurnStateKeeper(keeper *helps.CodexTurnStateKeeper) {
-	e.httpExec.turnStates = keeper
-	e.wsExec.turnStates = keeper
+// ForAPIKey retains WebSocket sessions and the shared proxy binding manager.
+func (e *CodexAutoExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
+	copy := *e
+	copy.httpExec = e.httpExec.ForAPIKey().(*CodexExecutor)
+	ws := *e.wsExec
+	ws.CodexExecutor = e.wsExec.CodexExecutor.ForAPIKey().(*CodexExecutor)
+	copy.wsExec = &ws
+	return &copy
 }
 
-func (e *CodexAutoExecutor) CodexTurnStateKeeper() *helps.CodexTurnStateKeeper {
-	return e.httpExec.turnStates
+func (e *CodexWebsocketsExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
+	copy := *e
+	copy.CodexExecutor = e.CodexExecutor.ForAPIKey().(*CodexExecutor)
+	return &copy
+}
+
+// SetEgressManager binds the service-owned routing state before publishing this executor.
+func (e *CodexAutoExecutor) SetEgressManager(manager *helps.CodexEgressManager) {
+	e.httpExec.egress = manager
+	e.wsExec.egress = manager
+}
+
+func (e *CodexAutoExecutor) CodexEgressManager() *helps.CodexEgressManager {
+	return e.httpExec.egress
 }
 
 func (e *CodexAutoExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
@@ -73,6 +82,10 @@ func (e *CodexAutoExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.
 		return nil, fmt.Errorf("codex auto executor: http executor is nil")
 	}
 	return e.httpExec.HttpRequest(ctx, auth, req)
+}
+
+func (e *CodexAutoExecutor) FetchQuota(ctx context.Context, auth *cliproxyauth.Auth) (http.Header, error) {
+	return e.httpExec.FetchQuota(ctx, auth)
 }
 
 func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {

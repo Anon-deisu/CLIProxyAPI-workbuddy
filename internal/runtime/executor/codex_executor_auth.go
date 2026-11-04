@@ -27,12 +27,60 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		}
 	}
 	if refreshToken == "" {
+		if tokenData, errRelogin := e.reloginAutoOAuth(ctx, auth, ""); errRelogin == nil {
+			applyCodexTokenData(auth, tokenData)
+			return auth, nil
+		} else if _, okAuto := codexauth.AutoOAuthCredentials(auth.Metadata); okAuto {
+			return nil, errRelogin
+		}
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
+	bound, errBinding := e.bindEgress(auth)
+	if errBinding != nil {
+		return nil, errBinding
+	}
+	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, bound.ProxyURL)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
+		if tokenData, errRelogin := e.reloginAutoOAuth(ctx, auth, bound.ProxyURL); errRelogin == nil {
+			applyCodexTokenData(auth, tokenData)
+			return auth, nil
+		} else if _, okAuto := codexauth.AutoOAuthCredentials(auth.Metadata); okAuto {
+			return nil, errRelogin
+		}
 		return nil, err
+	}
+	applyCodexTokenData(auth, td)
+	return auth, nil
+}
+
+func (e *CodexExecutor) reloginAutoOAuth(ctx context.Context, auth *cliproxyauth.Auth, proxyURL string) (*codexauth.CodexTokenData, error) {
+	account, ok := codexauth.AutoOAuthCredentials(auth.Metadata)
+	if !ok {
+		return nil, statusErr{code: 401, msg: "codex automatic OAuth recovery is not enabled"}
+	}
+	workspaceID, workspaceName := "", ""
+	if stored, okStored := auth.Metadata[codexauth.AutoOAuthKey].(map[string]any); okStored {
+		workspaceID, _ = stored["workspace_id"].(string)
+		workspaceName, _ = stored["workspace_name"].(string)
+	}
+	result, errLogin := codexauth.AutoOAuthLogin(ctx, e.cfg, account, proxyURL, workspaceID, workspaceName)
+	if errLogin != nil {
+		return nil, errLogin
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	stored := account.Metadata(result.WorkspaceID, result.WorkspaceName)
+	stored["account_id"] = result.Bundle.TokenData.AccountID
+	auth.Metadata[codexauth.AutoOAuthKey] = stored
+	auth.Metadata[codexauth.AutoOAuthRecoveryKey] = map[string]any{"enabled": true, "status": "active"}
+	return &result.Bundle.TokenData, nil
+}
+
+func applyCodexTokenData(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) {
+	if auth == nil || td == nil {
+		return
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -51,7 +99,6 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	auth.Metadata["type"] = "codex"
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
-	return auth, nil
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

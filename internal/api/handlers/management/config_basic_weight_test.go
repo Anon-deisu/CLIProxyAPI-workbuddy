@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"gopkg.in/yaml.v3"
 )
@@ -61,150 +62,256 @@ func TestPutRoutingSettingsUpdatesMemoryOnly(t *testing.T) {
 	}
 }
 
-func TestRoutingSettingsCodexTurnStateRoundTrip(t *testing.T) {
-	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	for _, enabled := range []bool{true, false} {
-		body, _ := json.Marshal(map[string]any{"codex-turn-state-enabled": enabled})
+func TestWorkBuddyFingerprintRoutingSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	const original = "# keep deployment settings\nport: 8317\n"
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	h := NewHandler(cfg, path, nil)
+	get := func(handler *Handler) bool {
+		t.Helper()
 		rec := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(rec)
-		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
-		h.PutRoutingSettings(ctx)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("PATCH: %s", rec.Body.String())
-		}
-		h.SetConfig(&config.Config{})
-		rec = httptest.NewRecorder()
-		ctx, _ = gin.CreateTestContext(rec)
-		h.GetRoutingSettings(ctx)
+		handler.GetRoutingSettings(ctx)
 		var settings map[string]any
 		if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
 			t.Fatal(err)
 		}
-		if settings["codex-turn-state-enabled"] != enabled {
-			t.Fatal("runtime toggle lost across reload")
+		value, ok := settings["workbuddy-fingerprint-convergence"].(bool)
+		if !ok {
+			t.Fatal("WorkBuddy fingerprint setting is missing")
 		}
-		yamlBytes, _ := yaml.Marshal(h.cfg)
-		if strings.Contains(string(yamlBytes), "codex-turn-state-enabled") {
-			t.Fatal("runtime toggle was persisted")
-		}
-		rec = httptest.NewRecorder()
-		ctx, _ = gin.CreateTestContext(rec)
-		h.GetCodexTurnStateStatus(ctx)
-		var status map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
-			t.Fatal(err)
-		}
-		if status["enabled"] != enabled || status["ttl_seconds"] != float64(3600) {
-			t.Fatal("incorrect keeper status")
-		}
+		return value
 	}
-}
-
-func TestRoutingSettingsCodexAutoDegradeRoundTrip(t *testing.T) {
-	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	for _, enabled := range []bool{true, false} {
-		body, _ := json.Marshal(map[string]any{"codex-auto-degrade": enabled})
+	patch := func(raw string) {
+		t.Helper()
 		rec := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(rec)
-		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(raw))
 		h.PutRoutingSettings(ctx)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("PATCH: %s", rec.Body.String())
+			t.Fatalf("PATCH: %d %s", rec.Code, rec.Body.String())
 		}
-		h.SetConfig(&config.Config{})
-		rec = httptest.NewRecorder()
-		ctx, _ = gin.CreateTestContext(rec)
-		h.GetRoutingSettings(ctx)
-		var settings map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
-			t.Fatal(err)
-		}
-		if settings["codex-auto-degrade"] != enabled {
-			t.Fatal("automatic degradation toggle lost across reload")
-		}
-		encoded, _ := yaml.Marshal(h.cfg)
-		if strings.Contains(string(encoded), "codex-auto-degrade") {
-			t.Fatal("runtime automation toggle was persisted")
-		}
-		if h.cfg.Routing.CodexTurnStateEnabled != nil {
-			t.Fatal("automation toggle implicitly enabled collection")
-		}
+	}
+	if get(h) {
+		t.Fatal("convergence should default to off")
+	}
+	patch(`{"workbuddy-fingerprint-convergence":true}`)
+	if !get(h) {
+		t.Fatal("runtime enable failed")
+	}
+	saved, _ := os.ReadFile(path)
+	if string(saved) != original {
+		t.Fatal("runtime-only change modified the file")
+	}
+	h.SetConfig(&config.Config{Debug: true})
+	if !get(h) || cfg.Routing.CodexFingerprintConvergence != nil {
+		t.Fatal("reload lost WorkBuddy state or changed Codex")
+	}
+	patch(`{"persist-settings":true}`)
+	fresh, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !get(NewHandlerWithoutConfigFilePath(fresh, nil)) {
+		t.Fatal("persisted convergence was not restored")
+	}
+	patch(`{"workbuddy-fingerprint-convergence":false}`)
+	h.SetConfig(&config.Config{})
+	if get(h) || !get(NewHandlerWithoutConfigFilePath(fresh, nil)) {
+		t.Fatal("false reload was lost or previous config snapshot was mutated")
+	}
+	fresh, err = config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if get(NewHandlerWithoutConfigFilePath(fresh, nil)) {
+		t.Fatal("explicit false did not persist")
 	}
 }
 
-func TestRoutingSettingsCliproxyRoundTrip(t *testing.T) {
-	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	patch := func(body string) {
+func TestPutRoutingSettingsFakeModels(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(path, []byte("port: 8317\n"), 0600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	cfg := &config.Config{}
+	h := NewHandler(cfg, path, nil)
+	patch := func(body string, want int) {
 		t.Helper()
 		rec := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(rec)
 		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(body))
 		h.PutRoutingSettings(ctx)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("PATCH: status=%d body=%s", rec.Code, rec.Body.String())
+		if rec.Code != want {
+			t.Fatalf("PATCH %s: status = %d, want %d; body = %s", body, rec.Code, want, rec.Body.String())
 		}
 	}
-	patch(`{"codex-state-cliproxy":{"enabled":true,"gateway":"proxy.test:1080","username":"test-region-US","password":"test-secret"}}`)
-	for _, enabled := range []bool{true, false, true} {
-		body, _ := json.Marshal(map[string]any{"codex-state-cliproxy": map[string]any{"enabled": enabled}})
-		patch(string(body))
-		h.SetConfig(&config.Config{})
-		rec := httptest.NewRecorder()
-		ctx, _ := gin.CreateTestContext(rec)
-		h.GetRoutingSettings(ctx)
-		var settings map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &settings); err != nil {
-			t.Fatal(err)
-		}
-		want := map[string]any{"enabled": enabled, "gateway": "proxy.test:1080", "username": "test-region-US", "password-configured": true}
-		if !reflect.DeepEqual(settings["codex-state-cliproxy"], want) {
-			t.Fatalf("Cliproxy settings after reload = %v", settings["codex-state-cliproxy"])
-		}
-		if rec.Header().Get("Cache-Control") != "no-store" || strings.Contains(rec.Body.String(), "test-secret") {
-			t.Fatal("settings response leaked or cached proxy credentials")
-		}
-		encoded, _ := yaml.Marshal(h.cfg)
-		if strings.Contains(string(encoded), "cliproxy") || strings.Contains(string(encoded), "test-secret") {
-			t.Fatal("runtime proxy settings were persisted to YAML")
-		}
-		encoded, _ = json.Marshal(h.cfg)
-		if strings.Contains(string(encoded), "test-secret") {
-			t.Fatal("config JSON exposed the proxy password")
-		}
-		if h.cfg.Routing.CodexTurnStateEnabled != nil || h.cfg.ProxyURL != "" {
-			t.Fatal("state proxy settings changed collection toggle or inference proxy")
-		}
-		proxyURL, errProxy := h.cfg.Routing.CodexStateCliproxy.ProxyURL()
-		wantProxy := "direct"
-		if enabled {
-			wantProxy = "socks5://test-region-US:test-secret@proxy.test:1080"
-		}
-		if errProxy != nil || proxyURL != wantProxy {
-			t.Fatal("bare gateway did not use SOCKS5 or password was lost across reload")
-		}
+	patch(`{"fake-models":[{"name":"fake-a","responses":["A","Alternative"],"input-tokens":114514,"output-tokens":1919810,"cache-read-tokens":325,"cache-write-tokens":799,"chars-per-second":25},{"name":"fake-b","content":"B","input-tokens":2}]}`, http.StatusOK)
+	if len(cfg.Routing.FakeModels) != 2 || cfg.Routing.FakeModels[0].CacheWriteTokens != 799 || len(cfg.Routing.FakeModels[0].Responses) != 2 {
+		t.Fatalf("runtime fake models = %#v", cfg.Routing.FakeModels)
+	}
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/routing/settings", nil)
+	h.GetRoutingSettings(ctx)
+	var settings struct {
+		FakeModels []config.FakeModelConfig `json:"fake-models"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &settings); errDecode != nil || !reflect.DeepEqual(settings.FakeModels, cfg.Routing.FakeModels) {
+		t.Fatalf("GET fake models = %#v, decode error = %v", settings.FakeModels, errDecode)
+	}
+	patch(`{"persist-settings":true}`, http.StatusOK)
+	fresh, errLoad := config.LoadConfig(path)
+	if errLoad != nil || !reflect.DeepEqual(fresh.Routing.FakeModels, cfg.Routing.FakeModels) {
+		t.Fatalf("fake models did not survive persisted reload: %v", errLoad)
+	}
+	patch(`{"fake-models":[{"name":"fake-a","content":"A"},{"name":"fake-a","content":"B"}]}`, http.StatusBadRequest)
+	patch(`{"fake-models":[{"name":"fake-a","content":"A","output-tokens":-2}]}`, http.StatusBadRequest)
+	patch(`{"fake-models":[{"name":"fake-a","responses":[]}]}`, http.StatusBadRequest)
+	patch(`{"fake-models":[{"name":"fake-a","responses":["A"],"chars-per-second":-1}]}`, http.StatusBadRequest)
+	patch(`{"fake-models":[{"name":"fake-a","responses":["A"],"chars-per-second":1.5}]}`, http.StatusBadRequest)
+	patch(`{"fake-models":[{"name":"fake-a","responses":["A"," "]}]}`, http.StatusBadRequest)
+	if len(cfg.Routing.FakeModels) != 2 {
+		t.Fatal("invalid patch changed runtime fake models")
+	}
+	patch(`{"fake-models":[]}`, http.StatusOK)
+	if len(cfg.Routing.FakeModels) != 0 {
+		t.Fatal("fake models were not removed")
+	}
+	fresh, errLoad = config.LoadConfig(path)
+	if errLoad != nil || len(fresh.Routing.FakeModels) != 0 {
+		t.Fatalf("fake model removal did not survive persisted reload: %v", errLoad)
 	}
 }
 
-func TestRoutingSettingsCliproxyValidation(t *testing.T) {
-	for _, proxy := range []string{
-		`{"enabled":true}`,
-		`{"enabled":true,"gateway":"direct","username":"test-region-US","password":"secret"}`,
-		`{"enabled":true,"gateway":"ftp://proxy.test:1080","username":"test-region-US","password":"secret"}`,
-		`{"enabled":true,"gateway":"socks5://proxy.test:70000","username":"test-region-US","password":"secret"}`,
-		`{"enabled":true,"gateway":"socks5://user:secret@proxy.test:1080","username":"test-region-US","password":"secret"}`,
-		`{"enabled":true,"gateway":"socks5://proxy.test:1080","username":"","password":"secret"}`,
-	} {
-		h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+func TestRoutingSettingsPersistenceRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if errWrite := os.WriteFile(path, []byte("# deployment comment\nport: 8317\napi-keys: [independent-key]\nrouting:\n  strategy: round-robin\n"), 0600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	cfg, errLoad := config.LoadConfig(path)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	h := NewHandler(cfg, path, nil)
+	h.SetDegradedPortController(func(int) error { return nil })
+	h.SetExoFreePortController(func(int) error { return nil })
+	patch := func(raw string) map[string]any {
+		t.Helper()
 		rec := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(rec)
-		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"auto-disable-quota":true,"codex-state-cliproxy":`+proxy+`}`))
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(raw))
 		h.PutRoutingSettings(ctx)
-		if rec.Code != http.StatusBadRequest || h.cfg.Routing.AutoDisableQuota {
-			t.Fatalf("invalid proxy settings mutated config: status=%d", rec.Code)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PATCH status=%d body=%s", rec.Code, rec.Body.String())
 		}
-		if strings.Contains(rec.Body.String(), "secret") {
-			t.Fatal("validation error exposed proxy credentials")
+		var result map[string]any
+		if errDecode := json.Unmarshal(rec.Body.Bytes(), &result); errDecode != nil {
+			t.Fatal(errDecode)
 		}
+		return result
+	}
+	result := patch(`{"persist-settings":true,"degraded-port":9444,"exo-free-port":18888,"auth-concurrency-limit":2,"c2a-max-retry-count":5,"c2a-max-retry-interval":7,"c2a-max-retry-credentials":1,"auto-disable-unauthorized":true,"auto-disable-quota":true,"disable-cooling":true,"codex-fingerprint-convergence":true,"codex-routing-hint":"","cache-token-rewrite":{"enabled":true,"min-percent":0,"max-percent":95}}`)
+	if result["persisted"] != true || result["runtime_only"] != false {
+		t.Fatalf("save was not acknowledged: %v", result)
+	}
+	saved, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if !strings.Contains(string(saved), "# deployment comment") || !strings.Contains(string(saved), "independent-key") {
+		t.Fatal("saving scheduler settings changed unrelated configuration")
+	}
+	fresh, errLoad := config.LoadConfig(path)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if fresh.Routing.DegradedPort == nil || *fresh.Routing.DegradedPort != 9444 || fresh.Routing.ExoFreePort == nil || *fresh.Routing.ExoFreePort != 18888 || fresh.Routing.AuthConcurrencyLimit == nil || *fresh.Routing.AuthConcurrencyLimit != 2 || !fresh.Routing.AutoDisableQuota || !fresh.Routing.AutoDisableUnauthorized {
+		t.Fatal("scheduler settings were not restored on fresh load")
+	}
+	if fresh.Routing.CodexRoutingHint == nil || *fresh.Routing.CodexRoutingHint != "" || fresh.CacheTokenRewrite == nil || fresh.CacheTokenRewrite.MinPercent == nil || *fresh.CacheTokenRewrite.MinPercent != 0 {
+		t.Fatal("Codex or explicit zero/empty settings were not restored")
+	}
+	result = patch(`{"persist-settings":false,"auth-concurrency-limit":9}`)
+	after, _ := os.ReadFile(path)
+	if string(after) != string(saved) || result["persisted"] != false || result["runtime_only"] != true {
+		t.Fatal("disabling persistence overwrote the last saved configuration")
+	}
+	if *h.cfg.Routing.AuthConcurrencyLimit != 9 || *h.cfg.Routing.PersistSettings {
+		t.Fatal("disabling persistence did not apply the runtime-only changes")
+	}
+	h.SetConfig(fresh)
+	if *h.cfg.Routing.AuthConcurrencyLimit != 2 || !*h.cfg.Routing.PersistSettings {
+		t.Fatal("explicit file reload did not restore the last saved snapshot")
+	}
+	result = patch(`{"persist-settings":true,"degraded-port":0,"exo-free-port":0,"auth-concurrency-limit":0,"c2a-max-retry-count":-1,"disable-cooling":false}`)
+	if result["persisted"] != true {
+		t.Fatal("re-enabling persistence did not save")
+	}
+	fresh, errLoad = config.LoadConfig(path)
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if fresh.Routing.DegradedPort == nil || *fresh.Routing.DegradedPort != 0 || fresh.Routing.ExoFreePort == nil || *fresh.Routing.ExoFreePort != 0 || fresh.Routing.AuthConcurrencyLimit == nil || *fresh.Routing.AuthConcurrencyLimit != 0 || fresh.Routing.C2AMaxRetryCount != nil || *fresh.Routing.DisableCooling {
+		t.Fatal("saving zero, false or reset overrides retained stale values")
+	}
+}
+
+func TestRoutingSettingsPersistenceFailureIsReported(t *testing.T) {
+	cfg := &config.Config{}
+	h := NewHandler(cfg, filepath.Join(t.TempDir(), "missing", "config.yaml"), nil)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"persist-settings":true,"auth-concurrency-limit":3}`))
+	h.PutRoutingSettings(ctx)
+	if rec.Code != http.StatusInternalServerError || cfg.Routing.AuthConcurrencyLimit == nil || *cfg.Routing.AuthConcurrencyLimit != 3 {
+		t.Fatalf("save failure did not report applied runtime settings: status=%d", rec.Code)
+	}
+	var result map[string]any
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &result); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if result["applied"] != true || result["persisted"] != false || result["error"] == nil {
+		t.Fatalf("ambiguous persistence failure: %v", result)
+	}
+}
+
+func TestRoutingSettingsRemovedCodexFeatures(t *testing.T) {
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
+	removed := map[string]any{
+		"codex-turn-state-enabled":     true,
+		"codex-auto-degrade":           true,
+		"codex-excel-routing-enabled":  true,
+		"codex-excel-disable-fallback": true,
+		"codex-state-cliproxy":         map[string]any{"enabled": true, "gateway": "proxy.test:1080", "username": "test", "password": "test-secret"},
+	}
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	h.GetRoutingSettings(ctx)
+	var settings map[string]any
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &settings); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	for key, value := range removed {
+		t.Run(key, func(t *testing.T) {
+			if _, exists := settings[key]; exists {
+				t.Error("removed setting is still exposed")
+			}
+			body, errMarshal := json.Marshal(map[string]any{key: value})
+			if errMarshal != nil {
+				t.Fatal(errMarshal)
+			}
+			rec := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(rec)
+			ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(string(body)))
+			h.PutRoutingSettings(ctx)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("removed setting was accepted: status=%d", rec.Code)
+			}
+		})
 	}
 }
 
@@ -225,7 +332,21 @@ func TestPutRoutingSettingsUpdatesCodexRoutingHint(t *testing.T) {
 func TestPutRoutingSettingsUpdatesDisableCooling(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{}
-	h := NewHandlerWithoutConfigFilePath(cfg, nil)
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(cfg)
+	credential := &coreauth.Auth{ID: t.Name(), Provider: "codex", Status: coreauth.StatusActive}
+	const model = "management-cooling-bypass-test"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(credential.ID, credential.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(credential.ID) })
+	if _, errRegister := manager.Register(t.Context(), credential); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	manager.MarkResult(t.Context(), coreauth.Result{AuthID: credential.ID, Provider: credential.Provider, Model: model, Error: &coreauth.Error{HTTPStatus: http.StatusServiceUnavailable, Message: "temporary failure"}})
+	if !reg.IsModelSuspendedForClient(credential.ID, model) {
+		t.Fatal("expected the model to be cooling before the settings update")
+	}
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(`{"disable-cooling":true}`))
@@ -233,6 +354,9 @@ func TestPutRoutingSettingsUpdatesDisableCooling(t *testing.T) {
 	h.PutRoutingSettings(ctx)
 	if recorder.Code != http.StatusOK || cfg.Routing.DisableCooling == nil || !*cfg.Routing.DisableCooling {
 		t.Fatalf("status = %d, body=%s, routing = %+v", recorder.Code, recorder.Body.String(), cfg.Routing)
+	}
+	if reg.IsModelSuspendedForClient(credential.ID, model) || reg.IsModelQuotaExceededForClient(credential.ID, model) {
+		t.Fatal("successful settings PATCH did not release the model registry cooldown")
 	}
 }
 

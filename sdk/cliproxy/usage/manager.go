@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,8 +23,10 @@ const AutoServiceTier = "auto"
 type Record struct {
 	Provider string
 	// ExecutorType stores the concrete executor type that handled the request.
-	ExecutorType    string
-	Model           string
+	ExecutorType string
+	Model        string
+	// ResponseModel records the model actually reported by the upstream.
+	ResponseModel   string
 	Alias           string
 	APIKey          string
 	SessionID       string
@@ -80,20 +83,23 @@ type Detail struct {
 
 // ModelPrice describes the built-in GPT price in USD per one million tokens.
 type ModelPrice struct {
-	InputPerMillionUSD           float64
-	CachedInputPerMillionUSD     float64
-	CacheCreationPerMillionUSD   float64
-	OutputPerMillionUSD          float64
-	LongInputPerMillionUSD       float64
-	LongCachedInputPerMillionUSD float64
-	LongOutputPerMillionUSD      float64
-	LongContextThreshold         int64
+	InputPerMillionUSD             float64
+	CachedInputPerMillionUSD       float64
+	CacheCreationPerMillionUSD     float64
+	OutputPerMillionUSD            float64
+	LongInputPerMillionUSD         float64
+	LongCachedInputPerMillionUSD   float64
+	LongCacheCreationPerMillionUSD float64
+	LongOutputPerMillionUSD        float64
+	// LongContextThreshold is the first total input-token count billed at long rates.
+	LongContextThreshold int64
 }
 
-// AuthCostSnapshot contains token and estimated cost totals for the current
-// local-calendar-day accounting cycle of one auth.
+// AuthCostSnapshot contains in-memory token and estimated cost totals for one auth.
+// Totals accumulate across calendar days until ResetAuthCost is called explicitly.
 type AuthCostSnapshot struct {
-	AuthID               string    `json:"auth_id"`
+	AuthID string `json:"auth_id"`
+	// CycleDate is the local date when the ledger entry was created or explicitly reset.
 	CycleDate            string    `json:"cycle_date"`
 	InputTokens          int64     `json:"input_tokens"`
 	OutputTokens         int64     `json:"output_tokens"`
@@ -102,6 +108,44 @@ type AuthCostSnapshot struct {
 	UnpricedOutputTokens int64     `json:"unpriced_output_tokens"`
 	UpdatedAt            time.Time `json:"updated_at"`
 }
+
+// AuthModelCostBucket contains the estimated cost for one model in one recent request bucket.
+type AuthModelCostBucket struct {
+	BucketID         int64
+	Model            string
+	EstimatedCostUSD float64
+}
+
+// AuthModelTokenUsage is one auth file's token total for one model in its current statistics cycle.
+type AuthModelTokenUsage struct {
+	Model             string `json:"model"`
+	InputTokens       int64  `json:"input_tokens"`
+	CachedInputTokens int64  `json:"cached_input_tokens"`
+	OutputTokens      int64  `json:"output_tokens"`
+}
+
+// RecentTokenUsageSummary contains token totals for the dashboard's rolling window.
+type RecentTokenUsageSummary struct {
+	WindowMinutes int                   `json:"window_minutes"`
+	InputTokens   int64                 `json:"input_tokens"`
+	CachedTokens  int64                 `json:"cached_tokens"`
+	OutputTokens  int64                 `json:"output_tokens"`
+	CacheRate     float64               `json:"cache_rate"`
+	Models        []AuthModelTokenUsage `json:"models"`
+}
+
+type recentTokenUsageBucket struct {
+	bucketID     int64
+	inputTokens  int64
+	cachedTokens int64
+	outputTokens int64
+	models       map[string]AuthModelTokenUsage
+}
+
+const (
+	authCostBucketSeconds int64 = 10 * 60
+	authCostBucketCount         = 20
+)
 
 // BuiltinGPTModelPrices is the CPA price table used for local cost estimates.
 // Values are USD per one million input/output tokens and are independent from
@@ -120,11 +164,28 @@ var BuiltinGPTModelPrices = map[string]ModelPrice{
 	"o3":           {InputPerMillionUSD: 2.00, OutputPerMillionUSD: 8.00},
 	"o3-mini":      {InputPerMillionUSD: 1.10, OutputPerMillionUSD: 4.40},
 	"o4-mini":      {InputPerMillionUSD: 1.10, OutputPerMillionUSD: 4.40},
+	// Standard rates verified 2026-09-23 against https://developers.openai.com/api/docs/pricing
+	// and /api/docs/models/gpt-6-sol and /api/docs/models/gpt-6-luna.
+	// The >272K rule applies to the full request, including cache reads and writes.
+	"gpt-6-sol": {
+		InputPerMillionUSD: 2.00, CachedInputPerMillionUSD: 0.20, CacheCreationPerMillionUSD: 2.50, OutputPerMillionUSD: 10.00,
+		LongInputPerMillionUSD: 4.00, LongCachedInputPerMillionUSD: 0.40, LongCacheCreationPerMillionUSD: 5.00, LongOutputPerMillionUSD: 15.00,
+		LongContextThreshold: 272_001,
+	},
+	"gpt-6.1-sol": {
+		InputPerMillionUSD: 2.00, CachedInputPerMillionUSD: 0.10, CacheCreationPerMillionUSD: 2.50, OutputPerMillionUSD: 10.00,
+		LongInputPerMillionUSD: 4.00, LongCachedInputPerMillionUSD: 0.20, LongCacheCreationPerMillionUSD: 5.00, LongOutputPerMillionUSD: 15.00,
+		LongContextThreshold: 272_001,
+	},
+	"gpt-6-luna": {
+		InputPerMillionUSD: 0.10, CachedInputPerMillionUSD: 0.01, CacheCreationPerMillionUSD: 0.125, OutputPerMillionUSD: 0.50,
+		LongInputPerMillionUSD: 0.20, LongCachedInputPerMillionUSD: 0.02, LongCacheCreationPerMillionUSD: 0.25, LongOutputPerMillionUSD: 0.75,
+		LongContextThreshold: 272_001,
+	},
 }
 
-// BuiltinCodexModelPrices follows Codex2API's standard pricing table in USD
-// per one million tokens. Codex gpt-6 and gpt-5.6 intentionally have no cache
-// creation price; gpt-6 also has no long-context multiplier.
+// BuiltinCodexModelPrices retains the existing Codex2API estimates and uses the
+// published GPT-6 Sol/Luna Standard rates. Legacy Astra and GPT-5.x rates are unchanged.
 var BuiltinCodexModelPrices = map[string]ModelPrice{
 	"gpt-5.2":             {InputPerMillionUSD: 1.75, CachedInputPerMillionUSD: 0.175, CacheCreationPerMillionUSD: 1.75, OutputPerMillionUSD: 14.00},
 	"gpt-5.3-codex":       {InputPerMillionUSD: 1.75, CachedInputPerMillionUSD: 0.175, CacheCreationPerMillionUSD: 1.75, OutputPerMillionUSD: 14.00},
@@ -138,6 +199,9 @@ var BuiltinCodexModelPrices = map[string]ModelPrice{
 	"gpt-5.6-sol":         {InputPerMillionUSD: 5.00, CachedInputPerMillionUSD: 0.50, OutputPerMillionUSD: 30.00, LongInputPerMillionUSD: 10.00, LongCachedInputPerMillionUSD: 1.00, LongOutputPerMillionUSD: 45.00, LongContextThreshold: 272000},
 	"gpt-5.6-terra":       {InputPerMillionUSD: 2.00, CachedInputPerMillionUSD: 0.20, OutputPerMillionUSD: 12.00, LongInputPerMillionUSD: 4.00, LongCachedInputPerMillionUSD: 0.40, LongOutputPerMillionUSD: 18.00, LongContextThreshold: 272000},
 	"gpt-5.6-luna":        {InputPerMillionUSD: 0.20, CachedInputPerMillionUSD: 0.02, OutputPerMillionUSD: 1.20, LongInputPerMillionUSD: 0.40, LongCachedInputPerMillionUSD: 0.04, LongOutputPerMillionUSD: 1.80, LongContextThreshold: 272000},
+	"gpt-6-sol":           BuiltinGPTModelPrices["gpt-6-sol"],
+	"gpt-6.1-sol":         BuiltinGPTModelPrices["gpt-6.1-sol"],
+	"gpt-6-luna":          BuiltinGPTModelPrices["gpt-6-luna"],
 	"gpt-6-astra":         {InputPerMillionUSD: 10.00, CachedInputPerMillionUSD: 1.00, OutputPerMillionUSD: 50.00},
 }
 
@@ -146,12 +210,19 @@ type authCostLedgerState struct {
 }
 
 type authCostLedger struct {
-	mu      sync.Mutex
-	entries map[string]*authCostLedgerState
+	mu                 sync.Mutex
+	entries            map[string]*authCostLedgerState
+	modelBuckets       map[string]map[int64]map[string]float64
+	modelTotals        map[string]map[string]AuthModelTokenUsage
+	recentTokenBuckets [authCostBucketCount]recentTokenUsageBucket
 }
 
 func newAuthCostLedger() *authCostLedger {
-	return &authCostLedger{entries: make(map[string]*authCostLedgerState)}
+	return &authCostLedger{
+		entries:      make(map[string]*authCostLedgerState),
+		modelBuckets: make(map[string]map[int64]map[string]float64),
+		modelTotals:  make(map[string]map[string]AuthModelTokenUsage),
+	}
 }
 
 func costCycleDate(now time.Time) string {
@@ -169,7 +240,17 @@ func normalizeCostModel(model string) string {
 	if suffix := strings.IndexAny(model, "(:"); suffix >= 0 {
 		model = model[:suffix]
 	}
+	if strings.HasPrefix(model, "gpt6-") {
+		model = "gpt-6-" + strings.TrimPrefix(model, "gpt6-")
+	} else if strings.HasPrefix(model, "gpt6.") {
+		model = "gpt-6." + strings.TrimPrefix(model, "gpt6.")
+	}
 	return strings.TrimSpace(model)
+}
+
+// NormalizeModelName returns the canonical model key used by local pricing.
+func NormalizeModelName(model string) string {
+	return normalizeCostModel(model)
 }
 
 func lookupModelPrice(table map[string]ModelPrice, model string) (ModelPrice, bool) {
@@ -196,6 +277,9 @@ func lookupModelPrice(table map[string]ModelPrice, model string) (ModelPrice, bo
 func modelPrice(provider, model string) (ModelPrice, bool) {
 	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
 		normalized := normalizeCostModel(model)
+		if price, ok := lookupModelPrice(BuiltinCodexModelPrices, normalized); ok {
+			return price, true
+		}
 		if strings.HasPrefix(normalized, "gpt-6") || strings.HasPrefix(normalized, "gpt6") {
 			model = "gpt-6-astra"
 		} else if strings.HasPrefix(normalized, "gpt-5.6") || strings.HasPrefix(normalized, "gpt5.6") {
@@ -233,6 +317,9 @@ func estimateRecordCost(record Record) (float64, int64, int64, int64, int64) {
 	if price.LongContextThreshold > 0 && inputTotal >= price.LongContextThreshold && price.LongInputPerMillionUSD > 0 {
 		price.InputPerMillionUSD = price.LongInputPerMillionUSD
 		price.CachedInputPerMillionUSD = price.LongCachedInputPerMillionUSD
+		if price.LongCacheCreationPerMillionUSD > 0 {
+			price.CacheCreationPerMillionUSD = price.LongCacheCreationPerMillionUSD
+		}
 		price.OutputPerMillionUSD = price.LongOutputPerMillionUSD
 	}
 	cost := float64(uncachedInput)*price.InputPerMillionUSD/1_000_000 + float64(cacheRead)*price.CachedInputPerMillionUSD/1_000_000 + float64(cacheWrite)*price.CacheCreationPerMillionUSD/1_000_000 + float64(output)*price.OutputPerMillionUSD/1_000_000
@@ -248,19 +335,22 @@ func (l *authCostLedger) stateLocked(authID string, now time.Time) *authCostLedg
 	if state == nil {
 		state = &authCostLedgerState{AuthCostSnapshot: AuthCostSnapshot{AuthID: authID, CycleDate: cycleDate}}
 		l.entries[authID] = state
-	} else if state.CycleDate != cycleDate {
-		state.AuthCostSnapshot = AuthCostSnapshot{AuthID: authID, CycleDate: cycleDate}
 	}
 	return state
 }
 
 func (l *authCostLedger) record(record Record, now time.Time) {
-	if l == nil || strings.TrimSpace(record.AuthID) == "" {
+	if l == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	state := l.stateLocked(strings.TrimSpace(record.AuthID), now)
+	l.recordRecentTokenUsageLocked(record, now)
+	authID := strings.TrimSpace(record.AuthID)
+	if authID == "" {
+		return
+	}
+	state := l.stateLocked(authID, now)
 	cost, inputTokens, outputTokens, unpricedInput, unpricedOutput := estimateRecordCost(record)
 	state.InputTokens += inputTokens
 	state.OutputTokens += outputTokens
@@ -268,6 +358,210 @@ func (l *authCostLedger) record(record Record, now time.Time) {
 	state.UnpricedInputTokens += unpricedInput
 	state.UnpricedOutputTokens += unpricedOutput
 	state.UpdatedAt = now
+	modelID := strings.TrimSpace(record.Model)
+	if modelID == "" {
+		return
+	}
+	if l.modelTotals == nil {
+		l.modelTotals = make(map[string]map[string]AuthModelTokenUsage)
+	}
+	totals := l.modelTotals[strings.TrimSpace(record.AuthID)]
+	if totals == nil {
+		totals = make(map[string]AuthModelTokenUsage)
+		l.modelTotals[strings.TrimSpace(record.AuthID)] = totals
+	}
+	modelTotal := totals[modelID]
+	modelTotal.Model = modelID
+	detail := EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
+	if detail.TokenBreakdown.Valid() && detail.TokenBreakdown.Quality != TokenAccountingQualityUnclassified {
+		modelTotal.InputTokens += detail.TokenBreakdown.Input.TotalTokens
+		modelTotal.CachedInputTokens += detail.TokenBreakdown.Input.CacheReadTokens
+		modelTotal.OutputTokens += detail.TokenBreakdown.Output.TotalTokens
+	} else {
+		modelTotal.InputTokens += detail.InputTokens
+		modelTotal.CachedInputTokens += max(detail.CacheReadTokens, detail.CachedTokens)
+		modelTotal.OutputTokens += detail.OutputTokens
+	}
+	totals[modelID] = modelTotal
+	model := normalizeCostModel(record.Model)
+	if model == "" || cost == 0 {
+		return
+	}
+	if l.modelBuckets == nil {
+		l.modelBuckets = make(map[string]map[int64]map[string]float64)
+	}
+	bucketID := now.Unix() / authCostBucketSeconds
+	byBucket := l.modelBuckets[strings.TrimSpace(record.AuthID)]
+	if byBucket == nil {
+		byBucket = make(map[int64]map[string]float64)
+		l.modelBuckets[strings.TrimSpace(record.AuthID)] = byBucket
+	}
+	byModel := byBucket[bucketID]
+	if byModel == nil {
+		byModel = make(map[string]float64)
+		byBucket[bucketID] = byModel
+	}
+	byModel[model] += cost
+	oldestBucketID := bucketID - int64(authCostBucketCount-1)
+	for staleBucketID := range byBucket {
+		if staleBucketID < oldestBucketID {
+			delete(byBucket, staleBucketID)
+		}
+	}
+}
+
+func (l *authCostLedger) recordRecentTokenUsageLocked(record Record, now time.Time) {
+	if !GenerateEnabled(record.Generate) {
+		return
+	}
+	detail := EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
+	var inputTokens, cachedTokens, outputTokens int64
+	if detail.TokenBreakdown.Valid() && detail.TokenBreakdown.Quality != TokenAccountingQualityInconsistent {
+		inputTokens = detail.TokenBreakdown.Input.TotalTokens
+		cachedTokens = detail.TokenBreakdown.Input.CacheReadTokens
+		outputTokens = detail.TokenBreakdown.Output.TotalTokens
+		if detail.TokenBreakdown.Quality == TokenAccountingQualityUnclassified {
+			inputTokens = max(inputTokens, detail.InputTokens, detail.CacheReadTokens+detail.CacheCreationTokens, detail.CachedTokens)
+			cachedTokens = max(cachedTokens, detail.CacheReadTokens, detail.CachedTokens)
+			outputTokens = max(outputTokens, detail.OutputTokens)
+		}
+	} else {
+		inputTokens = detail.InputTokens
+		cachedTokens = max(detail.CacheReadTokens, detail.CachedTokens)
+		outputTokens = detail.OutputTokens
+		inputTokens = max(inputTokens, detail.CacheReadTokens+detail.CacheCreationTokens, detail.CachedTokens)
+	}
+	if inputTokens == 0 && cachedTokens == 0 && outputTokens == 0 {
+		return
+	}
+	bucketID := now.Unix() / authCostBucketSeconds
+	index := bucketID % authCostBucketCount
+	if index < 0 {
+		index += authCostBucketCount
+	}
+	bucket := &l.recentTokenBuckets[index]
+	if bucket.bucketID != bucketID {
+		*bucket = recentTokenUsageBucket{bucketID: bucketID}
+	}
+	bucket.inputTokens += inputTokens
+	bucket.cachedTokens += cachedTokens
+	bucket.outputTokens += outputTokens
+	modelID := strings.TrimSpace(record.Model)
+	if modelID != "" {
+		if bucket.models == nil {
+			bucket.models = make(map[string]AuthModelTokenUsage)
+		}
+		model := bucket.models[modelID]
+		model.Model = modelID
+		model.InputTokens += inputTokens
+		model.CachedInputTokens += cachedTokens
+		model.OutputTokens += outputTokens
+		bucket.models[modelID] = model
+	}
+}
+
+func (l *authCostLedger) recentTokenUsageSnapshot(now time.Time) RecentTokenUsageSummary {
+	summary := RecentTokenUsageSummary{
+		WindowMinutes: int(authCostBucketSeconds * authCostBucketCount / 60),
+		Models:        []AuthModelTokenUsage{},
+	}
+	if l == nil {
+		return summary
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	currentBucketID := now.Unix() / authCostBucketSeconds
+	modelsByName := make(map[string]AuthModelTokenUsage)
+	for offset := int64(0); offset < authCostBucketCount; offset++ {
+		bucketID := currentBucketID - offset
+		index := bucketID % authCostBucketCount
+		if index < 0 {
+			index += authCostBucketCount
+		}
+		bucket := l.recentTokenBuckets[index]
+		if bucket.bucketID != bucketID {
+			continue
+		}
+		summary.InputTokens += bucket.inputTokens
+		summary.CachedTokens += bucket.cachedTokens
+		summary.OutputTokens += bucket.outputTokens
+		for modelID, usage := range bucket.models {
+			model := modelsByName[modelID]
+			model.Model = modelID
+			model.InputTokens += usage.InputTokens
+			model.CachedInputTokens += usage.CachedInputTokens
+			model.OutputTokens += usage.OutputTokens
+			modelsByName[modelID] = model
+		}
+	}
+	for _, model := range modelsByName {
+		summary.Models = append(summary.Models, model)
+	}
+	sort.Slice(summary.Models, func(i, j int) bool {
+		if summary.Models[i].InputTokens != summary.Models[j].InputTokens {
+			return summary.Models[i].InputTokens > summary.Models[j].InputTokens
+		}
+		return summary.Models[i].Model < summary.Models[j].Model
+	})
+	if summary.InputTokens > 0 {
+		summary.CacheRate = float64(summary.CachedTokens) / float64(summary.InputTokens) * 100
+	}
+	return summary
+}
+
+func (l *authCostLedger) modelCostBuckets(authID string, now time.Time) []AuthModelCostBucket {
+	if l == nil || strings.TrimSpace(authID) == "" {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	byBucket := l.modelBuckets[strings.TrimSpace(authID)]
+	if len(byBucket) == 0 {
+		return nil
+	}
+	currentBucketID := now.Unix() / authCostBucketSeconds
+	oldestBucketID := currentBucketID - int64(authCostBucketCount-1)
+	out := make([]AuthModelCostBucket, 0)
+	for bucketID, byModel := range byBucket {
+		if bucketID < oldestBucketID || bucketID > currentBucketID {
+			continue
+		}
+		models := make([]string, 0, len(byModel))
+		for model := range byModel {
+			models = append(models, model)
+		}
+		sort.Strings(models)
+		for _, model := range models {
+			out = append(out, AuthModelCostBucket{BucketID: bucketID, Model: model, EstimatedCostUSD: byModel[model]})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].BucketID != out[j].BucketID {
+			return out[i].BucketID < out[j].BucketID
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
+}
+
+func (l *authCostLedger) modelTokenUsage(authID string) []AuthModelTokenUsage {
+	if l == nil || strings.TrimSpace(authID) == "" {
+		return []AuthModelTokenUsage{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	totals := l.modelTotals[strings.TrimSpace(authID)]
+	out := make([]AuthModelTokenUsage, 0, len(totals))
+	for _, usage := range totals {
+		out = append(out, usage)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].InputTokens != out[j].InputTokens {
+			return out[i].InputTokens > out[j].InputTokens
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
 }
 
 func (l *authCostLedger) snapshot(authID string, now time.Time) AuthCostSnapshot {
@@ -288,6 +582,8 @@ func (l *authCostLedger) reset(authID string, now time.Time) {
 	trimmedID := strings.TrimSpace(authID)
 	state := l.stateLocked(trimmedID, now)
 	state.AuthCostSnapshot = AuthCostSnapshot{AuthID: trimmedID, CycleDate: costCycleDate(now), UpdatedAt: now}
+	delete(l.modelBuckets, trimmedID)
+	delete(l.modelTotals, trimmedID)
 }
 
 type requestedModelAliasContextKey struct{}
@@ -570,6 +866,39 @@ func (m *Manager) ResetAuthCost(authID string) {
 	m.costLedger.reset(authID, time.Now())
 }
 
+// AuthModelCostBuckets returns recent per-model cost estimates for authID.
+func (m *Manager) AuthModelCostBuckets(authID string, now time.Time) []AuthModelCostBucket {
+	if m == nil {
+		return nil
+	}
+	if m.costLedger == nil {
+		m.costLedger = newAuthCostLedger()
+	}
+	return m.costLedger.modelCostBuckets(authID, now)
+}
+
+// AuthModelTokens returns cumulative model token totals for the current statistics cycle.
+func (m *Manager) AuthModelTokens(authID string) []AuthModelTokenUsage {
+	if m == nil {
+		return []AuthModelTokenUsage{}
+	}
+	if m.costLedger == nil {
+		m.costLedger = newAuthCostLedger()
+	}
+	return m.costLedger.modelTokenUsage(authID)
+}
+
+// RecentTokenUsageSnapshot returns token totals over the rolling dashboard window.
+func (m *Manager) RecentTokenUsageSnapshot(now time.Time) RecentTokenUsageSummary {
+	if m == nil {
+		return RecentTokenUsageSummary{WindowMinutes: int(authCostBucketSeconds * authCostBucketCount / 60)}
+	}
+	if m.costLedger == nil {
+		m.costLedger = newAuthCostLedger()
+	}
+	return m.costLedger.recentTokenUsageSnapshot(now)
+}
+
 // Publish enqueues a usage record for processing. If no plugin is registered
 // the record will be discarded downstream.
 func (m *Manager) Publish(ctx context.Context, record Record) {
@@ -583,6 +912,9 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		m.mu.Unlock()
 		return
 	}
+	// Account statistics are committed before plugin delivery so queued records
+	// cannot restore a cycle after a management reset.
+	m.costLedger.record(record, time.Now())
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
@@ -606,9 +938,6 @@ func (m *Manager) run(ctx context.Context) {
 }
 
 func (m *Manager) dispatch(item queueItem) {
-	if m.costLedger != nil {
-		m.costLedger.record(item.record, time.Now())
-	}
 	m.pluginsMu.RLock()
 	plugins := make([]Plugin, len(m.plugins))
 	copy(plugins, m.plugins)
@@ -649,6 +978,21 @@ func AuthCost(authID string) AuthCostSnapshot { return DefaultManager().AuthCost
 
 // ResetAuthCost clears the current cost cycle in the default usage manager.
 func ResetAuthCost(authID string) { DefaultManager().ResetAuthCost(authID) }
+
+// AuthModelCostBuckets returns recent per-model cost estimates from the default usage manager.
+func AuthModelCostBuckets(authID string, now time.Time) []AuthModelCostBucket {
+	return DefaultManager().AuthModelCostBuckets(authID, now)
+}
+
+// AuthModelTokens returns cumulative per-model token totals from the default usage manager.
+func AuthModelTokens(authID string) []AuthModelTokenUsage {
+	return DefaultManager().AuthModelTokens(authID)
+}
+
+// RecentTokenUsageSnapshot returns token totals over the rolling dashboard window.
+func RecentTokenUsageSnapshot(now time.Time) RecentTokenUsageSummary {
+	return DefaultManager().RecentTokenUsageSnapshot(now)
+}
 
 // PublishRecord publishes a record using the default manager.
 func PublishRecord(ctx context.Context, record Record) { DefaultManager().Publish(ctx, record) }

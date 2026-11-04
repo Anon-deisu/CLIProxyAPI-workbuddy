@@ -42,11 +42,17 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("parse config payload: %w", err)
 	}
 
+	if errRestore := cfg.restoreAccountScheduling(); errRestore != nil {
+		return nil, errRestore
+	}
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
 	if errValidate := cfg.ValidateCredentialWeights(); errValidate != nil {
+		return nil, errValidate
+	}
+	if errValidate := cfg.Codex.QuotaRefresh.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
 
@@ -99,6 +105,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.SanitizeVertexCompatKeys()
 	cfg.SanitizeCodexKeys()
 	cfg.SanitizeXAIKeys()
+	cfg.SanitizeMetaKeys()
 	cfg.SanitizeCodexHeaderDefaults()
 	cfg.SanitizeCodexRoutingHint()
 	cfg.SanitizeClaudeHeaderDefaults()
@@ -107,6 +114,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 	cfg.SanitizeOAuthModelAlias()
 	cfg.SanitizeOAuthRequestScopedErrors()
+	cfg.SanitizeOAuthSettings()
 	cfg.SanitizePayloadRules()
 
 	return &cfg, nil

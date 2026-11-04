@@ -9,8 +9,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelconfig"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	log "github.com/sirupsen/logrus"
 )
 
 // registerModelsForAuth (re)binds provider models in the global registry using the core auth ID as client identifier.
@@ -143,6 +145,46 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	case "kimi":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
+	case "kimi-ai":
+		models = registry.GetKimiModels()
+		models = applyExcludedModels(models, excluded)
+	case "meta":
+		models = registry.GetMetaModels()
+		if authKind == "apikey" {
+			if entry := s.resolveConfigMetaKey(a); entry != nil {
+				if len(entry.Models) > 0 {
+					models = buildMetaConfigModels(entry)
+				}
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case "devin":
+		models = registry.GetDevinModels()
+		models = applyExcludedModels(models, excluded)
+	case "workbuddy", "workbuddy-ai":
+		var errCatalog error
+		models, errCatalog = helps.FetchWorkBuddyModels(ctx, s.cfg, a)
+		if errCatalog != nil {
+			log.WithError(errCatalog).WithField("provider", provider).Warn("using previous or built-in WorkBuddy model catalog")
+			models = GlobalModelRegistry().GetModelsForClient(a.ID)
+			if len(models) == 0 {
+				models = registry.GetWorkBuddyModels(provider)
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case "qoder", "qoder-cn":
+		var errCatalog error
+		models, errCatalog = helps.FetchQoderModels(ctx, s.cfg, a)
+		if errCatalog != nil {
+			log.WithError(errCatalog).WithField("provider", provider).Warn("using previous or built-in Qoder model catalog")
+			var found bool
+			models, _, found = registry.GetQoderCatalogForClient(a.ID, provider)
+			if !found {
+				models = registry.GetQoderModels(provider)
+			}
+		}
+		models = applyExcludedModels(models, excluded)
 	case "xai":
 		models = registry.GetXAIModels()
 		if entry := s.resolveConfigXAIKey(a); entry != nil {
@@ -265,6 +307,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		return
 	}
 	models = applyOAuthModelAliasForAuth(s.cfg, provider, authKind, a.Attributes, models)
+	models = applyOAuthSettingsForAuth(s.cfg, provider, authKind, models)
 	if ctx.Err() != nil {
 		return
 	}
@@ -497,6 +540,13 @@ func (s *Service) resolveConfigXAIKey(auth *coreauth.Auth) *config.XAIKey {
 		return nil
 	}
 	return resolveConfigCodexStyleKey(auth, s.cfg.XAIKey, false)
+}
+
+func (s *Service) resolveConfigMetaKey(auth *coreauth.Auth) *config.MetaKey {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return resolveConfigCodexStyleKey(auth, s.cfg.MetaKey, false)
 }
 
 func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey, validateIndexCredentials bool) *config.CodexKey {
@@ -823,6 +873,13 @@ func buildXAIConfigModels(entry *config.XAIKey) []*ModelInfo {
 	return buildConfigModels(entry.Models, "xai", "xai")
 }
 
+func buildMetaConfigModels(entry *config.MetaKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "meta", "meta")
+}
+
 func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	if entry == nil {
 		return nil
@@ -1021,6 +1078,9 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 			}
 			seen[aliasKey] = struct{}{}
 			clone := *model
+			if clone.MetadataModelID == "" {
+				clone.MetadataModelID = id
+			}
 			clone.ID = mappedID
 			if entry.displayName != "" {
 				clone.DisplayName = entry.displayName
@@ -1037,6 +1097,30 @@ func applyOAuthModelAliasEntries(aliases []config.OAuthModelAlias, models []*Mod
 				continue
 			}
 			seen[key] = struct{}{}
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+func applyOAuthSettingsForAuth(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
+	channel := coreauth.OAuthModelAliasChannel(provider, authKind)
+	if cfg == nil || channel == "" || len(cfg.OAuthSettings[channel]) == 0 {
+		return models
+	}
+	settings := cfg.OAuthSettings[channel]
+	out := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		setting := config.ResolveOAuthModelSetting(settings, model.ID, model.MetadataModelID, model.Name)
+		if setting != nil && setting.MaxContextLength > 0 {
+			clone := *model
+			clone.ContextLength = setting.MaxContextLength
+			clone.MaxContextLength = setting.MaxContextLength
+			out = append(out, &clone)
+		} else {
 			out = append(out, model)
 		}
 	}

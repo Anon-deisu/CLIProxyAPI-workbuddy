@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"testing"
@@ -198,10 +199,10 @@ func TestCodex2APIDefaultSelectorOrdersPriorityHealthAndUsage(t *testing.T) {
 		Quota:    QuotaState{Signals: map[string]string{"used-percent": "20"}},
 	}
 
-	if got := pickCodex2APIAuth([]*Auth{healthyHighUsage, healthyLowUsage}); got != healthyLowUsage {
+	if got := pickCodex2APIAuth([]*Auth{healthyHighUsage, healthyLowUsage}, &smoothWeightedState{}); got != healthyLowUsage {
 		t.Fatalf("healthy selection = %q, want %q", got.ID, healthyLowUsage.ID)
 	}
-	if got := pickCodex2APIAuth([]*Auth{healthyLowUsage, priorityCandidate}); got != priorityCandidate {
+	if got := pickCodex2APIAuth([]*Auth{healthyLowUsage, priorityCandidate}, &smoothWeightedState{}); got != priorityCandidate {
 		t.Fatalf("priority selection = %q, want %q", got.ID, priorityCandidate.ID)
 	}
 }
@@ -229,6 +230,170 @@ func TestAuthDispatchSlotsRespectRuntimeLimit(t *testing.T) {
 	auth.ReleaseDispatchSlot()
 	if got := auth.ActiveDispatchRequests(); got != 0 {
 		t.Fatalf("active requests after release = %d, want 0", got)
+	}
+}
+
+func TestCodex2APIQuotaWeightedUnlimitedDistribution(t *testing.T) {
+	for _, wrapped := range []bool{false, true} {
+		for _, mixed := range []bool{false, true} {
+			for _, hold := range []bool{false, true} {
+				for _, tc := range []struct {
+					name, usageA, usageB   string
+					requests, wantA, wantB int
+				}{
+					{"unequal", "10", "40", 50, 30, 20},
+					{"equal", "20", "20", 50, 25, 25},
+					{"unknown", "", "40", 80, 50, 30},
+					{"warm", "85", "90", 50, 30, 20},
+				} {
+					t.Run(fmt.Sprintf("%s/wrapped=%t/mixed=%t/hold=%t", tc.name, wrapped, mixed, hold), func(t *testing.T) {
+						var selector Selector = &Codex2APIDefaultSelector{}
+						if wrapped {
+							affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: selector, ProviderFilters: []string{"cursor"}})
+							t.Cleanup(affinity.Stop)
+							selector = affinity
+						}
+						manager := NewManager(nil, selector, nil)
+						manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{AuthConcurrencyLimit: new(0)}})
+						manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+						for _, item := range []struct{ id, usage string }{{"a", tc.usageA}, {"b", tc.usageB}} {
+							if _, err := manager.Register(t.Context(), &Auth{ID: item.id, Provider: "codex", Status: StatusActive,
+								Quota: QuotaState{Signals: map[string]string{"x-codex-primary-used-percent": item.usage}},
+							}); err != nil {
+								t.Fatal(err)
+							}
+						}
+						counts := map[string]int{}
+						for range tc.requests {
+							var selected *Auth
+							var err error
+							if mixed {
+								selected, _, _, err = manager.pickNextMixed(t.Context(), []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+							} else {
+								selected, _, err = manager.pickNext(t.Context(), "codex", "", cliproxyexecutor.Options{}, nil)
+							}
+							if err != nil {
+								t.Fatal(err)
+							}
+							counts[selected.ID]++
+							if selected.EffectiveConcurrencyLimit() != 0 {
+								t.Fatal("test did not use unlimited concurrency")
+							}
+							if hold {
+								t.Cleanup(selected.ReleaseDispatchSlot)
+							} else {
+								selected.ReleaseDispatchSlot()
+								manager.MarkResult(t.Context(), Result{AuthID: selected.ID, Provider: "codex", Success: true, SkipQuotaObservation: true})
+							}
+						}
+						if counts["a"] != tc.wantA || counts["b"] != tc.wantB {
+							t.Fatalf("picks=%v, want a:b=%d:%d", counts, tc.wantA, tc.wantB)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestCodex2APIQuotaWeightedMixedProviders(t *testing.T) {
+	scheduler := newSchedulerForTest(&Codex2APIDefaultSelector{},
+		&Auth{ID: "a", Provider: "codex", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "10"}}},
+		&Auth{ID: "b", Provider: "gemini", Status: StatusActive, Quota: QuotaState{Signals: map[string]string{"used-percent": "40"}}},
+	)
+	counts := map[string]int{}
+	for range 50 {
+		selected, _, err := scheduler.pickMixed(t.Context(), []string{"codex", "gemini"}, "", cliproxyexecutor.Options{}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[selected.ID]++
+		selected.ReleaseDispatchSlot()
+	}
+	if counts["a"] != 30 || counts["b"] != 20 {
+		t.Fatalf("mixed picks=%v, want 30:20", counts)
+	}
+}
+
+func TestCodex2APIQuotaWeightedUpdatesPreserveRotation(t *testing.T) {
+	for _, rebuilt := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rebuilt=%t", rebuilt), func(t *testing.T) {
+			a, b := &Auth{ID: "a", Provider: "codex", Status: StatusActive}, &Auth{ID: "b", Provider: "codex", Status: StatusActive}
+			selector := &Codex2APIDefaultSelector{}
+			scheduler := newSchedulerForTest(selector, a, b)
+			counts := map[string]int{}
+			for index := 0; index < 100; index++ {
+				a.Quota.Signals = map[string]string{"used-percent": fmt.Sprintf("%.2f", 10+float64(index)/100)}
+				b.Quota.Signals = map[string]string{"used-percent": fmt.Sprintf("%.2f", 40+float64(index)/100)}
+				var selected *Auth
+				var err error
+				if rebuilt {
+					scheduler.upsertAuth(a.Clone())
+					scheduler.upsertAuth(b.Clone())
+					selected, err = scheduler.pickSingle(t.Context(), "codex", "", cliproxyexecutor.Options{}, nil)
+				} else {
+					selected, err = selector.Pick(t.Context(), "codex", "", cliproxyexecutor.Options{}, []*Auth{a, b})
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				counts[selected.ID]++
+				if rebuilt {
+					selected.ReleaseDispatchSlot()
+				}
+			}
+			if counts["a"] < 59 || counts["a"] > 61 || counts["b"] < 39 || counts["b"] > 41 {
+				t.Fatalf("changing quota reset rotation: picks=%v, want approximately 60:40", counts)
+			}
+		})
+	}
+}
+
+func TestCodex2APIQuotaWeightedPoolIsolation(t *testing.T) {
+	for _, wrapped := range []bool{false, true} {
+		t.Run(fmt.Sprintf("wrapped=%t", wrapped), func(t *testing.T) {
+			var selector Selector = &Codex2APIDefaultSelector{}
+			if wrapped {
+				affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: selector, ProviderFilters: []string{"cursor"}})
+				t.Cleanup(affinity.Stop)
+				selector = affinity
+			}
+			manager := NewManager(nil, selector, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+			for _, item := range []struct {
+				id, usage string
+				degraded  bool
+			}{
+				{"normal-a", "10", false}, {"normal-b", "40", false},
+				{"degraded-a", "20", true}, {"degraded-b", "20", true},
+			} {
+				if _, err := manager.Register(t.Context(), &Auth{ID: item.id, Provider: "codex", Status: StatusActive,
+					Metadata: map[string]any{"degraded": item.degraded},
+					Quota:    QuotaState{Signals: map[string]string{"used-percent": item.usage}},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			counts := map[string]int{}
+			for range 50 {
+				for _, degraded := range []bool{false, true} {
+					ctx := cliproxyexecutor.WithDegradedRouting(t.Context(), degraded)
+					selected, _, _, err := manager.pickNextMixed(ctx, []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					selected.ReleaseDispatchSlot()
+					if selected.IsDegraded() != degraded {
+						t.Fatal("quota weighting crossed scheduling pools")
+					}
+					counts[selected.ID]++
+				}
+			}
+			want := map[string]int{"normal-a": 30, "normal-b": 20, "degraded-a": 25, "degraded-b": 25}
+			if !reflect.DeepEqual(counts, want) {
+				t.Fatalf("pool picks=%v, want %v", counts, want)
+			}
+		})
 	}
 }
 
@@ -394,6 +559,131 @@ func TestManagerLegacySelectionSkipsAuthAtConcurrencyLimit(t *testing.T) {
 	}
 	if got := selected.ActiveDispatchRequests(); got != 0 {
 		t.Fatalf("selected auth active requests = %d, want 0 after SelectAuth", got)
+	}
+}
+
+func TestManagerLegacySelectionFiltersBusyCandidatesBeforeScheduling(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mixed=%t", mixed), func(t *testing.T) {
+			selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+				Fallback:        &Codex2APIDefaultSelector{},
+				ProviderFilters: []string{"cursor"},
+			})
+			t.Cleanup(selector.Stop)
+			manager := NewManager(nil, selector, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+			plugin := &fakePluginScheduler{}
+			manager.SetPluginScheduler(plugin)
+			const busyCount = 32
+			for index := 0; index <= busyCount; index++ {
+				auth, errRegister := manager.Register(t.Context(), &Auth{
+					ID:               fmt.Sprintf("capacity-%02d", index),
+					Provider:         "codex",
+					Status:           StatusActive,
+					ConcurrencyLimit: 1,
+				})
+				if errRegister != nil {
+					t.Fatal(errRegister)
+				}
+				if index < busyCount {
+					if !auth.TryAcquireDispatchSlot() {
+						t.Fatal("failed to occupy auth")
+					}
+					t.Cleanup(auth.ReleaseDispatchSlot)
+				}
+			}
+			var selected *Auth
+			var errPick error
+			if mixed {
+				selected, _, _, errPick = manager.pickNextMixed(t.Context(), []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+			} else {
+				selected, _, errPick = manager.pickNext(t.Context(), "codex", "", cliproxyexecutor.Options{}, nil)
+			}
+			if errPick != nil {
+				t.Fatal(errPick)
+			}
+			t.Cleanup(selected.ReleaseDispatchSlot)
+			if selected.ID != fmt.Sprintf("capacity-%02d", busyCount) || selected.ActiveDispatchRequests() != 1 {
+				t.Fatalf("selection = %q active=%d, want the reserved free auth", selected.ID, selected.ActiveDispatchRequests())
+			}
+			if plugin.calls != 1 {
+				t.Fatalf("scheduler calls = %d, want one pass regardless of busy account count", plugin.calls)
+			}
+			if got := len(plugin.requests[0].Candidates); got != 1 {
+				t.Fatalf("scheduler candidates = %d, want only the free auth", got)
+			}
+			for _, auth := range manager.List() {
+				if auth.Success != 0 || auth.Failed != 0 {
+					t.Fatal("capacity filtering must not record an upstream result")
+				}
+			}
+		})
+	}
+}
+
+func TestManagerLegacySelectionRechecksCapacityAfterScheduling(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mixed=%t", mixed), func(t *testing.T) {
+			manager := NewManager(nil, &Codex2APIDefaultSelector{}, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+			for _, id := range []string{"a-raced", "b-free"} {
+				if _, errRegister := manager.Register(t.Context(), &Auth{ID: id, Provider: "codex", Status: StatusActive, ConcurrencyLimit: 1}); errRegister != nil {
+					t.Fatal(errRegister)
+				}
+			}
+			raced, _ := manager.GetByID("a-raced")
+			plugin := &fakePluginScheduler{}
+			plugin.pick = func(context.Context, pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
+				if plugin.calls == 1 {
+					if !raced.TryAcquireDispatchSlot() {
+						t.Fatal("failed to occupy auth after candidate snapshot")
+					}
+					t.Cleanup(raced.ReleaseDispatchSlot)
+				}
+				return pluginapi.SchedulerPickResponse{}, false, nil
+			}
+			manager.SetPluginScheduler(plugin)
+			var selected *Auth
+			var errPick error
+			if mixed {
+				selected, _, _, errPick = manager.pickNextMixed(t.Context(), []string{"codex"}, "", cliproxyexecutor.Options{}, nil)
+			} else {
+				selected, _, errPick = manager.pickNext(t.Context(), "codex", "", cliproxyexecutor.Options{}, nil)
+			}
+			if errPick != nil {
+				t.Fatal(errPick)
+			}
+			t.Cleanup(selected.ReleaseDispatchSlot)
+			if selected.ID != "b-free" || selected.ActiveDispatchRequests() != 1 || raced.ActiveDispatchRequests() != 1 {
+				t.Fatalf("capacity race was not respected: selected=%q active=%d raced=%d", selected.ID, selected.ActiveDispatchRequests(), raced.ActiveDispatchRequests())
+			}
+		})
+	}
+}
+
+func TestAvailableAuthsForSelectorPreservesPriorityWhenFilteringCapacity(t *testing.T) {
+	busy := &Auth{ID: "high-busy", Provider: "codex", Attributes: map[string]string{"priority": "10"}, ConcurrencyLimit: 1}
+	free := &Auth{ID: "low-free", Provider: "codex"}
+	if !busy.TryAcquireDispatchSlot() {
+		t.Fatal("failed to occupy high priority auth")
+	}
+	t.Cleanup(busy.ReleaseDispatchSlot)
+	free.ensureDispatchState()
+	manager := NewManager(nil, nil, nil)
+	_, _, errAvailable := manager.availableAuthsForSelector(&Codex2APIDefaultSelector{}, []*Auth{busy, free}, "codex", "", time.Now())
+	var capacityErr *Error
+	if !errors.As(errAvailable, &capacityErr) || capacityErr.Code != ErrorCodeConcurrencyLimit {
+		t.Fatalf("priority-scoped selection error = %v, want concurrency limit", errAvailable)
+	}
+
+	affinity := NewSessionAffinitySelector(&Codex2APIDefaultSelector{})
+	t.Cleanup(affinity.Stop)
+	priorityAuths, selectorAuths, errAvailable := manager.availableAuthsForSelector(affinity, []*Auth{busy, free}, "codex", "", time.Now())
+	if errAvailable != nil {
+		t.Fatal(errAvailable)
+	}
+	if len(priorityAuths) != 1 || priorityAuths[0].ID != free.ID || len(selectorAuths) != 1 || selectorAuths[0].ID != free.ID {
+		t.Fatal("affinity selection must retain the free lower-priority tier for failover")
 	}
 }
 

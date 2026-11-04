@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -24,9 +25,10 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 }
 
 type websocketConnectionCloser struct {
-	conn *websocket.Conn
-	once sync.Once
-	err  error
+	conn    *websocket.Conn
+	once    sync.Once
+	err     error
+	onClose func()
 }
 
 func newWebsocketConnectionCloser(conn *websocket.Conn) *websocketConnectionCloser {
@@ -42,6 +44,9 @@ func (c *websocketConnectionCloser) Close() error {
 	}
 	c.once.Do(func() {
 		c.err = c.conn.Close()
+		if c.onClose != nil {
+			c.onClose()
+		}
 	})
 	return c.err
 }
@@ -57,6 +62,7 @@ type codexWebsocketSession struct {
 	wsURL                     string
 	authID                    string
 	convergence               bool // Fingerprint mode used by the handshake, guarded by connMu.
+	egressFingerprint         string
 	multiAgentV2OptimizedConn *websocket.Conn
 	lifecycleBindMu           sync.Mutex
 	lifecycle                 cliproxyexecutor.ExecutionLifecycle
@@ -338,17 +344,20 @@ func websocketSessionTargetChanged(sess *codexWebsocketSession, authID string, w
 }
 
 func existingWebsocketSessionConn(sess *codexWebsocketSession, authID string, wsURL string, convergence ...bool) (*websocket.Conn, *websocketConnectionCloser) {
+	return existingWebsocketSessionConnForEgress(sess, authID, wsURL, len(convergence) > 0 && convergence[0], "")
+}
+
+func existingWebsocketSessionConnForEgress(sess *codexWebsocketSession, authID, wsURL string, expectedConvergence bool, egressFingerprint string) (*websocket.Conn, *websocketConnectionCloser) {
 	if sess == nil {
 		return nil, nil
 	}
-	expectedConvergence := len(convergence) > 0 && convergence[0]
 	sess.connMu.Lock()
 	conn := sess.conn
 	closer := sess.connCloser
 	matches := conn != nil && closer != nil &&
 		strings.TrimSpace(sess.authID) == strings.TrimSpace(authID) &&
 		strings.TrimSpace(sess.wsURL) == strings.TrimSpace(wsURL) &&
-		sess.convergence == expectedConvergence
+		sess.convergence == expectedConvergence && sess.egressFingerprint == egressFingerprint
 	sess.connMu.Unlock()
 	if !matches || sess.upstreamDisconnectError(conn) != nil {
 		return nil, nil
@@ -357,11 +366,13 @@ func existingWebsocketSessionConn(sess *codexWebsocketSession, authID string, ws
 }
 
 func detachMismatchedWebsocketSessionConn(sess *codexWebsocketSession, authID string, wsURL string, convergence ...bool) (*websocket.Conn, *websocketConnectionCloser, string, string, cliproxyexecutor.ExecutionLifecycle) {
+	return detachMismatchedWebsocketSessionConnForEgress(sess, authID, wsURL, len(convergence) > 0 && convergence[0], "")
+}
+
+func detachMismatchedWebsocketSessionConnForEgress(sess *codexWebsocketSession, authID, wsURL string, expectedConvergence bool, egressFingerprint string) (*websocket.Conn, *websocketConnectionCloser, string, string, cliproxyexecutor.ExecutionLifecycle) {
 	if sess == nil {
 		return nil, nil, "", "", nil
 	}
-	expectedConvergence := len(convergence) > 0 && convergence[0]
-
 	sess.connMu.Lock()
 	defer sess.connMu.Unlock()
 	conn := sess.conn
@@ -369,7 +380,7 @@ func detachMismatchedWebsocketSessionConn(sess *codexWebsocketSession, authID st
 		sess.convergence = false
 		return nil, nil, "", "", nil
 	}
-	if strings.TrimSpace(sess.authID) == strings.TrimSpace(authID) && strings.TrimSpace(sess.wsURL) == strings.TrimSpace(wsURL) && sess.convergence == expectedConvergence {
+	if strings.TrimSpace(sess.authID) == strings.TrimSpace(authID) && strings.TrimSpace(sess.wsURL) == strings.TrimSpace(wsURL) && sess.convergence == expectedConvergence && sess.egressFingerprint == egressFingerprint {
 		return nil, nil, "", "", nil
 	}
 
@@ -497,11 +508,17 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 }
 
 func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithConvergence(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header, expectedConvergence bool) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+	var errBinding error
+	auth, errBinding = e.bindEgress(auth)
+	if errBinding != nil {
+		return nil, nil, nil, errBinding
+	}
+	egressFingerprint := helps.CodexEgressFingerprint(auth)
 	if sess == nil {
 		return e.dialCodexWebsocket(ctx, auth, wsURL, headers)
 	}
 
-	if staleConn, staleCloser, staleAuthID, staleWSURL, staleLifecycle := detachMismatchedWebsocketSessionConn(sess, authID, wsURL, expectedConvergence); staleConn != nil {
+	if staleConn, staleCloser, staleAuthID, staleWSURL, staleLifecycle := detachMismatchedWebsocketSessionConnForEgress(sess, authID, wsURL, expectedConvergence, egressFingerprint); staleConn != nil {
 		logCodexWebsocketDisconnected(sess.sessionID, staleAuthID, staleWSURL, "target_changed", nil)
 		if staleCloser != nil {
 			if errClose := staleCloser.Close(); errClose != nil {
@@ -550,6 +567,7 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConnWithConvergence(ctx context.
 	sess.wsURL = wsURL
 	sess.authID = authID
 	sess.convergence = expectedConvergence
+	sess.egressFingerprint = egressFingerprint
 	sess.readerConn = conn
 	sess.connMu.Unlock()
 

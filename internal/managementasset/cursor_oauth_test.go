@@ -2,6 +2,7 @@ package managementasset
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,7 +57,45 @@ func TestAddCursorOAuthToLatestManagementHTML(t *testing.T) {
 	if !bytes.Contains(got, []byte("cursor_oauth_button:`开始 Cursor 登录`")) {
 		t.Fatal("latest management fixture does not contain the Chinese Cursor OAuth action")
 	}
-	if bytes.Count(got, []byte("cursor_oauth_title:`Cursor OAuth`")) < 4 {
+	labels := bytes.Count(got, []byte("cursor_oauth_title:`Cursor OAuth`")) + bytes.Count(got, []byte(`"cursor_oauth_title":"Cursor OAuth"`))
+	if labels != 4 {
 		t.Fatal("latest management fixture does not provide Cursor OAuth labels for every locale")
+	}
+}
+
+func TestAddCursorOAuthPreservesSerializedLocaleJSON(t *testing.T) {
+	input := []byte("<script>const p=[{kind:`builtin`,id:`xai`,titleKey:`auth_login.xai_oauth_title`,icon:{light:G,dark:D}}];" +
+		"const en={xai_oauth_polling_error:`Failed to check authentication status:`,plugin_oauth_title:`Plugin`};" +
+		"const ru=JSON.parse(`" + `{"xai_oauth_polling_error":"Не удалось проверить статус аутентификации:","plugin_oauth_title":"Plugin"}` + "`);</script>")
+	got, err := AddCursorOAuthToManagementHTML(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := []byte("JSON.parse(`")
+	start := bytes.Index(got, prefix) + len(prefix)
+	end := bytes.Index(got[start:], []byte("`);"))
+	var locale map[string]string
+	if err = json.Unmarshal(got[start:start+end], &locale); err != nil {
+		t.Fatalf("serialized locale was corrupted: %v", err)
+	}
+	if locale["cursor_oauth_button"] != "Начать вход в Cursor" || locale["plugin_oauth_title"] != "Plugin" {
+		t.Fatal("serialized locale did not retain both the Cursor labels and original properties")
+	}
+}
+
+func TestAddCursorOAuthPreservesV8ProvidersAndLocaleOrder(t *testing.T) {
+	input := []byte("<script>const providers=[{kind:`builtin`,id:`xai`,titleKey:`auth_login.xai_oauth_title`,icon:{light:Gx,dark:Kx}}," +
+		"{kind:`builtin`,id:`devin`,titleKey:`auth_login.devin_oauth_title`,icon:{light:D,dark:E}}];" +
+		"const zh={xai_oauth_polling_error:`检查认证状态失败:`,meta_oauth_title:`Meta OAuth`,plugin_oauth_title:`Plugin`};" +
+		`const en={xai_oauth_polling_error:"Failed to check authentication status:",meta_oauth_title:"Meta OAuth"};` + "</script>")
+	got, err := AddCursorOAuthToManagementHTML(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(got, []byte("id:`devin`")) != 1 || bytes.Count(got, []byte("id:`cursor`")) != 1 {
+		t.Fatal("injection duplicated an adjacent provider")
+	}
+	if bytes.Count(got, []byte("cursor_oauth_title:`Cursor OAuth`")) != 2 {
+		t.Fatal("Cursor locale insertion depends on property order or literal quote style")
 	}
 }

@@ -244,6 +244,46 @@ func TestIsResponsesTokenEvent_Classification(t *testing.T) {
 	}
 }
 
+func TestIsResponsesProgressEvent_UsesLooseCodexConvention(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{name: "created", payload: `{"type":"response.created"}`, want: false},
+		{name: "in progress", payload: `{"type":"response.in_progress"}`, want: false},
+		{name: "output item added", payload: `{"type":"response.output_item.added","item":{"type":"message","content":[]}}`, want: true},
+		{name: "content part added", payload: `{"type":"response.content_part.added","part":{"type":"output_text","text":""}}`, want: true},
+		{name: "metadata", payload: `{"type":"codex.response.metadata"}`, want: true},
+		{name: "output delta", payload: `{"type":"response.output_text.delta","delta":"hello"}`, want: true},
+		{name: "completed", payload: `{"type":"response.completed"}`, want: false},
+		{name: "error", payload: `{"type":"error"}`, want: false},
+		{name: "SSE output item added", payload: `data: {"type":"response.output_item.added"}`, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsResponsesProgressEvent([]byte(test.payload)); got != test.want {
+				t.Fatalf("IsResponsesProgressEvent(%s) = %v, want %v", test.payload, got, test.want)
+			}
+		})
+	}
+}
+
+func TestObserveResponsesProgressEventDisarmsOnFirstNonHandshakeEvent(t *testing.T) {
+	reporter := NewUsageReporter(context.Background(), "codex", "gpt-6.1-sol", nil)
+	reporter.StartResponseTTFT()
+
+	ObserveResponsesProgressEvent(reporter, []byte(`{"type":"response.created"}`))
+	if reporter.IsTTFTSet() {
+		t.Fatal("response.created must not set loose TTFT")
+	}
+
+	ObserveResponsesProgressEvent(reporter, []byte(`{"type":"response.output_item.added","item":{"type":"reasoning"}}`))
+	if !reporter.IsTTFTSet() {
+		t.Fatal("the first non-handshake event must set loose TTFT")
+	}
+}
+
 func TestObserveResponsesTokenEvent_Behavior(t *testing.T) {
 	ctx := context.Background()
 	reporter := NewUsageReporter(ctx, "codex", "gpt-5.6-luna", nil)

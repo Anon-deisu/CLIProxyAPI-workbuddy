@@ -20,12 +20,14 @@ func (s *Server) registerManagementRoutes() {
 	}
 
 	log.Info("management routes registered after secret key configuration")
+	s.registerManagementV8Routes()
 
 	s.engine.POST("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.PostOAuthCallback)
 	s.engine.GET("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.GetOAuthCallback)
 
 	mgmt := s.engine.Group("/v0/management")
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
+	s.registerAgentRoutes(mgmt)
 	{
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
@@ -66,6 +68,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
+		mgmt.GET("/workbuddy-quota", s.mgmt.GetWorkBuddyQuota)
+		mgmt.GET("/qoder-quota", s.mgmt.GetQoderQuota)
+		mgmt.POST("/qoder-checkin", s.mgmt.PostQoderCheckIn)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
@@ -131,7 +136,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/routing/settings", s.mgmt.GetRoutingSettings)
 		mgmt.PUT("/routing/settings", s.mgmt.PutRoutingSettings)
 		mgmt.PATCH("/routing/settings", s.mgmt.PutRoutingSettings)
-		mgmt.GET("/routing/codex-turn-state", s.mgmt.GetCodexTurnStateStatus)
+		mgmt.GET("/routing/codex-static-isp", s.mgmt.GetCodexStaticISPStatus)
 
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
@@ -147,6 +152,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/xai-api-key", s.mgmt.PutXAIKeys)
 		mgmt.PATCH("/xai-api-key", s.mgmt.PatchXAIKey)
 		mgmt.DELETE("/xai-api-key", s.mgmt.DeleteXAIKey)
+		mgmt.GET("/meta-api-key", s.mgmt.GetMetaKeys)
+		mgmt.PUT("/meta-api-key", s.mgmt.PutMetaKeys)
+		mgmt.PATCH("/meta-api-key", s.mgmt.PatchMetaKey)
+		mgmt.DELETE("/meta-api-key", s.mgmt.DeleteMetaKey)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
@@ -186,13 +195,36 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
+		mgmt.POST("/codex-auto-oauth", s.mgmt.RequestCodexAutoOAuth)
+		mgmt.GET("/codex-auto-oauth/:jobID", s.mgmt.GetCodexAutoOAuth)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
+		mgmt.GET("/kimi-ai-auth-url", s.mgmt.RequestKimiAIToken)
+		mgmt.GET("/devin-auth-url", s.mgmt.RequestDevinToken)
+		mgmt.GET("/workbuddy-auth-url", s.mgmt.RequestWorkBuddyToken)
+		mgmt.GET("/workbuddy-ai-auth-url", s.mgmt.RequestWorkBuddyAIToken)
+		mgmt.GET("/qoder-auth-url", s.mgmt.RequestQoderToken)
+		mgmt.GET("/qoder-cn-auth-url", s.mgmt.RequestQoderCNToken)
+		mgmt.GET("/meta-auth-url", s.mgmt.RequestMetaToken)
 		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)
 		mgmt.GET("/cursor-auth-url", s.mgmt.RequestCursorToken)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		mgmt.DELETE("/oauth-session", s.mgmt.CancelAuthSession)
 	}
+
+	// Plugin resource routes remain separately namespaced from management routes.
+	registerManagementAlias := func(sourcePrefix, targetPrefix string) {
+		forward := func(c *gin.Context) {
+			path := c.Request.URL.Path
+			c.Request.URL.Path = targetPrefix + strings.TrimPrefix(path, sourcePrefix)
+			c.Request.URL.RawPath = ""
+			s.engine.HandleContext(c)
+			c.Abort()
+		}
+		s.engine.Any(sourcePrefix, forward)
+		s.engine.Any(sourcePrefix+"/*path", forward)
+	}
+	registerManagementAlias("/v8/resource/plugins", "/v0/resource/plugins")
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
@@ -238,7 +270,7 @@ func (s *Server) registeredManagementRouteKeys() map[string]struct{} {
 		return out
 	}
 	for _, route := range s.engine.Routes() {
-		if strings.HasPrefix(route.Path, "/v0/management/") || route.Path == "/v0/management" {
+		if strings.HasPrefix(route.Path, "/v0/management/") || route.Path == "/v0/management" || strings.HasPrefix(route.Path, "/v8/management/") || route.Path == "/v8/management" {
 			out[strings.ToUpper(strings.TrimSpace(route.Method))+" "+route.Path] = struct{}{}
 		}
 	}
@@ -257,7 +289,7 @@ func (s *Server) pluginManagementNoRoute(c *gin.Context) {
 		s.pluginResourceNoRoute(c)
 		return
 	}
-	if path != "/v0/management" && !strings.HasPrefix(path, "/v0/management/") {
+	if path != "/v0/management" && !strings.HasPrefix(path, "/v0/management/") && path != "/v8/management" && !strings.HasPrefix(path, "/v8/management/") {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
@@ -346,14 +378,69 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	} else {
 		data = patchedData
 	}
+	patchedData, errPatch = managementasset.AddWorkBuddyOAuthToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support WorkBuddy OAuth injection")
+	} else {
+		data = patchedData
+	}
+	patchedData, errPatch = managementasset.AddWorkBuddyQuotaToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support WorkBuddy quota injection")
+	} else {
+		data = patchedData
+	}
+	patchedData, errPatch = managementasset.AddQoderOAuthToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support Qoder OAuth injection")
+	} else {
+		data = patchedData
+	}
+	patchedData, errPatch = managementasset.AddQoderQuotaToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support Qoder quota injection")
+	} else {
+		data = patchedData
+	}
 	patchedData, errPatch = managementasset.AddRuntimeSchedulerToManagementHTML(data)
 	if errPatch != nil {
 		log.WithError(errPatch).Warn("management control panel does not support runtime scheduler injection")
 	} else {
 		data = patchedData
 	}
+	patchedData, errPatch = managementasset.AddCodexAutoOAuthToManagementHTML(data)
+	if errPatch != nil {
+		log.WithError(errPatch).Warn("management control panel does not support Codex automatic OAuth injection")
+	} else {
+		data = patchedData
+	}
 	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	if patched, errAgent := managementasset.AddAgentWorkspaceToManagementHTML(data); errAgent != nil {
+		log.WithError(errAgent).Warn("management control panel does not support agent workspace injection")
+	} else {
+		data = patched
+	}
+	if patched, errTokenUsage := managementasset.AddRollingTokenUsageToManagementHTML(data); errTokenUsage != nil {
+		log.WithError(errTokenUsage).Warn("management control panel does not support dashboard token usage")
+	} else {
+		data = patched
+	}
 	c.Header("Pragma", "no-cache")
 	c.Header("Expires", "0")
 	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
+}
+
+func (s *Server) serveAgentWorkspaceAsset(c *gin.Context) {
+	if s.cfg.Home.Enabled || s.cfg.RemoteManagement.DisableControlPanel {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	data, contentType, ok := managementasset.AgentWorkspaceAsset(c.Param("asset"))
+	if !ok {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Data(http.StatusOK, contentType, data)
 }

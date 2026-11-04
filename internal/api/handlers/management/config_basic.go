@@ -121,6 +121,21 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": "cannot read request body"})
 		return
 	}
+	h.mu.Lock()
+	var saved config.Config
+	if raw, errRead := os.ReadFile(h.configFilePath); errRead == nil {
+		_ = yaml.Unmarshal(raw, &saved)
+	}
+	h.mu.Unlock()
+	var previous *config.CodexStaticISPConfig
+	if saved.AccountScheduling != nil {
+		previous = saved.AccountScheduling.CodexStaticISP
+	}
+	body, err = rewriteStaticISPPasswords(body, previous, false)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
+		return
+	}
 	var cfg config.Config
 	if err = yaml.Unmarshal(body, &cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
@@ -157,6 +172,12 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if cfg.AccountScheduling != nil && cfg.AccountScheduling.CodexStaticISP != nil && len(cfg.AccountScheduling.CodexStaticISP.Nodes) > 0 {
+		if errMode := os.Chmod(h.configFilePath, 0600); errMode != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "cannot protect static ISP credentials"})
+			return
+		}
+	}
 	if WriteConfig(h.configFilePath, body) != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "failed to write config"})
 		return
@@ -171,8 +192,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 
-// GetConfigYAML returns the raw config.yaml file bytes without re-encoding.
-// It preserves comments and original formatting/styles.
+// GetConfigYAML preserves raw YAML unless static ISP passwords require redaction.
 func (h *Handler) GetConfigYAML(c *gin.Context) {
 	data, err := os.ReadFile(h.configFilePath)
 	if err != nil {
@@ -183,10 +203,14 @@ func (h *Handler) GetConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed", "message": err.Error()})
 		return
 	}
+	data, err = rewriteStaticISPPasswords(data, nil, true)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "invalid_config", "message": "cannot redact config YAML"})
+		return
+	}
 	c.Header("Content-Type", "application/yaml; charset=utf-8")
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
-	// Write raw bytes as-is
 	_, _ = c.Writer.Write(data)
 }
 
@@ -336,11 +360,12 @@ func (h *Handler) GetRoutingStrategy(c *gin.Context) {
 	c.JSON(200, gin.H{"strategy": strategy})
 }
 
-// GetRoutingSettings returns the runtime-only scheduler controls used by the management panel.
+// GetRoutingSettings returns scheduler controls and their persistence preference.
 func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	h.mu.Lock()
 	cfg := h.cfg
 	strategy := activeRoutingStrategy(cfg)
+	persistSettings := cfg != nil && cfg.Routing.PersistSettings != nil && *cfg.Routing.PersistSettings
 	unauthorized := cfg != nil && cfg.Routing.AutoDisableUnauthorized
 	quota := cfg != nil && cfg.Routing.AutoDisableQuota
 	disableCooling := false
@@ -350,16 +375,22 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	authConcurrencyLimit := 0
 	degradedPort := 0
 	degradedPortConfigured := false
+	exoFreePort := 0
 	codexFingerprintConvergence := false
-	codexTurnStateEnabled := false
-	codexAutoDegrade := false
-	cliproxy := config.CliproxyConfig{}
+	workBuddyFingerprintConvergence := false
+	staticISPEnabled := false
+	staticISPNodes := make([]gin.H, 0)
+	fakeModels := make([]config.FakeModelConfig, 0)
 	codexRoutingHint := "europe"
 	cacheTokenRewrite := config.CacheTokenRewriteConfig{}
 	if cfg != nil {
+		fakeModels = append(fakeModels, config.CloneFakeModels(cfg.Routing.FakeModels)...)
 		if cfg.Routing.DegradedPort != nil {
 			degradedPort = *cfg.Routing.DegradedPort
 			degradedPortConfigured = true
+		}
+		if cfg.Routing.ExoFreePort != nil {
+			exoFreePort = *cfg.Routing.ExoFreePort
 		}
 		if cfg.CacheTokenRewrite != nil {
 			cacheTokenRewrite = *cfg.CacheTokenRewrite
@@ -372,14 +403,14 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		if cfg.Routing.CodexFingerprintConvergence != nil {
 			codexFingerprintConvergence = *cfg.Routing.CodexFingerprintConvergence
 		}
-		if cfg.Routing.CodexTurnStateEnabled != nil {
-			codexTurnStateEnabled = *cfg.Routing.CodexTurnStateEnabled
+		if cfg.Routing.WorkBuddyFingerprintConvergence != nil {
+			workBuddyFingerprintConvergence = *cfg.Routing.WorkBuddyFingerprintConvergence
 		}
-		if cfg.Routing.CodexAutoDegrade != nil {
-			codexAutoDegrade = *cfg.Routing.CodexAutoDegrade
-		}
-		if cfg.Routing.CodexStateCliproxy != nil {
-			cliproxy = *cfg.Routing.CodexStateCliproxy
+		if cfg.Routing.CodexStaticISP != nil {
+			staticISPEnabled = cfg.Routing.CodexStaticISP.Enabled
+			for _, node := range cfg.Routing.CodexStaticISP.Nodes {
+				staticISPNodes = append(staticISPNodes, gin.H{"id": node.ID, "scheme": node.Scheme, "host": node.Host, "port": node.Port, "username": node.Username, "password-configured": node.Password != ""})
+			}
 		}
 		if cfg.Routing.CodexRoutingHint != nil {
 			codexRoutingHint = strings.TrimSpace(*cfg.Routing.CodexRoutingHint)
@@ -401,76 +432,75 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	h.mu.Unlock()
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{
-		"strategy":                      strategy,
-		"scheduler-mode":                strategy,
-		"auto-disable-unauthorized":     unauthorized,
-		"auto-disable-quota":            quota,
-		"disable-cooling":               disableCooling,
-		"c2a-max-retry-count":           c2aRetryCount,
-		"c2a-max-retry-interval":        c2aRetryInterval,
-		"c2a-max-retry-credentials":     c2aRetryCredentials,
-		"auth-concurrency-limit":        authConcurrencyLimit,
-		"degraded-port":                 degradedPort,
-		"degraded-port-configured":      degradedPortConfigured,
-		"codex-fingerprint-convergence": codexFingerprintConvergence,
-		"codex-turn-state-enabled":      codexTurnStateEnabled,
-		"codex-auto-degrade":            codexAutoDegrade,
-		"codex-state-cliproxy": gin.H{
-			"enabled": cliproxy.Enabled, "gateway": cliproxy.Gateway,
-			"username": cliproxy.Username, "password-configured": cliproxy.Password != "",
-		},
-		"codex-routing-hint":  codexRoutingHint,
-		"cache-token-rewrite": cacheTokenRewrite,
-		"runtime_only":        true,
+		"persist-settings":                  persistSettings,
+		"strategy":                          strategy,
+		"scheduler-mode":                    strategy,
+		"auto-disable-unauthorized":         unauthorized,
+		"auto-disable-quota":                quota,
+		"disable-cooling":                   disableCooling,
+		"c2a-max-retry-count":               c2aRetryCount,
+		"c2a-max-retry-interval":            c2aRetryInterval,
+		"c2a-max-retry-credentials":         c2aRetryCredentials,
+		"auth-concurrency-limit":            authConcurrencyLimit,
+		"degraded-port":                     degradedPort,
+		"degraded-port-configured":          degradedPortConfigured,
+		"exo-free-port":                     exoFreePort,
+		"codex-fingerprint-convergence":     codexFingerprintConvergence,
+		"workbuddy-fingerprint-convergence": workBuddyFingerprintConvergence,
+		"codex-routing-hint":                codexRoutingHint,
+		"codex-static-isp":                  gin.H{"enabled": staticISPEnabled, "nodes": staticISPNodes},
+		"cache-token-rewrite":               cacheTokenRewrite,
+		"fake-models":                       fakeModels,
+		"runtime_only":                      !persistSettings,
 	})
 }
 
-// GetCodexTurnStateStatus returns only per-account validity estimates and collection status.
-func (h *Handler) GetCodexTurnStateStatus(c *gin.Context) {
+// GetCodexStaticISPStatus returns per-account proxy bindings without credentials.
+func (h *Handler) GetCodexStaticISPStatus(c *gin.Context) {
 	h.mu.Lock()
-	enabled := h.cfg != nil && h.cfg.Routing.CodexTurnStateEnabled != nil && *h.cfg.Routing.CodexTurnStateEnabled
 	manager := h.authManager
 	h.mu.Unlock()
-	accounts := []helps.CodexTurnStateStatus{}
+	bindings := []helps.CodexStaticISPStatus{}
+	staticISPError := ""
 	if manager != nil {
 		if executor, ok := manager.Executor("codex"); ok {
 			if source, ok := executor.(interface {
-				CodexTurnStateKeeper() *helps.CodexTurnStateKeeper
+				CodexEgressManager() *helps.CodexEgressManager
 			}); ok {
-				if keeper := source.CodexTurnStateKeeper(); keeper != nil {
-					accounts = keeper.Snapshot()
+				if keeper := source.CodexEgressManager(); keeper != nil {
+					bindings = keeper.StaticISPBindings()
+					staticISPError = keeper.StaticISPError()
 				}
 			}
 		}
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{"enabled": enabled, "accounts": accounts, "ttl_seconds": int64(helps.CodexTurnStateTTL / time.Second)})
+	c.JSON(http.StatusOK, gin.H{
+		"static_isp_bindings": bindings, "static_isp_error": staticISPError,
+	})
 }
 
-// PutRoutingSettings updates scheduler controls in memory and deliberately skips config.yaml writes.
+// PutRoutingSettings updates scheduler controls and optionally saves them to config.yaml.
 func (h *Handler) PutRoutingSettings(c *gin.Context) {
 	var body struct {
-		Strategy                    *string `json:"strategy"`
-		SchedulerMode               *string `json:"scheduler-mode"`
-		AutoDisableUnauthorized     *bool   `json:"auto-disable-unauthorized"`
-		AutoDisableQuota            *bool   `json:"auto-disable-quota"`
-		DisableCooling              *bool   `json:"disable-cooling"`
-		C2AMaxRetryCount            *int    `json:"c2a-max-retry-count"`
-		C2AMaxRetryInterval         *int    `json:"c2a-max-retry-interval"`
-		C2AMaxRetryCredentials      *int    `json:"c2a-max-retry-credentials"`
-		AuthConcurrencyLimit        *int    `json:"auth-concurrency-limit"`
-		DegradedPort                *int    `json:"degraded-port"`
-		CodexFingerprintConvergence *bool   `json:"codex-fingerprint-convergence"`
-		CodexTurnStateEnabled       *bool   `json:"codex-turn-state-enabled"`
-		CodexAutoDegrade            *bool   `json:"codex-auto-degrade"`
-		CodexStateCliproxy          *struct {
-			Enabled  *bool   `json:"enabled"`
-			Gateway  *string `json:"gateway"`
-			Username *string `json:"username"`
-			Password *string `json:"password"`
-		} `json:"codex-state-cliproxy"`
-		CodexRoutingHint  *string                         `json:"codex-routing-hint"`
-		CacheTokenRewrite *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
+		PersistSettings                 *bool                           `json:"persist-settings"`
+		Strategy                        *string                         `json:"strategy"`
+		SchedulerMode                   *string                         `json:"scheduler-mode"`
+		AutoDisableUnauthorized         *bool                           `json:"auto-disable-unauthorized"`
+		AutoDisableQuota                *bool                           `json:"auto-disable-quota"`
+		DisableCooling                  *bool                           `json:"disable-cooling"`
+		C2AMaxRetryCount                *int                            `json:"c2a-max-retry-count"`
+		C2AMaxRetryInterval             *int                            `json:"c2a-max-retry-interval"`
+		C2AMaxRetryCredentials          *int                            `json:"c2a-max-retry-credentials"`
+		AuthConcurrencyLimit            *int                            `json:"auth-concurrency-limit"`
+		DegradedPort                    *int                            `json:"degraded-port"`
+		ExoFreePort                     *int                            `json:"exo-free-port"`
+		CodexFingerprintConvergence     *bool                           `json:"codex-fingerprint-convergence"`
+		WorkBuddyFingerprintConvergence *bool                           `json:"workbuddy-fingerprint-convergence"`
+		CodexStaticISP                  *staticISPConfigPatch           `json:"codex-static-isp"`
+		CodexRoutingHint                *string                         `json:"codex-routing-hint"`
+		CacheTokenRewrite               *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
+		FakeModels                      *[]config.FakeModelConfig       `json:"fake-models"`
 	}
 	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
@@ -478,6 +508,12 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 	}
 	if body.CacheTokenRewrite != nil {
 		if errValidate := body.CacheTokenRewrite.Validate(); errValidate != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+			return
+		}
+	}
+	if body.FakeModels != nil {
+		if errValidate := config.ValidateFakeModels(*body.FakeModels); errValidate != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
 			return
 		}
@@ -515,6 +551,10 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "degraded-port must be between 0 and 65535"})
 		return
 	}
+	if body.ExoFreePort != nil && (*body.ExoFreePort < 0 || *body.ExoFreePort > 65535) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "exo-free-port must be between 0 and 65535"})
+		return
+	}
 	if body.CodexRoutingHint != nil {
 		value := strings.ToLower(strings.TrimSpace(*body.CodexRoutingHint))
 		switch value {
@@ -527,32 +567,18 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		}
 		body.CodexRoutingHint = &value
 	}
-	if mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.CodexFingerprintConvergence == nil && body.CodexTurnStateEnabled == nil && body.CodexAutoDegrade == nil && body.CodexStateCliproxy == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil {
+	if body.PersistSettings == nil && mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.ExoFreePort == nil && body.CodexFingerprintConvergence == nil && body.WorkBuddyFingerprintConvergence == nil && body.CodexStaticISP == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil && body.FakeModels == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
 
 	h.applyRuntimeConfig(c, func(cfg *config.Config) error {
-		var cliproxy *config.CliproxyConfig
-		if patch := body.CodexStateCliproxy; patch != nil {
-			cliproxy = &config.CliproxyConfig{}
-			if cfg.Routing.CodexStateCliproxy != nil {
-				*cliproxy = *cfg.Routing.CodexStateCliproxy
-			}
-			if patch.Enabled != nil {
-				cliproxy.Enabled = *patch.Enabled
-			}
-			if patch.Gateway != nil {
-				cliproxy.Gateway = strings.TrimSpace(*patch.Gateway)
-			}
-			if patch.Username != nil {
-				cliproxy.Username = strings.TrimSpace(*patch.Username)
-			}
-			if patch.Password != nil {
-				cliproxy.Password = *patch.Password
-			}
-			if _, errProxy := cliproxy.ProxyURL(); errProxy != nil {
-				return errProxy
+		var staticISP *config.CodexStaticISPConfig
+		if body.CodexStaticISP != nil {
+			var errPool error
+			staticISP, errPool = body.CodexStaticISP.apply(cfg.Routing.CodexStaticISP)
+			if errPool != nil {
+				return errPool
 			}
 		}
 		if body.DegradedPort != nil {
@@ -565,8 +591,22 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 			value := *body.DegradedPort
 			cfg.Routing.DegradedPort = &value
 		}
-		if cliproxy != nil {
-			cfg.Routing.CodexStateCliproxy = cliproxy
+		if body.ExoFreePort != nil {
+			if h.exoFreePortController == nil {
+				return fmt.Errorf("exo-free listener controller unavailable")
+			}
+			if errPort := h.exoFreePortController(*body.ExoFreePort); errPort != nil {
+				return errPort
+			}
+			value := *body.ExoFreePort
+			cfg.Routing.ExoFreePort = &value
+		}
+		if staticISP != nil {
+			cfg.Routing.CodexStaticISP = staticISP
+		}
+		if body.PersistSettings != nil {
+			value := *body.PersistSettings
+			cfg.Routing.PersistSettings = &value
 		}
 		if mode != nil {
 			cfg.Routing.SchedulerMode = normalizedMode
@@ -613,13 +653,9 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 			value := *body.CodexFingerprintConvergence
 			cfg.Routing.CodexFingerprintConvergence = &value
 		}
-		if body.CodexTurnStateEnabled != nil {
-			value := *body.CodexTurnStateEnabled
-			cfg.Routing.CodexTurnStateEnabled = &value
-		}
-		if body.CodexAutoDegrade != nil {
-			value := *body.CodexAutoDegrade
-			cfg.Routing.CodexAutoDegrade = &value
+		if body.WorkBuddyFingerprintConvergence != nil {
+			value := *body.WorkBuddyFingerprintConvergence
+			cfg.Routing.WorkBuddyFingerprintConvergence = &value
 		}
 		if body.CodexRoutingHint != nil {
 			value := *body.CodexRoutingHint
@@ -627,6 +663,9 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		}
 		if body.CacheTokenRewrite != nil {
 			cfg.CacheTokenRewrite = body.CacheTokenRewrite
+		}
+		if body.FakeModels != nil {
+			cfg.Routing.FakeModels = config.CloneFakeModels(*body.FakeModels)
 		}
 		return nil
 	})

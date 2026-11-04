@@ -10,21 +10,9 @@ import (
 // payload carries an actual output token, reasoning trace, tool call argument, or multimodal delta,
 // according to the official Responses API streaming / websocket specification plus Codex-compatible private events.
 func IsResponsesTokenEvent(payload []byte) bool {
-	payload = bytes.TrimSpace(payload)
+	payload = responsesJSONPayload(payload)
 	if len(payload) == 0 {
 		return false
-	}
-
-	// Handle SSE line format (e.g., "data: {...}")
-	if bytes.HasPrefix(payload, []byte("data:")) {
-		prefixLen := len("data:")
-		if bytes.HasPrefix(payload, []byte("data: ")) {
-			prefixLen = len("data: ")
-		}
-		payload = bytes.TrimSpace(payload[prefixLen:])
-		if len(payload) == 0 {
-			return false
-		}
 	}
 
 	eventType := gjson.GetBytes(payload, "type").String()
@@ -104,6 +92,41 @@ func IsResponsesTokenEvent(payload []byte) bool {
 	}
 }
 
+// IsResponsesProgressEvent implements Codex's loose first-token convention: created and
+// in_progress are handshake-only events, terminal events are not token/progress events, and every
+// other typed Responses event proves that the upstream has started producing a response.
+func IsResponsesProgressEvent(payload []byte) bool {
+	payload = responsesJSONPayload(payload)
+	if len(payload) == 0 {
+		return false
+	}
+
+	switch gjson.GetBytes(payload, "type").String() {
+	case "",
+		"response.created",
+		"response.in_progress",
+		"response.completed",
+		"response.done",
+		"response.failed",
+		"response.incomplete",
+		"response.cancelled",
+		"response.canceled",
+		"response.error",
+		"error":
+		return false
+	default:
+		return true
+	}
+}
+
+func responsesJSONPayload(payload []byte) []byte {
+	payload = bytes.TrimSpace(payload)
+	if bytes.HasPrefix(payload, []byte("data:")) {
+		payload = bytes.TrimSpace(payload[len("data:"):])
+	}
+	return payload
+}
+
 // ObserveResponsesTokenEvent inspects a Responses API frame payload and records TTFT if the frame
 // represents the first meaningful token event. It records the first packet arrival time as a fallback
 // and exits immediately with zero allocations once effective token TTFT is set.
@@ -115,4 +138,17 @@ func ObserveResponsesTokenEvent(reporter *UsageReporter, payload []byte) {
 		return
 	}
 	reporter.ObserveTokenEvent(IsResponsesTokenEvent(payload))
+}
+
+// ObserveResponsesProgressEvent records Codex TTFT using the loose progress convention. The strict
+// ObserveResponsesTokenEvent helper remains available for protocols and logic that require actual
+// generated content rather than the first non-handshake response event.
+func ObserveResponsesProgressEvent(reporter *UsageReporter, payload []byte) {
+	if reporter == nil || len(payload) == 0 {
+		return
+	}
+	if reporter.IsTTFTSet() {
+		return
+	}
+	reporter.ObserveTokenEvent(IsResponsesProgressEvent(payload))
 }

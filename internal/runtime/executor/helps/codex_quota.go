@@ -1,7 +1,9 @@
 package helps
 
 import (
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -22,8 +24,8 @@ const (
 // The websocket payload identifies each additional limit only by limit name
 // ("GPT-5.3-Codex-Spark"), while HTTP responses namespace the same limit by a
 // short name (x-codex-bengalfox-*). The two forms therefore cannot produce
-// identical header names; the X-Codex-Additional- prefix marks the websocket
-// origin, and the snapshot-replacement semantics in QuotaState keep the two
+// identical header names; the X-Codex-Additional- prefix marks limits parsed
+// from JSON, and the snapshot-replacement semantics in QuotaState keep the two
 // spellings from accumulating side by side.
 func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 	if len(payload) == 0 {
@@ -38,12 +40,29 @@ func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 	if eventKind == codexQuotaEventError {
 		return parseCodexQuotaHeadersObject(root.Get("headers"))
 	}
+	return parseCodexQuotaSnapshotHeaders(root, false)
+}
 
+// ParseCodexUsageQuotaHeaders converts a /backend-api/wham/usage response into
+// quota observation headers. Missing or invalid windows return nil so callers
+// can retain the previous snapshot instead of treating absent usage as zero.
+func ParseCodexUsageQuotaHeaders(payload []byte) http.Header {
+	if !gjson.ValidBytes(payload) {
+		return nil
+	}
+	root := gjson.ParseBytes(payload)
+	if !root.IsObject() {
+		return nil
+	}
+	return parseCodexQuotaSnapshotHeaders(root, true)
+}
+
+func parseCodexQuotaSnapshotHeaders(root gjson.Result, requireWindow bool) http.Header {
 	headers := make(http.Header)
 	hasQuotaData := false
 
-	baseRateLimits := firstCodexQuotaResult(root, "rate_limits", "rateLimit")
-	if addCodexQuotaRateLimitHeaders(headers, "X-Codex-", baseRateLimits) {
+	baseRateLimits := firstCodexQuotaResult(root, "rate_limit", "rate_limits", "rateLimit")
+	if addCodexQuotaRateLimitHeaders(headers, "X-Codex-", baseRateLimits, requireWindow) {
 		// The main rate-limit object has no user-facing name in the websocket
 		// payload, so its fields retain the HTTP response header names.
 		hasQuotaData = true
@@ -72,7 +91,7 @@ func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 				rateInfo = value
 			}
 			prefix := codexQuotaAdditionalHeaderKey + identifier + "-"
-			if addCodexQuotaRateLimitHeaders(headers, prefix, rateInfo) {
+			if addCodexQuotaRateLimitHeaders(headers, prefix, rateInfo, requireWindow) {
 				// The limit name is upstream-controlled and lands in the
 				// plain-text request log, so reject control characters here the
 				// same way the plan type is validated below.
@@ -86,16 +105,19 @@ func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 		})
 	}
 
-	codeReview := firstCodexQuotaResult(root, "code_review_rate_limits", "codeReviewRateLimits")
-	if addCodexQuotaRateLimitHeaders(headers, "X-Codex-Code-Review-", codeReview) {
+	codeReview := firstCodexQuotaResult(root, "code_review_rate_limit", "code_review_rate_limits", "codeReviewRateLimits")
+	if addCodexQuotaRateLimitHeaders(headers, "X-Codex-Code-Review-", codeReview, requireWindow) {
 		hasQuotaData = true
 	}
 
 	credits := firstCodexQuotaResult(root, "credits")
 	if credits.Exists() && credits.IsObject() {
-		hasQuotaData = setCodexQuotaScalarHeader(headers, "X-Codex-Credits-Has-Credits", credits, "has_credits", "hasCredits") || hasQuotaData
-		hasQuotaData = setCodexQuotaScalarHeader(headers, "X-Codex-Credits-Unlimited", credits, "unlimited") || hasQuotaData
-		hasQuotaData = setCodexQuotaScalarHeader(headers, "X-Codex-Credits-Balance", credits, "balance") || hasQuotaData
+		hasCredits := setCodexQuotaScalarHeader(headers, "X-Codex-Credits-Has-Credits", credits, "has_credits", "hasCredits")
+		hasCredits = setCodexQuotaScalarHeader(headers, "X-Codex-Credits-Unlimited", credits, "unlimited") || hasCredits
+		hasCredits = setCodexQuotaScalarHeader(headers, "X-Codex-Credits-Balance", credits, "balance") || hasCredits
+		if !requireWindow {
+			hasQuotaData = hasQuotaData || hasCredits
+		}
 	}
 
 	if !hasQuotaData {
@@ -165,46 +187,63 @@ func codexQuotaEventKind(payload []byte) int {
 	return codexQuotaEventOther
 }
 
-func addCodexQuotaRateLimitHeaders(headers http.Header, prefix string, rateInfo gjson.Result) bool {
+func addCodexQuotaRateLimitHeaders(headers http.Header, prefix string, rateInfo gjson.Result, requireWindow bool) bool {
 	if !rateInfo.Exists() || !rateInfo.IsObject() {
 		return false
 	}
 
 	changed := false
+	for _, windowName := range []string{"primary", "secondary"} {
+		window := firstCodexQuotaResult(rateInfo, windowName+"_window", windowName)
+		windowPrefix := prefix + strings.ToUpper(windowName[:1]) + windowName[1:] + "-"
+		changed = addCodexQuotaWindowHeaders(headers, windowPrefix, window) || changed
+	}
+	if requireWindow && !changed {
+		return false
+	}
 	if setCodexQuotaScalarHeaderFromResult(headers, prefix+"Allowed", rateInfo, "allowed") {
 		changed = true
 	}
 	if setCodexQuotaScalarHeaderFromResult(headers, prefix+"Limit-Reached", rateInfo, "limit_reached", "limitReached") {
 		changed = true
 	}
-	for _, windowName := range []string{"primary", "secondary"} {
-		window := firstCodexQuotaResult(rateInfo, windowName)
-		if !window.Exists() || !window.IsObject() {
-			continue
-		}
-		used := firstCodexQuotaResult(window, "used_percent", "usedPercent")
-		minutes := firstCodexQuotaResult(window, "window_minutes", "windowMinutes")
-		resetAfter := firstCodexQuotaResult(window, "reset_after_seconds", "resetAfterSeconds")
-		resetAt := firstCodexQuotaResult(window, "reset_at", "resetAt")
-		hasResetAfter := resetAfter.Exists() && resetAfter.Int() >= 0
-		hasResetAt := resetAt.Exists() && resetAt.Int() > 0
-		if !used.Exists() || !minutes.Exists() ||
-			used.Float() < 0 || used.Float() > 100 || minutes.Int() <= 0 ||
-			(!hasResetAfter && !hasResetAt) {
-			continue
-		}
-		windowPrefix := prefix + strings.ToUpper(windowName[:1]) + windowName[1:] + "-"
-		setCodexQuotaScalarHeaderFromResult(headers, windowPrefix+"Used-Percent", window, "used_percent", "usedPercent")
-		setCodexQuotaScalarHeaderFromResult(headers, windowPrefix+"Window-Minutes", window, "window_minutes", "windowMinutes")
-		if hasResetAfter {
-			setCodexQuotaScalarHeaderFromResult(headers, windowPrefix+"Reset-After-Seconds", window, "reset_after_seconds", "resetAfterSeconds")
-		}
-		if hasResetAt {
-			setCodexQuotaScalarHeaderFromResult(headers, windowPrefix+"Reset-At", window, "reset_at", "resetAt")
-		}
-		changed = true
-	}
 	return changed
+}
+
+func addCodexQuotaWindowHeaders(headers http.Header, prefix string, window gjson.Result) bool {
+	if !window.IsObject() {
+		return false
+	}
+	used, hasUsed := codexQuotaNumber(firstCodexQuotaResult(window, "used_percent", "usedPercent"))
+	minutes, hasMinutes := codexQuotaNumber(firstCodexQuotaResult(window, "window_minutes", "windowMinutes"))
+	if !hasMinutes {
+		seconds, hasSeconds := codexQuotaNumber(firstCodexQuotaResult(window, "limit_window_seconds"))
+		minutes, hasMinutes = seconds/60, hasSeconds
+	}
+	resetAfter, hasResetAfter := codexQuotaNumber(firstCodexQuotaResult(window, "reset_after_seconds", "resetAfterSeconds"))
+	resetAt, hasResetAt := codexQuotaNumber(firstCodexQuotaResult(window, "reset_at", "resetAt"))
+	hasResetAfter = hasResetAfter && resetAfter >= 0 && resetAfter < 1<<63 && math.Trunc(resetAfter) == resetAfter
+	hasResetAt = hasResetAt && resetAt > 0 && resetAt < 1<<63 && math.Trunc(resetAt) == resetAt
+	if !hasUsed || used < 0 || used > 100 || !hasMinutes || minutes <= 0 || minutes >= 1<<63 || (!hasResetAfter && !hasResetAt) {
+		return false
+	}
+	headers.Set(prefix+"Used-Percent", strconv.FormatFloat(used, 'f', -1, 64))
+	headers.Set(prefix+"Window-Minutes", strconv.FormatFloat(minutes, 'f', -1, 64))
+	if hasResetAfter {
+		headers.Set(prefix+"Reset-After-Seconds", strconv.FormatFloat(resetAfter, 'f', -1, 64))
+	}
+	if hasResetAt {
+		headers.Set(prefix+"Reset-At", strconv.FormatFloat(resetAt, 'f', -1, 64))
+	}
+	return true
+}
+
+func codexQuotaNumber(value gjson.Result) (float64, bool) {
+	if value.Type != gjson.Number && value.Type != gjson.String {
+		return 0, false
+	}
+	number, errParse := strconv.ParseFloat(strings.TrimSpace(value.String()), 64)
+	return number, errParse == nil && !math.IsNaN(number) && !math.IsInf(number, 0)
 }
 
 func parseCodexQuotaHeadersObject(headersNode gjson.Result) http.Header {
@@ -267,7 +306,7 @@ func setCodexQuotaScalarHeaderFromResult(headers http.Header, name string, objec
 		return false
 	}
 	raw := codexQuotaScalarValue(value)
-	if raw == "" {
+	if !validCodexQuotaEventText(raw) {
 		return false
 	}
 	headers.Set(name, raw)

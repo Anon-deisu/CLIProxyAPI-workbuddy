@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,7 +12,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	metaauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/meta"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -60,7 +63,7 @@ type apiCallResponse struct {
 // Request JSON:
 //   - auth_index / authIndex / AuthIndex (optional):
 //     The credential "auth_index" from GET /v0/management/auth-files (or other endpoints returning it).
-//     If omitted or not found, credential-specific proxy/token substitution is skipped.
+//     If omitted, credential-specific proxy selection is skipped. Unresolved token placeholders fail with HTTP 400.
 //   - method (required): HTTP method, e.g. GET, POST, PUT, PATCH, DELETE.
 //   - url (required): Absolute URL including scheme and host, e.g. "https://api.example.com/v1/ping".
 //   - proxy_url (optional): Proxy used for this request. Supports HTTP, HTTPS, SOCKS5, SOCKS5H,
@@ -72,7 +75,7 @@ type apiCallResponse struct {
 //     3) metadata.token / metadata.id_token / metadata.cookie
 //     Example: {"Authorization":"Bearer $TOKEN$"}.
 //     Note: if you need to override the HTTP Host header, set header["Host"].
-//   - data (optional): Raw request body as string (useful for POST/PUT/PATCH).
+//   - data (optional): Raw request body as string. Supports "$TOKEN$" with JSON string escaping when applicable.
 //
 // Proxy selection (highest priority first):
 //  1. Request proxy_url (when set, lower-priority proxy settings are ignored)
@@ -140,26 +143,45 @@ func (h *Handler) APICall(c *gin.Context) {
 	var token string
 	var tokenResolved bool
 	var tokenErr error
-	for key, value := range reqHeaders {
-		if !strings.Contains(value, "$TOKEN$") {
-			continue
-		}
+	resolveToken := func() error {
 		if !tokenResolved {
 			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth, requestProxyURL)
 			tokenResolved = true
 		}
-		if auth != nil && token == "" {
-			if tokenErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
-				return
-			}
-			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found"})
-			return
-		}
 		if token == "" {
+			if tokenErr != nil {
+				return errors.New("auth token refresh failed")
+			}
+			if authIndex != "" && auth == nil {
+				return errors.New("auth credential not found for auth_index")
+			}
+			return errors.New("auth token not found")
+		}
+		return nil
+	}
+	for key, value := range reqHeaders {
+		if !strings.Contains(value, "$TOKEN$") {
 			continue
 		}
+		if errToken := resolveToken(); errToken != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errToken.Error()})
+			return
+		}
 		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+	}
+	if strings.Contains(body.Data, "$TOKEN$") {
+		if errToken := resolveToken(); errToken != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errToken.Error()})
+			return
+		}
+		replacement := token
+		if json.Valid([]byte(body.Data)) {
+			// In valid JSON the placeholder can only occur inside a string.
+			// Encode that string fragment without rewriting numbers or formatting.
+			encoded, _ := json.Marshal(token)
+			replacement = string(encoded[1 : len(encoded)-1])
+		}
+		body.Data = strings.ReplaceAll(body.Data, "$TOKEN$", replacement)
 	}
 
 	var requestBody io.Reader
@@ -237,6 +259,9 @@ func tokenValueForAuth(auth *coreauth.Auth) string {
 		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
 			return v
 		}
+		if v := strings.TrimSpace(auth.Attributes["session_token"]); v != "" {
+			return v
+		}
 	}
 	return ""
 }
@@ -250,8 +275,75 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth, 
 		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth, requestProxyURL)
 		return token, errToken
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+		return h.resolveMetaToken(ctx, auth, requestProxyURL)
+	}
 
 	return tokenValueForAuth(auth), nil
+}
+
+func metaTokenFromAuth(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	for _, field := range []string{"api_key", "access_token"} {
+		if token := stringValue(auth.Metadata, field); token != "" && !strings.HasPrefix(token, "dca:") {
+			return token
+		}
+	}
+	for _, field := range []string{"api_key", "access_token"} {
+		if token := strings.TrimSpace(auth.Attributes[field]); token != "" && !strings.HasPrefix(token, "dca:") {
+			return token
+		}
+	}
+	if storage, ok := auth.Storage.(*metaauth.MetaTokenStorage); ok && storage != nil {
+		for _, token := range []string{storage.APIKey, storage.AccessToken} {
+			if token = strings.TrimSpace(token); token != "" && !strings.HasPrefix(token, "dca:") {
+				return token
+			}
+		}
+	}
+	return ""
+}
+
+// metaManagementPreparer scopes the proxy override to this acquisition only.
+type metaManagementPreparer struct {
+	executor *executor.MetaExecutor
+	proxyURL string
+}
+
+func (p metaManagementPreparer) ShouldPrepareRequestAuth(auth *coreauth.Auth) bool {
+	return p.executor.ShouldPrepareRequestAuth(auth)
+}
+
+func (p metaManagementPreparer) PrepareRequestAuth(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	proxyURL := auth.ProxyURL
+	if p.proxyURL != "" {
+		auth.ProxyURL = p.proxyURL
+	}
+	updated, err := p.executor.PrepareRequestAuth(ctx, auth)
+	if updated != nil {
+		updated.ProxyURL = proxyURL
+	}
+	return updated, err
+}
+
+func (h *Handler) resolveMetaToken(ctx context.Context, auth *coreauth.Auth, requestProxyURL string) (string, error) {
+	if token := metaTokenFromAuth(auth); token != "" {
+		return token, nil
+	}
+	preparer := metaManagementPreparer{executor: executor.NewMetaExecutor(h.cfg), proxyURL: strings.TrimSpace(requestProxyURL)}
+	if !preparer.ShouldPrepareRequestAuth(auth) {
+		return "", nil
+	}
+	if h.authManager == nil || auth.ID == "" {
+		return "", errors.New("meta token mint requires a registered credential")
+	}
+	updated, err := h.authManager.PrepareRequestAuth(ctx, preparer, auth)
+	if err != nil {
+		return "", err
+	}
+	return metaTokenFromAuth(updated), nil
 }
 
 func (h *Handler) refreshAntigravityOAuthAccessToken(ctx context.Context, auth *coreauth.Auth, requestProxyURL string) (string, error) {
@@ -457,6 +549,11 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 	if v, ok := metadata["id_token"].(string); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
 	}
+	for _, field := range []string{"api_key", "session_token"} {
+		if token := stringValue(metadata, field); token != "" {
+			return token
+		}
+	}
 	if v, ok := metadata["cookie"].(string); ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
 	}
@@ -608,6 +705,10 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 		}
 	case "xai":
 		if entry := resolveAPIKeyConfig(cfg.XAIKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyURL)
+		}
+	case "meta":
+		if entry := resolveAPIKeyConfig(cfg.MetaKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
 	}

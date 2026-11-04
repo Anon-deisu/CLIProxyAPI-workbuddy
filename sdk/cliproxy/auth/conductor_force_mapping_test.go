@@ -590,6 +590,11 @@ func setupAPIKeyForceMappingManager(t *testing.T, provider, upstreamModel, alias
 				ForceMapping: true,
 			}},
 		}}
+	case "meta":
+		cfg.MetaKey = []internalconfig.MetaKey{{
+			APIKey: apiKey,
+			Models: []internalconfig.MetaModel{{Name: upstreamModel, Alias: aliasModel, ForceMapping: true}},
+		}}
 	case "vertex":
 		cfg.VertexCompatAPIKey = []internalconfig.VertexCompatKey{{
 			APIKey: apiKey,
@@ -645,6 +650,7 @@ func TestManagerExecute_APIKeyAliasForceMappingRewritesResponse(t *testing.T) {
 		{provider: "claude", upstreamModel: "glm-5.2", aliasModel: "claude-sonnet-latest"},
 		{provider: "codex", upstreamModel: "gpt-5.5", aliasModel: "claude-sonnet-4-5"},
 		{provider: "xai", upstreamModel: "grok-4.5", aliasModel: "grok-latest"},
+		{provider: "meta", upstreamModel: "muse-spark-1.3", aliasModel: "muse-latest"},
 		{provider: "vertex", upstreamModel: "gemini-3-pro", aliasModel: "claude-opus-4-5"},
 		{provider: "openai-compatibility", upstreamModel: "deepseek-v3.1", aliasModel: "claude-opus-4.66"},
 	}
@@ -676,6 +682,7 @@ func TestManagerExecuteStream_APIKeyAliasForceMappingRewritesResponse(t *testing
 		{provider: "claude", upstreamModel: "glm-5.2", aliasModel: "claude-sonnet-latest"},
 		{provider: "codex", upstreamModel: "gpt-5.5", aliasModel: "claude-sonnet-4-5"},
 		{provider: "xai", upstreamModel: "grok-4.5", aliasModel: "grok-latest"},
+		{provider: "meta", upstreamModel: "muse-spark-1.3", aliasModel: "muse-latest"},
 		{provider: "vertex", upstreamModel: "gemini-3-pro", aliasModel: "claude-opus-4-5"},
 		{provider: "openai-compatibility", upstreamModel: "deepseek-v3.1", aliasModel: "claude-opus-4.66"},
 	}

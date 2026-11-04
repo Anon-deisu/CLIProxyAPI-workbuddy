@@ -45,6 +45,10 @@ func TestManagerMarkResultRecordsRecentRequests(t *testing.T) {
 	if successTotal != 1 || failedTotal != 1 {
 		t.Fatalf("totals = success=%d failed=%d, want 1/1", successTotal, failedTotal)
 	}
+	newest := snapshot[len(snapshot)-1]
+	if len(newest.Models) != 1 || newest.Models[0].Model != "gpt-5" || newest.Models[0].Success != 1 || newest.Models[0].Failed != 1 {
+		t.Fatalf("model totals = %+v, want gpt-5 1/1", newest.Models)
+	}
 }
 
 func TestManagerUpdatePreservesRecentRequestsAndTotals(t *testing.T) {

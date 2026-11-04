@@ -2,11 +2,215 @@ package auth
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
+
+func TestManagerWorkBuddy6004CooldownResumesAtReset(t *testing.T) {
+	for _, provider := range []string{"workbuddy", "workbuddy-ai"} {
+		for _, disableCooling := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/disable_cooling=%t", provider, disableCooling), func(t *testing.T) {
+				manager := NewManager(nil, &RoundRobinSelector{}, nil)
+				cfg := &internalconfig.Config{Routing: internalconfig.RoutingConfig{
+					AutoDisableQuota: true,
+					DisableCooling:   &disableCooling,
+				}}
+				manager.SetConfig(cfg)
+				authID := t.Name()
+				models := []string{"workbuddy-model-a", "workbuddy-model-b"}
+				reg := registry.GetGlobalRegistry()
+				modelInfo := []*registry.ModelInfo{{ID: models[0]}, {ID: models[1]}}
+				reg.RegisterClient(authID, provider, modelInfo)
+				t.Cleanup(func() { reg.UnregisterClient(authID) })
+				auth := &Auth{ID: authID, Provider: provider, Status: StatusActive}
+				if _, err := manager.Register(t.Context(), auth); err != nil {
+					t.Fatalf("register auth: %v", err)
+				}
+				for _, model := range models {
+					picked, err := manager.scheduler.pickSingle(t.Context(), provider, model, cliproxyexecutor.Options{}, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					picked.ReleaseDispatchSlot()
+				}
+
+				retryAfter := time.Hour
+				manager.MarkResult(t.Context(), Result{
+					AuthID: authID, Provider: provider, Model: models[0], Success: false,
+					CredentialScope: true, RetryAfter: &retryAfter,
+					Error: &Error{Code: ErrorCodeWorkBuddyRateLimit, HTTPStatus: http.StatusTooManyRequests, Message: "WorkBuddy usage limit reached"},
+				})
+
+				updated, ok := manager.GetByID(authID)
+				if !ok || updated == nil {
+					t.Fatal("rate-limited account was not retained")
+				}
+				if updated.AutoDisabled || updated.Disabled || updated.Status == StatusDisabled {
+					t.Fatalf("temporary limit permanently disabled account: %+v", updated)
+				}
+				if !updated.Unavailable || updated.Quota.Reason != "credential_quota" || !updated.Quota.NextRecoverAt.After(time.Now()) {
+					t.Fatalf("credential-wide cooldown missing: unavailable=%t quota=%+v", updated.Unavailable, updated.Quota)
+				}
+				for _, model := range models {
+					blocked, reason, next := isAuthBlockedForModel(updated, model, time.Now())
+					if !blocked || reason != blockReasonCooldown || !next.Equal(updated.Quota.NextRecoverAt) {
+						t.Fatalf("model %q block = (%t, %v, %v), want account cooldown until %v", model, blocked, reason, next, updated.Quota.NextRecoverAt)
+					}
+				}
+				resetAt := updated.Quota.NextRecoverAt
+				manager.MarkResult(t.Context(), Result{AuthID: authID, Provider: provider, Model: models[1], Success: true})
+				if _, err := manager.Update(t.Context(), auth.Clone()); err != nil {
+					t.Fatal(err)
+				}
+				manager.SetConfig(cfg)
+				updated, _ = manager.GetByID(authID)
+				if !updated.Quota.NextRecoverAt.Equal(resetAt) || !updated.Unavailable {
+					t.Fatal("concurrent success, account reload or config reload erased the active limit")
+				}
+				records := manager.cooldownStateRecordsSnapshot()
+				if len(records) == 0 {
+					t.Fatal("active limit was omitted from cooldown persistence")
+				}
+				restored := NewManager(nil, &RoundRobinSelector{}, nil)
+				restored.SetConfig(cfg)
+				if _, err := restored.Register(t.Context(), auth.Clone()); err != nil {
+					t.Fatal(err)
+				}
+				restored.SetCooldownStateStore(&mockCooldownStateStore{records: records})
+				if err := restored.RestoreCooldownStates(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				restoredAuth, _ := restored.GetByID(authID)
+				for _, model := range append(models, "previously-unused-model") {
+					if blocked, _, next := isAuthBlockedForModel(restoredAuth, model, resetAt.Add(-time.Nanosecond)); !blocked || !next.Equal(resetAt) {
+						t.Fatalf("restored account admitted %q before the reset", model)
+					}
+					if blocked, _, _ := isAuthBlockedForModel(restoredAuth, model, resetAt); blocked {
+						t.Fatalf("restored account remained blocked for %q at the reset", model)
+					}
+				}
+				if len(CooldownSnapshotForAuth(restoredAuth, resetAt)) != 0 {
+					t.Fatal("management cooldown view remained active after the reset")
+				}
+				manuallyDisabled := updated.Clone()
+				manuallyDisabled.Disabled = true
+				if blocked, reason, _ := isAuthBlockedForModel(manuallyDisabled, models[0], resetAt); !blocked || reason != blockReasonDisabled {
+					t.Fatal("reset must not re-enable a manually disabled account")
+				}
+
+				manager.scheduler.mu.Lock()
+				defer manager.scheduler.mu.Unlock()
+				providerState := manager.scheduler.providers[provider]
+				if providerState == nil {
+					t.Fatal("provider missing from scheduler")
+				}
+				for _, model := range models {
+					entry := providerState.modelShards[model].entries[authID]
+					if entry == nil || entry.state != scheduledStateCooldown {
+						t.Fatalf("model %q was not removed from ready scheduling", model)
+					}
+				}
+				for _, model := range models {
+					providerState.modelShards[model].promoteExpiredLocked(resetAt)
+					if entry := providerState.modelShards[model].entries[authID]; entry == nil || entry.state != scheduledStateReady {
+						t.Fatalf("model %q was not restored to ready scheduling at reset", model)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestManagerWorkBuddy6000CooldownIsModelScoped(t *testing.T) {
+	for _, provider := range []string{"workbuddy", "workbuddy-ai"} {
+		t.Run(provider, func(t *testing.T) {
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			disableCooling := true
+			manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{
+				AutoDisableQuota: true,
+				DisableCooling:   &disableCooling,
+			}})
+			authID := t.Name()
+			models := []string{"workbuddy-model-a", "workbuddy-model-b"}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(authID, provider, []*registry.ModelInfo{{ID: models[0]}, {ID: models[1]}})
+			t.Cleanup(func() { reg.UnregisterClient(authID) })
+			auth := &Auth{ID: authID, Provider: provider, Status: StatusActive}
+			if _, err := manager.Register(t.Context(), auth); err != nil {
+				t.Fatalf("register auth: %v", err)
+			}
+			for _, model := range models {
+				picked, err := manager.scheduler.pickSingle(t.Context(), provider, model, cliproxyexecutor.Options{}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				picked.ReleaseDispatchSlot()
+			}
+
+			retryAfter := time.Hour
+			manager.MarkResult(t.Context(), Result{
+				AuthID: authID, Provider: provider, Model: models[0], Success: false,
+				RetryAfter: &retryAfter,
+				Error:      &Error{Code: ErrorCodeWorkBuddyModelRateLimit, HTTPStatus: http.StatusTooManyRequests, Message: "model usage limit reached"},
+			})
+
+			updated, ok := manager.GetByID(authID)
+			if !ok || updated == nil {
+				t.Fatal("rate-limited account was not retained")
+			}
+			if updated.AutoDisabled || updated.Disabled {
+				t.Fatalf("temporary model limit disabled the account: %+v", updated)
+			}
+			resetAt := updated.ModelStates[models[0]].NextRetryAfter
+			if !resetAt.After(time.Now()) {
+				t.Fatalf("model cooldown deadline = %s, want future reset", resetAt)
+			}
+			if blocked, reason, next := isAuthBlockedForModel(updated, models[0], time.Now()); !blocked || reason != blockReasonCooldown || !next.Equal(resetAt) {
+				t.Fatalf("limited model block = (%t, %v, %v), want cooldown until %v", blocked, reason, next, resetAt)
+			}
+			if blocked, _, _ := isAuthBlockedForModel(updated, models[1], time.Now()); blocked {
+				t.Fatal("model limit blocked a sibling model on the same auth")
+			}
+			if blocked, _, _ := isAuthBlockedForModel(updated, models[0], resetAt); blocked {
+				t.Fatal("limited model remained blocked at its reset")
+			}
+			pickedSibling, err := manager.scheduler.pickSingle(t.Context(), provider, models[1], cliproxyexecutor.Options{}, nil)
+			if err != nil || pickedSibling.ID != authID {
+				t.Fatalf("sibling model was not schedulable on the same auth: auth=%v error=%v", pickedSibling, err)
+			}
+			pickedSibling.ReleaseDispatchSlot()
+			if pickedLimited, errPick := manager.scheduler.pickSingle(t.Context(), provider, models[0], cliproxyexecutor.Options{}, nil); errPick == nil {
+				pickedLimited.ReleaseDispatchSlot()
+				t.Fatal("limited model remained schedulable before its reset")
+			}
+
+			manager.scheduler.mu.Lock()
+			defer manager.scheduler.mu.Unlock()
+			providerState := manager.scheduler.providers[provider]
+			if providerState == nil {
+				t.Fatal("provider missing from scheduler")
+			}
+			limited := providerState.modelShards[models[0]].entries[authID]
+			sibling := providerState.modelShards[models[1]].entries[authID]
+			if limited == nil || limited.state != scheduledStateCooldown {
+				t.Fatal("limited model was not removed from ready scheduling")
+			}
+			if sibling == nil || sibling.state != scheduledStateReady {
+				t.Fatal("sibling model was removed from ready scheduling")
+			}
+			providerState.modelShards[models[0]].promoteExpiredLocked(resetAt)
+			if limited.state != scheduledStateReady {
+				t.Fatal("limited model was not restored to scheduling at reset")
+			}
+		})
+	}
+}
 
 func TestUpdateAggregatedAvailability_UnavailableWithoutNextRetryDoesNotBlockAuth(t *testing.T) {
 	t.Parallel()

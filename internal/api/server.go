@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/agentworkspace"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
@@ -53,6 +55,18 @@ type Server struct {
 	degradedTLS         config.TLSConfig
 	degradedMainPort    int
 	degradedHomeEnabled bool
+	exoFreeMu           sync.Mutex
+	exoFreeServer       *http.Server
+	exoFreeListener     net.Listener
+	exoFreePort         int
+	exoFreeStopped      bool
+	exoFreeHost         string
+	exoFreeTLS          config.TLSConfig
+	exoFreeUpstreamURL  string
+	exoFreeResponsesURL string
+	exoFreeHTTPClient   *http.Client
+	exoFreePool         atomic.Value // config.CodexStaticISPConfig
+	exoFreeSelectNode   func(int) int
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	muxBaseListener net.Listener
@@ -66,6 +80,8 @@ type Server struct {
 
 	// cfg holds the current server configuration.
 	cfg *config.Config
+	// fakeModels holds an immutable copy of the panel's live synthetic models.
+	fakeModels atomic.Value // []config.FakeModelConfig
 
 	// oldConfigYaml stores a YAML snapshot of the previous configuration for change detection.
 	// This prevents issues when the config object is modified in place by Management API.
@@ -114,6 +130,9 @@ type Server struct {
 
 	exampleAPIKeySafeModeEnabled bool
 	exampleAPIKeySafeModeActive  atomic.Bool
+	agentStoreOnce               sync.Once
+	agentStore                   *agentworkspace.Store
+	agentStoreErr                error
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -195,10 +214,18 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		degradedTLS:         cfg.TLS,
 		degradedMainPort:    cfg.Port,
 		degradedHomeEnabled: cfg.Home.Enabled,
+		exoFreeHost:         cfg.Host,
+		exoFreeTLS:          cfg.TLS,
+		exoFreeUpstreamURL:  "https://opencode.ai/zen/v1/chat/completions",
+		exoFreeResponsesURL: "https://opencode.ai/zen/v1/responses",
+		exoFreeHTTPClient:   http.DefaultClient,
+		exoFreeSelectNode:   rand.IntN,
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
+	s.fakeModels.Store(config.CloneFakeModels(cfg.Routing.FakeModels))
+	s.setExoFreePool(cfg.Routing.CodexStaticISP)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))
 	s.handlers.SetPluginHost(optionState.pluginHost)
 	if optionState.pluginHost != nil {
@@ -233,8 +260,17 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	s.mgmt.SetPluginHost(optionState.pluginHost)
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
-	s.mgmt.SetRuntimeConfigHook(optionState.runtimeConfigHook)
+	s.mgmt.SetRuntimeConfigHook(func(ctx context.Context, snapshot *config.Config) {
+		s.fakeModels.Store(config.CloneFakeModels(snapshot.Routing.FakeModels))
+		s.setExoFreePool(snapshot.Routing.CodexStaticISP)
+		if optionState.runtimeConfigHook != nil {
+			optionState.runtimeConfigHook(ctx, snapshot)
+		} else if authManager != nil {
+			authManager.SetConfig(snapshot)
+		}
+	})
 	s.mgmt.SetDegradedPortController(s.setDegradedPort)
+	s.mgmt.SetExoFreePortController(s.setExoFreePort)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -340,6 +376,23 @@ func (s *Server) Start() error {
 		log.Debugf("Starting API server on %s", addr)
 	}
 
+	if s.cfg != nil && s.cfg.Routing.DegradedPort != nil {
+		if errDegraded := s.setDegradedPort(*s.cfg.Routing.DegradedPort); errDegraded != nil {
+			if errClose := listener.Close(); errClose != nil {
+				log.WithError(errClose).Warn("failed to close main listener after degraded listener failure")
+			}
+			return fmt.Errorf("restore degraded listener: %w", errDegraded)
+		}
+	}
+	if s.cfg != nil && s.cfg.Routing.ExoFreePort != nil {
+		if errExoFree := s.setExoFreePort(*s.cfg.Routing.ExoFreePort); errExoFree != nil {
+			_ = s.stopDegradedListener()
+			if errClose := listener.Close(); errClose != nil {
+				log.WithError(errClose).Warn("failed to close main listener after exo-free listener failure")
+			}
+			return fmt.Errorf("restore exo-free listener: %w", errExoFree)
+		}
+	}
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
@@ -406,7 +459,12 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	s.agentStoreOnce.Do(func() { s.agentStoreErr = agentworkspace.ErrStoreClosed })
+	if s.agentStore != nil {
+		s.agentStore.Close()
+	}
 	degradedErr := s.stopDegradedListener()
+	exoFreeErr := s.stopExoFreeListener()
 
 	if s.keepAliveEnabled {
 		select {
@@ -434,5 +492,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 
 	log.Debug("API server stopped")
-	return degradedErr
+	if degradedErr != nil {
+		return degradedErr
+	}
+	return exoFreeErr
 }

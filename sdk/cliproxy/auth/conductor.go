@@ -30,6 +30,17 @@ type ProviderExecutor interface {
 	HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error)
 }
 
+// APIKeyConfigExecutor binds an independent configuration view after credential selection.
+type APIKeyConfigExecutor interface {
+	ForAPIKey() ProviderExecutor
+}
+
+// QuotaFetcher is an optional executor capability for non-generation quota probes.
+// It returns normalized quota headers, or an error for an invalid response.
+type QuotaFetcher interface {
+	FetchQuota(context.Context, *Auth) (http.Header, error)
+}
+
 // RequestAuthPreparer lets an executor update missing auth metadata immediately
 // before a request. Manager serializes and persists returned updates.
 type RequestAuthPreparer interface {
@@ -166,6 +177,12 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
+
+	// quotaRefreshMu serializes start/stop, including waiting for the old loop.
+	// quotaRefreshLoop is published under mu; probes never acquire dispatch slots.
+	quotaRefreshMu       sync.Mutex
+	quotaRefreshLoop     *quotaRefreshLoop
+	quotaRefreshInFlight sync.Map
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent

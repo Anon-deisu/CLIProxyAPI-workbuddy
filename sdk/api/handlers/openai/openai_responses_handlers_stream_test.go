@@ -2,19 +2,125 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+type cacheRewriteStreamExecutor struct {
+	initialFailureStreamExecutor
+	chunks []string
+}
+
+func (e *cacheRewriteStreamExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	chunks := make(chan coreexecutor.StreamChunk, len(e.chunks))
+	for _, chunk := range e.chunks {
+		chunks <- coreexecutor.StreamChunk{Payload: []byte(chunk)}
+	}
+	close(chunks)
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func TestCacheTokenRewriteHTTPStreamsComplete(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, wire := range []string{"responses-lines", "responses-frames", "responses-multiline", "chat"} {
+		t.Run(wire, func(t *testing.T) {
+			const model = "cache-rewrite-stream-model"
+			completed := `{"type":"response.completed","response":{"id":"r1","output":[],"usage":{"input_tokens":100,"output_tokens":9,"total_tokens":109,"input_tokens_details":{"cached_tokens":98}}}}`
+			item := `{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc1","call_id":"call1","name":"lookup","arguments":"{}","status":"completed"}}`
+			chunks := []string{"event: response.output_item.done", "data: " + item, "event: response.completed", "data: " + completed}
+			switch wire {
+			case "responses-frames":
+				chunks = []string{"event: response.output_item.done\ndata: " + item + "\n\n", "event: response.completed\ndata: " + completed + "\n\n"}
+			case "responses-multiline":
+				chunks = []string{"event: response.output_item.done\ndata: " + item + "\n\n", "event: response.completed\ndata: {\"type\":\"response.completed\",\n", "data: \"response\":{\"id\":\"r1\",\"output\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":9,\"total_tokens\":109,\"input_tokens_details\":{\"cached_tokens\":98}}}}\n\n"}
+			case "chat":
+				chunks = []string{`{"choices":[{"index":0,"delta":{"content":"hello"}}]}`, `{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":9,"total_tokens":109,"prompt_tokens_details":{"cached_tokens":98}}}`}
+			}
+			executor := &cacheRewriteStreamExecutor{chunks: chunks}
+			manager := coreauth.NewManager(nil, nil, nil)
+			manager.RegisterExecutor(executor)
+			auth := &coreauth.Auth{ID: t.Name(), Provider: executor.Identifier(), Status: coreauth.StatusActive}
+			if _, err := manager.Register(t.Context(), auth); err != nil {
+				t.Fatal(err)
+			}
+			registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+			minimum := 95.0
+			base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{CacheTokenRewrite: &sdkconfig.CacheTokenRewriteConfig{Enabled: true, MinPercent: &minimum}}, manager)
+			router := gin.New()
+			endpoint := "/v1/responses"
+			body := `{"model":"` + model + `","input":"hi","stream":true}`
+			if wire == "chat" {
+				endpoint = "/v1/chat/completions"
+				body = `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"stream":true}`
+				router.POST(endpoint, NewOpenAIAPIHandler(base).ChatCompletions)
+			} else {
+				router.POST(endpoint, NewOpenAIResponsesAPIHandler(base).Responses)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			request := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(body)).WithContext(ctx)
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if ctx.Err() != nil || recorder.Code != http.StatusOK {
+				t.Fatalf("stream did not complete: context=%v status=%d body=%s", ctx.Err(), recorder.Code, recorder.Body)
+			}
+			terminal, usageCount := 0, 0
+			for _, line := range strings.Split(recorder.Body.String(), "\n") {
+				if !strings.HasPrefix(line, "data: ") {
+					continue
+				}
+				data := strings.TrimPrefix(line, "data: ")
+				if data == "[DONE]" {
+					terminal++
+					continue
+				}
+				if !json.Valid([]byte(data)) || gjson.Get(data, "error").Exists() {
+					t.Fatalf("invalid stream payload: %s", data)
+				}
+				path := "usage"
+				if wire != "chat" {
+					path = "response.usage"
+					if gjson.Get(data, "type").String() == "response.completed" {
+						terminal++
+						if gjson.Get(data, "response.output.0.call_id").String() != "call1" {
+							t.Fatalf("tool call was lost: %s", data)
+						}
+					}
+				}
+				if usage := gjson.Get(data, path); usage.IsObject() {
+					usageCount++
+					inputPath, cachedPath := "input_tokens", "input_tokens_details.cached_tokens"
+					if wire == "chat" {
+						inputPath, cachedPath = "prompt_tokens", "prompt_tokens_details.cached_tokens"
+					}
+					if usage.Get(inputPath).Int() != 100 || usage.Get(cachedPath).Int() != 95 || usage.Get("total_tokens").Int() != 109 {
+						t.Fatalf("incorrect usage: %s", usage.Raw)
+					}
+				}
+			}
+			if terminal != 1 || usageCount != 1 {
+				t.Fatalf("terminal=%d usage=%d, want one each: %s", terminal, usageCount, recorder.Body)
+			}
+		})
+	}
+}
 
 func newResponsesStreamTestHandler(t *testing.T) (*OpenAIResponsesAPIHandler, *httptest.ResponseRecorder, *gin.Context, http.Flusher) {
 	t.Helper()
@@ -325,7 +431,6 @@ func TestForwardResponsesStreamErrorEventPreservesNestedError(t *testing.T) {
 	go func() {
 		data <- []byte("event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0}\n\n")
 		data <- []byte("event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n")
-		close(data)
 
 		errText := `{"error":{"type":"invalid_request","code":"cyber_policy","message":"This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber","param":null}}`
 		errs <- &interfaces.ErrorMessage{
@@ -333,6 +438,8 @@ func TestForwardResponsesStreamErrorEventPreservesNestedError(t *testing.T) {
 			Error:      errors.New(errText),
 		}
 		close(errs)
+		// Match the producer contract: publish the error before closing data.
+		close(data)
 	}()
 
 	framer := &responsesSSEFramer{}

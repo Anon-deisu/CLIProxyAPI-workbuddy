@@ -49,6 +49,12 @@ func NewOpenAICompatExecutor(provider string, cfg *config.Config) *OpenAICompatE
 	return &OpenAICompatExecutor{provider: provider, cfg: cfg}
 }
 
+func (e *OpenAICompatExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
+	copy := *e
+	copy.cfg = e.cfg.ForAPIKey()
+	return &copy
+}
+
 // Identifier implements cliproxyauth.ProviderExecutor.
 func (e *OpenAICompatExecutor) Identifier() string { return e.provider }
 
@@ -994,6 +1000,15 @@ func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, b
 		}
 	}
 	hasTopLevelErrorFields := gjson.GetBytes(payload, "code").Exists() && gjson.GetBytes(payload, "message").Exists()
+	if helps.IsWorkBuddyQueueWaiting(payload) {
+		// WorkBuddy's 6020 queue frame carries no HTTP status; without this it
+		// would be downgraded to a generic 502 and lose its retry delay.
+		err := statusErr{code: http.StatusTooManyRequests, msg: string(payload)}
+		if retryAfter := helps.WorkBuddyQueueWaitingRetryAfter(payload, time.Now()); retryAfter != nil {
+			err.retryAfter = retryAfter
+		}
+		return err, true
+	}
 	if !hasError && !strings.EqualFold(payloadType, "error") && !strings.EqualFold(payloadType, "response.error") && !strings.EqualFold(payloadType, "response.failed") &&
 		!openAICompatErrorEvent(eventName) && !hasTopLevelErrorFields {
 		return statusErr{}, false
@@ -1017,6 +1032,7 @@ type statusErr struct {
 	msg              string
 	retryAfter       *time.Duration
 	credentialScoped bool
+	resultCode       string
 }
 
 func (e statusErr) Error() string {
@@ -1028,6 +1044,7 @@ func (e statusErr) Error() string {
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
+func (e statusErr) ResultCode() string         { return e.resultCode }
 
 const openAICompatTPMFallbackRetryAfter = time.Minute
 

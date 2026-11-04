@@ -19,6 +19,10 @@ import (
 )
 
 func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	auth, err = e.bindEgress(auth)
+	if err != nil {
+		return nil, err
+	}
 	log.Debugf("Executing Codex Websockets stream request with auth ID: %s, model: %s", auth.ID, req.Model)
 	if ctx == nil {
 		ctx = context.Background()
@@ -108,7 +112,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
-	upstreamBody, usedTurnState := e.turnStates.StampWebsocket(auth, wsHeaders, upstreamBody)
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
@@ -129,7 +132,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var errDial error
 	dialCtx := ctx
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
-		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL, identityState.convergence)
+		conn, closer = existingWebsocketSessionConnForEgress(sess, authID, wsURL, identityState.convergence, helps.CodexEgressFingerprint(auth))
 		if conn == nil {
 			if sess != nil {
 				sess.reqMu.Unlock()
@@ -221,10 +224,16 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			// Retry once with a new websocket connection for the same execution session.
 			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithConvergence(ctx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence)
 			if errDialRetry != nil || connRetry == nil {
-				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
-				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
+				bodyErr := websocketHandshakeBody(respHSRetry)
+				if respHSRetry != nil {
+					helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHSRetry.StatusCode, respHSRetry.Header.Clone(), bodyErr)
+				}
 				sess.clearActive(conn, readCh)
 				sess.reqMu.Unlock()
+				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
+					return nil, newCodexStatusErrWithCooling(respHSRetry.StatusCode, bodyErr, e.modelLevelCooling())
+				}
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				return nil, errDialRetry
 			}
 			previousConn, previousReadCh := conn, readCh
@@ -340,7 +349,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				continue
 			}
 			observeCodexTokenEvent(reporter, payload)
-			e.turnStates.ObserveWebsocket(auth, usedTurnState, payload)
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)
@@ -577,7 +585,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				continue
 			}
 			observeCodexTokenEvent(reporter, payload)
-			e.turnStates.ObserveWebsocket(auth, usedTurnState, payload)
 			payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 			helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 			helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)

@@ -27,6 +27,10 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if previous == nil {
 		return cloned
 	}
+	if cloned.Routing.PersistSettings == nil && previous.Routing.PersistSettings != nil {
+		value := *previous.Routing.PersistSettings
+		cloned.Routing.PersistSettings = &value
+	}
 	if cloned.CacheTokenRewrite == nil && previous.CacheTokenRewrite != nil {
 		cloned.CacheTokenRewrite = cloneRuntimeValue(reflect.ValueOf(previous.CacheTokenRewrite)).Interface().(*CacheTokenRewriteConfig)
 	}
@@ -38,25 +42,24 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 		value := *previous.Routing.DegradedPort
 		cloned.Routing.DegradedPort = &value
 	}
+	if cloned.Routing.ExoFreePort == nil && previous.Routing.ExoFreePort != nil {
+		value := *previous.Routing.ExoFreePort
+		cloned.Routing.ExoFreePort = &value
+	}
 	if cloned.Routing.CodexFingerprintConvergence == nil && previous.Routing.CodexFingerprintConvergence != nil {
 		value := *previous.Routing.CodexFingerprintConvergence
 		cloned.Routing.CodexFingerprintConvergence = &value
+	}
+	if cloned.Routing.WorkBuddyFingerprintConvergence == nil && previous.Routing.WorkBuddyFingerprintConvergence != nil {
+		value := *previous.Routing.WorkBuddyFingerprintConvergence
+		cloned.Routing.WorkBuddyFingerprintConvergence = &value
 	}
 	if cloned.Routing.CodexRoutingHint == nil && previous.Routing.CodexRoutingHint != nil {
 		value := *previous.Routing.CodexRoutingHint
 		cloned.Routing.CodexRoutingHint = &value
 	}
-	if cloned.Routing.CodexTurnStateEnabled == nil && previous.Routing.CodexTurnStateEnabled != nil {
-		value := *previous.Routing.CodexTurnStateEnabled
-		cloned.Routing.CodexTurnStateEnabled = &value
-	}
-	if cloned.Routing.CodexAutoDegrade == nil && previous.Routing.CodexAutoDegrade != nil {
-		value := *previous.Routing.CodexAutoDegrade
-		cloned.Routing.CodexAutoDegrade = &value
-	}
-	if cloned.Routing.CodexStateCliproxy == nil && previous.Routing.CodexStateCliproxy != nil {
-		value := *previous.Routing.CodexStateCliproxy
-		cloned.Routing.CodexStateCliproxy = &value
+	if cloned.Routing.CodexStaticISP == nil && previous.Routing.CodexStaticISP != nil {
+		cloned.Routing.CodexStaticISP = cloneRuntimeValue(reflect.ValueOf(previous.Routing.CodexStaticISP)).Interface().(*CodexStaticISPConfig)
 	}
 	if cloned.Routing.DisableCooling == nil && previous.Routing.DisableCooling != nil {
 		value := *previous.Routing.DisableCooling
@@ -73,6 +76,9 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 	if cloned.Routing.C2AMaxRetryCredentials == nil && previous.Routing.C2AMaxRetryCredentials != nil {
 		value := *previous.Routing.C2AMaxRetryCredentials
 		cloned.Routing.C2AMaxRetryCredentials = &value
+	}
+	if cloned.Routing.FakeModels == nil && previous.Routing.FakeModels != nil {
+		cloned.Routing.FakeModels = CloneFakeModels(previous.Routing.FakeModels)
 	}
 	return cloned
 }

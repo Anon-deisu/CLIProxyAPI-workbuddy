@@ -2,12 +2,14 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
@@ -41,6 +43,9 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
+	if override := cliproxyexecutor.RequestProxyURL(ctx); override != "" {
+		proxyURL = override
+	}
 
 	// If we have a proxy URL configured, set up the transport
 	if proxyURL != "" {
@@ -59,6 +64,42 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	return httpClient
+}
+
+var devinTransportCache = NewTransportCache[string](DefaultTransportCacheCapacity)
+
+// NewDevinHTTPClient suppresses automatic gzip on the Connect-RPC transport.
+func NewDevinHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	client := NewProxyAwareHTTPClient(ctx, cfg, auth, timeout)
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	if tr, ok := transport.(*http.Transport); ok {
+		key := fmt.Sprintf("transport:%p", tr)
+		cloned, errClone := devinTransportCache.Get(key, func() (*http.Transport, error) {
+			copy := tr.Clone()
+			copy.DisableCompression = true
+			return copy, nil
+		})
+		if errClone == nil {
+			client.Transport = cloned
+			return client
+		}
+	}
+	client.Transport = devinNoGzipRoundTripper{base: transport}
+	return client
+}
+
+type devinNoGzipRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (rt devinNoGzipRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("Accept-Encoding") == "" {
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+	return rt.base.RoundTrip(req)
 }
 
 // buildProxyTransport creates an HTTP transport configured for the given proxy URL.

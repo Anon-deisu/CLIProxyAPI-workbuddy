@@ -3,9 +3,12 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -117,6 +120,10 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 
 // HttpRequest injects Codex credentials into the request and executes it.
 func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	auth, errBinding := e.bindEgress(auth)
+	if errBinding != nil {
+		return nil, errBinding
+	}
 	if req == nil {
 		return nil, fmt.Errorf("codex executor: request is nil")
 	}
@@ -128,8 +135,70 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := helps.NewCodexHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = e.turnStates.WrapHTTPClient(httpClient, auth)
+	httpClient = e.egress.WrapHTTPClient(httpClient, auth)
 	return httpClient.Do(httpReq)
+}
+
+// FetchQuota probes account usage without issuing a model request. It returns
+// only validated quota headers; callers must retain their snapshot on error.
+func (e *CodexExecutor) FetchQuota(ctx context.Context, auth *cliproxyauth.Auth) (http.Header, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	auth, errBinding := e.bindEgress(auth)
+	if errBinding != nil {
+		return nil, errors.New("codex quota: egress binding failed")
+	}
+	token, baseURL := codexCreds(auth)
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("codex quota: credentials unavailable")
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://chatgpt.com"
+	}
+	base, errParse := url.Parse(strings.TrimSpace(baseURL))
+	if errParse != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Hostname() == "" {
+		return nil, errors.New("codex quota: invalid base URL")
+	}
+	endpoint := (&url.URL{Scheme: base.Scheme, Host: base.Host, Path: "/backend-api/wham/usage"}).String()
+	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if errRequest != nil {
+		return nil, errors.New("codex quota: could not create usage request")
+	}
+	applyCodexHeaders(req, auth, token, false, e.cfg)
+	httpClient := helps.NewCodexHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient = e.egress.WrapHTTPClient(httpClient, auth)
+	// A redirect is a failed probe, not permission to call another endpoint.
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, errDo := httpClient.Do(req)
+	if errDo != nil {
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
+		}
+		return nil, errors.New("codex quota: usage request failed")
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			helps.LogWithRequestID(ctx).Debug("codex quota: response body close failed")
+		}
+	}()
+	// Preserve the HTTP status even when the body cannot be read, and never
+	// include upstream error bodies or transport diagnostics in returned errors.
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, newCodexStatusErr(resp.StatusCode, []byte(fmt.Sprintf("codex quota: upstream returned HTTP %d", resp.StatusCode)))
+	}
+	payload, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
+		}
+		return nil, errors.New("codex quota: could not read usage response")
+	}
+	headers := helps.ParseCodexUsageQuotaHeaders(payload)
+	if headers == nil {
+		return nil, errors.New("codex quota: usage response contains no valid quota windows")
+	}
+	return headers, nil
 }
 
 type codexIdentityConfuseState struct {

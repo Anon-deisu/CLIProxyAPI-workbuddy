@@ -27,6 +27,158 @@ var quotaCooldownDisabled atomic.Bool
 
 var transientErrorCooldownSeconds atomic.Int64
 
+// CooldownView describes an unexpired local retry restriction without exposing
+// credential metadata or raw upstream errors.
+type CooldownView struct {
+	Scope            string    `json:"scope"`
+	ModelKey         string    `json:"model_key,omitempty"`
+	Reason           string    `json:"reason"`
+	RetryAt          time.Time `json:"retry_at"`
+	RemainingSeconds int64     `json:"remaining_seconds"`
+	BackoffLevel     *int      `json:"backoff_level,omitempty"`
+	HTTPStatus       int       `json:"http_status,omitempty"`
+}
+
+// CooldownSnapshotForAuth projects a detached auth snapshot without mutating
+// it. An empty result does not imply that the credential is usable.
+func CooldownSnapshotForAuth(auth *Auth, now time.Time) []CooldownView {
+	views := make([]CooldownView, 0)
+	if auth == nil {
+		return views
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+		views = append(views, newCooldownView("credential", "", auth.Quota.NextRecoverAt, now, auth.Quota, auth.StatusMessage, auth.LastError))
+	} else if len(auth.ModelStates) == 0 {
+		if blocked, _, next := availabilityBlock(auth.Unavailable, auth.Quota.Exceeded, auth.NextRetryAfter, auth.Quota.NextRecoverAt, now); blocked && next.After(now) {
+			views = append(views, newCooldownView("credential", "", next, now, auth.Quota, auth.StatusMessage, auth.LastError))
+		}
+	}
+
+	keys := make([]string, 0, len(auth.ModelStates))
+	for key := range auth.ModelStates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	type modelCooldown struct {
+		view   CooldownView
+		reason blockReason
+	}
+	byModel := make(map[string]modelCooldown)
+	for _, key := range keys {
+		state := auth.ModelStates[key]
+		model := canonicalModelKey(key)
+		if state == nil || model == "" {
+			continue
+		}
+		blocked, reason, next := availabilityBlock(state.Unavailable, state.Quota.Exceeded, state.NextRetryAfter, state.Quota.NextRecoverAt, now)
+		if !blocked || !next.After(now) {
+			continue
+		}
+		if previous, ok := byModel[model]; ok {
+			preferQuotaTie := next.Equal(previous.view.RetryAt) && reason == blockReasonCooldown && previous.reason != blockReasonCooldown
+			if !next.After(previous.view.RetryAt) && !preferQuotaTie {
+				continue
+			}
+		}
+		byModel[model] = modelCooldown{
+			view:   newCooldownView("model", model, next, now, state.Quota, state.StatusMessage, state.LastError),
+			reason: reason,
+		}
+	}
+	models := make([]string, 0, len(byModel))
+	for model := range byModel {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		views = append(views, byModel[model].view)
+	}
+	return views
+}
+
+func newCooldownView(scope, model string, next, now time.Time, quota QuotaState, statusMessage string, lastErr *Error) CooldownView {
+	remaining := next.Sub(now)
+	seconds := int64(remaining / time.Second)
+	if remaining%time.Second != 0 {
+		seconds++
+	}
+	view := CooldownView{
+		Scope: scope, ModelKey: model, Reason: "unknown",
+		RetryAt: next.UTC(), RemainingSeconds: seconds,
+	}
+	if quota.Exceeded && (quota.NextRecoverAt.IsZero() || !quota.NextRecoverAt.Before(next)) {
+		switch quota.Reason {
+		case "credential_quota", "quota":
+			view.Reason = quota.Reason
+		case "cloudflare challenge":
+			view.Reason = "cloudflare_challenge"
+		}
+	}
+	propagatedQuota := quota.Exceeded && quota.Reason == "credential_quota"
+	if view.Reason == "credential_quota" {
+		return view
+	}
+	if (view.Reason == "quota" || view.Reason == "cloudflare_challenge") && quota.BackoffLevel >= 0 {
+		level := quota.BackoffLevel
+		view.BackoffLevel = &level
+	}
+	errorReason := cooldownErrorReason(lastErr)
+	if view.Reason == "unknown" {
+		view.Reason = errorReason
+	}
+	if view.Reason == "unknown" {
+		view.Reason = cooldownStatusReason(statusMessage)
+	}
+	if !propagatedQuota && lastErr != nil && lastErr.HTTPStatus >= 400 && lastErr.HTTPStatus <= 599 && errorReason == view.Reason {
+		view.HTTPStatus = lastErr.HTTPStatus
+	}
+	return view
+}
+
+func cooldownErrorReason(err *Error) string {
+	switch {
+	case isModelSupportResultError(err):
+		return "model_not_supported"
+	case isCloudflareChallengeResultError(err):
+		return "cloudflare_challenge"
+	case isInvalidGrantResultError(err):
+		return "invalid_grant"
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		return "payment_required"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusTooManyRequests:
+		return "quota"
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 520, 521, 522, 523, 524, 525, 526:
+		return "transient_error"
+	}
+	if err != nil {
+		return cooldownStatusReason(err.Code)
+	}
+	return "unknown"
+}
+
+func cooldownStatusReason(message string) string {
+	switch strings.TrimSpace(message) {
+	case "quota", "quota exhausted":
+		return "quota"
+	case "cloudflare challenge":
+		return "cloudflare_challenge"
+	case "invalid_grant", "unauthorized", "payment_required", "not_found":
+		return strings.TrimSpace(message)
+	case "model_not_supported":
+		return "model_not_supported"
+	case "transient upstream error":
+		return "transient_error"
+	default:
+		return "unknown"
+	}
+}
+
 // SetQuotaCooldownDisabled toggles auth/model cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
@@ -57,6 +209,10 @@ func quotaCooldownDisabledForAuthWithConfig(auth *Auth, cfg *internalconfig.Conf
 	if cfg != nil && cfg.Home.Enabled {
 		return true
 	}
+	// Explicit WorkBuddy usage windows remain binding until the upstream reset.
+	if auth != nil && workBuddyRateLimitCooldown(auth.Provider, auth.Quota, auth.LastError, time.Now()) {
+		return false
+	}
 	if cfg != nil && cfg.Routing.DisableCooling != nil && *cfg.Routing.DisableCooling {
 		return true
 	}
@@ -72,6 +228,14 @@ func quotaCooldownDisabledForAuthWithConfig(auth *Auth, cfg *internalconfig.Conf
 		return true
 	}
 	return quotaCooldownDisabled.Load()
+}
+
+func workBuddyRateLimitCooldown(provider string, quota QuotaState, lastErr *Error, now time.Time) bool {
+	if provider != "workbuddy" && provider != "workbuddy-ai" {
+		return false
+	}
+	return quota.Exceeded && quota.NextRecoverAt.After(now) &&
+		(quota.Reason == "credential_quota" || isWorkBuddyRateLimitError(lastErr))
 }
 
 func providerCoolingOverrideForAuth(auth *Auth, cfg *internalconfig.Config) (bool, bool) {
@@ -298,8 +462,18 @@ func (m *Manager) clearDisabledCooldownStates(cfg *internalconfig.Config) bool {
 	}
 	m.mu.Unlock()
 
-	if m.scheduler != nil {
-		for _, snapshot := range snapshots {
+	reg := registry.GetGlobalRegistry()
+	for _, snapshot := range snapshots {
+		models, epoch := reg.GetModelsAndEpochForClient(snapshot.ID)
+		projections := make([]registry.ClientModelProjection, 0, len(models))
+		for _, model := range models {
+			if model == nil || strings.TrimSpace(model.ID) == "" {
+				continue
+			}
+			projections = append(projections, m.clientModelProjectionForAuth(snapshot, model.ID, now))
+		}
+		reg.ApplyClientModelProjections(snapshot.ID, epoch, snapshot.Generation, projections)
+		if m.scheduler != nil {
 			m.scheduler.upsertAuth(snapshot)
 		}
 	}
@@ -368,7 +542,10 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 		return false
 	}
 	auth := m.auths[authID]
-	if auth == nil || auth.IsDispatchDisabled() || m.cooldownDisabledForAuth(auth) {
+	if auth == nil || auth.IsDispatchDisabled() {
+		return false
+	}
+	if m.cooldownDisabledForAuth(auth) && (m.HomeEnabled() || !workBuddyRateLimitCooldown(auth.Provider, record.Quota, record.LastError, now)) {
 		return false
 	}
 	updatedAt := record.UpdatedAt
@@ -799,7 +976,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			windows := codexAccountQuotaWindows(auth.Quota, now)
 			quotaWindowFailure = auth.CodexQuotaResumeAt.After(now) || (quotaObservationChanged && (windows.sevenDayExhausted || windows.fiveHourResetAt.After(now)))
 		}
-		auth.recordRecentRequest(now, result.Success)
+		auth.recordRecentRequest(now, result.Success, modelKey)
 		if result.Success {
 			auth.Success++
 		} else {
@@ -826,7 +1003,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if modelKey != "" {
 				if !shouldSkipCredentialCooldown(result.Error) {
 					disableCooling := m.cooldownDisabledForAuth(auth)
-					if result.Error != nil && result.Error.Code == ErrorCodeForceCooldown {
+					if result.Error != nil && (result.Error.Code == ErrorCodeForceCooldown || isWorkBuddyRateLimitError(result.Error)) {
 						disableCooling = false
 					}
 					state := ensureModelState(auth, modelKey)
@@ -846,6 +1023,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					if isModelSupportResultError(result.Error) {
 						if disableCooling {
 							state.NextRetryAfter = time.Time{}
+						} else if result.RetryAfter != nil && *result.RetryAfter > 0 {
+							state.NextRetryAfter = now.Add(*result.RetryAfter).Round(0)
 						} else {
 							next := now.Add(12 * time.Hour)
 							state.NextRetryAfter = next
@@ -883,6 +1062,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(12 * time.Hour)
+								if result.RetryAfter != nil && *result.RetryAfter > 0 {
+									next = now.Add(*result.RetryAfter).Round(0)
+								}
 								state.NextRetryAfter = next
 							}
 						case 429:
@@ -971,7 +1153,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 			} else {
 				disableCooling := m.cooldownDisabledForAuth(auth)
-				if result.Error != nil && result.Error.Code == ErrorCodeForceCooldown {
+				if result.Error != nil && (result.Error.Code == ErrorCodeForceCooldown || isWorkBuddyRateLimitError(result.Error)) {
 					disableCooling = false
 				}
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
@@ -1072,7 +1254,11 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 		// the dispatch attempt that reserved this auth's runtime slot.
 		auth.ReleaseDispatchSlot()
 		now := time.Now()
-		auth.recordRecentRequest(now, result.Success)
+		modelKey := canonicalModelKey(result.Model)
+		if modelKey == "" {
+			modelKey = canonicalModelKey(result.RouteModel)
+		}
+		auth.recordRecentRequest(now, result.Success, modelKey)
 		if result.Success {
 			auth.Success++
 		} else {
@@ -1427,10 +1613,23 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.UpdatedAt = now
 }
 
-// maybeAutoDisableAuthLocked applies the opt-in runtime disable policies after
+// maybeAutoDisableAuthLocked applies account bans and opt-in runtime disable policies after
 // the result and current response quota observation have been recorded.
 func (m *Manager) maybeAutoDisableAuthLocked(auth *Auth, resultErr *Error, quotaObserved bool, now time.Time) {
-	if m == nil || auth == nil || auth.Disabled || auth.Status == StatusDisabled || auth.AutoDisabled {
+	if m == nil || auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+		return
+	}
+	if (auth.Provider == "workbuddy" || auth.Provider == "workbuddy-ai") && resultErr != nil && resultErr.Code == ErrorCodeWorkBuddyAccountBanned {
+		auth.AutoDisabled = true
+		auth.AutoDisableReason = AutoDisableReasonAccountBanned
+		auth.AutoDisabledAt = now
+		auth.Status = StatusError
+		auth.StatusMessage = "automatically disabled: WorkBuddy account banned (11140)"
+		auth.Unavailable = true
+		auth.NextRetryAfter = time.Time{}
+		return
+	}
+	if auth.AutoDisabled {
 		return
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
@@ -1449,6 +1648,10 @@ func (m *Manager) maybeAutoDisableAuthLocked(auth *Auth, resultErr *Error, quota
 		return
 	}
 	if !cfg.Routing.AutoDisableQuota {
+		return
+	}
+	// WorkBuddy 6000/6004 usage windows are temporary, not persistent account disables.
+	if (auth.Provider == "workbuddy" || auth.Provider == "workbuddy-ai") && isWorkBuddyRateLimitError(resultErr) {
 		return
 	}
 	quotaExhausted := isQuotaExhaustedResultError(resultErr) || (quotaObserved && quotaSignalsExhausted(auth.Quota))
@@ -1600,6 +1803,10 @@ func resultErrorFromError(err error) *Error {
 		resultErr = cloneError(sourceErr)
 	} else {
 		resultErr = &Error{Message: err.Error()}
+		var codeProvider interface{ ResultCode() string }
+		if errors.As(err, &codeProvider) && codeProvider != nil {
+			resultErr.Code = codeProvider.ResultCode()
+		}
 	}
 	if resultErr.HTTPStatus == 0 {
 		resultErr.HTTPStatus = statusCodeFromError(err)
@@ -2210,6 +2417,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	autoFailureCode := autoOAuthFailureCodeFromMetadata(auth)
 	if isCloudflareChallengeResultError(resultErr) {
 		auth.StatusMessage = "cloudflare challenge"
 		next, backoffLevel := nextCloudflareCooldown(auth.Quota.BackoffLevel, disableCooling, now)
@@ -2230,7 +2438,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	} else {
 		switch statusCode {
 		case 401:
-			auth.StatusMessage = "unauthorized"
+			if autoFailureCode != "" {
+				auth.StatusMessage = autoOAuthFailureMessage(autoFailureCode)
+			} else {
+				auth.StatusMessage = "unauthorized"
+			}
 			if disableCooling {
 				auth.NextRetryAfter = time.Time{}
 			} else {

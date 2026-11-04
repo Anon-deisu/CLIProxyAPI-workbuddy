@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	log "github.com/sirupsen/logrus"
 )
 
 type openAICompatibilityRegistrationCache struct {
@@ -187,11 +189,13 @@ func (s *Service) registerAvailableExecutors(ctx context.Context, opts executorR
 	if ctx.Err() != nil {
 		return
 	}
-	if s.codexTurnStates != nil {
+	if s.codexEgress != nil {
 		s.cfgMu.RLock()
 		cfg := s.cfg
 		s.cfgMu.RUnlock()
-		s.codexTurnStates.Configure(cfg)
+		if errConfigure := s.codexEgress.Configure(cfg); errConfigure != nil {
+			log.WithError(errConfigure).Error("failed to configure Codex egress")
+		}
 	}
 	// Keep all Service-owned executor registration paths here so native, Home,
 	// auth-derived, and plugin executors stay in the same binding order.
@@ -217,6 +221,12 @@ func baselineExecutorAuths() []*coreauth.Auth {
 		"antigravity",
 		"kimi",
 		"xai",
+		"meta",
+		"devin",
+		"workbuddy",
+		"workbuddy-ai",
+		"qoder",
+		"qoder-cn",
 		"cursor",
 		"openai-compatibility",
 	}
@@ -265,11 +275,17 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
 	if strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
-		if s.codexTurnStates == nil {
-			s.codexTurnStates = helps.NewCodexTurnStateKeeper(s.coreManager.List)
-			s.codexTurnStates.SetSchedulingUpdater(s.coreManager.ApplyCodexStateScheduling)
+		if s.codexEgress == nil {
+			s.codexEgress = helps.NewCodexEgressManager(s.coreManager.List)
+			if s.configPath != "" {
+				if errStore := s.codexEgress.SetStaticISPBindingFile(filepath.Join(filepath.Dir(s.configPath), "runtime", "codex-static-isp-bindings.json")); errStore != nil {
+					log.WithError(errStore).Error("failed to load Codex ISP bindings")
+				}
+			}
 		}
-		s.codexTurnStates.Configure(cfg)
+		if errConfigure := s.codexEgress.Configure(cfg); errConfigure != nil {
+			log.WithError(errConfigure).Error("failed to configure Codex egress")
+		}
 		if !forceReplace {
 			existingExecutor, hasExecutor := s.coreManager.Executor("codex")
 			if hasExecutor {
@@ -280,7 +296,7 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 			}
 		}
 		codexExecutor := executor.NewCodexAutoExecutor(cfg)
-		codexExecutor.SetTurnStateKeeper(s.codexTurnStates)
+		codexExecutor.SetEgressManager(s.codexEgress)
 		s.coreManager.RegisterExecutor(codexExecutor)
 		return
 	}
@@ -320,8 +336,8 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		// the credential refresh path are deleted from the fork (F3); turns are
 		// dispatched to per-account real CC agents over local sockets.
 		s.coreManager.RegisterExecutor(s.relayExecutorSingleton())
-	case "kimi":
-		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(cfg))
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
+		s.coreManager.RegisterExecutor(executor.NewKimiExecutorForProvider(cfg, strings.ToLower(a.Provider)))
 	case "xai":
 		if !forceReplace {
 			existingExecutor, hasExecutor := s.coreManager.Executor("xai")
@@ -333,6 +349,14 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 			}
 		}
 		s.coreManager.RegisterExecutor(executor.NewXAIAutoExecutor(cfg))
+	case "meta":
+		s.coreManager.RegisterExecutor(executor.NewMetaExecutor(cfg))
+	case "devin":
+		s.coreManager.RegisterExecutor(executor.NewDevinExecutor(cfg))
+	case "workbuddy", "workbuddy-ai":
+		s.coreManager.RegisterExecutor(executor.NewWorkBuddyExecutor(cfg, strings.ToLower(a.Provider)))
+	case "qoder", "qoder-cn":
+		s.coreManager.RegisterExecutor(executor.NewQoderExecutor(cfg, strings.ToLower(a.Provider)))
 	case "cursor":
 		s.coreManager.RegisterExecutor(executor.NewCursorExecutor(cfg))
 	default:
@@ -585,6 +609,7 @@ func (s *Service) tryRegisterPluginModelsForAuth(ctx context.Context, a *coreaut
 	}
 	models := applyExcludedModels(result.Models, activeExcluded)
 	models = applyOAuthModelAliasForAuth(s.cfg, providerKey, activeAuthKind, activeAuth.Attributes, models)
+	models = applyOAuthSettingsForAuth(s.cfg, providerKey, activeAuthKind, models)
 	if len(models) > 0 {
 		s.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		return true

@@ -44,10 +44,11 @@ type WeightedRoundRobinSelector struct {
 }
 
 // Codex2APIDefaultSelector implements the unified Codex2API default scheduler.
-// Priority, health, quota watermarks and dispatch score are evaluated as one
-// ordering rather than exposing quota as a standalone routing mode. Runtime
-// concurrency is enforced separately when a candidate is acquired.
-type Codex2APIDefaultSelector struct{}
+// Priority and health select a tier; remaining quota weights smooth rotation
+// within that tier. Runtime concurrency is enforced separately at acquisition.
+type Codex2APIDefaultSelector struct {
+	weighted WeightedRoundRobinSelector
+}
 
 type smoothWeightedState struct {
 	current map[string]int64
@@ -57,7 +58,12 @@ type smoothWeightedState struct {
 type weightedSelectorStateModelKey struct{}
 
 func withWeightedSelectorStateModel(ctx context.Context, selector Selector, routeModel string) context.Context {
-	if _, ok := selector.(*WeightedRoundRobinSelector); !ok || strings.TrimSpace(routeModel) == "" {
+	switch selector.(type) {
+	case *WeightedRoundRobinSelector, *Codex2APIDefaultSelector:
+	default:
+		return ctx
+	}
+	if strings.TrimSpace(routeModel) == "" {
 		return ctx
 	}
 	return context.WithValue(ctx, weightedSelectorStateModelKey{}, routeModel)
@@ -693,6 +699,17 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	state := s.stateForKeyLocked(key)
+	weights := authWeightVector(available)
+	state.prepare(weights)
+	picked := pickSmoothWeightedAuth(available, state.current, weights, nil)
+	if picked == nil {
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
+	}
+	return picked, nil
+}
+
+func (s *WeightedRoundRobinSelector) stateForKeyLocked(key string) *smoothWeightedState {
 	if s.states == nil {
 		s.states = make(map[string]*smoothWeightedState)
 	}
@@ -708,24 +725,21 @@ func (s *WeightedRoundRobinSelector) Pick(ctx context.Context, provider, model s
 		state = &smoothWeightedState{}
 		s.states[key] = state
 	}
-	weights := authWeightVector(available)
-	state.prepare(weights)
-	picked := pickSmoothWeightedAuth(available, state.current)
-	if picked == nil {
-		return nil, &Error{Code: "auth_unavailable", Message: "no auth available with positive weight"}
-	}
-	return picked, nil
+	return state
 }
 
-// Pick selects the best candidate using Codex2API's default ordering.
+// Pick balances remaining quota within the highest-priority, healthiest tier.
 func (s *Codex2APIDefaultSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, errAvailable := getAvailableAuths(auths, provider, model, time.Now())
+	available, errAvailable := getSelectorAvailableAuths(ctx, auths, provider, model, time.Now())
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	return pickCodex2APIAuth(available), nil
+	key := provider + ":" + canonicalModelKey(weightedSelectorStateModel(ctx, model))
+	s.weighted.mu.Lock()
+	defer s.weighted.mu.Unlock()
+	return pickCodex2APIAuth(available, s.weighted.stateForKeyLocked(key)), nil
 }
 
 type codex2APIHealthTier int
@@ -737,17 +751,36 @@ const (
 	codex2APIBanned
 )
 
-func pickCodex2APIAuth(auths []*Auth) *Auth {
+func pickCodex2APIAuth(auths []*Auth, state *smoothWeightedState) *Auth {
 	if len(auths) == 0 {
 		return nil
 	}
-	best := auths[0]
+	bestPriority, bestTier := authPriority(auths[0]), codex2APIHealth(auths[0])
 	for _, candidate := range auths[1:] {
-		if compareCodex2APIAuth(candidate, best) < 0 {
-			best = candidate
+		priority, tier := authPriority(candidate), codex2APIHealth(candidate)
+		if priority > bestPriority || priority == bestPriority && tier < bestTier {
+			bestPriority, bestTier = priority, tier
 		}
 	}
-	return best
+	weights := make(map[string]int64, len(auths))
+	for _, candidate := range auths {
+		if authPriority(candidate) == bestPriority && codex2APIHealth(candidate) == bestTier {
+			weights[candidate.ID] = codex2APIQuotaWeight(candidate)
+		}
+	}
+	// Observed watermarks change on successful requests, not just config edits.
+	// Retain rotation credits instead of restarting at the largest weight.
+	state.updateWeights(weights)
+	return pickSmoothWeightedAuth(auths, state.current, weights, compareCodex2APIAuth)
+}
+
+func codex2APIQuotaWeight(auth *Auth) int64 {
+	const percentScale = 100
+	remaining := 100.0
+	if used, known := authQuotaUsedPercent(auth); known {
+		remaining -= used
+	}
+	return max(1, int64(math.Round(remaining*percentScale)))
 }
 
 func compareCodex2APIAuth(left, right *Auth) int {
@@ -817,6 +850,9 @@ func codex2APIHealth(auth *Auth) codex2APIHealthTier {
 	if auth == nil || auth.IsDispatchDisabled() {
 		return codex2APIBanned
 	}
+	if isExpiredWorkBuddyRateLimitCooldown(auth, time.Now()) {
+		return codex2APIHealthy
+	}
 	if auth.Status == StatusError || auth.Unavailable || auth.LastError != nil {
 		if auth.Quota.Exceeded || !auth.NextRetryAfter.IsZero() {
 			return codex2APIRisky
@@ -827,6 +863,38 @@ func codex2APIHealth(auth *Auth) codex2APIHealthTier {
 		return codex2APIWarm
 	}
 	return codex2APIHealthy
+}
+
+func isExpiredWorkBuddyRateLimitCooldown(auth *Auth, now time.Time) bool {
+	if auth == nil || (!strings.EqualFold(auth.Provider, "workbuddy") && !strings.EqualFold(auth.Provider, "workbuddy-ai")) {
+		return false
+	}
+
+	hasExpiredLimit := false
+	if isWorkBuddyRateLimitError(auth.LastError) {
+		if auth.Quota.NextRecoverAt.After(now) || auth.NextRetryAfter.After(now) {
+			return false
+		}
+		hasExpiredLimit = !auth.Quota.NextRecoverAt.IsZero() || !auth.NextRetryAfter.IsZero()
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil || !isWorkBuddyRateLimitError(state.LastError) {
+			continue
+		}
+		if state.Quota.NextRecoverAt.After(now) || state.NextRetryAfter.After(now) {
+			return false
+		}
+		if !state.Quota.NextRecoverAt.IsZero() || !state.NextRetryAfter.IsZero() {
+			hasExpiredLimit = true
+		}
+	}
+	if !hasExpiredLimit {
+		return false
+	}
+	if blocked, _, _ := isAuthBlockedForModel(auth, "", now); blocked {
+		return false
+	}
+	return true
 }
 
 func codex2APIDispatchScore(auth *Auth) float64 {
@@ -880,6 +948,13 @@ const maxSmoothWeightedStateEntries = 1024
 // candidate in slice order.
 func (s *smoothWeightedState) prepare(weights map[string]int64) {
 	if s.current == nil || weightsConfigChanged(s.weights, weights) {
+		s.current = make(map[string]int64, len(weights))
+	}
+	s.updateWeights(weights)
+}
+
+func (s *smoothWeightedState) updateWeights(weights map[string]int64) {
+	if s.current == nil {
 		s.current = make(map[string]int64, len(weights))
 	}
 	if s.weights == nil {
@@ -937,18 +1012,21 @@ func authWeightVector(auths []*Auth) map[string]int64 {
 	return weights
 }
 
-func pickSmoothWeightedAuth(auths []*Auth, current map[string]int64) *Auth {
+func pickSmoothWeightedAuth(auths []*Auth, current, weights map[string]int64, tieBreak func(*Auth, *Auth) int) *Auth {
 	var picked *Auth
 	var pickedCurrent int64
 	var totalWeight int64
 	for _, auth := range auths {
-		weight := authWeight(auth)
-		if auth == nil || weight <= 0 {
+		if auth == nil {
+			continue
+		}
+		weight := weights[auth.ID]
+		if weight <= 0 {
 			continue
 		}
 		current[auth.ID] = saturatingAddInt64(current[auth.ID], weight)
 		totalWeight = saturatingAddInt64(totalWeight, weight)
-		if picked == nil || current[auth.ID] > pickedCurrent {
+		if picked == nil || current[auth.ID] > pickedCurrent || current[auth.ID] == pickedCurrent && tieBreak != nil && tieBreak(auth, picked) < 0 {
 			picked = auth
 			pickedCurrent = current[auth.ID]
 		}
@@ -1035,19 +1113,28 @@ func authQuotaUsedPercent(auth *Auth) (float64, bool) {
 	if auth == nil || len(auth.Quota.Signals) == 0 {
 		return 0, false
 	}
-	var (
+	var windows, credential struct {
 		usage float64
 		found bool
-	)
+	}
 	for key, rawValue := range auth.Quota.Signals {
 		name := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "_", "-"))
-		value := strings.TrimSpace(rawValue)
-		if strings.Contains(name, "limit-reached") {
-			if parsed, errParse := strconv.ParseBool(value); errParse == nil && parsed {
-				return 100, true
-			}
+		name = strings.TrimPrefix(name, "x-codex-")
+		watermark := &windows
+		// Only unnamed credential windows affect global weight and health.
+		// Review/additional limits, including HTTP short namespaces, are independent.
+		switch name {
+		case "primary-used-percent", "secondary-used-percent", "primary-limit-reached", "secondary-limit-reached":
+		case "used-percent", "limit-reached":
+			watermark = &credential
+		default:
+			continue
 		}
-		if !strings.Contains(name, "used-percent") {
+		value := strings.TrimSpace(rawValue)
+		if strings.HasSuffix(name, "limit-reached") {
+			if parsed, errParse := strconv.ParseBool(value); errParse == nil && parsed {
+				watermark.usage, watermark.found = 100, true
+			}
 			continue
 		}
 		parsed, errParse := strconv.ParseFloat(value, 64)
@@ -1059,12 +1146,16 @@ func authQuotaUsedPercent(auth *Auth) (float64, bool) {
 		} else if parsed > 100 {
 			parsed = 100
 		}
-		if !found || parsed > usage {
-			usage = parsed
-			found = true
+		if !watermark.found || parsed > watermark.usage {
+			watermark.usage = parsed
+			watermark.found = true
 		}
 	}
-	return usage, found
+	if windows.found {
+		return windows.usage, true
+	}
+	// Legacy credential-level fields are a fallback when no main window is known.
+	return credential.usage, credential.found
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {

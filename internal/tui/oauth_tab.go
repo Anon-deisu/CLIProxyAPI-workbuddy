@@ -24,6 +24,8 @@ var oauthProviders = []oauthProvider{
 	{"Codex (OpenAI)", "codex-auth-url", "🟩", false},
 	{"Antigravity", "antigravity-auth-url", "🟪", false},
 	{"Kimi", "kimi-auth-url", "🟫", true},
+	{"Qoder (International)", "qoder-auth-url", "🟦", true},
+	{"Qoder (China)", "qoder-cn-auth-url", "🟦", true},
 	{"xAI", "xai-auth-url", "⬛", true},
 	{"Cursor", "cursor-auth-url", "🟦", true},
 }

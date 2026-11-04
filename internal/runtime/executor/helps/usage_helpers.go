@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -49,6 +50,94 @@ type UsageReporter struct {
 	ttftStart           time.Time
 	ttftSet             bool
 	once                sync.Once
+	responseModelMu     sync.RWMutex
+	responseModel       string
+	responseModelFinal  atomic.Bool
+	upstreamModelMu     sync.RWMutex
+	upstreamModel       string
+}
+
+// ObserveResponseModel records the served model from a response or stream event.
+func (r *UsageReporter) ObserveResponseModel(payload []byte) {
+	if r == nil || r.responseModelFinal.Load() {
+		return
+	}
+	served, terminal := extractResponseModelEvent(payload, r.provider)
+	if served != "" {
+		r.responseModelMu.Lock()
+		r.responseModel = served
+		r.responseModelMu.Unlock()
+	}
+	if terminal {
+		r.responseModelFinal.Store(true)
+	}
+}
+
+// SetResponseModel records a protocol-specific model observation.
+func (r *UsageReporter) SetResponseModel(model string) {
+	if r == nil || r.responseModelFinal.Load() {
+		return
+	}
+	r.responseModelMu.Lock()
+	r.responseModel = strings.TrimSpace(model)
+	r.responseModelMu.Unlock()
+}
+
+// SetUpstreamModel records the canonical model selected by the provider.
+func (r *UsageReporter) SetUpstreamModel(model string) {
+	if r == nil {
+		return
+	}
+	r.upstreamModelMu.Lock()
+	r.upstreamModel = strings.TrimSpace(model)
+	r.upstreamModelMu.Unlock()
+}
+
+func (r *UsageReporter) warnModelSubstitution(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	served := r.ResponseModel()
+	expected := r.UpstreamModel()
+	if expected == "" {
+		expected = r.model
+	}
+	if served == "" || !IsModelSubstituted(expected, served) || (r.model != "" && !IsModelSubstituted(r.model, served)) {
+		return
+	}
+	provider := r.provider
+	if provider == "" {
+		provider = "unknown"
+	}
+	if !codexModelSubstitutionWarns.allow(codexModelSubstitutionKey{
+		provider:  provider,
+		authID:    r.authID,
+		requested: normalizeModelName(expected),
+		served:    normalizeModelName(served),
+	}) {
+		return
+	}
+	LogWithRequestID(ctx).Warnf("%s executor: upstream served model %q for requested model %q (auth_index=%s)", provider, served, r.model, r.authIndex)
+}
+
+// ResponseModel returns the latest served-model observation.
+func (r *UsageReporter) ResponseModel() string {
+	if r == nil {
+		return ""
+	}
+	r.responseModelMu.RLock()
+	defer r.responseModelMu.RUnlock()
+	return r.responseModel
+}
+
+// UpstreamModel returns the provider-selected canonical model.
+func (r *UsageReporter) UpstreamModel() string {
+	if r == nil {
+		return ""
+	}
+	r.upstreamModelMu.RLock()
+	defer r.upstreamModelMu.RUnlock()
+	return r.upstreamModel
 }
 
 type usageExecutor interface {
@@ -379,6 +468,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	r.once.Do(func() {
+		r.warnModelSubstitution(ctx)
 		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
@@ -435,6 +525,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Provider:            r.provider,
 		ExecutorType:        r.executorType,
 		Model:               model,
+		ResponseModel:       r.ResponseModel(),
 		Alias:               r.alias,
 		Source:              r.source,
 		APIKey:              r.apiKey,

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,9 +116,10 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
-	recentRequests recentRequestRing  `json:"-"`
-	indexAssigned  bool               `json:"-"`
-	dispatchState  *authDispatchState `json:"-"`
+	recentRequests      recentRequestRing      `json:"-"`
+	recentModelRequests recentModelRequestRing `json:"-"`
+	indexAssigned       bool                   `json:"-"`
+	dispatchState       *authDispatchState     `json:"-"`
 }
 
 type authDispatchState struct {
@@ -246,6 +248,8 @@ const (
 
 	// AutoDisableReasonUnauthorized identifies an upstream authentication failure.
 	AutoDisableReasonUnauthorized = "unauthorized"
+	// AutoDisableReasonAccountBanned identifies an explicit upstream account ban.
+	AutoDisableReasonAccountBanned = "account_banned"
 	// AutoDisableReasonQuotaExhausted identifies an exhausted upstream quota.
 	AutoDisableReasonQuotaExhausted = "quota_exhausted"
 )
@@ -317,10 +321,33 @@ type recentRequestRing struct {
 	buckets [recentRequestBucketCount]recentRequestBucket
 }
 
+type recentRequestModelCounts struct {
+	success int64
+	failed  int64
+}
+
+type recentModelRequestBucket struct {
+	bucketID int64
+	models   map[string]recentRequestModelCounts
+}
+
+type recentModelRequestRing struct {
+	buckets [recentRequestBucketCount]recentModelRequestBucket
+}
+
+type RecentRequestModelBucket struct {
+	Model            string  `json:"model"`
+	Success          int64   `json:"success"`
+	Failed           int64   `json:"failed"`
+	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+}
+
 type RecentRequestBucket struct {
-	Time    string `json:"time"`
-	Success int64  `json:"success"`
-	Failed  int64  `json:"failed"`
+	BucketID int64                      `json:"-"`
+	Time     string                     `json:"time"`
+	Success  int64                      `json:"success"`
+	Failed   int64                      `json:"failed"`
+	Models   []RecentRequestModelBucket `json:"models,omitempty"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -395,7 +422,7 @@ func formatRecentRequestBucketLabel(bucketID int64) string {
 	return start.Format("15:04") + "-" + end.Format("15:04")
 }
 
-func (a *Auth) recordRecentRequest(now time.Time, success bool) {
+func (a *Auth) recordRecentRequest(now time.Time, success bool, modelNames ...string) {
 	if a == nil {
 		return
 	}
@@ -409,9 +436,32 @@ func (a *Auth) recordRecentRequest(now time.Time, success bool) {
 	}
 	if success {
 		bucket.success++
+	} else {
+		bucket.failed++
+	}
+
+	if len(modelNames) == 0 {
 		return
 	}
-	bucket.failed++
+	model := canonicalModelKey(strings.TrimSpace(modelNames[0]))
+	if model == "" {
+		return
+	}
+	modelBucket := &a.recentModelRequests.buckets[idx]
+	if modelBucket.bucketID != bucketID {
+		modelBucket.bucketID = bucketID
+		modelBucket.models = make(map[string]recentRequestModelCounts)
+	}
+	if modelBucket.models == nil {
+		modelBucket.models = make(map[string]recentRequestModelCounts)
+	}
+	modelCounts := modelBucket.models[model]
+	if success {
+		modelCounts.success++
+	} else {
+		modelCounts.failed++
+	}
+	modelBucket.models[model] = modelCounts
 }
 
 func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
@@ -426,11 +476,29 @@ func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
 		idx := recentRequestBucketIndex(bucketID)
 		bucket := a.recentRequests.buckets[idx]
 		entry := RecentRequestBucket{
-			Time: formatRecentRequestBucketLabel(bucketID),
+			BucketID: bucketID,
+			Time:     formatRecentRequestBucketLabel(bucketID),
 		}
 		if bucket.bucketID == bucketID {
 			entry.Success = bucket.success
 			entry.Failed = bucket.failed
+		}
+		modelBucket := a.recentModelRequests.buckets[idx]
+		if modelBucket.bucketID == bucketID && len(modelBucket.models) > 0 {
+			models := make([]string, 0, len(modelBucket.models))
+			for model := range modelBucket.models {
+				models = append(models, model)
+			}
+			sort.Strings(models)
+			entry.Models = make([]RecentRequestModelBucket, 0, len(models))
+			for _, model := range models {
+				counts := modelBucket.models[model]
+				entry.Models = append(entry.Models, RecentRequestModelBucket{
+					Model:   model,
+					Success: counts.success,
+					Failed:  counts.failed,
+				})
+			}
 		}
 		out = append(out, entry)
 	}
@@ -461,6 +529,15 @@ func (a *Auth) Clone() *Auth {
 		copyAuth.ModelStates = make(map[string]*ModelState, len(a.ModelStates))
 		for key, state := range a.ModelStates {
 			copyAuth.ModelStates[key] = state.Clone()
+		}
+	}
+	for i, bucket := range a.recentModelRequests.buckets {
+		copyAuth.recentModelRequests.buckets[i].bucketID = bucket.bucketID
+		if len(bucket.models) > 0 {
+			copyAuth.recentModelRequests.buckets[i].models = make(map[string]recentRequestModelCounts, len(bucket.models))
+			for model, counts := range bucket.models {
+				copyAuth.recentModelRequests.buckets[i].models[model] = counts
+			}
 		}
 	}
 	copyAuth.Runtime = a.Runtime

@@ -31,6 +31,37 @@ type SessionInfo struct {
 // SessionTreeInfo is an alias for SessionInfo for backward compatibility.
 type SessionTreeInfo = SessionInfo
 
+// sessionJSONObject indexes top-level fields once so missing identity fields do
+// not repeatedly scan large message, tool or image payloads.
+type sessionJSONObject struct {
+	gjson.Result
+	fields map[string]gjson.Result
+}
+
+func indexSessionJSONObject(root gjson.Result) sessionJSONObject {
+	object := sessionJSONObject{Result: root}
+	if root.IsObject() {
+		object.fields = make(map[string]gjson.Result)
+		root.ForEach(func(key, value gjson.Result) bool {
+			name := key.String()
+			if _, exists := object.fields[name]; !exists {
+				object.fields[name] = value
+			}
+			return true
+		})
+	}
+	return object
+}
+
+func (object sessionJSONObject) Get(path string) gjson.Result {
+	key, rest, nested := strings.Cut(path, ".")
+	value := object.fields[key]
+	if nested {
+		return value.Get(rest)
+	}
+	return value
+}
+
 // ExtractSessionInfo extracts session hierarchy and client identification from request attributes.
 // Priority matches selector.go:
 //  1. X-Claude-Code-Session-Id
@@ -53,18 +84,18 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 		}
 	}
 
-	var root gjson.Result
-	var reqRoot gjson.Result
+	var root sessionJSONObject
+	var reqRoot sessionJSONObject
 	var hasNestedReq bool
 	var parentCandidate string
 
 	if len(payload) > 0 {
-		root = util.ParseGJSONBytesNoCopy(payload)
+		root = indexSessionJSONObject(util.ParseGJSONBytesNoCopy(payload))
 		reqRoot = root
 		req := root.Get("request")
 		hasNestedReq = req.Exists() && !root.Get("contents").Exists()
 		if hasNestedReq {
-			reqRoot = req
+			reqRoot = indexSessionJSONObject(req)
 		}
 		for _, p := range []string{
 			// Standard session / thread parent keys
@@ -843,7 +874,7 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 	return SessionInfo{}, false
 }
 
-func isBodyForkCandidate(root, reqRoot gjson.Result, hasNestedReq bool) bool {
+func isBodyForkCandidate(root, reqRoot sessionJSONObject, hasNestedReq bool) bool {
 	if !root.Exists() {
 		return false
 	}

@@ -20,6 +20,10 @@ import (
 )
 
 func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	auth, err = e.bindEgress(auth)
+	if err != nil {
+		return resp, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -113,7 +117,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer unlockSession()
 	}
 
-	upstreamBody, usedTurnState := e.turnStates.StampWebsocket(auth, wsHeaders, upstreamBody)
 	wsReqBody := buildCodexWebsocketRequestBody(upstreamBody)
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
@@ -134,7 +137,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var errDial error
 	dialCtx := ctx
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
-		conn, closer = existingWebsocketSessionConn(sess, authID, wsURL, identityState.convergence)
+		conn, closer = existingWebsocketSessionConnForEgress(sess, authID, wsURL, identityState.convergence, helps.CodexEgressFingerprint(auth))
 		if conn == nil {
 			return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
@@ -254,7 +257,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					return resp, errSendRetry
 				}
 			} else {
-				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
+				bodyErr := websocketHandshakeBody(respHSRetry)
+				if respHSRetry != nil {
+					helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHSRetry.StatusCode, respHSRetry.Header.Clone(), bodyErr)
+				}
+				if respHSRetry != nil && respHSRetry.StatusCode > 0 {
+					return resp, newCodexStatusErrWithCooling(respHSRetry.StatusCode, bodyErr, e.modelLevelCooling())
+				}
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				return resp, errDialRetry
 			}
@@ -298,7 +307,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			continue
 		}
 		observeCodexTokenEvent(reporter, payload)
-		e.turnStates.ObserveWebsocket(auth, usedTurnState, payload)
 		payload = applyCodexIdentityConfuseResponsePayload(payload, identityState)
 		helps.AppendCodexAPIWebsocketResponse(ctx, e.cfg, payload)
 		helps.EmitWebSocketResponseEvent(ctx, opts, auth, e.Identifier(), req.Model, payload)

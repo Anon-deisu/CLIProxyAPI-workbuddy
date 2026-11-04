@@ -76,6 +76,23 @@ func (cache *BoundedLRU[K, V]) Get(key K) (V, bool) {
 	return zero, false
 }
 
+// Delete removes a key and invokes its eviction callback after releasing the lock.
+func (cache *BoundedLRU[K, V]) Delete(key K) {
+	cache.mu.Lock()
+	element, exists := cache.entries[key]
+	if !exists {
+		cache.mu.Unlock()
+		return
+	}
+	entry := element.Value.(boundedLRUEntry[K, V])
+	delete(cache.entries, key)
+	cache.order.Remove(element)
+	cache.mu.Unlock()
+	if cache.onEvict != nil {
+		cache.onEvict(entry.key, entry.value)
+	}
+}
+
 func (cache *BoundedLRU[K, V]) Len() int {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()

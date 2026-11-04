@@ -1,12 +1,45 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 )
+
+// StartStreamingKeepAlive covers synchronous upstream setup and bootstrap retries.
+// Call the returned stop function before writing or inspecting the response writer.
+func (h *BaseAPIHandler) StartStreamingKeepAlive(ctx context.Context, writeKeepAlive func()) func() {
+	interval := StreamingKeepAliveInterval(h.Cfg)
+	if interval <= 0 {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				writeKeepAlive()
+			}
+		}
+	}()
+	return func() {
+		once.Do(func() { close(stop) })
+		<-done
+	}
+}
 
 // PendingStreamError returns an immediately available non-nil stream error.
 func PendingStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces.ErrorMessage, bool) {

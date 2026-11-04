@@ -330,6 +330,16 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
+		if rootAuthFileField(fieldPath) == "qoder_auto_checkin" {
+			if fieldPath != "qoder_auto_checkin" || (targetAuth.Provider != "qoder" && targetAuth.Provider != "qoder-cn") {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "qoder_auto_checkin is a Qoder account setting"})
+				return
+			}
+			if _, ok := value.(bool); !ok {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "qoder_auto_checkin must be a boolean"})
+				return
+			}
+		}
 
 		if fieldPath == coreauth.AttributeWeight {
 			if value == nil {

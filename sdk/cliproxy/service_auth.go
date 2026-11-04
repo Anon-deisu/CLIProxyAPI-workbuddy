@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
@@ -22,6 +23,15 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
 		sdkAuth.NewXAIAuthenticator(),
+		sdkAuth.NewMetaAuthenticator(),
+		sdkAuth.NewDevinAuthenticator(),
+		sdkAuth.NewWorkBuddyAuthenticator("workbuddy"),
+		sdkAuth.NewWorkBuddyAuthenticator("workbuddy-ai"),
+		sdkAuth.NewQoderAuthenticator("qoder"),
+		sdkAuth.NewQoderAuthenticator("qoder-cn"),
+		sdkAuth.NewKimiAuthenticator(),
+		sdkAuth.NewKimiAIAuthenticator(),
+		sdkAuth.NewKimiAIDotAuthenticator(),
 	)
 }
 
@@ -344,9 +354,15 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 		provider = strings.TrimSpace(existing.Provider)
 	}
 	GlobalModelRegistry().UnregisterClient(id)
+	if provider == "qoder" || provider == "qoder-cn" {
+		registry.DeleteQoderModelsForClient(id, provider)
+	}
 	s.coreManager.Remove(ctx, id)
 	if strings.EqualFold(provider, "codex") {
 		executor.CloseCodexWebsocketSessionsForAuthID(id, "auth_removed")
+		if s.codexEgress != nil {
+			s.codexEgress.RemoveAuth(id)
+		}
 	}
 	if strings.EqualFold(provider, "xai") {
 		executor.CloseXAIWebsocketSessionsForAuthID(id, "auth_removed")
@@ -369,7 +385,6 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	s.coreManager.SetC2AMaxRetryCredentials(cfg.Routing.C2AMaxRetryCredentials)
 	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 }
-
 func (s *Service) configureCooldownStateStore(cfg *config.Config) {
 	_ = s.configureCooldownStateStoreContext(context.Background(), cfg, false)
 }

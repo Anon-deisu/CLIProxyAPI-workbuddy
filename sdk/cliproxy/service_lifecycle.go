@@ -9,6 +9,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/qodercheckin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
@@ -205,9 +206,24 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
+	if s.coreManager != nil && !homeEnabled {
+		checkinCtx, cancelCheckin := context.WithCancel(ctx)
+		checkinDone := make(chan struct{})
+		go func() {
+			defer close(checkinDone)
+			s.runQoderCheckIns(checkinCtx)
+		}()
+		defer func() {
+			cancelCheckin()
+			<-checkinDone
+		}()
+	}
 
-	// The auth auto-refresh path is deleted from this fork (relay docs 6.6.1/F3):
-	// the account's real CC agent owns the OAuth token lifecycle. No loop is started.
+	if s.coreManager != nil {
+		s.coreManager.StartQuotaRefresh(ctx)
+		enabled, interval, concurrency := s.cfg.Codex.QuotaRefresh.Effective()
+		log.WithFields(log.Fields{"enabled": enabled && !homeEnabled, "interval": interval, "concurrency": concurrency}).Info("codex quota refresh configured")
+	}
 
 	select {
 	case <-ctx.Done():
@@ -215,6 +231,37 @@ func (s *Service) Run(ctx context.Context) error {
 		return ctx.Err()
 	case errServer := <-s.serverErr:
 		return errServer
+	}
+}
+
+// runQoderCheckIns reads opt-in settings on every pass, so account edits and
+// disable operations take effect without restarting the server.
+func (s *Service) runQoderCheckIns(ctx context.Context) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		for _, auth := range s.coreManager.List() {
+			if ctx.Err() != nil {
+				return
+			}
+			if !qodercheckin.Eligible(auth, time.Now()) {
+				continue
+			}
+			s.cfgMu.RLock()
+			cfg := s.cfg
+			s.cfgMu.RUnlock()
+			result, err := qodercheckin.Run(ctx, s.coreManager, auth, cfg, true)
+			if err != nil && ctx.Err() == nil {
+				log.WithField("auth_id", auth.ID).WithField("provider", auth.Provider).Warn("Qoder automatic check-in failed; retry deferred")
+			} else if ctx.Err() == nil {
+				log.WithFields(log.Fields{"auth_id": auth.ID, "status": result.Status, "claimed": result.Claimed, "credits": result.Credits}).Debug("Qoder automatic check-in completed")
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -289,11 +336,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			s.watcherCancel()
 		}
 		if s.coreManager != nil {
+			s.coreManager.StopQuotaRefresh()
 			s.coreManager.StopAutoRefresh()
 		}
 		s.executorRegistrationMu.Lock()
-		if s.codexTurnStates != nil {
-			s.codexTurnStates.Close()
+		if s.codexEgress != nil {
+			s.codexEgress.Close()
 		}
 		s.executorRegistrationMu.Unlock()
 		if s.watcher != nil {

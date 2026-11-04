@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 type apiKeyUsageEntry struct {
@@ -114,4 +115,9 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, out)
+}
+
+// GetRollingTokenUsageSummary returns token totals for the dashboard's rolling window.
+func (h *Handler) GetRollingTokenUsageSummary(c *gin.Context) {
+	c.JSON(http.StatusOK, coreusage.RecentTokenUsageSnapshot(time.Now()))
 }

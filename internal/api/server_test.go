@@ -14,7 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+	"unicode/utf8"
 
 	gin "github.com/gin-gonic/gin"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
@@ -35,6 +37,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
+	"github.com/tidwall/gjson"
 	"gopkg.in/yaml.v3"
 )
 
@@ -630,6 +633,254 @@ func newTestServerWithOptions(t *testing.T, opts ...ServerOption) *Server {
 
 	configPath := filepath.Join(tmpDir, "config.yaml")
 	return NewServer(cfg, authManager, accessManager, configPath, opts...)
+}
+
+func TestFakeModelsListAndResponses(t *testing.T) {
+	s := newTestServer(t)
+	settings := s.cfg.CloneForRuntime()
+	settings.Routing.FakeModels = []proxyconfig.FakeModelConfig{
+		{Name: "fake-one", Content: "A fixed answer", InputTokens: 114514, OutputTokens: 1919810, CacheReadTokens: 325, CacheWriteTokens: 799},
+		{Name: "fake-two", Content: "Second answer", InputTokens: 2, OutputTokens: 3},
+	}
+	s.UpdateClients(settings)
+	unauthorized := httptest.NewRecorder()
+	s.engine.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"fake-one"}`)))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("fake models bypassed API authentication: status = %d", unauthorized.Code)
+	}
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer test-key")
+		recorder := httptest.NewRecorder()
+		s.engine.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, body = %s", path, recorder.Code, recorder.Body.String())
+		}
+		return recorder
+	}
+	models := request(http.MethodGet, "/v1/models", "")
+	var listing struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if errDecode := json.Unmarshal(models.Body.Bytes(), &listing); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	ids := map[string]bool{}
+	for _, model := range listing.Data {
+		ids[model.ID] = true
+	}
+	if !ids["fake-one"] || !ids["fake-two"] {
+		t.Fatalf("/v1/models does not list configured fake models: %v", ids)
+	}
+	codexModels := request(http.MethodGet, "/v1/models?client_version=0.149.1", "")
+	if gjson.GetBytes(codexModels.Body.Bytes(), `models.#(slug=="fake-one").slug`).String() != "fake-one" {
+		t.Fatal("Codex model list does not include fake models")
+	}
+	for _, tc := range []struct {
+		path, body, textPath, usagePath string
+	}{
+		{"/v1/chat/completions", `{"model":"fake-one","messages":[{"role":"user","content":"anything"}]}`, "choices.0.message.content", "usage"},
+		{"/v1/completions", `{"model":"fake-one","prompt":"anything"}`, "choices.0.text", "usage"},
+		{"/v1/responses", `{"model":"fake-one","input":"anything"}`, "output.0.content.0.text", "usage"},
+		{"/backend-api/codex/responses", `{"model":"fake-one","input":"anything"}`, "output.0.content.0.text", "usage"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			resp := request(http.MethodPost, tc.path, tc.body)
+			if got := gjson.GetBytes(resp.Body.Bytes(), tc.textPath).String(); got != "A fixed answer" {
+				t.Fatalf("content = %v", got)
+			}
+			usage := gjson.GetBytes(resp.Body.Bytes(), tc.usagePath)
+			input := "input_tokens"
+			output := "output_tokens"
+			details := "input_tokens_details"
+			if strings.Contains(tc.path, "completions") {
+				input, output, details = "prompt_tokens", "completion_tokens", "prompt_tokens_details"
+			}
+			if usage.Get(input).Int() != 114514 || usage.Get(output).Int() != 1919810 || usage.Get("total_tokens").Int() != 2034324 {
+				t.Fatalf("usage = %#v", usage)
+			}
+			cache := usage.Get(details)
+			if cache.Get("cached_tokens").Int() != 325 || cache.Get("cache_write_tokens").Int() != 799 {
+				t.Fatalf("cache usage = %#v", cache)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		path, body, want string
+	}{
+		{"/v1/chat/completions", `{"model":"fake-two","stream":true}`, "data: [DONE]"},
+		{"/v1/completions", `{"model":"fake-two","stream":true}`, "data: [DONE]"},
+		{"/v1/responses", `{"model":"fake-two","stream":true}`, "event: response.completed"},
+	} {
+		t.Run("stream-"+tc.path, func(t *testing.T) {
+			resp := request(http.MethodPost, tc.path, tc.body)
+			if got := resp.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+				t.Fatalf("Content-Type = %q", got)
+			}
+			if !strings.Contains(resp.Body.String(), "Second answer") || !strings.Contains(resp.Body.String(), tc.want) || !strings.Contains(resp.Body.String(), `"cached_tokens":0`) {
+				t.Fatalf("stream content/usage incomplete: %s", resp.Body.String())
+			}
+		})
+	}
+	settings.Routing.FakeModels = []proxyconfig.FakeModelConfig{}
+	s.UpdateClients(settings)
+	models = request(http.MethodGet, "/v1/models", "")
+	if strings.Contains(models.Body.String(), "fake-one") {
+		t.Fatal("removed fake model remains in list")
+	}
+}
+
+func TestFakeModelRandomResponseAndRuntimeUpdates(t *testing.T) {
+	s := newTestServer(t)
+	patch := func(body string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/routing/settings", strings.NewReader(body))
+		s.mgmt.PutRoutingSettings(ctx)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("runtime patch: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	patch(`{"fake-models":[{"name":"random-reply","responses":["A\n\"quoted\" <tag>","B"],"input-tokens":12,"output-tokens":23,"cache-read-tokens":3,"cache-write-tokens":4}]}`)
+	seen := make(map[string]bool)
+	for range 128 {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"random-reply","stream":true}`))
+		req.Header.Set("Authorization", "Bearer test-key")
+		s.engine.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("fake response: %d %s", rec.Code, rec.Body.String())
+		}
+		var delta, completed string
+		for _, line := range strings.Split(rec.Body.String(), "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			event := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			switch event.Get("type").String() {
+			case "response.output_text.delta":
+				delta = event.Get("delta").String()
+			case "response.completed":
+				completed = event.Get("response.output.0.content.0.text").String()
+				if event.Get("response.usage.input_tokens").Int() != 12 || event.Get("response.usage.output_tokens").Int() != 23 || event.Get("response.usage.input_tokens_details.cached_tokens").Int() != 3 || event.Get("response.usage.input_tokens_details.cache_write_tokens").Int() != 4 {
+					t.Fatalf("random selection changed usage: %s", event.Raw)
+				}
+			}
+		}
+		if delta != completed || (completed != "A\n\"quoted\" <tag>" && completed != "B") {
+			t.Fatalf("response selection changed within one stream: delta=%q, completed=%q", delta, completed)
+		}
+		seen[completed] = true
+	}
+	if len(seen) != 2 {
+		t.Fatal("128 requests only selected one response")
+	}
+	patch(`{"fake-models":[]}`)
+	if len(s.configuredFakeModels()) != 0 {
+		t.Fatal("runtime deletion did not clear response routing")
+	}
+}
+
+func TestFakeModelStreamingRate(t *testing.T) {
+	for _, rate := range []int{0, 2, 25} {
+		for _, format := range []string{"chat", "completion", "responses"} {
+			synctest.Test(t, func(t *testing.T) {
+				const text = "A\u4e2d\u6587\U0001f600Z"
+				model := proxyconfig.FakeModelConfig{Name: "paced", Responses: []string{text}, CharsPerSecond: rate, InputTokens: 17, OutputTokens: 29, CacheReadTokens: 3, CacheWriteTokens: 4}
+				rec := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(rec)
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/stream", nil)
+				started := time.Now()
+				(&Server{}).writeFakeModel(ctx, format, model, true)
+				wantElapsed := time.Duration(0)
+				if rate > 0 {
+					wantElapsed = time.Duration(float64(time.Second) * float64(utf8.RuneCountInString(text)) / float64(rate))
+				}
+				if got := time.Since(started); got != wantElapsed {
+					t.Fatalf("%s rate=%d elapsed=%s, want %s", format, rate, got, wantElapsed)
+				}
+				var pieces []string
+				var usage gjson.Result
+				sequence := int64(0)
+				for _, line := range strings.Split(rec.Body.String(), "\n") {
+					if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
+						continue
+					}
+					event := gjson.Parse(strings.TrimPrefix(line, "data: "))
+					var part string
+					switch format {
+					case "chat":
+						part = event.Get("choices.0.delta.content").String()
+					case "completion":
+						part = event.Get("choices.0.text").String()
+					case "responses":
+						if event.Get("sequence_number").Int() != sequence {
+							t.Fatalf("out of order event: %s", event.Raw)
+						}
+						sequence++
+						if event.Get("type").String() == "response.output_text.delta" {
+							part = event.Get("delta").String()
+						}
+					}
+					if part != "" {
+						pieces = append(pieces, part)
+					}
+					if event.Get("usage").Exists() {
+						usage = event.Get("usage")
+					}
+					if event.Get("response.usage").Exists() {
+						usage = event.Get("response.usage")
+					}
+				}
+				if strings.Join(pieces, "") != text || (rate == 0 && len(pieces) != 1) || (rate > 0 && len(pieces) < 2) {
+					t.Fatalf("%s rate=%d chunks=%q", format, rate, pieces)
+				}
+				if usage.Get("total_tokens").Int() != 46 {
+					t.Fatalf("stream did not retain final usage: %s", usage.Raw)
+				}
+				rec = httptest.NewRecorder()
+				ctx, _ = gin.CreateTestContext(rec)
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/non-stream", nil)
+				started = time.Now()
+				(&Server{}).writeFakeModel(ctx, format, model, false)
+				if time.Since(started) != 0 {
+					t.Fatal("non-streaming request was paced")
+				}
+			})
+		}
+	}
+}
+
+func TestFakeModelStreamingStopsOnCancelOrWriteError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var parts []string
+		started := time.Now()
+		errStream := streamFakeModelText(ctx, "abcdef", 1, func(text string) error {
+			parts = append(parts, text)
+			cancel()
+			return nil
+		})
+		if !errors.Is(errStream, context.Canceled) || len(parts) != 1 || time.Since(started) != time.Second {
+			t.Fatalf("cancelled stream kept sending: parts=%v, err=%v", parts, errStream)
+		}
+		writeError := errors.New("client write failed")
+		for _, rate := range []int{0, 10} {
+			calls := 0
+			errStream = streamFakeModelText(t.Context(), "abcdef", rate, func(string) error {
+				calls++
+				return writeError
+			})
+			if !errors.Is(errStream, writeError) || calls != 1 {
+				t.Fatalf("write failure kept sending: calls=%d, err=%v", calls, errStream)
+			}
+		}
+	})
 }
 
 func TestHealthz(t *testing.T) {
@@ -1540,6 +1791,67 @@ func TestManagementResponseExposesPluginSupportHeaderForCORS(t *testing.T) {
 	for _, headerName := range corsExposedResponseHeaders {
 		if _, ok := exposedHeaders[strings.ToLower(headerName)]; !ok {
 			t.Fatalf("Access-Control-Expose-Headers missing %s: %q", headerName, rr.Header().Get("Access-Control-Expose-Headers"))
+		}
+	}
+}
+
+func TestV8ManagementUsesV8ConfigContract(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+	server := newTestServer(t)
+	if err := os.WriteFile(server.configFilePath, []byte("port: 8317\n"), 0o600); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+
+	for _, path := range []string{"/v0/management/config", "/v8/management/config"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer test-management-key")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d body=%s", path, rr.Code, http.StatusOK, rr.Body.String())
+		}
+		if got := rr.Header().Get("X-CPA-VERSION"); got == "" {
+			t.Fatalf("%s missing X-CPA-VERSION", path)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s returned invalid JSON: %v body=%s", path, err, rr.Body.String())
+		}
+	}
+
+	usageReq := httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/token-summary", nil)
+	usageReq.Header.Set("Authorization", "Bearer test-management-key")
+	usageRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(usageRR, usageReq)
+	if usageRR.Code != http.StatusOK {
+		t.Fatalf("token summary status = %d, want %d body=%s", usageRR.Code, http.StatusOK, usageRR.Body.String())
+	}
+	var usagePayload map[string]any
+	if err := json.Unmarshal(usageRR.Body.Bytes(), &usagePayload); err != nil {
+		t.Fatalf("token summary returned invalid JSON: %v body=%s", err, usageRR.Body.String())
+	}
+	if usagePayload["window_minutes"] != float64(200) {
+		t.Fatalf("token summary window = %#v, want 200 minutes", usagePayload["window_minutes"])
+	}
+
+	configReq := httptest.NewRequest(http.MethodGet, "/v8/management/config.yaml", nil)
+	configReq.Header.Set("Authorization", "Bearer test-management-key")
+	configRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(configRR, configReq)
+	if configRR.Code != http.StatusOK {
+		t.Fatalf("/v8/management/config.yaml status = %d, want %d body=%s", configRR.Code, http.StatusOK, configRR.Body.String())
+	}
+	var configPayload map[string]any
+	if err := yaml.Unmarshal(configRR.Body.Bytes(), &configPayload); err != nil {
+		t.Fatalf("/v8/management/config.yaml returned invalid YAML: %v body=%s", err, configRR.Body.String())
+	}
+
+	for _, path := range []string{"/v0/management/config", "/v8/management/config"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("unauthorized %s status = %d, want %d", path, rr.Code, http.StatusUnauthorized)
 		}
 	}
 }

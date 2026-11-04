@@ -3416,7 +3416,7 @@ func TestResponsesWebsocketRewritesCacheTokenUsageDownstream(t *testing.T) {
 	minimum := 95.0
 	executor := &websocketDirectCaptureExecutor{
 		provider:        "codex",
-		responsePayload: []byte(`{"type":"response.completed","response":{"id":"resp-cache","output":[],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":12,"cache_write_tokens":7}}}}`),
+		responsePayload: []byte(`{"type":"response.completed","response":{"id":"resp-cache","output":[],"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":98,"cache_write_tokens":7}}}}`),
 	}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)

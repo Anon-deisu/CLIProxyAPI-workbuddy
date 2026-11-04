@@ -412,11 +412,26 @@ func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexe
 		return sdktranslator.FormatGemini
 	case "kimi":
 		return sdktranslator.FormatOpenAI
+	case "kimi-ai":
+		return sdktranslator.FormatOpenAI
+	case "meta":
+		return sdktranslator.FormatOpenAIResponse
+	case "devin":
+		return sdktranslator.FormatInteractions
 	case "antigravity":
 		return sdktranslator.FormatAntigravity
 	default:
 		return sdktranslator.FormatOpenAI
 	}
+}
+
+func executorForAuth(executor ProviderExecutor, auth *Auth) ProviderExecutor {
+	if auth.AuthKind() == AuthKindAPIKey {
+		if scoped, ok := executor.(APIKeyConfigExecutor); ok {
+			return scoped.ForAPIKey()
+		}
+	}
+	return executor
 }
 
 func cloneRequestHeaders(src http.Header) http.Header {
@@ -514,7 +529,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
+		executor = executorForAuth(executor, auth)
+		selectedAuth := auth
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
+		if auth == nil {
+			auth = selectedAuth
+		}
 		if errPrepare != nil {
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				auth.ReleaseDispatchSlot()
@@ -733,7 +753,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
+		executor = executorForAuth(executor, auth)
+		selectedAuth := auth
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
+		if auth == nil {
+			auth = selectedAuth
+		}
 		if errPrepare != nil {
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				auth.ReleaseDispatchSlot()
@@ -1070,9 +1095,18 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		attempted[auth.ID] = struct{}{}
 		var errPrepare error
 		if selection != nil {
+			selectedAuth := auth
 			auth, errPrepare = m.prepareHomeRequestAuth(execCtx, executor, selection)
+			if auth == nil {
+				auth = selectedAuth
+			}
 		} else {
+			executor = executorForAuth(executor, auth)
+			selectedAuth := auth
 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
+			if auth == nil {
+				auth = selectedAuth
+			}
 		}
 		if errPrepare != nil {
 			if selection != nil {
@@ -1186,6 +1220,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			if errCtx := execCtx.Err(); errCtx != nil && ctx != nil && ctx.Err() != nil {
 				return nil, errCtx
+			}
+			if isRequestStopError(errStream) {
+				return nil, errStream
 			}
 			action, okAction := matchRequestScopedErrorAction(auth, errStream, m.runtimeConfigSnapshot())
 			if okAction {
@@ -1511,11 +1548,18 @@ func (m *Manager) prepareHomeAuthSnapshot(ctx context.Context, executor Provider
 }
 
 func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, error) {
-	if m == nil || executor == nil || auth == nil {
+	preparer, ok := executor.(RequestAuthPreparer)
+	if !ok {
 		return auth, nil
 	}
-	preparer, ok := executor.(RequestAuthPreparer)
-	if !ok || preparer == nil || !preparer.ShouldPrepareRequestAuth(auth) {
+	return m.PrepareRequestAuth(ctx, preparer, auth)
+}
+
+// PrepareRequestAuth prepares a registered credential using the same lifecycle
+// checks as normal request execution. Management and provider-specific callers use
+// this path so a minted credential is installed atomically before the request.
+func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPreparer, auth *Auth) (*Auth, error) {
+	if m == nil || preparer == nil || auth == nil || !preparer.ShouldPrepareRequestAuth(auth) {
 		return auth, nil
 	}
 
@@ -1535,10 +1579,14 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 
 	target := auth.Clone()
 	m.mu.RLock()
-	if current := m.auths[id]; current != nil {
+	var current *Auth
+	if current = m.auths[id]; current != nil {
 		target = current.Clone()
 	}
 	m.mu.RUnlock()
+	if current == nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+		return nil, fmt.Errorf("prepare meta auth: credential no longer registered")
+	}
 
 	if !preparer.ShouldPrepareRequestAuth(target) {
 		return target, nil
@@ -1559,6 +1607,9 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 	}
 	if saved != nil {
 		return saved, nil
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+		return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
 	}
 	return target, nil
 }

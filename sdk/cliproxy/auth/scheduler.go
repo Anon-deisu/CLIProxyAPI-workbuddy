@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"maps"
 	"net/http"
 	"sort"
 	"strings"
@@ -101,6 +102,7 @@ type readyView struct {
 	flat          []*scheduledAuth
 	lastPicked    string
 	weightedState smoothWeightedState
+	quotaState    smoothWeightedState
 }
 
 // cooldownQueue is the blocked auth collection ordered by next retry time during rebuilds.
@@ -109,6 +111,7 @@ type cooldownQueue []*scheduledAuth
 type readyViewCursorState struct {
 	lastPicked    string
 	weightedState smoothWeightedState
+	quotaState    smoothWeightedState
 }
 
 type readyBucketCursorState struct {
@@ -118,6 +121,8 @@ type readyBucketCursorState struct {
 
 func snapshotReadyViewCursors(view readyView) readyViewCursorState {
 	state := readyViewCursorState{lastPicked: view.lastPicked}
+	state.quotaState.current = maps.Clone(view.quotaState.current)
+	state.quotaState.weights = maps.Clone(view.quotaState.weights)
 	if len(view.weightedState.current) > 0 {
 		state.weightedState.current = make(map[string]int64, len(view.weightedState.current))
 		for authID, current := range view.weightedState.current {
@@ -138,6 +143,7 @@ func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 		return
 	}
 	view.lastPicked = state.lastPicked
+	view.quotaState = state.quotaState
 	weights := scheduledWeightVector(view.flat)
 	if len(state.weightedState.current) == 0 || weightsConfigChanged(state.weightedState.weights, weights) {
 		return
@@ -453,7 +459,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
-	if strategy == schedulerStrategyWeightedRoundRobin {
+	if strategy == schedulerStrategyWeightedRoundRobin || strategy == schedulerStrategyCodex2APIDefault {
 		entries := make([]*scheduledAuth, 0)
 		for _, shard := range candidateShards {
 			if shard == nil {
@@ -476,12 +482,18 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		if s.mixedWeightedStates == nil {
 			s.mixedWeightedStates = make(map[string]*smoothWeightedState)
 		}
-		state := s.mixedWeightedStates[cursorKey]
+		stateKey := cursorKey
+		if strategy == schedulerStrategyCodex2APIDefault {
+			stateKey += ":quota"
+		}
+		state := s.mixedWeightedStates[stateKey]
 		if state == nil {
 			state = &smoothWeightedState{}
-			s.mixedWeightedStates[cursorKey] = state
+			s.mixedWeightedStates[stateKey] = state
 		}
-		state.prepare(scheduledWeightVectorMatching(entries, predicate))
+		if strategy == schedulerStrategyWeightedRoundRobin {
+			state.prepare(scheduledWeightVectorMatching(entries, predicate))
+		}
 		busy := make(map[string]struct{})
 		for attempt := 0; attempt < len(entries); attempt++ {
 			candidatePredicate := func(entry *scheduledAuth) bool {
@@ -493,7 +505,12 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 				}
 				return predicate == nil || predicate(entry)
 			}
-			picked := pickSmoothWeightedScheduled(entries, state.current, candidatePredicate)
+			var picked *scheduledAuth
+			if strategy == schedulerStrategyCodex2APIDefault {
+				picked = pickCodex2APIScheduled(entries, state, candidatePredicate)
+			} else {
+				picked = pickSmoothWeightedScheduled(entries, state.current, candidatePredicate)
+			}
 			if picked == nil || picked.meta == nil {
 				break
 			}
@@ -1352,23 +1369,24 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 }
 
 func (v *readyView) pickCodex2API(predicate func(*scheduledAuth) bool) *scheduledAuth {
-	var candidates []*scheduledAuth
-	for _, entry := range v.flat {
+	return pickCodex2APIScheduled(v.flat, &v.quotaState, predicate)
+}
+
+func pickCodex2APIScheduled(entries []*scheduledAuth, state *smoothWeightedState, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	candidates := make([]*Auth, 0, len(entries))
+	for _, entry := range entries {
 		if entry == nil || entry.auth == nil || predicate != nil && !predicate(entry) {
 			continue
 		}
-		candidates = append(candidates, entry)
+		candidates = append(candidates, entry.auth)
 	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	best := candidates[0]
-	for _, candidate := range candidates[1:] {
-		if compareCodex2APIAuth(candidate.auth, best.auth) < 0 {
-			best = candidate
+	picked := pickCodex2APIAuth(candidates, state)
+	for _, entry := range entries {
+		if entry != nil && entry.auth != nil && entry.auth == picked {
+			return entry
 		}
 	}
-	return best
+	return nil
 }
 
 func (v *readyView) pickQuota(predicate func(*scheduledAuth) bool, preferRemaining bool) *scheduledAuth {

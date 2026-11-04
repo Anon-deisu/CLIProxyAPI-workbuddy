@@ -2,6 +2,7 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -336,5 +337,166 @@ func TestMergeWebsocketQuotaHeaders(t *testing.T) {
 	headers := internallogging.GetResponseHeaders(ctx)
 	if headers.Get("X-Request-Id") != "req-1" || headers.Get("X-Codex-Active-Limit") != "codex_bengalfox" {
 		t.Fatalf("merged response headers = %#v", headers)
+	}
+}
+
+func TestParseCodexUsageQuotaHeadersWhamFixture(t *testing.T) {
+	// Synthetic values in the wham response shape, with the weekly window first.
+	payload := []byte(`{
+		"user_id":"synthetic-user","account_id":"synthetic-account","plan_type":"pro",
+		"rate_limit":{
+			"allowed":true,"limit_reached":false,
+			"primary_window":{"used_percent":81.5,"limit_window_seconds":604800,"reset_after_seconds":137160,"reset_at":1787588999},
+			"secondary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":0}
+		},
+		"additional_rate_limits":[{
+			"limit_name":"GPT-5.3-Codex-Spark","metered_feature":"codex_bengalfox",
+			"rate_limit":{"allowed":true,"limit_reached":false,
+				"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_at":1787231961},
+				"secondary_window":null}
+		}],
+		"code_review_rate_limit":{"allowed":false,"limit_reached":true,
+			"primary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_after_seconds":900},
+			"secondary_window":null},
+		"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"promo":null
+	}`)
+	headers := ParseCodexUsageQuotaHeaders(payload)
+	for key, want := range map[string]string{
+		"X-Codex-Plan-Type":                                             "pro",
+		"X-Codex-Allowed":                                               "true",
+		"X-Codex-Limit-Reached":                                         "false",
+		"X-Codex-Primary-Used-Percent":                                  "81.5",
+		"X-Codex-Primary-Window-Minutes":                                "10080",
+		"X-Codex-Primary-Reset-After-Seconds":                           "137160",
+		"X-Codex-Primary-Reset-At":                                      "1787588999",
+		"X-Codex-Secondary-Used-Percent":                                "0",
+		"X-Codex-Secondary-Window-Minutes":                              "300",
+		"X-Codex-Secondary-Reset-After-Seconds":                         "0",
+		"X-Codex-Additional-GPT-5.3-Codex-Spark-Limit-Name":             "GPT-5.3-Codex-Spark",
+		"X-Codex-Additional-GPT-5.3-Codex-Spark-Primary-Used-Percent":   "3",
+		"X-Codex-Additional-GPT-5.3-Codex-Spark-Primary-Window-Minutes": "300",
+		"X-Codex-Additional-GPT-5.3-Codex-Spark-Primary-Reset-At":       "1787231961",
+		"X-Codex-Code-Review-Limit-Reached":                             "true",
+		"X-Codex-Code-Review-Primary-Used-Percent":                      "100",
+		"X-Codex-Code-Review-Primary-Window-Minutes":                    "10080",
+		"X-Codex-Code-Review-Primary-Reset-After-Seconds":               "900",
+		"X-Codex-Credits-Has-Credits":                                   "false",
+		"X-Codex-Credits-Unlimited":                                     "false",
+		"X-Codex-Credits-Balance":                                       "0",
+	} {
+		if got := headers.Get(key); got != want {
+			t.Errorf("header %s = %q, want %q", key, got, want)
+		}
+	}
+	for _, key := range []string{
+		"X-Codex-Secondary-Reset-At", "X-Codex-Active-Limit",
+		"X-Codex-Additional-GPT-5.3-Codex-Spark-Secondary-Used-Percent",
+		"X-Codex-Code-Review-Secondary-Used-Percent",
+	} {
+		if got := headers.Get(key); got != "" {
+			t.Errorf("invented header %s = %q", key, got)
+		}
+	}
+	if got := ParseCodexQuotaEventHeaders(payload); got != nil {
+		t.Fatalf("wham fixture was mistaken for a websocket event: %#v", got)
+	}
+}
+
+func TestParseCodexUsageQuotaHeadersWindowOrderAndNulls(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		primary       string
+		secondary     string
+		wantPrimary   string
+		wantSecondary string
+	}{
+		{"short first", `{"used_percent":1,"limit_window_seconds":18000,"reset_at":1787588999}`, `{"used_percent":2,"limit_window_seconds":604800,"reset_after_seconds":60}`, "300", "10080"},
+		{"long first", `{"used_percent":1,"limit_window_seconds":604800,"reset_at":1787588999}`, `{"used_percent":2,"limit_window_seconds":18000,"reset_after_seconds":60}`, "10080", "300"},
+		{"null primary", `null`, `{"used_percent":2,"limit_window_seconds":604800,"reset_after_seconds":60}`, "", "10080"},
+		{"null secondary", `{"used_percent":1,"limit_window_seconds":18000,"reset_at":1787588999}`, `null`, "300", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := fmt.Sprintf(`{"rate_limit":{"primary_window":%s,"secondary_window":%s}}`, tc.primary, tc.secondary)
+			headers := ParseCodexUsageQuotaHeaders([]byte(payload))
+			if headers == nil || headers.Get("X-Codex-Primary-Window-Minutes") != tc.wantPrimary || headers.Get("X-Codex-Secondary-Window-Minutes") != tc.wantSecondary {
+				t.Fatalf("unexpected window headers: %#v", headers)
+			}
+		})
+	}
+}
+
+func TestParseCodexUsageQuotaHeadersRejectsInvalidSnapshots(t *testing.T) {
+	for _, payload := range []string{
+		``, `null`, `{}`, `[]`, `{"plan_type":"pro"}`,
+		`{"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}`,
+		`{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":null,"secondary_window":null},"credits":{"balance":"0"}}`,
+		`{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_at":1787588999}}`,
+		`{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_at":1787588999}}} trailing`,
+	} {
+		if headers := ParseCodexUsageQuotaHeaders([]byte(payload)); headers != nil {
+			t.Errorf("invalid snapshot %q produced headers: %#v", payload, headers)
+		}
+	}
+	for _, window := range []string{
+		`null`, `{}`, `{"used_percent":0}`,
+		`{"used_percent":null,"limit_window_seconds":18000,"reset_after_seconds":60}`,
+		`{"used_percent":"invalid","limit_window_seconds":18000,"reset_after_seconds":60}`,
+		`{"used_percent":false,"limit_window_seconds":18000,"reset_after_seconds":60}`,
+		`{"used_percent":{},"limit_window_seconds":18000,"reset_after_seconds":60}`,
+		`{"used_percent":-1,"limit_window_seconds":18000,"reset_after_seconds":60}`,
+		`{"used_percent":101,"limit_window_seconds":18000,"reset_after_seconds":60}`,
+		`{"used_percent":1,"limit_window_seconds":null,"reset_after_seconds":60}`,
+		`{"used_percent":1,"limit_window_seconds":0,"reset_after_seconds":60}`,
+		`{"used_percent":1,"limit_window_seconds":-60,"reset_after_seconds":60}`,
+		`{"used_percent":1,"limit_window_seconds":18000}`,
+		`{"used_percent":1,"limit_window_seconds":18000,"reset_at":null,"reset_after_seconds":null}`,
+		`{"used_percent":1,"limit_window_seconds":18000,"reset_at":0,"reset_after_seconds":-1}`,
+		`{"used_percent":1,"limit_window_seconds":18000,"reset_after_seconds":"invalid"}`,
+		`{"used_percent":1,"limit_window_seconds":18000,"reset_after_seconds":false}`,
+	} {
+		payload := fmt.Sprintf(`{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":%s},"credits":{"balance":"0"}}`, window)
+		if headers := ParseCodexUsageQuotaHeaders([]byte(payload)); headers != nil {
+			t.Errorf("invalid window %s produced headers: %#v", window, headers)
+		}
+	}
+}
+
+func TestParseCodexUsageQuotaHeadersAdditionalOnlyAndBounded(t *testing.T) {
+	var limits []string
+	for i := 0; i < 12; i++ {
+		limits = append(limits, fmt.Sprintf(`{"limit_name":"limit-%d","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_after_seconds":60}}}`, i))
+	}
+	headers := ParseCodexUsageQuotaHeaders([]byte(`{"rate_limit":null,"additional_rate_limits":[` + strings.Join(limits, ",") + `]}`))
+	if headers == nil {
+		t.Fatal("valid additional windows were discarded")
+	}
+	count := 0
+	for key := range headers {
+		if strings.HasSuffix(key, "-Limit-Name") {
+			count++
+		}
+	}
+	if count != 8 || headers.Get("X-Codex-Primary-Used-Percent") != "" {
+		t.Fatalf("unexpected additional limits: count=%d headers=%#v", count, headers)
+	}
+}
+
+func TestParseCodexUsageQuotaHeadersKeepsValidWindowsAndSafeMetadata(t *testing.T) {
+	headers := ParseCodexUsageQuotaHeaders([]byte(`{
+		"plan_type":"bad\r\nplan",
+		"rate_limit":{"primary_window":{"used_percent":null,"limit_window_seconds":18000,"reset_after_seconds":60}},
+		"code_review_rate_limit":{"primary_window":{"used_percent":4,"limit_window_seconds":18000,"reset_at":1787588999,"reset_after_seconds":"bad"}},
+		"additional_rate_limits":[{"limit_name":"unsafe\r\nname","rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":60}}}],
+		"credits":{"balance":"bad\r\nbalance"}
+	}`))
+	if headers.Get("X-Codex-Code-Review-Primary-Used-Percent") != "4" || headers.Get("X-Codex-Primary-Used-Percent") != "" || headers.Get("X-Codex-Code-Review-Primary-Reset-After-Seconds") != "" {
+		t.Fatalf("invalid windows or resets were retained: %#v", headers)
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			if strings.ContainsAny(value, "\r\n") {
+				t.Errorf("unsafe metadata in %s: %q", key, value)
+			}
+		}
 	}
 }

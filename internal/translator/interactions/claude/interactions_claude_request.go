@@ -282,14 +282,24 @@ func claudeToolResultToInteractions(part gjson.Result) []byte {
 			step, _ = sjson.SetBytes(step, "result", result.String())
 		case result.IsArray():
 			contentItems := make([][]byte, 0, 4)
+			var businessJSON []string
 			result.ForEach(func(_, item gjson.Result) bool {
 				if item.Get("type").String() == "text" {
 					contentPart := []byte(`{"type":"text","text":""}`)
 					contentPart, _ = sjson.SetBytes(contentPart, "text", item.Get("text").String())
 					contentItems = append(contentItems, contentPart)
+				} else if item.Get("type").String() != "image" && item.Raw != "" {
+					businessJSON = append(businessJSON, item.Raw)
 				}
 				return true
 			})
+			if len(businessJSON) > 0 {
+				for _, raw := range businessJSON {
+					contentPart := []byte(`{"type":"text","text":""}`)
+					contentPart, _ = sjson.SetBytes(contentPart, "text", raw)
+					contentItems = append(contentItems, contentPart)
+				}
+			}
 			step, _ = sjson.SetRawBytes(step, "result", translatorcommon.JoinRawArray(contentItems))
 		default:
 			step, _ = sjson.SetRawBytes(step, "result", []byte(result.Raw))

@@ -1,13 +1,58 @@
 package session
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/tidwall/gjson"
 )
+
+func TestSessionJSONObjectPreservesLookupSemantics(t *testing.T) {
+	for _, body := range []string{
+		`{"session_id":"first","session_id":"second","metadata":{"parent_session_id":"parent"},"request":{"session_id":"nested"},"contents":null}`,
+		`{"\u0073ession_id":"escaped","metadata":null,"request":{}}`,
+		`{"metadata":{"parent_session_id":"one","parent_session_id":"two"},"contents":[]}`,
+		`{}`, `null`, `[]`,
+	} {
+		root := gjson.Parse(body)
+		indexed := indexSessionJSONObject(root)
+		if root.Exists() != indexed.Exists() {
+			t.Fatalf("existence changed for %s", body)
+		}
+		for _, path := range []string{"session_id", "metadata", "metadata.parent_session_id", "metadata.agent_id", "contents", "request", "request.session_id", "absent"} {
+			want, got := root.Get(path), indexed.Get(path)
+			if want.Type != got.Type || want.Raw != got.Raw || want.String() != got.String() {
+				t.Fatalf("%s: indexed=%+v original=%+v", path, got, want)
+			}
+		}
+	}
+}
+
+func BenchmarkExtractSessionInfoLargePayload(b *testing.B) {
+	for _, size := range []int{1024, 1024 * 1024} {
+		for _, nested := range []bool{false, true} {
+			b.Run(fmt.Sprintf("bytes_%d/nested_%t", size, nested), func(b *testing.B) {
+				body := `{"messages":[{"role":"user","content":"` + strings.Repeat("x", size) + `"}],"session_id":"child","metadata":{"parent_session_id":"parent"}}`
+				if nested {
+					body = `{"request":` + body + `}`
+				}
+				payload := []byte(body)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					info, ok := ExtractSessionInfo(nil, payload, nil)
+					if !ok || info.SessionID != "session:child" || info.ParentSessionID != "session:parent" {
+						b.Fatal(info)
+					}
+				}
+			})
+		}
+	}
+}
 
 func TestExtractSessionInfoAllClients(t *testing.T) {
 	t.Parallel()

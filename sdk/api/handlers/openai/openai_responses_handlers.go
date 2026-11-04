@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/optimize-multi-agent-v2"
@@ -660,7 +661,6 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	// New core execution path
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -673,13 +673,39 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		failureEvent = "response.failed"
 	}
 	framer := &responsesSSEFramer{failureEvent: failureEvent}
-	var initialOutput bytes.Buffer
+	stopKeepAlive := h.StartStreamingKeepAlive(cliCtx, func() {
+		setSSEHeaders()
+		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+		flusher.Flush()
+	})
+	defer stopKeepAlive()
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	stopKeepAlive()
+	if c.Writer.Written() {
+		h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
+		return
+	}
 
-	// Peek at the first complete SSE data frame.
+	var initialOutput bytes.Buffer
+	var keepAliveC <-chan time.Time
+	if interval := handlers.StreamingKeepAliveInterval(h.Cfg); interval > 0 {
+		keepAlive := time.NewTimer(interval)
+		defer keepAlive.Stop()
+		keepAliveC = keepAlive.C
+	}
+
+	// Preserve HTTP errors until either a complete data frame or a configured heartbeat commits SSE.
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cliCancel(c.Request.Context().Err())
+			return
+		case <-keepAliveC:
+			setSSEHeaders()
+			_, _ = c.Writer.Write(initialOutput.Bytes())
+			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+			flusher.Flush()
+			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
 		case errMsg, ok := <-errChan:
 			if !ok {

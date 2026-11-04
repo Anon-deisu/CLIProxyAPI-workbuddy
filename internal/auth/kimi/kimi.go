@@ -47,13 +47,26 @@ var kimiRefreshGroup singleflight.Group
 type KimiAuth struct {
 	deviceClient *DeviceFlowClient
 	cfg          *config.Config
+	domain       string
 }
 
 // NewKimiAuth creates a new KimiAuth service instance.
 func NewKimiAuth(cfg *config.Config) *KimiAuth {
+	return NewKimiAuthWithDomain(cfg, KimiDefaultDomain)
+}
+
+// NewKimiAIAuth creates a Kimi.ai authorization service.
+func NewKimiAIAuth(cfg *config.Config) *KimiAuth {
+	return NewKimiAuthWithDomain(cfg, KimiAIDomain)
+}
+
+// NewKimiAuthWithDomain creates an authorization service for either Kimi domain.
+func NewKimiAuthWithDomain(cfg *config.Config, domain string) *KimiAuth {
+	domain = NormalizeKimiDomain(domain)
 	return &KimiAuth{
-		deviceClient: NewDeviceFlowClient(cfg),
+		deviceClient: NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg, domain, "", ""),
 		cfg:          cfg,
+		domain:       domain,
 	}
 }
 
@@ -81,6 +94,10 @@ func (k *KimiAuth) CreateTokenStorage(bundle *KimiAuthBundle) *KimiTokenStorage 
 	if bundle.TokenData.ExpiresAt > 0 {
 		expired = time.Unix(bundle.TokenData.ExpiresAt, 0).UTC().Format(time.RFC3339)
 	}
+	provider := "kimi"
+	if IsKimiAIDomain(k.domain) {
+		provider = "kimi-ai"
+	}
 	return &KimiTokenStorage{
 		AccessToken:  bundle.TokenData.AccessToken,
 		RefreshToken: bundle.TokenData.RefreshToken,
@@ -88,7 +105,9 @@ func (k *KimiAuth) CreateTokenStorage(bundle *KimiAuthBundle) *KimiTokenStorage 
 		Scope:        bundle.TokenData.Scope,
 		DeviceID:     strings.TrimSpace(bundle.DeviceID),
 		Expired:      expired,
-		Type:         "kimi",
+		Type:         provider,
+		Domain:       NormalizeKimiDomain(k.domain),
+		BaseURL:      ResolveKimiAPIBaseURL(k.domain),
 	}
 }
 
@@ -97,6 +116,8 @@ type DeviceFlowClient struct {
 	httpClient *http.Client
 	cfg        *config.Config
 	deviceID   string
+	domain     string
+	oauthHost  string
 }
 
 // NewDeviceFlowClient creates a new device flow client.
@@ -112,6 +133,16 @@ func NewDeviceFlowClientWithDeviceID(cfg *config.Config, deviceID string) *Devic
 // NewDeviceFlowClientWithDeviceIDAndProxyURL creates a new device flow client with a proxy override.
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg *config.Config, deviceID string, proxyURL string) *DeviceFlowClient {
+	return NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg, KimiDefaultDomain, deviceID, proxyURL)
+}
+
+// NewDeviceFlowClientWithDomain selects the authorization domain explicitly.
+func NewDeviceFlowClientWithDomain(cfg *config.Config, domain string) *DeviceFlowClient {
+	return NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg, domain, "", "")
+}
+
+// NewDeviceFlowClientWithDomainDeviceIDAndProxyURL keeps token acquisition domain-scoped.
+func NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg *config.Config, domain, deviceID, proxyURL string) *DeviceFlowClient {
 	client := &http.Client{Timeout: 30 * time.Second}
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
 	var sdkCfg config.SDKConfig
@@ -132,7 +163,28 @@ func NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg *config.Config, deviceID str
 		httpClient: client,
 		cfg:        cfg,
 		deviceID:   resolvedDeviceID,
+		domain:     NormalizeKimiDomain(domain),
+		oauthHost:  ResolveKimiOAuthHost(domain),
 	}
+}
+
+func (c *DeviceFlowClient) deviceCodeURL() string {
+	if c.oauthHost != "" {
+		return c.oauthHost + "/api/oauth/device_authorization"
+	}
+	return ResolveKimiOAuthHost(c.domain) + "/api/oauth/device_authorization"
+}
+
+func (c *DeviceFlowClient) tokenURL() string {
+	if c.oauthHost != "" {
+		return c.oauthHost + "/api/oauth/token"
+	}
+	return ResolveKimiOAuthHost(c.domain) + "/api/oauth/token"
+}
+
+// SetHTTPClient uses the caller's configured credential-acquisition transport.
+func (c *DeviceFlowClient) SetHTTPClient(client *http.Client) {
+	c.httpClient = client
 }
 
 // getOrCreateDeviceID returns an in-memory device ID for the current authentication flow.
@@ -182,7 +234,7 @@ func (c *DeviceFlowClient) RequestDeviceCode(ctx context.Context) (*DeviceCodeRe
 	data := url.Values{}
 	data.Set("client_id", kimiClientID)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, kimiDeviceCodeURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.deviceCodeURL(), strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("kimi: failed to create device code request: %w", err)
 	}
@@ -270,7 +322,7 @@ func (c *DeviceFlowClient) exchangeDeviceCode(ctx context.Context, deviceCode st
 	data.Set("device_code", deviceCode)
 	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, kimiTokenURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL(), strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("kimi: failed to create token request: %w", err), false
 	}
@@ -353,7 +405,7 @@ func (c *DeviceFlowClient) RefreshToken(ctx context.Context, refreshToken string
 	}
 	refreshToken = strings.TrimSpace(refreshToken)
 
-	result, err, _ := kimiRefreshGroup.Do(refreshToken, func() (interface{}, error) {
+	result, err, _ := kimiRefreshGroup.Do(c.tokenURL()+":"+refreshToken, func() (interface{}, error) {
 		return c.refreshTokenSingleFlight(context.WithoutCancel(ctx), refreshToken)
 	})
 	if err != nil {
@@ -372,7 +424,7 @@ func (c *DeviceFlowClient) refreshTokenSingleFlight(ctx context.Context, refresh
 	data.Set("grant_type", "refresh_token")
 	data.Set("refresh_token", refreshToken)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, kimiTokenURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL(), strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("kimi: failed to create refresh request: %w", err)
 	}

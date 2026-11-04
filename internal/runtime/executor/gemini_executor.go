@@ -59,6 +59,12 @@ func NewGeminiExecutor(cfg *config.Config) *GeminiExecutor {
 	return &GeminiExecutor{cfg: cfg, identifier: "gemini"}
 }
 
+func (e *GeminiExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
+	copy := *e
+	copy.cfg = e.cfg.ForAPIKey()
+	return &copy
+}
+
 // NewGeminiInteractionsExecutor creates a Gemini executor bound to the native Interactions provider.
 func NewGeminiInteractionsExecutor(cfg *config.Config) *GeminiExecutor {
 	return &GeminiExecutor{cfg: cfg, identifier: "gemini-interactions"}

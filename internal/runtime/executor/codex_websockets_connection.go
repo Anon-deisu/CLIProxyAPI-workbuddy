@@ -28,6 +28,10 @@ const (
 )
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+	auth, errBinding := e.bindEgress(auth)
+	if errBinding != nil {
+		return nil, nil, nil, errBinding
+	}
 	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
@@ -40,6 +44,11 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	}
 	closer := newWebsocketConnectionCloser(conn)
 	if conn != nil {
+		closer.onClose = func() { e.egress.ReleaseEgressConnection(auth, closer) }
+		if errTrack := e.egress.TrackEgressConnection(auth, closer); errTrack != nil {
+			_ = closer.Close()
+			return nil, nil, resp, errTrack
+		}
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
 		conn.EnableWriteCompression(false)
@@ -208,9 +217,7 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 			return dialer
 		}
 		dialer.Proxy = nil
-		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
-			return socksDialer.Dial(network, addr)
-		}
+		dialer.NetDialContext = socksDialer.(proxy.ContextDialer).DialContext
 	case "http", "https":
 		dialer.Proxy = http.ProxyURL(setting.URL)
 	default:

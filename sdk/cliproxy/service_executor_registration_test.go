@@ -3,8 +3,11 @@ package cliproxy
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -104,28 +107,45 @@ func TestRegisterAvailableExecutors(t *testing.T) {
 	}
 }
 
-func TestCodexTurnStateKeeperSurvivesExecutorReplacement(t *testing.T) {
+func TestCodexEgressManagerSurvivesExecutorReplacement(t *testing.T) {
 	service := &Service{cfg: &config.Config{}, coreManager: coreauth.NewManager(nil, nil, nil)}
 	auth := &coreauth.Auth{ID: "codex", Provider: "codex"}
 	service.registerExecutorForAuth(auth, false)
-	keeper := service.codexTurnStates
+	keeper := service.codexEgress
 	defer keeper.Close()
 	initial, _ := service.coreManager.Executor("codex")
 	service.cfg = &config.Config{}
-	service.cfg.Routing.CodexTurnStateEnabled = new(true)
 	service.registerExecutorForAuth(auth, true)
 	replacement, _ := service.coreManager.Executor("codex")
 	if replacement == initial {
 		t.Fatal("executor was not replaced")
 	}
-	if replacement.(*runtimeexecutor.CodexAutoExecutor).CodexTurnStateKeeper() != keeper {
-		t.Fatal("config reload lost the service-owned keeper")
+	if replacement.(*runtimeexecutor.CodexAutoExecutor).CodexEgressManager() != keeper {
+		t.Fatal("config reload lost the service-owned egress manager")
 	}
 	service.cfg = &config.Config{}
-	service.cfg.Routing.CodexTurnStateEnabled = new(false)
 	service.registerAvailableExecutors(t.Context(), executorRegistrationOptions{})
-	if len(keeper.Snapshot()) != 0 {
-		t.Fatal("disabled keeper retained cached state")
+	if len(keeper.StaticISPBindings()) != 0 {
+		t.Fatal("disabled static ISP retained proxy bindings")
+	}
+}
+
+func TestCodexStaticISPUsesDedicatedRuntimeDirectory(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.Routing.CodexStaticISP = &internalconfig.CodexStaticISPConfig{Enabled: true, Nodes: []internalconfig.StaticISPNode{{ID: "isp-a", Host: "proxy.test", Port: 1080, Username: "u", Password: "p"}}}
+	service := &Service{cfg: cfg, configPath: filepath.Join(dir, "config.yaml"), coreManager: coreauth.NewManager(nil, nil, nil)}
+	auth := &coreauth.Auth{ID: "codex-a", Provider: "codex", Metadata: map[string]any{"access_token": "synthetic", "account_id": "a"}}
+	service.registerExecutorForAuth(auth, false)
+	t.Cleanup(service.codexEgress.Close)
+	if _, err := service.codexEgress.BindEgress(auth); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "runtime", "codex-static-isp-bindings.json")); err != nil {
+		t.Fatalf("binding snapshot must live in the dedicated runtime directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "codex-static-isp-bindings.json")); !os.IsNotExist(err) {
+		t.Fatal("binding snapshot was written to the protected installation directory")
 	}
 }
 

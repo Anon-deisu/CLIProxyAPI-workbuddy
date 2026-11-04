@@ -88,6 +88,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	if errRestore := cfg.restoreAccountScheduling(); errRestore != nil {
+		return nil, errRestore
+	}
 	cfg.CredentialConcurrency = cfg.CredentialConcurrency.WithDefaults()
 	if errValidate := cfg.CredentialInFlight.Validate(); errValidate != nil {
 		return nil, errValidate
@@ -95,22 +98,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if errValidate := cfg.Codex.LiveMediaRelay.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
-	if errValidate := cfg.ValidateCredentialWeights(); errValidate != nil {
+	if errValidate := cfg.Codex.QuotaRefresh.Validate(); errValidate != nil {
 		return nil, errValidate
 	}
-
-	// Hash remote management key if plaintext is detected (nested)
-	// We consider a value to be already hashed if it looks like a bcrypt hash ($2a$, $2b$, or $2y$ prefix).
-	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
-		hashed, errHash := hashSecret(cfg.RemoteManagement.SecretKey)
-		if errHash != nil {
-			return nil, fmt.Errorf("failed to hash remote management key: %w", errHash)
-		}
-		cfg.RemoteManagement.SecretKey = hashed
-
-		// Persist the hashed value back to the config file to avoid re-hashing on next startup.
-		// Preserve YAML comments and ordering; update only the nested key.
-		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, []string{"remote-management", "secret-key"}, hashed)
+	if errValidate := cfg.ValidateCredentialWeights(); errValidate != nil {
+		return nil, errValidate
 	}
 
 	cfg.RemoteManagement.PanelGitHubRepository = strings.TrimSpace(cfg.RemoteManagement.PanelGitHubRepository)
@@ -162,6 +154,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize xAI keys: drop entries without base-url
 	cfg.SanitizeXAIKeys()
 
+	// Sanitize Meta API keys and apply its default endpoint.
+	cfg.SanitizeMetaKeys()
+
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 	cfg.SanitizeCodexRoutingHint()
@@ -184,9 +179,33 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize global OAuth request-scoped error rules.
 	cfg.SanitizeOAuthRequestScopedErrors()
 
+	// Normalize global OAuth model settings.
+	cfg.SanitizeOAuthSettings()
+
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
-	// Return the populated configuration struct.
+	// Complete layout cleanup before writing the hash so it cannot restore plaintext.
+	if normalized, changed, errNormalize := NormalizeConfigLayout(data, false); errNormalize != nil {
+		return nil, fmt.Errorf("normalize configuration layout: %w", errNormalize)
+	} else if changed {
+		if errWrite := os.WriteFile(configFile, normalized, 0600); errWrite != nil {
+			return nil, fmt.Errorf("remove conflicting legacy configuration fields: %w", errWrite)
+		}
+		data = normalized
+	}
+	if cfg.RemoteManagement.SecretKey != "" && !looksLikeBcrypt(cfg.RemoteManagement.SecretKey) {
+		hashed, errHash := hashSecret(cfg.RemoteManagement.SecretKey)
+		if errHash != nil {
+			return nil, fmt.Errorf("failed to hash remote management key: %w", errHash)
+		}
+		cfg.RemoteManagement.SecretKey = hashed
+		secretPath := []string{"remote-management", "secret-key"}
+		var source yaml.Node
+		if yaml.Unmarshal(data, &source) == nil && len(source.Content) > 0 && yamlPath(expandConfigAliases(source.Content[0]), "management.secret-key") != nil {
+			secretPath[0] = "management"
+		}
+		_ = SaveConfigPreserveCommentsUpdateNestedScalar(configFile, secretPath, hashed)
+	}
 	return &cfg, nil
 }

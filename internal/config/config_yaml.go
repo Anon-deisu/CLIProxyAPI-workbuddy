@@ -11,9 +11,9 @@ import (
 
 // SaveConfigPreserveComments writes the config back to YAML while preserving existing comments
 // and key ordering by loading the original file into a yaml.Node tree and updating values in-place.
-func SaveConfigPreserveComments(configFile string, cfg *Config) error {
+func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...bool) error {
 	persistCfg := cfg
-	// Load original YAML as a node tree to preserve comments and ordering.
+	migrating := len(migrateV8) > 0 && migrateV8[0]
 	data, err := os.ReadFile(configFile)
 	if err != nil {
 		return err
@@ -23,15 +23,20 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if err = yaml.Unmarshal(data, &original); err != nil {
 		return err
 	}
-	if original.Kind != yaml.DocumentNode || len(original.Content) == 0 {
+	if original.Kind != yaml.DocumentNode || len(original.Content) == 0 || original.Content[0] == nil || original.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("invalid yaml document structure")
 	}
-	if original.Content[0] == nil || original.Content[0].Kind != yaml.MappingNode {
-		return fmt.Errorf("expected root mapping node")
+	layout := deepCopyNode(original.Content[0])
+	flat, err := flattenV8(layout)
+	if err != nil {
+		return err
 	}
+	original.Content[0] = flat
+	layout = expandConfigAliases(layout)
+	removeRetiredCodexSettings(original.Content[0])
+	removeRetiredCodexSettings(layout)
 
-	// Marshal the current cfg to YAML, then unmarshal to a yaml.Node we can merge from.
-	rendered, err := yaml.Marshal(persistCfg)
+	rendered, err := yaml.Marshal((*legacyConfig)(persistCfg))
 	if err != nil {
 		return err
 	}
@@ -39,34 +44,27 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	if err = yaml.Unmarshal(rendered, &generated); err != nil {
 		return err
 	}
-	if generated.Kind != yaml.DocumentNode || len(generated.Content) == 0 || generated.Content[0] == nil {
+	if generated.Kind != yaml.DocumentNode || len(generated.Content) == 0 || generated.Content[0] == nil || generated.Content[0].Kind != yaml.MappingNode {
 		return fmt.Errorf("invalid generated yaml structure")
 	}
-	if generated.Content[0].Kind != yaml.MappingNode {
-		return fmt.Errorf("expected generated root mapping node")
+
+	if !migrating {
+		removeLegacyAuthBlock(original.Content[0])
+		removeRemovedIntegrationKeys(original.Content[0])
+		removeLegacyGenerativeLanguageKeys(original.Content[0])
 	}
-
-	// Remove deprecated sections before merging back the sanitized config.
-	removeLegacyAuthBlock(original.Content[0])
 	removeLegacyOpenAICompatAPIKeys(original.Content[0])
-	removeRemovedIntegrationKeys(original.Content[0])
-	removeLegacyGenerativeLanguageKeys(original.Content[0])
-
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-request-scoped-errors")
+	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-settings")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "plugins", "configs")
-
-	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
-	normalizeCollectionNodeStyles(original.Content[0])
-
-	// Write back.
-	f, err := os.Create(configFile)
-	if err != nil {
+	if err = restoreV8Layout(original.Content[0], layout, data, generated.Content[0]); err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
+	normalizeCollectionNodeStyles(original.Content[0])
+
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
@@ -78,8 +76,53 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 		return err
 	}
 	data = NormalizeCommentIndentation(buf.Bytes())
-	_, err = f.Write(data)
-	return err
+	var migrated *Config
+	if migrating {
+		data, _, err = NormalizeConfigLayout(data, true)
+		if err != nil {
+			return err
+		}
+		migrated = new(Config)
+		if err = yaml.Unmarshal(data, migrated); err != nil {
+			return fmt.Errorf("decode migrated config: %w", err)
+		}
+	}
+	if cfg.AccountScheduling != nil && cfg.AccountScheduling.CodexStaticISP != nil && len(cfg.AccountScheduling.CodexStaticISP.Nodes) > 0 {
+		if errMode := os.Chmod(configFile, 0600); errMode != nil {
+			return fmt.Errorf("protect static ISP config: %w", errMode)
+		}
+	}
+	if err = os.WriteFile(configFile, data, 0600); err != nil {
+		return err
+	}
+	if migrated != nil {
+		cfg.OAuthOnlyFields = migrated.OAuthOnlyFields
+	}
+	return nil
+}
+
+func removeRetiredCodexSettings(root *yaml.Node) {
+	for _, group := range []struct {
+		name string
+		keys []string
+	}{
+		{"account-scheduling", []string{"codex-turn-state-enabled", "codex-auto-degrade", "codex-excel-routing-enabled", "codex-excel-disable-fallback", "codex-state-cliproxy"}},
+		{"codex", []string{"turn-state-probe-model"}},
+	} {
+		index := findMapKeyIndex(root, group.name)
+		if index < 0 {
+			continue
+		}
+		section := root.Content[index+1]
+		if section.Kind != yaml.MappingNode {
+			continue
+		}
+		for _, key := range group.keys {
+			if at := findMapKeyIndex(section, key); at >= 0 {
+				section.Content = append(section.Content[:at], section.Content[at+2:]...)
+			}
+		}
+	}
 }
 
 // SaveConfigPreserveCommentsUpdateNestedScalar updates a nested scalar key path like ["a","b"]
@@ -312,6 +355,10 @@ func appendPath(path []string, key string) []string {
 // represents a known default value that should not be written to the config file.
 // This prevents non-zero defaults from polluting the config.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
+	// Saved panel overrides must retain explicit zero, false, empty and null values.
+	if len(path) > 0 && path[0] == "account-scheduling" {
+		return false
+	}
 	// Weight is pointer-backed, so an explicit zero is meaningful and must be preserved.
 	if len(path) > 0 && path[len(path)-1] == "weight" && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!int" {
 		return false
@@ -691,7 +738,7 @@ func pruneMappingToGeneratedKeys(dstRoot, srcRoot *yaml.Node, keyPath ...string)
 		// Keep an explicit empty mapping for oauth-model-alias and oauth-request-scoped-errors when previously present.
 		// When users delete the last channel via the management API,
 		// we want that deletion to persist across hot reloads and restarts.
-		if key == "oauth-model-alias" || key == "oauth-request-scoped-errors" {
+		if key == "oauth-excluded-models" || key == "oauth-model-alias" || key == "oauth-request-scoped-errors" || key == "oauth-settings" {
 			dstRoot.Content[dstIdx+1] = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 			return
 		}

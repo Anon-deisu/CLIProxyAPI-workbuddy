@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"sort"
 	"strconv"
@@ -13,12 +15,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
 	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/client/grokbuild"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -52,6 +56,7 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/management-agent/:asset", s.serveAgentWorkspaceAsset)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
@@ -63,8 +68,8 @@ func (s *Server) setupRoutes() {
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
-		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
-		v1.POST("/completions", openaiHandlers.Completions)
+		v1.POST("/chat/completions", s.fakeModelHandler("chat", openaiHandlers.ChatCompletions))
+		v1.POST("/completions", s.fakeModelHandler("completion", openaiHandlers.Completions))
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
 		v1.POST("/images/edits", openaiHandlers.ImagesEdits)
 		v1.POST("/videos", openaiHandlers.XAIVideosGenerations)
@@ -75,7 +80,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
-		v1.POST("/responses", openaiResponsesHandlers.Responses)
+		v1.POST("/responses", s.fakeModelHandler("responses", openaiResponsesHandlers.Responses))
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		v1.POST("/alpha/search", s.codexAlphaSearch)
 		v1.POST("/live", s.codexLiveHandler.Handle)
@@ -112,7 +117,7 @@ func (s *Server) setupRoutes() {
 	codexDirect.Use(AuthMiddleware(s.accessManager))
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
-		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
+		codexDirect.POST("/responses", s.fakeModelHandler("responses", openaiResponsesHandlers.Responses))
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		codexDirect.POST("/alpha/search", s.codexAlphaSearch)
 	}
@@ -183,6 +188,27 @@ func (s *Server) setupRoutes() {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
+
+	devinCallbackHandler := func(c *gin.Context) {
+		code := c.Query("code")
+		state := c.Query("state")
+		errStr := c.Query("error")
+		if errStr == "" {
+			errStr = c.Query("error_description")
+		}
+		if state == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
+			return
+		}
+		if _, errWrite := managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "devin", state, code, errStr); errWrite != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
+			return
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	}
+	s.engine.GET("/callback", devinCallbackHandler)
+	s.engine.GET("/devin/callback", devinCallbackHandler)
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
@@ -578,7 +604,8 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 				s.handleHomeCodexClientModels(c, clientVersion)
 				return
 			}
-			openaiHandler.OpenAIModels(c)
+			models := s.appendFakeModels(openaiHandler.Models())
+			c.JSON(http.StatusOK, codexmodels.BuildResponseForClient(models, registry.GetGlobalRegistry().GetModelProviders, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
 			return
 		}
 
@@ -591,7 +618,21 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 		if isAnthropicModelsRequest(c) {
 			claudeHandler.ClaudeModels(c)
 		} else {
-			openaiHandler.OpenAIModels(c)
+			if len(s.configuredFakeModels()) == 0 {
+				openaiHandler.OpenAIModels(c)
+				return
+			}
+			models := make([]map[string]any, 0)
+			for _, model := range openaiHandler.Models() {
+				entry := map[string]any{"id": model["id"], "object": model["object"]}
+				for _, key := range []string{"created", "owned_by"} {
+					if value, exists := model[key]; exists {
+						entry[key] = value
+					}
+				}
+				models = append(models, entry)
+			}
+			c.JSON(http.StatusOK, gin.H{"object": "list", "data": s.appendFakeModels(models)})
 		}
 	}
 }
@@ -654,7 +695,7 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context, clientVersion strin
 		models = append(models, formatHomeCodexModel(entry))
 	}
 
-	c.JSON(http.StatusOK, codexmodels.BuildResponseForClient(models, nil, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
+	c.JSON(http.StatusOK, codexmodels.BuildResponseForClient(s.appendFakeModels(models), nil, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
 }
 
 func formatHomeCodexModel(entry homeModelEntry) map[string]any {
@@ -744,10 +785,230 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		}
 		filtered = append(filtered, model)
 	}
+	filtered = s.appendFakeModels(filtered)
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
 		"data":   filtered,
 	})
+}
+
+func (s *Server) configuredFakeModels() []config.FakeModelConfig {
+	models, _ := s.fakeModels.Load().([]config.FakeModelConfig)
+	return models
+}
+
+func (s *Server) appendFakeModels(models []map[string]any) []map[string]any {
+	for _, fake := range s.configuredFakeModels() {
+		entry := map[string]any{"id": fake.Name, "object": "model", "owned_by": "local"}
+		found := false
+		for i, model := range models {
+			if model["id"] == fake.Name {
+				models[i] = entry
+				found = true
+				break
+			}
+		}
+		if !found {
+			models = append(models, entry)
+		}
+	}
+	return models
+}
+
+func (s *Server) fakeModelHandler(format string, next gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		models := s.configuredFakeModels()
+		if len(models) == 0 {
+			next(c)
+			return
+		}
+		body, errRead := handlers.ReadRequestBody(c)
+		if errRead != nil {
+			c.JSON(http.StatusBadRequest, handlers.ErrorResponse{Error: handlers.ErrorDetail{Message: errRead.Error(), Type: "invalid_request_error"}})
+			return
+		}
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		c.Request.Header.Del("Content-Encoding")
+		c.Request.ContentLength = int64(len(body))
+		var request struct {
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
+		}
+		if json.Unmarshal(body, &request) != nil {
+			next(c)
+			return
+		}
+		for _, fake := range models {
+			if fake.Name == request.Model {
+				s.writeFakeModel(c, format, fake, request.Stream)
+				return
+			}
+		}
+		next(c)
+	}
+}
+
+func fakeModelUsage(fake config.FakeModelConfig, responses bool) gin.H {
+	usage := gin.H{"total_tokens": fake.InputTokens + fake.OutputTokens}
+	if responses {
+		usage["input_tokens"] = fake.InputTokens
+		usage["output_tokens"] = fake.OutputTokens
+		usage["input_tokens_details"] = gin.H{"cached_tokens": fake.CacheReadTokens, "cache_write_tokens": fake.CacheWriteTokens}
+		return usage
+	}
+	usage["prompt_tokens"] = fake.InputTokens
+	usage["completion_tokens"] = fake.OutputTokens
+	usage["prompt_tokens_details"] = gin.H{"cached_tokens": fake.CacheReadTokens, "cache_write_tokens": fake.CacheWriteTokens}
+	return usage
+}
+
+func (s *Server) writeFakeModel(c *gin.Context, format string, fake config.FakeModelConfig, stream bool) {
+	created := time.Now().Unix()
+	id := "fake-" + uuid.NewString()
+	responses := fake.FixedResponses()
+	content := responses[rand.IntN(len(responses))]
+	if format == "responses" {
+		part := gin.H{"type": "output_text", "text": content, "annotations": []any{}}
+		item := gin.H{"id": "msg_" + id, "type": "message", "status": "completed", "role": "assistant", "content": []gin.H{part}}
+		response := gin.H{"id": "resp_" + id, "object": "response", "created_at": created, "status": "completed", "model": fake.Name, "output": []gin.H{item}, "usage": fakeModelUsage(fake, true), "error": nil, "incomplete_details": nil}
+		if !stream {
+			c.JSON(http.StatusOK, response)
+			return
+		}
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("X-Accel-Buffering", "no")
+		c.Status(http.StatusOK)
+		initial := gin.H{"id": response["id"], "object": "response", "created_at": created, "status": "in_progress", "model": fake.Name, "output": []any{}}
+		sequence := 0
+		emit := func(event gin.H) error {
+			event["sequence_number"] = sequence
+			sequence++
+			return writeFakeSSE(c, event["type"].(string), event)
+		}
+		for _, event := range []gin.H{
+			{"type": "response.created", "response": initial},
+			{"type": "response.output_item.added", "output_index": 0, "item": gin.H{"id": item["id"], "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}},
+			{"type": "response.content_part.added", "item_id": item["id"], "output_index": 0, "content_index": 0, "part": gin.H{"type": "output_text", "text": "", "annotations": []any{}}},
+		} {
+			if errWrite := emit(event); errWrite != nil {
+				return
+			}
+		}
+		if errStream := streamFakeModelText(c.Request.Context(), content, fake.CharsPerSecond, func(text string) error {
+			return emit(gin.H{"type": "response.output_text.delta", "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": text})
+		}); errStream != nil {
+			return
+		}
+		for _, event := range []gin.H{
+			{"type": "response.output_text.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "text": content},
+			{"type": "response.content_part.done", "item_id": item["id"], "output_index": 0, "content_index": 0, "part": part},
+			{"type": "response.output_item.done", "output_index": 0, "item": item},
+			{"type": "response.completed", "response": response},
+		} {
+			if errWrite := emit(event); errWrite != nil {
+				return
+			}
+		}
+		return
+	}
+	object := "chat.completion"
+	choice := gin.H{"index": 0, "message": gin.H{"role": "assistant", "content": content}, "finish_reason": "stop"}
+	if format == "completion" {
+		object = "text_completion"
+		choice = gin.H{"index": 0, "text": content, "finish_reason": "stop"}
+	}
+	result := gin.H{"id": id, "object": object, "created": created, "model": fake.Name, "choices": []gin.H{choice}, "usage": fakeModelUsage(fake, false)}
+	if !stream {
+		c.JSON(http.StatusOK, result)
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	chunk := gin.H{"id": id, "object": object + ".chunk", "created": created, "model": fake.Name}
+	if format == "completion" {
+		chunk["object"] = object
+	} else {
+		chunk["choices"] = []gin.H{{"index": 0, "delta": gin.H{"role": "assistant"}, "finish_reason": nil}}
+		if errWrite := writeFakeSSE(c, "", chunk); errWrite != nil {
+			return
+		}
+	}
+	if errStream := streamFakeModelText(c.Request.Context(), content, fake.CharsPerSecond, func(text string) error {
+		if format == "completion" {
+			chunk["choices"] = []gin.H{{"index": 0, "text": text, "finish_reason": nil}}
+		} else {
+			chunk["choices"] = []gin.H{{"index": 0, "delta": gin.H{"content": text}, "finish_reason": nil}}
+		}
+		return writeFakeSSE(c, "", chunk)
+	}); errStream != nil {
+		return
+	}
+	chunk["choices"] = []gin.H{{"index": 0, "text": "", "finish_reason": "stop"}}
+	if format != "completion" {
+		chunk["choices"] = []gin.H{{"index": 0, "delta": gin.H{}, "finish_reason": "stop"}}
+	}
+	if errWrite := writeFakeSSE(c, "", chunk); errWrite != nil {
+		return
+	}
+	chunk["choices"] = []any{}
+	chunk["usage"] = fakeModelUsage(fake, false)
+	if errWrite := writeFakeSSE(c, "", chunk); errWrite != nil {
+		return
+	}
+	_, _ = c.Writer.WriteString("data: [DONE]\n\n")
+}
+
+// streamFakeModelText paces Unicode characters in batches of roughly 100ms.
+func streamFakeModelText(ctx context.Context, content string, rate int, emit func(string) error) error {
+	if errContext := ctx.Err(); errContext != nil {
+		return errContext
+	}
+	if rate == 0 {
+		return emit(content)
+	}
+	runes := []rune(content)
+	const framesPerSecond = 10
+	chunkSize := max(1, rate/framesPerSecond)
+	started := time.Now()
+	for offset := 0; offset < len(runes); {
+		end := min(len(runes), offset+chunkSize)
+		deadline := started.Add(time.Duration(float64(time.Second) * float64(end) / float64(rate)))
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if errContext := ctx.Err(); errContext != nil {
+			return errContext
+		}
+		if errWrite := emit(string(runes[offset:end])); errWrite != nil {
+			return errWrite
+		}
+		offset = end
+	}
+	return nil
+}
+
+func writeFakeSSE(c *gin.Context, event string, payload gin.H) error {
+	if errContext := c.Request.Context().Err(); errContext != nil {
+		return errContext
+	}
+	data, _ := json.Marshal(payload)
+	if event != "" {
+		if _, errWrite := fmt.Fprintf(c.Writer, "event: %s\n", event); errWrite != nil {
+			return errWrite
+		}
+	}
+	if _, errWrite := fmt.Fprintf(c.Writer, "data: %s\n\n", data); errWrite != nil {
+		return errWrite
+	}
+	c.Writer.Flush()
+	return nil
 }
 
 func formatHomeClaudeModels(entries []homeModelEntry) []map[string]any {

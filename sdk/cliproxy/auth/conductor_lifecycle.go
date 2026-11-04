@@ -201,52 +201,6 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return m.updateInternal(ctx, nil, auth, updateModeReplace)
 }
 
-// ApplyCodexStateScheduling changes only pool membership on the latest credential snapshot.
-// Disabled/replaced accounts and observations superseded by a manual pool change are ignored.
-func (m *Manager) ApplyCodexStateScheduling(ctx context.Context, observed *Auth, degraded bool) error {
-	m.mu.Lock()
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if ctx.Err() != nil || cfg == nil || cfg.Home.Enabled || cfg.Routing.CodexTurnStateEnabled == nil || !*cfg.Routing.CodexTurnStateEnabled || cfg.Routing.CodexAutoDegrade == nil || !*cfg.Routing.CodexAutoDegrade {
-		m.mu.Unlock()
-		return nil
-	}
-	current := m.auths[observed.ID]
-	if current == nil || current.IsDispatchDisabled() || current.Provider != "codex" || current.AuthKind() != AuthKindOAuth || current.RegistrationEpoch != observed.RegistrationEpoch || current.IsDegraded() != observed.IsDegraded() {
-		m.mu.Unlock()
-		return nil
-	}
-	for _, key := range []string{"account_id", "chatgpt_account_id", "access_token", "plan_type", "chatgpt_plan_type"} {
-		if authMetadataString(current, key) != authMetadataString(observed, key) {
-			m.mu.Unlock()
-			return nil
-		}
-	}
-	if authAttribute(current, "base_url") != authAttribute(observed, "base_url") || authAttribute(current, "plan_type") != authAttribute(observed, "plan_type") {
-		m.mu.Unlock()
-		return nil
-	}
-	updated := current.Clone()
-	changed := current.IsDegraded() != degraded
-	if changed {
-		updated.Metadata["degraded"] = degraded
-		updated.Generation++
-		updated.UpdatedAt = time.Now()
-		m.auths[updated.ID] = updated.Clone()
-	}
-	m.mu.Unlock()
-	if changed {
-		if m.scheduler != nil {
-			m.scheduler.upsertAuth(updated.Clone())
-		}
-		m.invalidateSessionAffinity(updated.ID)
-		m.hook.OnAuthUpdated(ctx, updated.Clone())
-	}
-	if errPersist := m.persist(ctx, updated); errPersist != nil {
-		return fmt.Errorf("persist automatic account pool: %w", errPersist)
-	}
-	return nil
-}
-
 func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode updateAuthMode) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
@@ -254,6 +208,10 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	NormalizeCredentialMetadata(auth.Metadata)
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, fmt.Errorf("update auth: %w", errWeight)
+	}
+	var quotaRecovery *quotaRefreshRecovery
+	if mode == updateModeRefresh && ctx != nil {
+		quotaRecovery, _ = ctx.Value(quotaRefreshRecoveryKey{}).(*quotaRefreshRecovery)
 	}
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
@@ -271,8 +229,24 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		m.mu.Unlock()
 		return nil, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
 	}
+	if quotaRecovery != nil && (!quotaRefreshCredentialMatches(existing, base) || !quotaRefreshAccountMatches(auth, base) || authAccessToken(auth) == "") {
+		// Validate under the same lock as the token-priority three-way merge.
+		// A canceled probe may save a completed rotation, but never replace a
+		// deleted/re-registered account or credentials changed in the meantime.
+		m.mu.Unlock()
+		return nil, fmt.Errorf("update auth: quota recovery credential identity changed")
+	}
 	if mode == updateModeRefresh {
-		merged := MergeRefreshedAuth(base, existing, auth)
+		var merged *Auth
+		if quotaRecovery != nil {
+			// Preserve current disable, health, model cooldown and quota state.
+			// Polling recovery commits credentials and their refresh timestamps.
+			merged = MergePreparedAuth(base, existing, auth)
+			merged.LastRefreshedAt = auth.LastRefreshedAt
+			merged.NextRefreshAfter = auth.NextRefreshAfter
+		} else {
+			merged = MergeRefreshedAuth(base, existing, auth)
+		}
 		if merged != nil {
 			auth = merged
 			NormalizeCredentialMetadata(auth.Metadata)
@@ -306,6 +280,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	auth.Success = existing.Success
 	auth.Failed = existing.Failed
 	auth.recentRequests = existing.recentRequests
+	auth.recentModelRequests = existing.recentModelRequests
 	if strings.EqualFold(auth.Provider, "codex") && strings.EqualFold(existing.Provider, "codex") {
 		// Auth-file reloads and token refreshes cannot erase a runtime quota gate.
 		auth.CodexQuotaResumeAt = existing.CodexQuotaResumeAt
@@ -315,6 +290,15 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 			auth.AutoDisabledAt = existing.AutoDisabledAt
 			auth.StatusMessage = existing.StatusMessage
 		}
+	}
+	// Account bans survive token rotation; only an explicit enable clears the gate.
+	if shouldSkipPersist(ctx) && existing.AutoDisabled &&
+		(existing.AutoDisableReason == AutoDisableReasonUnauthorized && sameAuthCredential(existing, auth) ||
+			existing.AutoDisableReason == AutoDisableReasonAccountBanned && strings.EqualFold(existing.Provider, auth.Provider)) {
+		auth.AutoDisabled = true
+		auth.AutoDisableReason = existing.AutoDisableReason
+		auth.AutoDisabledAt = existing.AutoDisabledAt
+		auth.StatusMessage = existing.StatusMessage
 	}
 	if auth.Generation <= existing.Generation {
 		auth.Generation = existing.Generation + 1
@@ -337,7 +321,7 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 	now := time.Now()
 	auth.UpdatedAt = now
 	cooldownStateChanged := normalizeModelStates(auth)
-	if m.cooldownDisabledForAuth(auth) || auth.IsDispatchDisabled() {
+	if quotaRecovery == nil && (m.cooldownDisabledForAuth(auth) || auth.IsDispatchDisabled()) {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}
 	auth.EnsureIndex()
@@ -357,6 +341,22 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		m.persistCooldownStates(context.Background())
 	}
 	return auth.Clone(), nil
+}
+
+func sameAuthCredential(existing, updated *Auth) bool {
+	if existing == nil || updated == nil || !strings.EqualFold(existing.Provider, updated.Provider) {
+		return false
+	}
+
+	existingToken := authAccessToken(existing)
+	updatedToken := authAccessToken(updated)
+	if existingToken != "" || updatedToken != "" {
+		return existingToken != "" && existingToken == updatedToken
+	}
+
+	existingAPIKey := authAttribute(existing, AttributeAPIKey)
+	updatedAPIKey := authAttribute(updated, AttributeAPIKey)
+	return existingAPIKey != "" && existingAPIKey == updatedAPIKey
 }
 
 // Remove deletes an auth from runtime state without persisting.

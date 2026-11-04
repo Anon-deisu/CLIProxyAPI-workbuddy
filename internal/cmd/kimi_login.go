@@ -17,6 +17,15 @@ import (
 //   - cfg: The application configuration containing proxy and auth directory settings
 //   - options: Login options including browser behavior settings
 func DoKimiLogin(cfg *config.Config, options *LoginOptions) {
+	doKimiLogin(cfg, options, "kimi")
+}
+
+// DoKimiAILogin uses the independent Kimi.ai device authorization service.
+func DoKimiAILogin(cfg *config.Config, options *LoginOptions) {
+	doKimiLogin(cfg, options, "kimi-ai")
+}
+
+func doKimiLogin(cfg *config.Config, options *LoginOptions, provider string) {
 	if options == nil {
 		options = &LoginOptions{}
 	}
@@ -28,7 +37,7 @@ func DoKimiLogin(cfg *config.Config, options *LoginOptions) {
 		Prompt:    options.Prompt,
 	}
 
-	record, savedPath, err := manager.Login(context.Background(), "kimi", cfg, authOpts)
+	record, savedPath, err := manager.Login(context.Background(), provider, cfg, authOpts)
 	if err != nil {
 		log.Errorf("Kimi authentication failed: %v", err)
 		return

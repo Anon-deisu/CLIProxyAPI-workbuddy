@@ -1,11 +1,24 @@
 package common
 
 import (
+	"bytes"
+	"encoding/json"
 	"strconv"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// SetStringWithoutHTMLEscape preserves literal HTML characters in tool argument strings.
+func SetStringWithoutHTMLEscape(data []byte, path, value string) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if errEncode := encoder.Encode(value); errEncode != nil {
+		return nil, errEncode
+	}
+	return sjson.SetRawBytes(data, path, bytes.TrimSuffix(buffer.Bytes(), []byte("\n")))
+}
 
 func GeminiTokenCountJSON(count int64) []byte {
 	out := make([]byte, 0, 96)

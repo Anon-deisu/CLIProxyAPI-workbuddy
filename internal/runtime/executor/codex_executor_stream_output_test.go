@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -392,6 +394,50 @@ func TestCodexExecutorTransportFailureBeforeTerminalIsRequestScoped(t *testing.T
 	}
 }
 
+func TestCodexExecutorExecuteStreamPreservesHTTPStatusOnBodyReadError(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusBadRequest, http.StatusBadGateway} {
+		for _, body := range []struct {
+			name string
+			data string
+		}{
+			{name: "empty"},
+			{name: "error body", data: `{"error":{"message":"Upstream rejected request."}}`},
+			{name: "truncated JSON", data: `{"error":{"message":"Upstream rejected`},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", status, body.name), func(t *testing.T) {
+				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: status,
+						Header:     http.Header{"Content-Type": {"application/json"}},
+						Body:       io.NopCloser(io.MultiReader(strings.NewReader(body.data), unexpectedEOFReader{})),
+						Request:    req,
+					}, nil
+				}))
+				executor := NewCodexExecutor(&config.Config{})
+				auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "http://codex.test", "api_key": "test"}}
+				result, err := executor.ExecuteStream(ctx, auth,
+					cliproxyexecutor.Request{Model: "gpt-5.5", Payload: []byte(`{"model":"gpt-5.5","input":"hello"}`)},
+					cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: true})
+				if result != nil {
+					t.Fatal("HTTP rejection unexpectedly returned a stream")
+				}
+				if got := statusCodeFromTestError(t, err); got != status {
+					t.Fatalf("status code = %d, want %d; err=%v", got, status, err)
+				}
+				if body.data != "" && !strings.Contains(err.Error(), "Upstream rejected") {
+					t.Fatalf("error lost the partially read upstream body: %v", err)
+				}
+				if status == http.StatusUnauthorized {
+					assertCodexErrorCode(t, err.Error(), "authentication_error", "auth_unavailable")
+					if clienterror.IsRequestFault(status, err) {
+						t.Fatalf("authentication failure must not be request-scoped: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestCodexExecutorExecuteIgnoresTransportErrorAfterCompletion(t *testing.T) {
 	completed := []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
@@ -567,6 +613,46 @@ func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 			wantStatus: http.StatusUnauthorized,
 		},
 		{
+			name:       "authentication type without status or code",
+			event:      `{"type":"error","error":{"type":"authentication_error","message":"Credential rejected."}}`,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "invalid API key without status",
+			event:      `{"type":"error","error":{"type":"invalid_request_error","code":"invalid_api_key","message":"Credential rejected."}}`,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "top-level bad request status",
+			event:      `{"type":"error","status":400,"error":{"message":"Invalid input.","param":"input"}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "nested status takes precedence",
+			event:      `{"type":"error","status":401,"error":{"status_code":400,"type":"invalid_request_error","code":"invalid_value","message":"Invalid input."}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "invalid nested status falls back to envelope",
+			event:      `{"type":"error","status_code":401,"error":{"status":"failed","message":"Credential rejected."}}`,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "status without error details",
+			event:      `{"type":"response.failed","status_code":401}`,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "success status is not an error status",
+			event:      `{"type":"error","status":200,"error":{"message":"Upstream failed."}}`,
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name:       "out-of-range status is ignored",
+			event:      `{"type":"error","status_code":600,"error":{"message":"Upstream failed."}}`,
+			wantStatus: http.StatusBadGateway,
+		},
+		{
 			name:       "rate limit",
 			event:      `{"type":"error","error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"Rate limit reached."}}`,
 			wantStatus: http.StatusTooManyRequests,
@@ -599,7 +685,57 @@ func TestCodexTerminalFailureErrClassifiesStatus(t *testing.T) {
 			if got := streamErr.StatusCode(); got != tc.wantStatus {
 				t.Fatalf("status code = %d, want %d; err=%v", got, tc.wantStatus, streamErr)
 			}
+			if tc.wantStatus == http.StatusUnauthorized {
+				assertCodexErrorCode(t, streamErr.Error(), "authentication_error", "auth_unavailable")
+				if clienterror.IsRequestFault(streamErr.StatusCode(), streamErr) {
+					t.Fatalf("authentication failure must not be request-scoped: %v", streamErr)
+				}
+			}
 		})
+	}
+}
+
+func TestCodexTerminalFailureErrAuthenticationStatusLayouts(t *testing.T) {
+	for _, layout := range []struct {
+		name  string
+		event string
+	}{
+		{"error status", `{"type":"error","status":401,"error":{%s}}`},
+		{"error status_code", `{"type":"error","status_code":401,"error":{%s}}`},
+		{"error string status_code", `{"type":"error","status_code":"401","error":{%s}}`},
+		{"failed status", `{"type":"response.failed","status":401,"response":{"status":"failed","error":{%s}}}`},
+		{"failed status_code", `{"type":"response.failed","status_code":401,"response":{"status":"failed","error":{%s}}}`},
+		{"nested error status", `{"type":"error","error":{"status":401,%s}}`},
+		{"nested error status_code", `{"type":"error","error":{"status_code":401,%s}}`},
+		{"nested failed status", `{"type":"response.failed","response":{"status":"failed","error":{"status":401,%s}}}`},
+		{"nested failed status_code", `{"type":"response.failed","response":{"status":"failed","error":{"status_code":401,%s}}}`},
+	} {
+		for _, failure := range []struct {
+			name   string
+			fields string
+		}{
+			{"status only", `"message":"Credential rejected."`},
+			{"authentication type", `"type":"authentication_error","message":"Credential rejected."`},
+			{"invalid API key", `"type":"invalid_request_error","code":"invalid_api_key","message":"Credential rejected."`},
+		} {
+			t.Run(layout.name+"/"+failure.name, func(t *testing.T) {
+				event := []byte(fmt.Sprintf(layout.event, failure.fields))
+				streamErr, _, ok := codexTerminalFailureErr(event)
+				if !ok {
+					t.Fatal("expected terminal authentication failure")
+				}
+				if got := streamErr.StatusCode(); got != http.StatusUnauthorized {
+					t.Errorf("status code = %d, want 401; err=%v", got, streamErr)
+				}
+				assertCodexErrorCode(t, streamErr.Error(), "authentication_error", "auth_unavailable")
+				if got := gjson.Get(streamErr.Error(), "error.message").String(); got != "Credential rejected." {
+					t.Errorf("error message = %q, want upstream message", got)
+				}
+				if clienterror.IsRequestFault(streamErr.StatusCode(), streamErr) {
+					t.Errorf("authentication failure must not be request-scoped: %v", streamErr)
+				}
+			})
+		}
 	}
 }
 

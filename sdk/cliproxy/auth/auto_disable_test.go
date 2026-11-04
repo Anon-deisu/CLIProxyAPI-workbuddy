@@ -48,6 +48,122 @@ func TestManagerAutoDisablesUnauthorizedAuthInMemory(t *testing.T) {
 	}
 }
 
+func TestManagerAutoDisablesUnauthorizedSurvivesSameTokenReloadAndExplicitEnable(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+	cfg := &internalconfig.Config{}
+	cfg.Routing.AutoDisableUnauthorized = true
+	manager.SetConfig(cfg)
+	auth := &Auth{
+		ID:       "auth-401-reload",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "same-token"},
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	if _, errPick := manager.SelectAuth(t.Context(), "codex", "gpt-5", cliproxyexecutor.Options{}); errPick != nil {
+		t.Fatalf("auth was not selectable before unauthorized result: %v", errPick)
+	}
+
+	manager.MarkResult(t.Context(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5",
+		Error:    &Error{HTTPStatus: http.StatusUnauthorized, Code: "auth_unavailable", Message: "token expired"},
+	})
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil || !updated.AutoDisabled || updated.AutoDisableReason != AutoDisableReasonUnauthorized {
+		t.Fatalf("unauthorized auto-disable state = %+v", updated)
+	}
+	if _, errPick := manager.SelectAuth(t.Context(), "codex", "gpt-5", cliproxyexecutor.Options{}); errPick == nil {
+		t.Fatal("automatically disabled auth was selected after unauthorized result")
+	}
+
+	if _, errUpdate := manager.Update(WithSkipPersist(t.Context()), &Auth{
+		ID:       auth.ID,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "same-token"},
+	}); errUpdate != nil {
+		t.Fatalf("reload auth: %v", errUpdate)
+	}
+	updated, ok = manager.GetByID(auth.ID)
+	if !ok || updated == nil || !updated.AutoDisabled || updated.AutoDisableReason != AutoDisableReasonUnauthorized {
+		t.Fatalf("reload erased unauthorized auto-disable state = %+v", updated)
+	}
+	if _, errPick := manager.SelectAuth(t.Context(), "codex", "gpt-5", cliproxyexecutor.Options{}); errPick == nil {
+		t.Fatal("same-token reload made unauthorized auth selectable")
+	}
+
+	// This models the management enable action: it explicitly clears the runtime gate.
+	enabled := updated.Clone()
+	enabled.ClearAutoDisabled()
+	enabled.Disabled = false
+	enabled.Status = StatusActive
+	if _, errUpdate := manager.Update(t.Context(), enabled); errUpdate != nil {
+		t.Fatalf("explicit enable: %v", errUpdate)
+	}
+	updated, ok = manager.GetByID(auth.ID)
+	if !ok || updated == nil || updated.AutoDisabled {
+		t.Fatalf("explicit enable did not clear unauthorized auto-disable: %+v", updated)
+	}
+	if _, errPick := manager.SelectAuth(t.Context(), "codex", "gpt-5", cliproxyexecutor.Options{}); errPick != nil {
+		t.Fatalf("explicitly enabled auth was not selectable: %v", errPick)
+	}
+}
+
+func TestManagerUnauthorizedAutoDisableClearsOnSameIDCredentialReplacement(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+	cfg := &internalconfig.Config{}
+	cfg.Routing.AutoDisableUnauthorized = true
+	manager.SetConfig(cfg)
+	auth := &Auth{
+		ID:       "auth-401-replaced-token",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "old-token"},
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, errRegister := manager.Register(t.Context(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	manager.MarkResult(t.Context(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5",
+		Error:    &Error{HTTPStatus: http.StatusUnauthorized, Code: "auth_unavailable", Message: "token expired"},
+	})
+
+	if _, errUpdate := manager.Update(WithSkipPersist(t.Context()), &Auth{
+		ID:       auth.ID,
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"access_token": "new-token"},
+	}); errUpdate != nil {
+		t.Fatalf("replace credential: %v", errUpdate)
+	}
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("replaced auth was not retained")
+	}
+	if updated.AutoDisabled {
+		t.Fatalf("credential replacement inherited unauthorized auto-disable: %+v", updated)
+	}
+	if _, errPick := manager.SelectAuth(t.Context(), "codex", "gpt-5", cliproxyexecutor.Options{}); errPick != nil {
+		t.Fatalf("replacement credential was not selectable: %v", errPick)
+	}
+}
+
 func TestManagerAutoDisablesQuotaFromResponseSignal(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	cfg := &internalconfig.Config{}
@@ -70,6 +186,105 @@ func TestManagerAutoDisablesQuotaFromResponseSignal(t *testing.T) {
 	}
 	if updated.AutoDisableReason != AutoDisableReasonQuotaExhausted {
 		t.Fatalf("quota auto-disable reason = %q", updated.AutoDisableReason)
+	}
+}
+
+func TestManagerWorkBuddyBanSurvivesRuntimeUpdates(t *testing.T) {
+	for _, provider := range []string{"workbuddy", "workbuddy-ai"} {
+		for _, ignoreCooling := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/ignore-cooling=%t", provider, ignoreCooling), func(t *testing.T) {
+				manager := NewManager(nil, &FillFirstSelector{}, nil)
+				cfg := &internalconfig.Config{Routing: internalconfig.RoutingConfig{DisableCooling: &ignoreCooling}}
+				manager.SetConfig(cfg)
+				manager.RegisterExecutor(schedulerTestExecutor{provider: provider})
+				auth := &Auth{ID: t.Name(), Provider: provider, Status: StatusActive, Metadata: map[string]any{"uid": "banned", "access_token": "old-token"}}
+				reg := registry.GetGlobalRegistry()
+				reg.RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: "m"}, {ID: "sibling"}})
+				t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+				if _, err := manager.Register(t.Context(), auth); err != nil {
+					t.Fatal(err)
+				}
+				for _, model := range []string{"m", "sibling"} {
+					picked, err := manager.SelectAuth(t.Context(), provider, model, cliproxyexecutor.Options{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					picked.ReleaseDispatchSlot()
+				}
+				assertDisabled := func(stage string) {
+					t.Helper()
+					updated, _ := manager.GetByID(auth.ID)
+					if !updated.AutoDisabled || updated.AutoDisableReason != "account_banned" || updated.Disabled || updated.AutoDisabledAt.IsZero() {
+						t.Fatalf("%s: incorrect auto-disable state: %+v", stage, updated)
+					}
+					for _, model := range []string{"m", "sibling"} {
+						if _, err := manager.SelectAuth(t.Context(), provider, model, cliproxyexecutor.Options{}); err == nil {
+							t.Fatalf("%s: banned account was selected for %s", stage, model)
+						}
+					}
+				}
+				manager.MarkResult(t.Context(), Result{AuthID: auth.ID, Provider: provider, Model: "m", CredentialScope: true,
+					Error: &Error{HTTPStatus: http.StatusForbidden, Code: "workbuddy_account_banned", Message: `{"code":11140,"msg":"request illegal"}`}})
+				assertDisabled("ban")
+				manager.MarkResult(t.Context(), Result{AuthID: auth.ID, Provider: provider, Model: "m", Success: true})
+				assertDisabled("in-flight success")
+				manager.SetConfig(cfg)
+				assertDisabled("config reload")
+				if _, err := manager.Update(WithSkipPersist(t.Context()), &Auth{ID: auth.ID, Provider: provider, Status: StatusActive,
+					Metadata: map[string]any{"uid": "banned", "access_token": "rotated-token"}}); err != nil {
+					t.Fatal(err)
+				}
+				assertDisabled("auth reload with rotated token")
+				base, _ := manager.GetByID(auth.ID)
+				refreshed := base.Clone()
+				refreshed.Metadata["access_token"] = "refreshed-token"
+				refreshed.Status = StatusActive
+				if _, err := manager.UpdateRefreshedAuth(t.Context(), base, refreshed); err != nil {
+					t.Fatal(err)
+				}
+				assertDisabled("token refresh")
+				if _, _, err := manager.ResetQuota(t.Context(), auth.ID); err != nil {
+					t.Fatal(err)
+				}
+				assertDisabled("quota reset")
+				enabled, _ := manager.GetByID(auth.ID)
+				enabled.ClearAutoDisabled()
+				enabled.Status = StatusActive
+				if _, err := manager.Update(t.Context(), enabled); err != nil {
+					t.Fatal(err)
+				}
+				for _, model := range []string{"m", "sibling"} {
+					picked, err := manager.SelectAuth(t.Context(), provider, model, cliproxyexecutor.Options{})
+					if err != nil {
+						t.Fatalf("explicitly enabled account was not selectable for %s: %v", model, err)
+					}
+					picked.ReleaseDispatchSlot()
+				}
+			})
+		}
+	}
+}
+
+func TestManagerWorkBuddyBanDoesNotDisableOtherErrorsOrProviders(t *testing.T) {
+	for _, tc := range []struct{ provider, code string }{
+		{"workbuddy", "request_scoped"},
+		{"workbuddy-ai", ""},
+		{"codex", "workbuddy_account_banned"},
+	} {
+		t.Run(tc.provider+"/"+tc.code, func(t *testing.T) {
+			manager := NewManager(nil, nil, nil)
+			manager.SetConfig(&internalconfig.Config{})
+			auth := &Auth{ID: t.Name(), Provider: tc.provider, Status: StatusActive}
+			if _, err := manager.Register(t.Context(), auth); err != nil {
+				t.Fatal(err)
+			}
+			manager.MarkResult(t.Context(), Result{AuthID: auth.ID, Provider: tc.provider, Model: "m",
+				Error: &Error{HTTPStatus: http.StatusForbidden, Code: tc.code, Message: "11140 request illegal"}})
+			updated, _ := manager.GetByID(auth.ID)
+			if updated.IsDispatchDisabled() {
+				t.Fatal("unrelated error or provider was automatically disabled")
+			}
+		})
 	}
 }
 

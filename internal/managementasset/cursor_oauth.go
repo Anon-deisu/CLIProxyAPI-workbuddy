@@ -2,6 +2,7 @@ package managementasset
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"regexp"
 )
@@ -64,10 +65,28 @@ var cursorOAuthLocales = []struct {
 				"plugin_oauth_title:",
 		),
 	},
+	{
+		marker: []byte("xai_oauth_polling_error:`Не удалось проверить статус аутентификации:`,plugin_oauth_title:"),
+		replacement: []byte(
+			"xai_oauth_polling_error:`Не удалось проверить статус аутентификации:`," +
+				"cursor_oauth_title:`Cursor OAuth`," +
+				"cursor_oauth_button:`Начать вход в Cursor`," +
+				"cursor_oauth_hint:`Войдите в Cursor через авторизацию и автоматически сохраните учетные данные.`," +
+				"cursor_oauth_url_label:`URL авторизации:`," +
+				"cursor_open_link:`Открыть ссылку`," +
+				"cursor_copy_link:`Копировать ссылку`," +
+				"cursor_oauth_status_waiting:`Ожидание авторизации...`," +
+				"cursor_oauth_status_success:`Авторизация успешна!`," +
+				"cursor_oauth_status_error:`Ошибка авторизации:`," +
+				"cursor_oauth_start_error:`Не удалось начать Cursor OAuth:`," +
+				"cursor_oauth_polling_error:`Не удалось проверить статус аутентификации:`," +
+				"plugin_oauth_title:",
+		),
+	},
 }
 
 var remainingCursorOAuthLocale = regexp.MustCompile(
-	"xai_oauth_polling_error:`([^`]*)`,plugin_oauth_title:",
+	"xai_oauth_polling_error:(?:`[^`]*`|\"(?:\\\\.|[^\"\\\\])*\"),",
 )
 
 var fallbackCursorOAuthLocale = []byte(
@@ -101,7 +120,7 @@ func AddCursorOAuthToManagementHTML(data []byte) ([]byte, error) {
 	if providerStart < 0 {
 		return nil, fmt.Errorf("management html Cursor OAuth provider anchor not found")
 	}
-	providerEndRelative := bytes.Index(data[providerStart:], []byte("}}]"))
+	providerEndRelative := bytes.Index(data[providerStart:], []byte("}}"))
 	if providerEndRelative < 0 {
 		return nil, fmt.Errorf("management html Cursor OAuth provider boundary not found")
 	}
@@ -113,25 +132,50 @@ func AddCursorOAuthToManagementHTML(data []byte) ([]byte, error) {
 
 	patchedLocales := 0
 	for _, locale := range cursorOAuthLocales {
-		if bytes.Contains(data, locale.marker) {
-			data = bytes.Replace(data, locale.marker, locale.replacement, 1)
-			patchedLocales++
+		marker := bytes.TrimSuffix(locale.marker, []byte("plugin_oauth_title:"))
+		replacement := bytes.TrimSuffix(locale.replacement, []byte("plugin_oauth_title:"))
+		for _, literal := range [][]byte{marker, bytes.ReplaceAll(marker, []byte("`"), []byte(`"`))} {
+			if bytes.Contains(data, literal) {
+				data = bytes.Replace(data, literal, replacement, 1)
+				patchedLocales++
+				break
+			}
 		}
 	}
-	data = remainingCursorOAuthLocale.ReplaceAllFunc(data, func(match []byte) []byte {
-		patchedLocales++
-		prefixEnd := bytes.Index(match, []byte("plugin_oauth_title:"))
-		if prefixEnd < 0 {
-			return match
+	// Already localized properties now precede cursor_oauth_title and must not be
+	// visited again. Process unmatched locale properties from the end of the file.
+	for matches := remainingCursorOAuthLocale.FindAllIndex(data, -1); len(matches) > 0; matches = matches[:len(matches)-1] {
+		match := matches[len(matches)-1]
+		if bytes.HasPrefix(data[match[1]:], []byte("cursor_oauth_title:")) {
+			continue
 		}
-		result := make([]byte, 0, len(match)+len(fallbackCursorOAuthLocale))
-		result = append(result, match[:prefixEnd]...)
-		result = append(result, fallbackCursorOAuthLocale...)
-		result = append(result, match[prefixEnd:]...)
-		return result
-	})
+		patchedLocales++
+		data = insertBytes(data, match[1], fallbackCursorOAuthLocale)
+	}
 	if patchedLocales == 0 {
 		return nil, fmt.Errorf("management html Cursor OAuth locale anchor not found")
+	}
+	// Rolldown can keep large locale objects in JSON.parse literals. Insert
+	// serialized JSON properties there, not JavaScript template literals.
+	jsonMarker := []byte(`"xai_oauth_polling_error":"Не удалось проверить статус аутентификации:",`)
+	if index := bytes.Index(data, jsonMarker); index >= 0 {
+		labels, err := json.Marshal(map[string]string{
+			"cursor_oauth_title":          "Cursor OAuth",
+			"cursor_oauth_button":         "Начать вход в Cursor",
+			"cursor_oauth_hint":           "Войдите в Cursor через авторизацию и автоматически сохраните учетные данные.",
+			"cursor_oauth_url_label":      "URL авторизации:",
+			"cursor_open_link":            "Открыть ссылку",
+			"cursor_copy_link":            "Копировать ссылку",
+			"cursor_oauth_status_waiting": "Ожидание авторизации...",
+			"cursor_oauth_status_success": "Авторизация успешна!",
+			"cursor_oauth_status_error":   "Ошибка авторизации:",
+			"cursor_oauth_start_error":    "Не удалось начать Cursor OAuth:",
+			"cursor_oauth_polling_error":  "Не удалось проверить статус аутентификации:",
+		})
+		if err != nil {
+			return nil, err
+		}
+		data = insertBytes(data, index+len(jsonMarker), append(labels[1:len(labels)-1], ','))
 	}
 	return data, nil
 }

@@ -591,22 +591,23 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 // priority tiers so an established binding can be validated instead of being preempted by a
 // recovered higher-priority credential.
 func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
-	if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
-		priorityAuths, err = m.availableAuthsForRouteModel(auths, provider, routeModel, now)
-		if err != nil {
-			return nil, nil, err
-		}
-		priorityAuths = cloneAuthSlice(priorityAuths)
-		return priorityAuths, priorityAuths, nil
-	}
-
-	// One availability pass and one clone pass serve both lists: the highest priority tier is a
-	// subset of the across-priority candidates, so it is narrowed from the same cloned auths.
-	selectorAuths, err = m.availableAuthsForRouteModelAcrossPriorities(auths, provider, routeModel, now)
+	_, sessionAffinity := selector.(*SessionAffinitySelector)
+	available, err := m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, sessionAffinity)
 	if err != nil {
 		return nil, nil, err
 	}
-	selectorAuths = cloneAuthSlice(selectorAuths)
+	// Skip full credentials before cloning or invoking a selector; otherwise each
+	// rejected reservation recursively repeats the entire pool scan and clone.
+	// TryAcquireDispatchSlot still arbitrates races after this snapshot is taken.
+	selectorAuths = make([]*Auth, 0, len(available))
+	for _, candidate := range available {
+		if candidate.DispatchSlotAvailable() {
+			selectorAuths = append(selectorAuths, candidate.Clone())
+		}
+	}
+	if len(selectorAuths) == 0 {
+		return nil, nil, NewConcurrencyLimitError()
+	}
 	return highestPriorityAuths(selectorAuths), selectorAuths, nil
 }
 

@@ -52,6 +52,18 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
+	if cfg.Routing.DegradedPort != nil {
+		if errDegraded := s.setDegradedPort(*cfg.Routing.DegradedPort); errDegraded != nil {
+			log.WithError(errDegraded).Error("failed to apply degraded listener config")
+			return false
+		}
+	}
+	if cfg.Routing.ExoFreePort != nil {
+		if errExoFree := s.setExoFreePort(*cfg.Routing.ExoFreePort); errExoFree != nil {
+			log.WithError(errExoFree).Error("failed to apply exo-free listener config")
+			return false
+		}
+	}
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
@@ -168,6 +180,8 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 		s.exampleAPIKeySafeModeActive.Store(exampleAPIKeySafeModeRequired)
 	}
 	s.cfg = cfg
+	s.fakeModels.Store(config.CloneFakeModels(cfg.Routing.FakeModels))
+	s.setExoFreePool(cfg.Routing.CodexStaticISP)
 	if s.codexLiveHandler != nil {
 		if errUpdate := s.codexLiveHandler.UpdateConfig(cfg); errUpdate != nil {
 			log.WithError(errUpdate).Error("failed to update Codex Live media relay configuration")

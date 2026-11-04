@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 func sumRecentRequestBuckets(buckets []coreauth.RecentRequestBucket) (int64, int64) {
@@ -138,5 +139,37 @@ func TestGetAPIKeyUsage_GroupsOpenAICompatibleByCompatName(t *testing.T) {
 	vastEntry := vastBucket["https://www.vastnum.com/v1|vast-key"]
 	if vastEntry.Success != 1 || vastEntry.Failed != 0 {
 		t.Fatalf("vast totals = %d/%d, want 1/0", vastEntry.Success, vastEntry.Failed)
+	}
+}
+
+func TestGetRollingTokenUsageSummary(t *testing.T) {
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/token-summary", nil)
+
+	(&Handler{}).GetRollingTokenUsageSummary(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var got struct {
+		WindowMinutes int                             `json:"window_minutes"`
+		Models        []coreusage.AuthModelTokenUsage `json:"models"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode token summary: %v", err)
+	}
+	if got.WindowMinutes != 200 {
+		t.Fatalf("window_minutes = %d, want 200", got.WindowMinutes)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got.Models == nil {
+		t.Fatalf("token summary models = nil, want an aggregate model list: %+v", got)
+	}
+	if _, ok := payload["auth_files"]; ok {
+		t.Fatalf("token summary must not expose auth-file groups: %s", rec.Body.String())
 	}
 }

@@ -71,6 +71,12 @@ func NewXAIExecutor(cfg *config.Config) *XAIExecutor {
 	return &XAIExecutor{cfg: cfg}
 }
 
+func (e *XAIExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
+	copy := *e
+	copy.cfg = e.cfg.ForAPIKey()
+	return &copy
+}
+
 // Identifier returns the provider identifier.
 func (e *XAIExecutor) Identifier() string {
 	return "xai"

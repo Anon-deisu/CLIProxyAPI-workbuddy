@@ -138,6 +138,12 @@ const defaultModelMaxTokens = 1024
 
 func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecutor{cfg: cfg} }
 
+func (e *ClaudeExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
+	copy := *e
+	copy.cfg = e.cfg.ForAPIKey()
+	return &copy
+}
+
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
 func (e *ClaudeExecutor) upstreamRequestLogProvider() string {

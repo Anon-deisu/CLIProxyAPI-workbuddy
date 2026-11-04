@@ -35,6 +35,8 @@ type staticModelsJSON struct {
 	Antigravity []*ModelInfo `json:"antigravity"`
 	XAI         []*ModelInfo `json:"xai"`
 	Cursor      []*ModelInfo `json:"cursor"`
+	Devin       []*ModelInfo `json:"devin"`
+	Meta        []*ModelInfo `json:"meta"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -147,6 +149,36 @@ func AntigravityWebSearchModelFor(modelID string) string {
 // GetXAIModels returns the standard xAI Grok model definitions.
 func GetXAIModels() []*ModelInfo {
 	return WithXAIBuiltins(cloneModelInfos(getModels().XAI))
+}
+
+// GetMetaModels returns Meta Muse model definitions.
+func GetMetaModels() []*ModelInfo {
+	models := cloneModelInfos(getModels().Meta)
+	if len(models) > 0 {
+		return models
+	}
+	return []*ModelInfo{
+		{ID: "muse-spark-1.3", Object: "model", Created: 1704067200, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.3", ContextLength: 200000, MaxCompletionTokens: 64000},
+		{ID: "muse-spark-1.3-contributor", Object: "model", Created: 1704067200, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.3 Contributor", ContextLength: 200000, MaxCompletionTokens: 64000},
+		{ID: "muse-spark-1.2", Object: "model", Created: 1704067200, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.2", ContextLength: 200000, MaxCompletionTokens: 64000},
+		{ID: "muse-spark-1.2-contributor", Object: "model", Created: 1704067200, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.2 Contributor", ContextLength: 200000, MaxCompletionTokens: 64000},
+		{ID: "muse-spark-1.1", Object: "model", Created: 1704067200, OwnedBy: "meta", Type: "meta", DisplayName: "Muse Spark 1.1", ContextLength: 200000, MaxCompletionTokens: 64000},
+	}
+}
+
+var staticDevinModels = []*ModelInfo{
+	devinBuiltinSWE16SlowModelInfo(),
+	{ID: "devin/swe-2", Type: "devin", OwnedBy: "cognition", DisplayName: "SWE-2", ContextLength: 262000, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"medium", "high", "max"}}},
+	{ID: "devin/claude-fable-5-1", Type: "devin", OwnedBy: "anthropic", DisplayName: "Claude Fable 5.1", ContextLength: 1000000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}}},
+	{ID: "devin/gpt-6-astra", Type: "devin", OwnedBy: "openai", DisplayName: "GPT-6 Astra", ContextLength: 1000000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh", "max"}}},
+	{ID: "devin/glm-5-2", Type: "devin", OwnedBy: "zhipu", DisplayName: "GLM-5.2", ContextLength: 200000, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"none", "high"}}},
+	{ID: "devin/glm-5-3", Type: "devin", OwnedBy: "zhipu", DisplayName: "GLM-5.3", ContextLength: 1048576, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"low", "high", "max"}}},
+	{ID: "devin/glm-5-3-flash", Type: "devin", OwnedBy: "zhipu", DisplayName: "GLM-5.3 Flash", ContextLength: 1000000, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"low", "high", "max"}}},
+	{ID: "devin/gpt-5-6-sol", Type: "devin", OwnedBy: "openai", DisplayName: "GPT-5.6 Sol", ContextLength: 1000000, MaxCompletionTokens: 128000, Thinking: &ThinkingSupport{Levels: []string{"none", "low", "medium", "high", "xhigh", "max"}}},
+	{ID: "devin/gemini-3-8-flash", Type: "devin", OwnedBy: "google", DisplayName: "Gemini 3.8 Flash", ContextLength: 1048576, MaxCompletionTokens: 65536, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high"}}},
+	{ID: "devin/grok-4-6", Type: "devin", OwnedBy: "xai", DisplayName: "Grok 4.6", ContextLength: 500000, MaxCompletionTokens: 131072, Thinking: &ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}},
+	{ID: "devin/deepseek-v4-flash", Type: "devin", OwnedBy: "deepseek", DisplayName: "DeepSeek V4 Flash", ContextLength: 1048576, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"high", "max"}}},
+	{ID: "devin/deepseek-v4-1-flash", Type: "devin", OwnedBy: "deepseek", DisplayName: "DeepSeek V4.1 Flash", ContextLength: 1048576, MaxCompletionTokens: 64000, Thinking: &ThinkingSupport{Levels: []string{"high", "max"}}},
 }
 
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
@@ -445,7 +477,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetAIStudioModels()
 	case "codex":
 		return GetCodexProModels()
-	case "kimi":
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		return GetKimiModels()
 	case "antigravity":
 		return GetAntigravityModels()
@@ -453,6 +485,14 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetXAIModels()
 	case "cursor":
 		return GetCursorModels()
+	case "devin":
+		return GetDevinModels()
+	case "workbuddy", "workbuddy-ai":
+		return GetWorkBuddyModels(key)
+	case "qoder", "qoder-cn":
+		return GetQoderModels(key)
+	case "meta":
+		return GetMetaModels()
 	default:
 		return nil
 	}
@@ -476,6 +516,11 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Antigravity,
 		data.XAI,
 		data.Cursor,
+		data.Meta,
+		data.Devin,
+		staticDevinModels,
+		GetQoderModels("qoder"),
+		GetQoderModels("qoder-cn"),
 	}
 	for _, models := range allModels {
 		for _, m := range models {

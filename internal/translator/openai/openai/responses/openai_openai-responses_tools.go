@@ -20,6 +20,73 @@ type responsesToolDeclaration struct {
 	custom    bool
 }
 
+// responsesToolIdentityIndex caches the request's first-wins tool namespace
+// mapping so stream chunks do not repeatedly walk the full request.
+type responsesToolIdentityIndex struct {
+	exact     map[string]responsesToolDeclaration
+	local     map[string]string
+	ambiguous map[string]bool
+	custom    map[string]struct{}
+}
+
+func newResponsesToolIdentityIndex(root gjson.Result) *responsesToolIdentityIndex {
+	index := &responsesToolIdentityIndex{
+		exact:     make(map[string]responsesToolDeclaration),
+		local:     make(map[string]string),
+		ambiguous: make(map[string]bool),
+		custom:    make(map[string]struct{}),
+	}
+	walkResponsesToolDeclarations(root, func(declaration responsesToolDeclaration) bool {
+		if _, duplicate := index.exact[declaration.chatName]; duplicate {
+			return true
+		}
+		index.exact[declaration.chatName] = declaration
+		if declaration.custom {
+			index.custom[declaration.chatName] = struct{}{}
+		}
+		if previous, exists := index.local[declaration.localName]; exists && previous != declaration.chatName {
+			index.ambiguous[declaration.localName] = true
+		} else if !exists {
+			index.local[declaration.localName] = declaration.chatName
+		}
+		return true
+	})
+	return index
+}
+
+func (index *responsesToolIdentityIndex) canonical(name string) string {
+	if index == nil {
+		return name
+	}
+	if _, found := index.exact[name]; found {
+		return name
+	}
+	if candidate, found := index.local[name]; found && !index.ambiguous[name] {
+		return candidate
+	}
+	return name
+}
+
+func (index *responsesToolIdentityIndex) split(qualifiedName string) (name, namespace string) {
+	if index == nil {
+		return qualifiedName, ""
+	}
+	if declaration, found := index.exact[qualifiedName]; found {
+		return declaration.localName, declaration.namespace
+	}
+	return qualifiedName, ""
+}
+
+func (index *responsesToolIdentityIndex) singleCustomToolName() (string, bool) {
+	if index == nil || len(index.custom) != 1 || len(index.exact) != 1 {
+		return "", false
+	}
+	for name := range index.custom {
+		return name, true
+	}
+	return "", false
+}
+
 // walkResponsesToolDeclarations visits the tool declarations of a Responses
 // request in one canonical order: the top-level "tools" field first, then
 // Codex Desktop (Responses Lite) "additional_tools" input items, namespace
@@ -227,35 +294,11 @@ func responsesToolOutputText(output gjson.Result) string {
 // a discarded custom declaration must not turn a surviving ordinary function
 // into a custom_tool_call.
 func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
-	names := make(map[string]struct{})
-	seenToolNames := make(map[string]struct{})
-	walkResponsesToolDeclarations(gjson.ParseBytes(requestRawJSON), func(declaration responsesToolDeclaration) bool {
-		if _, duplicate := seenToolNames[declaration.chatName]; duplicate {
-			return true
-		}
-		seenToolNames[declaration.chatName] = struct{}{}
-		if declaration.custom {
-			names[declaration.chatName] = struct{}{}
-		}
-		return true
-	})
-	return names
+	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).custom
 }
 
 func responsesSingleCustomToolName(requestRawJSON []byte) (string, bool) {
-	customToolNames := responsesCustomToolNames(requestRawJSON)
-	if len(customToolNames) != 1 {
-		return "", false
-	}
-
-	// Count the tools actually emitted, which are deduplicated by name, so a
-	// tool delivered through both "tools" and "additional_tools" still counts
-	// once and freeform unwrapping stays enabled.
-	toolCount := len(mergeResponsesRequestChatTools(gjson.ParseBytes(requestRawJSON)))
-	for name := range customToolNames {
-		return name, toolCount == 1
-	}
-	return "", false
+	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).singleCustomToolName()
 }
 
 // unwrapCustomToolInput extracts the freeform input from the {"input": "..."}
@@ -308,30 +351,7 @@ func resolveResponsesQualifiedToolIdentity(root gjson.Result, qualifiedName stri
 // request declares exactly one matching local name. Exact emitted names win;
 // ambiguous names remain unresolved rather than being dispatched to another tool.
 func canonicalResponsesToolName(requestRawJSON []byte, name string) string {
-	root := gjson.ParseBytes(requestRawJSON)
-	if _, _, found := resolveResponsesQualifiedToolIdentity(root, name); found {
-		return name
-	}
-	seen := make(map[string]struct{})
-	candidate := ""
-	ambiguous := false
-	walkResponsesToolDeclarations(root, func(declaration responsesToolDeclaration) bool {
-		if _, duplicate := seen[declaration.chatName]; duplicate {
-			return true
-		}
-		seen[declaration.chatName] = struct{}{}
-		if declaration.localName == name {
-			if candidate != "" {
-				ambiguous = true
-			}
-			candidate = declaration.chatName
-		}
-		return true
-	})
-	if candidate != "" && !ambiguous {
-		return candidate
-	}
-	return name
+	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).canonical(name)
 }
 
 func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, qualifiedName string) (name, namespace string) {
@@ -340,10 +360,7 @@ func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, quali
 		return "", ""
 	}
 
-	if resolvedName, resolvedNamespace, ok := resolveResponsesQualifiedToolIdentity(gjson.ParseBytes(requestRawJSON), qualifiedName); ok {
-		return resolvedName, resolvedNamespace
-	}
-	return qualifiedName, ""
+	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).split(qualifiedName)
 }
 
 func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
@@ -358,5 +375,10 @@ func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
 
 func applyResponsesFunctionCallNamespaceFields(item []byte, requestRawJSON []byte, qualifiedName string, itemPath string) []byte {
 	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON, qualifiedName)
+	return translatorcommon.SetResponsesToolCallIdentity(item, name, namespace, itemPath)
+}
+
+func applyResponsesFunctionCallNamespaceFieldsWithIndex(item []byte, index *responsesToolIdentityIndex, qualifiedName string, itemPath string) []byte {
+	name, namespace := index.split(qualifiedName)
 	return translatorcommon.SetResponsesToolCallIdentity(item, name, namespace, itemPath)
 }

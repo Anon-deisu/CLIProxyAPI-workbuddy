@@ -1,0 +1,11 @@
+{
+  "name": "cpa-codex-auto-oauth",
+  "private": true,
+  "scripts": {
+    "install-browser": "playwright install chromium",
+    "test": "node --test ../../internal/auth/codex/auto_oauth_helpers.test.cjs ../../internal/auth/codex/auto_oauth_runner.test.cjs"
+  },
+  "dependencies": {
+    "playwright": "1.52.0"
+  }
+}

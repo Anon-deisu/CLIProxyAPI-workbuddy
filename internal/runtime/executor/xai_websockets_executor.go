@@ -1641,6 +1641,15 @@ func NewXAIAutoExecutor(cfg *config.Config) *XAIAutoExecutor {
 
 func (e *XAIAutoExecutor) Identifier() string { return "xai" }
 
+func (e *XAIAutoExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
+	copy := *e
+	copy.httpExec = e.httpExec.ForAPIKey().(*XAIExecutor)
+	ws := *e.wsExec
+	ws.XAIExecutor = e.wsExec.XAIExecutor.ForAPIKey().(*XAIExecutor)
+	copy.wsExec = &ws
+	return &copy
+}
+
 // UsesConfig reports whether the executor was created for cfg.
 func (e *XAIAutoExecutor) UsesConfig(cfg *config.Config) bool {
 	return e != nil && e.httpExec != nil && e.httpExec.cfg == cfg

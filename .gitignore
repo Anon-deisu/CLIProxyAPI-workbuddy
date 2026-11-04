@@ -8,6 +8,7 @@ config.yaml
 credentials.txt
 
 # Generated content
+tools/codex-auto-oauth/node_modules/
 bin/*
 logs/*
 run/*

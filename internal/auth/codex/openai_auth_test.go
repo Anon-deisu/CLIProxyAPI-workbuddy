@@ -1,16 +1,20 @@
 package codex
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -192,4 +196,65 @@ func TestNewCodexAuthWithProxyURL_OverrideProxyTakesPrecedence(t *testing.T) {
 	if proxyURL == nil || proxyURL.String() != "http://override.example.com:8081" {
 		t.Fatalf("proxy URL = %v, want http://override.example.com:8081", proxyURL)
 	}
+}
+
+func TestRefreshTokensTypedErrorsAreRedacted(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		body, code string
+	}{
+		{"standard", 400, `{"error":"invalid_grant","error_description":"private-response-secret"}`, "invalid_grant"},
+		{"top-code", 400, `{"error":"invalid_grant","code":"refresh_token_reused","refresh_token":"private-response-secret"}`, "refresh_token_reused"},
+		{"nested-code", 400, `{"error":{"code":"refresh_token_reused","message":"private-response-secret"}}`, "refresh_token_reused"},
+		{"nested-type", 400, `{"error":{"type":"invalid_grant","message":"private-response-secret"}}`, "invalid_grant"},
+		{"unauthorized", 401, `{"error":"refresh_token_invalidated","message":"private-response-secret"}`, "refresh_token_invalidated"},
+		{"server", 503, `{"error":"invalid_grant","message":"private-response-secret"}`, "invalid_grant"},
+		{"unknown-code", 400, `{"error":"private-response-secret"}`, ""},
+		{"malformed", 502, "private-response-secret\n<html>", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := log.StandardLogger().Out
+			log.SetOutput(&logs)
+			defer log.SetOutput(previous)
+			auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tc.status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(tc.body)), Request: req}, nil
+			})}}
+			_, err := auth.RefreshTokensWithRetry(t.Context(), "private-request-token", 1)
+			var typed interface {
+				StatusCode() int
+				ErrorCode() string
+			}
+			if !errors.As(err, &typed) {
+				t.Errorf("refresh error has no typed status/code: %T", err)
+			} else if typed.StatusCode() != tc.status || typed.ErrorCode() != tc.code {
+				t.Errorf("status/code = %d/%q, want %d/%q", typed.StatusCode(), typed.ErrorCode(), tc.status, tc.code)
+			}
+			if err == nil {
+				t.Fatal("expected refresh failure")
+			}
+			for _, secret := range []string{"private-response-secret", "private-request-token"} {
+				if strings.Contains(err.Error(), secret) || strings.Contains(logs.String(), secret) {
+					t.Error("refresh error or retry log leaked credential/response content")
+				}
+			}
+		})
+	}
+}
+
+func TestRefreshTokensWithRetryInvalidGrantStopsWithoutRetrying(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)), Request: req}, nil
+		})}}
+		if _, err := auth.RefreshTokensWithRetry(t.Context(), "invalid-grant-refresh", 3); err == nil {
+			t.Fatal("expected refresh error")
+		}
+		if calls != 1 {
+			t.Fatalf("invalid_grant attempts = %d, want 1", calls)
+		}
+	})
 }

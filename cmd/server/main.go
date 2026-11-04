@@ -78,6 +78,13 @@ func main() {
 	var oauthCallbackPort int
 	var antigravityLogin bool
 	var kimiLogin bool
+	var kimiAILogin bool
+	var devinLogin bool
+	var workBuddyLogin bool
+	var workBuddyAILogin bool
+	var qoderLogin bool
+	var qoderCNLogin bool
+	var metaLogin bool
 	var xaiLogin bool
 	var cursorLogin bool
 	var vertexImport string
@@ -98,6 +105,13 @@ func main() {
 	flag.IntVar(&oauthCallbackPort, "oauth-callback-port", 0, "Override OAuth callback port (defaults to provider-specific port)")
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
 	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi using OAuth")
+	flag.BoolVar(&kimiAILogin, "kimi-ai-login", false, "Login to Kimi.ai using OAuth")
+	flag.BoolVar(&devinLogin, "devin-login", false, "Login to Devin using OAuth")
+	flag.BoolVar(&workBuddyLogin, "workbuddy-login", false, "Login to WorkBuddy China using OAuth")
+	flag.BoolVar(&workBuddyAILogin, "workbuddy-ai-login", false, "Login to WorkBuddy international using OAuth")
+	flag.BoolVar(&qoderLogin, "qoder-login", false, "Login to Qoder international using device flow")
+	flag.BoolVar(&qoderCNLogin, "qoder-cn-login", false, "Login to Qoder China using device flow")
+	flag.BoolVar(&metaLogin, "meta-login", false, "Login to Meta using OAuth")
 	flag.BoolVar(&xaiLogin, "xai-login", false, "Login to xAI using OAuth")
 	flag.BoolVar(&cursorLogin, "cursor-login", false, "Login to Cursor using OAuth")
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
@@ -588,7 +602,7 @@ func main() {
 		CallbackPort: oauthCallbackPort,
 	}
 
-	commandMode := vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin || cursorLogin
+	commandMode := vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || kimiAILogin || devinLogin || workBuddyLogin || workBuddyAILogin || qoderLogin || qoderCNLogin || metaLogin || xaiLogin || cursorLogin
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
 	exampleAPIKeySafeMode := shouldEnableExampleAPIKeySafeMode(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode)
@@ -660,6 +674,20 @@ func main() {
 		cmd.DoClaudeLogin(cfg, options)
 	} else if kimiLogin {
 		cmd.DoKimiLogin(cfg, options)
+	} else if kimiAILogin {
+		cmd.DoKimiAILogin(cfg, options)
+	} else if devinLogin {
+		cmd.DoDevinLogin(cfg, options)
+	} else if workBuddyLogin {
+		cmd.DoWorkBuddyLogin(cfg, options, "workbuddy")
+	} else if workBuddyAILogin {
+		cmd.DoWorkBuddyLogin(cfg, options, "workbuddy-ai")
+	} else if qoderLogin {
+		cmd.DoQoderLogin(cfg, options, "qoder")
+	} else if qoderCNLogin {
+		cmd.DoQoderLogin(cfg, options, "qoder-cn")
+	} else if metaLogin {
+		cmd.DoMetaLogin(cfg, options)
 	} else if xaiLogin {
 		cmd.DoXAILogin(cfg, options)
 	} else if cursorLogin {
@@ -776,6 +804,7 @@ func startModelCatalogUpdaters(localModel, homeEnabled bool) {
 	}
 	if startModels {
 		registry.StartModelsUpdater(context.Background())
+		registry.StartDevinModelsUpdater(context.Background())
 	} else if homeEnabled {
 		log.Info("Home mode: remote models.json updates disabled; Codex client model list follows Home model IDs")
 	}

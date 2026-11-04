@@ -2,11 +2,28 @@ package responses
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func BenchmarkResponsesStreamRequestSize(b *testing.B) {
+	for _, size := range []int{1024, 1024 * 1024} {
+		b.Run(fmt.Sprintf("request_%d", size), func(b *testing.B) {
+			request := []byte(`{"model":"bench","input":"` + strings.Repeat("x", size) + `"}`)
+			chunk := []byte(`data: {"id":"r1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":30}}`)
+			var state any
+			ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "bench", request, request, chunk, &state)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "bench", request, request, chunk, &state)
+			}
+		})
+	}
+}
 
 func parseOpenAIResponsesSSEEvent(t *testing.T, chunk []byte) (string, gjson.Result) {
 	t.Helper()
