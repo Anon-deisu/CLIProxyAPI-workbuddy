@@ -14,8 +14,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	agentv1 "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/agent/v1"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"

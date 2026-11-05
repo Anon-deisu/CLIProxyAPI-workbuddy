@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	misc "github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	log "github.com/sirupsen/logrus"
 )
@@ -42,6 +43,10 @@ type ModelInfo struct {
 	ID string `json:"id"`
 	// MetadataModelID retains the upstream identity when an OAuth alias changes ID.
 	MetadataModelID string `json:"-"`
+	// ExplicitThinking indicates thinking configuration was explicitly configured for this model.
+	ExplicitThinking bool `json:"-"`
+	// ExplicitInputModalities indicates input modalities were explicitly configured for this model.
+	ExplicitInputModalities bool `json:"-"`
 	// Object type for the model (typically "model")
 	Object string `json:"object"`
 	// Created timestamp when the model was created
@@ -124,6 +129,18 @@ func (m *ModelInfo) UnmarshalJSON(data []byte) error {
 	if errUnmarshal := json.Unmarshal(data, &aux); errUnmarshal != nil {
 		return errUnmarshal
 	}
+	m.ExplicitThinking, m.ExplicitInputModalities = false, false
+	// Presence is explicit even for null or an empty array. Match the typed
+	// decoder's case-insensitive field lookup without conflating absence with null.
+	ojson.ParseBytes(data).ForEach(func(key, _ ojson.Result) bool {
+		if strings.EqualFold(key.String(), "thinking") {
+			m.ExplicitThinking = true
+		}
+		if strings.EqualFold(key.String(), "supportedInputModalities") {
+			m.ExplicitInputModalities = true
+		}
+		return true
+	})
 	m.NativeCapabilities = aux.NativeCapabilities
 	m.SupportConfigurationUpdate = aux.SupportConfigurationUpdate
 	return nil

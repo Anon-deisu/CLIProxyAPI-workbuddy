@@ -102,8 +102,9 @@ func TestWebsocketCompressionRoundTrip(t *testing.T) {
 						log.Errorf("close compression test client websocket: %v", errClose)
 					}
 				}()
-				if !strings.Contains(response.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate") {
-					t.Fatal("compression was not negotiated")
+				gotNegotiated := strings.Contains(response.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate")
+				if gotNegotiated != tc.want {
+					t.Fatalf("compression negotiation = %v, want %v", gotNegotiated, tc.want)
 				}
 				payload := make([]byte, 96*1024)
 				random := rand.New(rand.NewSource(6905))

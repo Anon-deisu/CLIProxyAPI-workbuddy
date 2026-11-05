@@ -29,119 +29,43 @@ import (
 )
 
 type UsageReporter struct {
-	provider            string
-	executorType        string
-	model               string
-	alias               string
-	authID              string
-	authIndex           string
-	authMu              sync.RWMutex
-	accessTokenHash     string
-	authType            string
-	apiKey              string
-	sessionID           string
-	parentSessionID     string
-	source              string
-	reasoning           string
-	serviceTier         string
-	generate            bool
-	stream              bool
-	requestedAt         time.Time
-	ttftMu              sync.RWMutex
-	ttft                time.Duration
-	firstPacketDuration time.Duration
-	firstPacketSet      bool
-	ttftStart           time.Time
-	ttftSet             bool
-	once                sync.Once
-	responseModelMu     sync.RWMutex
-	responseModel       string
-	responseModelFinal  atomic.Bool
-	upstreamModelMu     sync.RWMutex
-	upstreamModel       string
-}
-
-// ObserveResponseModel records the served model from a response or stream event.
-func (r *UsageReporter) ObserveResponseModel(payload []byte) {
-	if r == nil || r.responseModelFinal.Load() {
-		return
-	}
-	served, terminal := extractResponseModelEvent(payload, r.provider)
-	if served != "" {
-		r.responseModelMu.Lock()
-		r.responseModel = served
-		r.responseModelMu.Unlock()
-	}
-	if terminal {
-		r.responseModelFinal.Store(true)
-	}
-}
-
-// SetResponseModel records a protocol-specific model observation.
-func (r *UsageReporter) SetResponseModel(model string) {
-	if r == nil || r.responseModelFinal.Load() {
-		return
-	}
-	r.responseModelMu.Lock()
-	r.responseModel = strings.TrimSpace(model)
-	r.responseModelMu.Unlock()
-}
-
-// SetUpstreamModel records the canonical model selected by the provider.
-func (r *UsageReporter) SetUpstreamModel(model string) {
-	if r == nil {
-		return
-	}
-	r.upstreamModelMu.Lock()
-	r.upstreamModel = strings.TrimSpace(model)
-	r.upstreamModelMu.Unlock()
-}
-
-func (r *UsageReporter) warnModelSubstitution(ctx context.Context) {
-	if r == nil {
-		return
-	}
-	served := r.ResponseModel()
-	expected := r.UpstreamModel()
-	if expected == "" {
-		expected = r.model
-	}
-	if served == "" || !IsModelSubstituted(expected, served) || (r.model != "" && !IsModelSubstituted(r.model, served)) {
-		return
-	}
-	provider := r.provider
-	if provider == "" {
-		provider = "unknown"
-	}
-	if !codexModelSubstitutionWarns.allow(codexModelSubstitutionKey{
-		provider:  provider,
-		authID:    r.authID,
-		requested: normalizeModelName(expected),
-		served:    normalizeModelName(served),
-	}) {
-		return
-	}
-	LogWithRequestID(ctx).Warnf("%s executor: upstream served model %q for requested model %q (auth_index=%s)", provider, served, r.model, r.authIndex)
-}
-
-// ResponseModel returns the latest served-model observation.
-func (r *UsageReporter) ResponseModel() string {
-	if r == nil {
-		return ""
-	}
-	r.responseModelMu.RLock()
-	defer r.responseModelMu.RUnlock()
-	return r.responseModel
-}
-
-// UpstreamModel returns the provider-selected canonical model.
-func (r *UsageReporter) UpstreamModel() string {
-	if r == nil {
-		return ""
-	}
-	r.upstreamModelMu.RLock()
-	defer r.upstreamModelMu.RUnlock()
-	return r.upstreamModel
+	requestID            string
+	traceID              string
+	selectionID          string
+	provider             string
+	baseURL              string
+	executorType         string
+	model                string
+	alias                string
+	authID               string
+	authIndex            string
+	authMu               sync.RWMutex
+	accessTokenHash      string
+	authType             string
+	apiKey               string
+	accessProvider       string
+	isNativeKey          bool
+	sessionID            string
+	parentSessionID      string
+	source               string
+	reasoning            string
+	serviceTier          string
+	effectiveServiceTier string
+	generate             bool
+	stream               bool
+	requestedAt          time.Time
+	ttftMu               sync.RWMutex
+	ttft                 time.Duration
+	firstPacketDuration  time.Duration
+	firstPacketSet       bool
+	ttftStart            time.Time
+	ttftSet              bool
+	once                 sync.Once
+	responseModelMu      sync.RWMutex
+	responseModel        string
+	responseModelFinal   atomic.Bool
+	upstreamModelMu      sync.RWMutex
+	upstreamModel        string
 }
 
 type usageExecutor interface {
@@ -370,6 +294,14 @@ func (r *UsageReporter) warnModelSubstitution(ctx context.Context) {
 	providerName := strings.TrimSpace(r.provider)
 	if providerName == "" {
 		providerName = "unknown"
+	}
+	if !codexModelSubstitutionWarns.allow(codexModelSubstitutionKey{
+		provider:  providerName,
+		authID:    r.authID,
+		requested: normalizeModelName(expectedModel),
+		served:    normalizeModelName(served),
+	}) {
+		return
 	}
 	LogWithRequestID(ctx).Warnf("%s executor: upstream served model %q for requested model %q (auth_index=%s)", providerName, served, r.model, r.authIndexForLog())
 }
@@ -637,8 +569,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	detail = normalizeUsageDetailTotal(detail, r.provider, r.executorType)
 	r.once.Do(func() {
-		r.warnModelSubstitution(ctx)
-		r.publishRecord(ctx, r.buildRecord(detail, failed, fail))
+		r.publishAttemptRecord(ctx, r.buildRecord(detail, failed, fail))
 	})
 }
 
@@ -747,30 +678,37 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		responseModel = r.ResponseModel()
 	}
 	return usage.Record{
-		Provider:            r.provider,
-		ExecutorType:        r.executorType,
-		Model:               model,
-		ResponseModel:       r.ResponseModel(),
-		Alias:               r.alias,
-		Source:              r.source,
-		APIKey:              r.apiKey,
-		SessionID:           r.sessionID,
-		ParentSessionID:     r.parentSessionID,
-		AuthID:              r.authID,
-		AuthIndex:           r.authIndex,
-		AccessTokenSHA256:   r.accessTokenFingerprint(),
-		AuthType:            r.authType,
-		ReasoningEffort:     r.reasoning,
-		ServiceTier:         r.serviceTier,
-		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
-		Generate:            usage.GenerateFlag(r.generate),
-		Stream:              r.stream,
-		RequestedAt:         r.requestedAt,
-		Latency:             r.latency(),
-		TTFT:                r.ttftDuration(),
-		Failed:              failed,
-		Fail:                fail,
-		Detail:              detail,
+		RequestID:            r.requestID,
+		TraceID:              r.traceID,
+		SelectionID:          r.selectionID,
+		Provider:             r.provider,
+		BaseURL:              r.baseURL,
+		ExecutorType:         r.executorType,
+		Model:                model,
+		ResponseModel:        responseModel,
+		Alias:                r.alias,
+		Source:               r.source,
+		APIKey:               r.apiKey,
+		AccessProvider:       r.accessProvider,
+		IsNativeKey:          r.isNativeKey,
+		SessionID:            r.sessionID,
+		ParentSessionID:      r.parentSessionID,
+		AuthID:               r.authID,
+		AuthIndex:            r.authIndex,
+		AccessTokenSHA256:    r.accessTokenFingerprint(),
+		AuthType:             r.authType,
+		ReasoningEffort:      r.reasoning,
+		ServiceTier:          r.serviceTier,
+		EffectiveServiceTier: r.effectiveServiceTier,
+		ResponseServiceTier:  strings.TrimSpace(detail.ResponseServiceTier),
+		Generate:             usage.GenerateFlag(r.generate),
+		Stream:               r.stream,
+		RequestedAt:          r.requestedAt,
+		Latency:              r.latency(),
+		TTFT:                 r.ttftDuration(),
+		Failed:               failed,
+		Fail:                 fail,
+		Detail:               detail,
 	}
 }
 

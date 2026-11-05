@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	sdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -43,7 +43,7 @@ func TestAccountSchedulingStatePersists(t *testing.T) {
 			t.Fatalf("persisted wrong scheduling state for %s", state)
 		}
 		auth, _ := manager.GetByID("account.json")
-		entry := h.buildAuthFileEntry(auth)
+		entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 		if entry["scheduling_state"] != state {
 			t.Fatalf("entry state=%v", entry["scheduling_state"])
 		}

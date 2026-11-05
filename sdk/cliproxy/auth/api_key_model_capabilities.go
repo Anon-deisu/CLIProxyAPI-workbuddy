@@ -416,10 +416,6 @@ func compileAPIKeyModelCapabilitiesForAuth(cfg *internalconfig.Config, auth *Aut
 				addConfiguredModelCapability(out, configured.Name, configured.Alias, "gemini", support, false)
 			}
 		}
-	case "meta":
-		if entry := resolveMetaAPIKeyConfig(cfg, auth); entry != nil {
-			compileConfiguredModelCapabilities(out, entry.Models, "meta")
-		}
 	default:
 		providerKey, compatName := "", ""
 		if auth.Attributes != nil {

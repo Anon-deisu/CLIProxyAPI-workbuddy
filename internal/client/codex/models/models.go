@@ -461,7 +461,11 @@ func applyCodexClientModelCapabilities(entry map[string]any, id, metadataID stri
 			continue
 		}
 		isCodex := strings.EqualFold(strings.TrimSpace(p), "codex")
-		if (!isCodex && isAlias) || pInfo.ExplicitThinking {
+		// The Codex client template is authoritative for Codex model reasoning
+		// levels. Static provider catalogs may expose a smaller set than the
+		// modern Codex client supports, so only user-defined Codex restrictions
+		// should narrow the template. Non-Codex aliases still constrain support.
+		if (!isCodex && isAlias) || (pInfo.ExplicitThinking && (!isCodex || pInfo.UserDefined)) {
 			hasThinkingConstraint = true
 			pThinking := pInfo.Thinking
 			if pThinking == nil {
@@ -474,7 +478,7 @@ func applyCodexClientModelCapabilities(entry map[string]any, id, metadataID stri
 			}
 		}
 	}
-	if !hasThinkingConstraint && info != nil && info.ExplicitThinking {
+	if !hasThinkingConstraint && info != nil && info.ExplicitThinking && info.UserDefined {
 		pThinking := info.Thinking
 		if pThinking == nil {
 			pThinking = &registry.ThinkingSupport{Levels: []string{}}

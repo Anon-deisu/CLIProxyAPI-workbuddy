@@ -26,7 +26,7 @@ func BenchmarkResponsesStreamRequestSize(b *testing.B) {
 	}
 }
 
-func parseOpenAIResponsesSSEEvent(t *testing.T, chunk []byte) (string, gjson.Result) {
+func parseOpenAIResponsesSSEEvent(t *testing.T, chunk []byte) (string, ojson.Result) {
 	t.Helper()
 
 	lines := strings.Split(string(chunk), "\n")

@@ -71,8 +71,22 @@ func (h *Handler) GetStaticModelDefinitions(c *gin.Context) {
 	}
 
 	models := registry.GetStaticModelDefinitionsByChannel(channel)
+	if pluginModels := h.pluginModelDefinitionsByChannel(channel); len(pluginModels) > 0 {
+		models = pluginModels
+	}
 	if len(models) == 0 {
-		models = h.pluginModelDefinitionsByChannel(channel)
+		models = registry.GetGlobalRegistry().GetAvailableModelsByProvider(channel)
+		if len(models) > 1 {
+			sort.Slice(models, func(i, j int) bool {
+				if models[i] == nil {
+					return models[j] != nil
+				}
+				if models[j] == nil {
+					return false
+				}
+				return models[i].ID < models[j].ID
+			})
+		}
 	}
 	if len(models) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown channel", "channel": channel})
@@ -97,17 +111,5 @@ func (h *Handler) pluginModelDefinitionsByChannel(channel string) []*registry.Mo
 			return models
 		}
 	}
-	models := registry.GetGlobalRegistry().GetAvailableModelsByProvider(channel)
-	if len(models) > 1 {
-		sort.Slice(models, func(i, j int) bool {
-			if models[i] == nil {
-				return models[j] != nil
-			}
-			if models[j] == nil {
-				return false
-			}
-			return models[i].ID < models[j].ID
-		})
-	}
-	return models
+	return nil
 }

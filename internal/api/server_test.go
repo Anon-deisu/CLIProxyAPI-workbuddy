@@ -46,7 +46,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
-	"github.com/tidwall/gjson"
 	"gopkg.in/yaml.v3"
 )
 
@@ -690,7 +689,7 @@ func TestFakeModelsListAndResponses(t *testing.T) {
 		t.Fatalf("/v1/models does not list configured fake models: %v", ids)
 	}
 	codexModels := request(http.MethodGet, "/v1/models?client_version=0.149.1", "")
-	if gjson.GetBytes(codexModels.Body.Bytes(), `models.#(slug=="fake-one").slug`).String() != "fake-one" {
+	if ojson.GetBytes(codexModels.Body.Bytes(), `models.#(slug=="fake-one").slug`).String() != "fake-one" {
 		t.Fatal("Codex model list does not include fake models")
 	}
 	for _, tc := range []struct {
@@ -703,10 +702,10 @@ func TestFakeModelsListAndResponses(t *testing.T) {
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			resp := request(http.MethodPost, tc.path, tc.body)
-			if got := gjson.GetBytes(resp.Body.Bytes(), tc.textPath).String(); got != "A fixed answer" {
+			if got := ojson.GetBytes(resp.Body.Bytes(), tc.textPath).String(); got != "A fixed answer" {
 				t.Fatalf("content = %v", got)
 			}
-			usage := gjson.GetBytes(resp.Body.Bytes(), tc.usagePath)
+			usage := ojson.GetBytes(resp.Body.Bytes(), tc.usagePath)
 			input := "input_tokens"
 			output := "output_tokens"
 			details := "input_tokens_details"
@@ -774,7 +773,7 @@ func TestFakeModelRandomResponseAndRuntimeUpdates(t *testing.T) {
 			if !strings.HasPrefix(line, "data: ") {
 				continue
 			}
-			event := gjson.Parse(strings.TrimPrefix(line, "data: "))
+			event := ojson.Parse(strings.TrimPrefix(line, "data: "))
 			switch event.Get("type").String() {
 			case "response.output_text.delta":
 				delta = event.Get("delta").String()
@@ -818,13 +817,13 @@ func TestFakeModelStreamingRate(t *testing.T) {
 					t.Fatalf("%s rate=%d elapsed=%s, want %s", format, rate, got, wantElapsed)
 				}
 				var pieces []string
-				var usage gjson.Result
+				var usage ojson.Result
 				sequence := int64(0)
 				for _, line := range strings.Split(rec.Body.String(), "\n") {
 					if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
 						continue
 					}
-					event := gjson.Parse(strings.TrimPrefix(line, "data: "))
+					event := ojson.Parse(strings.TrimPrefix(line, "data: "))
 					var part string
 					switch format {
 					case "chat":

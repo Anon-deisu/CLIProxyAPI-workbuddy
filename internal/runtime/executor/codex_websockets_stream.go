@@ -50,7 +50,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	clientBody := prepared.clientBody
 	wsURL := prepared.wsURL
 	wsHeaders := prepared.wsHeaders
-	useSIWC := prepared.useSIWC
+	identityState := prepared.identityState
 	replayScope := prepared.replayScope
 	optimizeMultiAgentV2 := prepared.optimizeMultiAgentV2
 	multiAgentV2Conflict := prepared.multiAgentV2Conflict
@@ -107,7 +107,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	var errDial error
 	dialCtx := ctx
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
-		conn, closer = existingWebsocketSessionConnForEgress(sess, authID, wsURL, identityState.convergence, helps.CodexEgressFingerprint(auth))
+		conn, closer = existingWebsocketSessionConnForEgress(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), identityState.convergence, helps.CodexEgressFingerprint(auth), prepared.useSIWC)
 		if conn == nil {
 			unlockStreamSession()
 			if cliproxyexecutor.DownstreamWebsocket(ctx) && sess != nil {
@@ -123,7 +123,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	} else {
 		dialCtx = cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
-		conn, closer, respHS, errDial = e.ensureUpstreamConnWithConvergence(dialCtx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence)
+		conn, closer, respHS, errDial = e.ensureUpstreamConnWithConvergence(dialCtx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence, prepared.useSIWC)
 	}
 	var upstreamHeaders http.Header
 	if respHS != nil {
@@ -220,7 +220,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			// Retry once with a new websocket connection for the same execution session.
-			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithConvergence(ctx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence)
+			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithConvergence(ctx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence, prepared.useSIWC)
 			if errDialRetry != nil || connRetry == nil {
 				bodyErr := websocketHandshakeBody(respHSRetry)
 				if respHSRetry != nil {
@@ -539,14 +539,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
 					payload = completedPayload
 				}
-				downstreamPayload := helps.EnsureResponsesUsageDetails(payload)
+				downstreamPayload := helps.EnsureResponsesUsageDetails(applyCodexIdentityExposeResponsePayload(payload, identityState))
 				currentChunks = [][]byte{downstreamPayload}
 			} else {
 				payload = normalizeCodexWebsocketCompletion(payload)
 				if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
 					payload = completedPayload
 				}
-				line := encodeCodexWebsocketAsSSE(payload)
+				line := encodeCodexWebsocketAsSSE(applyCodexIdentityExposeResponsePayload(payload, identityState))
 				currentChunks = helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
 			}
 
@@ -801,7 +801,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete" {
 					payload = completedPayload
 				}
-				downstreamPayload := helps.EnsureResponsesUsageDetails(payload)
+				downstreamPayload := helps.EnsureResponsesUsageDetails(applyCodexIdentityExposeResponsePayload(payload, identityState))
 				if !send(cliproxyexecutor.StreamChunk{Payload: downstreamPayload, Incomplete: eventType == "response.incomplete"}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
@@ -820,7 +820,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 			eventType = ojson.GetBytesNoCopy(payload, "type").String()
 			isIncomplete := eventType == "response.incomplete"
-			line := encodeCodexWebsocketAsSSE(payload)
+			line := encodeCodexWebsocketAsSSE(applyCodexIdentityExposeResponsePayload(payload, identityState))
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, clientBody, line, &param, claudeInputTokens)
 			for i := range chunks {
 				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i], Incomplete: isIncomplete}) {
@@ -858,6 +858,7 @@ type codexWebsocketPrepared struct {
 	wsURL                string
 	wsHeaders            http.Header
 	useSIWC              bool
+	identityState        codexIdentityConfuseState
 	replayScope          codexReasoningReplayScope
 	optimizeMultiAgentV2 bool
 	multiAgentV2Conflict bool
@@ -939,11 +940,15 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	if useSIWC {
 		applyCodexSIWCWebsocketBodyRulesDoc(doc, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
 	}
+	identityState := applyCodexIdentityConfuseBodyDoc(e.cfg, auth, originalPayloadSource, doc)
 	helps.FinalizePayloadDoc(ctx, doc)
+	identityState.recordFinalizedPayload(doc)
+	alignCodexPromptCacheHeadersDoc(wsHeaders, doc)
 	body = doc.Bytes()
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, preserveNativeOutput, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, baseModel, body, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
+	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	return &codexWebsocketPrepared{
 		from:                 from,
@@ -955,6 +960,7 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		wsURL:                wsURL,
 		wsHeaders:            wsHeaders,
 		useSIWC:              useSIWC,
+		identityState:        identityState,
 		replayScope:          replayScope,
 		optimizeMultiAgentV2: optimizeMultiAgentV2,
 		multiAgentV2Conflict: multiAgentV2Conflict,

@@ -36,17 +36,23 @@ type SessionTreeInfo = SessionInfo
 // sessionJSONObject indexes top-level fields once so missing identity fields do
 // not repeatedly scan large message, tool or image payloads.
 type sessionJSONObject struct {
-	gjson.Result
-	fields map[string]gjson.Result
+	ojson.Result
+	fields     map[string]ojson.Result
+	duplicates map[string]bool
 }
 
-func indexSessionJSONObject(root gjson.Result) sessionJSONObject {
+func indexSessionJSONObject(root ojson.Result) sessionJSONObject {
 	object := sessionJSONObject{Result: root}
 	if root.IsObject() {
-		object.fields = make(map[string]gjson.Result)
-		root.ForEach(func(key, value gjson.Result) bool {
+		object.fields = make(map[string]ojson.Result)
+		root.ForEach(func(key, value ojson.Result) bool {
 			name := key.String()
-			if _, exists := object.fields[name]; !exists {
+			if _, exists := object.fields[name]; exists {
+				if object.duplicates == nil {
+					object.duplicates = make(map[string]bool)
+				}
+				object.duplicates[name] = true
+			} else {
 				object.fields[name] = value
 			}
 			return true
@@ -55,8 +61,11 @@ func indexSessionJSONObject(root gjson.Result) sessionJSONObject {
 	return object
 }
 
-func (object sessionJSONObject) Get(path string) gjson.Result {
+func (object sessionJSONObject) Get(path string) ojson.Result {
 	key, rest, nested := strings.Cut(path, ".")
+	if nested && object.duplicates[key] {
+		return object.Result.Get(path)
+	}
 	value := object.fields[key]
 	if nested {
 		return value.Get(rest)

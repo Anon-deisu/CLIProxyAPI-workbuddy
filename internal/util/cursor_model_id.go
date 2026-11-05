@@ -1,10 +1,6 @@
 package util
 
-import (
-	"strings"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-)
+import "strings"
 
 // Cursor variant hyphen suffixes used by desktop / cursor2api. They are never
 // public registry model IDs; strip them when looking up providers/auth shards.
@@ -27,12 +23,25 @@ func RegistryModelID(modelName string) string {
 	if modelName == "" {
 		return ""
 	}
-	parsed := thinking.ParseSuffix(modelName)
-	base := strings.TrimSpace(parsed.ModelName)
-	if base == "" {
-		base = modelName
+	return stripCursorVariantSuffix(stripModelValueSuffix(modelName))
+}
+
+func stripModelValueSuffix(modelName string) string {
+	lastOpen := strings.LastIndex(modelName, "(")
+	if lastOpen < 0 || !strings.HasSuffix(modelName, ")") {
+		return modelName
 	}
-	return stripCursorVariantSuffix(base)
+
+	suffix := strings.TrimSpace(modelName[lastOpen+1 : len(modelName)-1])
+	if suffix == "" {
+		return modelName
+	}
+
+	base := strings.TrimSpace(modelName[:lastOpen])
+	if base == "" {
+		return modelName
+	}
+	return base
 }
 
 func stripCursorVariantSuffix(requested string) string {

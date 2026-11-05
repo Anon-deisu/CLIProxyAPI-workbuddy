@@ -1178,7 +1178,7 @@ func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, b
 			break
 		}
 	}
-	hasTopLevelErrorFields := gjson.GetBytes(payload, "code").Exists() && gjson.GetBytes(payload, "message").Exists()
+	hasTopLevelErrorFields := ojson.GetBytesNoCopy(payload, "code").Exists() && ojson.GetBytesNoCopy(payload, "message").Exists()
 	if helps.IsWorkBuddyQueueWaiting(payload) {
 		// WorkBuddy's 6020 queue frame carries no HTTP status; without this it
 		// would be downgraded to a generic 502 and lose its retry delay.
@@ -1207,11 +1207,14 @@ func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, b
 }
 
 type statusErr struct {
-	code             int
-	msg              string
-	retryAfter       *time.Duration
-	credentialScoped bool
-	resultCode       string
+	code               int
+	msg                string
+	diagnostic         string
+	streamTruncated    bool
+	transientRateLimit bool
+	retryAfter         *time.Duration
+	credentialScoped   bool
+	resultCode         string
 }
 
 func (e statusErr) Error() string {

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"reflect"
@@ -9,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -206,6 +207,20 @@ type DevinConfig struct {
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 }
 
+// ProxyConnectionPoolConfig configures upstream connection reuse for one API-key
+// credential. Pools remain isolated per credential; omitting the block disables pooling.
+type ProxyConnectionPoolConfig struct {
+	// Enabled defaults to true when the connection-pool block is present.
+	// An explicit false opts a key out of its group pool.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// IdleConnTimeout defaults to "300s". A non-positive duration disables keep-alives.
+	IdleConnTimeout string `yaml:"idle-conn-timeout,omitempty" json:"idle-conn-timeout,omitempty"`
+
+	// MaxIdleConnsPerHost defaults to 2. A non-positive value disables keep-alives.
+	MaxIdleConnsPerHost *int `yaml:"max-idle-conns-per-host,omitempty" json:"max-idle-conns-per-host,omitempty"`
+}
+
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
@@ -254,6 +269,12 @@ func (c ResponseCompressionConfig) EffectiveMinBytes() int {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+	// WebsocketCompression controls upstream and downstream permessage-deflate; unset means enabled.
+	WebsocketCompression *bool `yaml:"websocket-compression,omitempty" json:"websocket-compression,omitempty"`
+	// UpstreamRequestCompression enables zstd request bodies for the ChatGPT Codex backend.
+	UpstreamRequestCompression bool `yaml:"upstream-request-compression" json:"upstream-request-compression"`
+	// UpstreamRequestCompressionMinBytes defaults to 1024 when zero or negative.
+	UpstreamRequestCompressionMinBytes int `yaml:"upstream-request-compression-min-bytes,omitempty" json:"upstream-request-compression-min-bytes,omitempty"`
 	// QuotaRefresh keeps local account quota weights current without manual probes.
 	QuotaRefresh CodexQuotaRefreshConfig `yaml:"quota-refresh,omitempty" json:"quota-refresh"`
 	// DisableCodexCloaking disables forcing the official Codex identity headers on HTTP/SSE and WebSocket requests.
@@ -290,8 +311,58 @@ type CodexConfig struct {
 	ModelLevelCooling bool `yaml:"model-level-cooling" json:"model-level-cooling"`
 	// LiveMediaRelay terminates and relays Codex Live WebRTC media in this process.
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
-	// ResponseSteering enables full-duplex Codex WebSocket steering for OAuth credentials.
+	// ResponseSteering enables full-duplex Codex WebSockets bound to one upstream
+	// model, account, and socket for their entire lifetime. Default is false.
 	ResponseSteering bool `yaml:"response-steering" json:"response-steering"`
+	// SignInWithChatGPTIdentifier identifies this client during SIWC OAuth authorization and API requests.
+	// Defaults to "CLIProxyAPI".
+	SignInWithChatGPTIdentifier string `yaml:"signin-with-chatgpt-identifier,omitempty" json:"signin-with-chatgpt-identifier,omitempty"`
+}
+
+// WebsocketCompressionEnabled reports whether WebSocket compression is enabled.
+func (c *CodexConfig) WebsocketCompressionEnabled() bool {
+	return c == nil || c.WebsocketCompression == nil || *c.WebsocketCompression
+}
+
+// RequestCompressionMinBytes returns the minimum request size eligible for compression.
+func (c *CodexConfig) RequestCompressionMinBytes() int {
+	if c == nil || c.UpstreamRequestCompressionMinBytes <= 0 {
+		return 1024
+	}
+	return c.UpstreamRequestCompressionMinBytes
+}
+
+const DefaultCodexStreamBootstrapTimeout time.Duration = 0
+
+const maxBootstrapTimeoutSeconds = int64(math.MaxInt64 / time.Second)
+
+// StreamBootstrapTimeoutDuration parses the optional bootstrap hold ceiling.
+func (c *CodexConfig) StreamBootstrapTimeoutDuration() time.Duration {
+	if c == nil {
+		return DefaultCodexStreamBootstrapTimeout
+	}
+	raw := strings.TrimSpace(c.StreamBootstrapTimeout)
+	if raw == "" || raw == "0" || strings.EqualFold(raw, "none") || strings.EqualFold(raw, "unlimited") || strings.EqualFold(raw, "disabled") || strings.EqualFold(raw, "off") || strings.EqualFold(raw, "never") {
+		return 0
+	}
+	if duration, err := time.ParseDuration(raw); err == nil && duration >= 0 {
+		return duration
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 && int64(seconds) <= maxBootstrapTimeoutSeconds {
+		return time.Duration(seconds) * time.Second
+	}
+	return DefaultCodexStreamBootstrapTimeout
+}
+
+// DefaultSignInWithChatGPTIdentifier is the default SIWC agent name and User-Agent prefix.
+const DefaultSignInWithChatGPTIdentifier = "CLIProxyAPI"
+
+// EffectiveSignInWithChatGPTIdentifier returns the configured identifier or its default when blank.
+func (c CodexConfig) EffectiveSignInWithChatGPTIdentifier() string {
+	if value := strings.TrimSpace(c.SignInWithChatGPTIdentifier); value != "" {
+		return value
+	}
+	return DefaultSignInWithChatGPTIdentifier
 }
 
 // CodexQuotaRefreshConfig controls periodic usage-window observations, not token refresh.
@@ -497,6 +568,12 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+
+	// SessionAffinityRebindOn selects which failures rebind an established session.
+	// "any" (default) rebinds on any credential failure; "quota" retains the
+	// original binding across transient failures. Ignored when affinity is disabled.
+	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
 	// FakeModels are runtime-only fixed responses owned by the account scheduling panel.
 	FakeModels []FakeModelConfig `yaml:"-" json:"fake-models,omitempty"`
 }
@@ -761,6 +838,9 @@ type OAuthModelAlias struct {
 
 // OAuthModelSetting defines provider/channel model settings for OAuth credentials.
 type OAuthModelSetting struct {
+	// OpenAPI overrides Vertex endpoint selection for this model.
+	OpenAPI *bool `yaml:"openapi,omitempty" json:"openapi,omitempty"`
+
 	Name             string `yaml:"name" json:"name"`
 	Alias            string `yaml:"alias,omitempty" json:"alias,omitempty"`
 	MaxContextLength int    `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`

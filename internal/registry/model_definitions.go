@@ -156,7 +156,10 @@ func GetXAIModels() []*ModelInfo {
 
 // GetMetaModels returns Meta Muse model definitions.
 func GetMetaModels() []*ModelInfo {
-	models := cloneModelInfos(getModels().Meta)
+	var models []*ModelInfo
+	if data := getModels(); data != nil {
+		models = cloneModelInfos(data.Meta)
+	}
 	if len(models) > 0 {
 		return models
 	}
@@ -537,7 +540,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetWorkBuddyModels(key)
 	case "qoder", "qoder-cn":
 		return GetQoderModels(key)
-	case "meta":
+	case "meta", "muse":
 		return GetMetaModels()
 	default:
 		return nil
@@ -569,11 +572,6 @@ func LookupStaticModelInfoByChannel(modelID, channel string) *ModelInfo {
 	return nil
 }
 
-// GetMetaModels returns the standard Meta Muse model definitions.
-func GetMetaModels() []*ModelInfo {
-	return cloneModelInfos(getModels().Meta)
-}
-
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
 // Returns nil if no matching model is found.
 func LookupStaticModelInfo(modelID string) *ModelInfo {
@@ -582,6 +580,9 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 	}
 
 	data := getModels()
+	if data == nil {
+		data = &staticModelsJSON{}
+	}
 	allModels := [][]*ModelInfo{
 		data.Claude,
 		data.Gemini,
@@ -592,9 +593,8 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Antigravity,
 		data.XAI,
 		data.Cursor,
-		data.Meta,
-		data.Devin,
-		staticDevinModels,
+		GetMetaModels(),
+		GetDevinModels(),
 		GetQoderModels("qoder"),
 		GetQoderModels("qoder-cn"),
 	}

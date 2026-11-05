@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
-	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
-	aiserverv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cursorauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
+	agentv1 "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/agent/v1"
+	aiserverv1 "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/aiserver/v1"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 const (

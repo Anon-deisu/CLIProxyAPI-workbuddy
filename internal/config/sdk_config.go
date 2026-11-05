@@ -5,16 +5,33 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// MaxRequestBodyBytes limits incoming HTTP request bodies. Non-positive values disable the limit.
+	MaxRequestBodyBytes int64 `yaml:"max-request-body-bytes" json:"max-request-body-bytes"`
+
+	// ResponseCompression is the canonical downstream response compression configuration.
+	// Config.ServerResponseCompression mirrors it for JSON and programmatic access.
+	ResponseCompression ResponseCompressionConfig `yaml:"response-compression" json:"-"`
+
+	// Client configures client-facing compatibility behavior.
+	Client ClientConfig `yaml:"client" json:"client"`
+
 	// OAuthOnlyFields records v8 provider settings that apply only to OAuth/file credentials.
 	OAuthOnlyFields map[string]bool `yaml:"-" json:"-"`
 
-	// CodexResponseSteering mirrors the OAuth-only Codex WebSocket steering setting.
+	// CodexResponseSteering mirrors the provider-wide runtime setting for API handlers.
 	CodexResponseSteering bool `yaml:"-" json:"-"`
 
 	// CacheTokenRewrite overrides only downstream cache usage. Nil disables it.
@@ -89,6 +106,194 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// TLSHandshakeTimeout returns the upstream TLS handshake bound for the shared uTLS client.
+// Non-positive values disable the bound; overflowing durations saturate.
+func (c *SDKConfig) TLSHandshakeTimeout() time.Duration {
+	if c == nil || c.TLSHandshakeTimeoutSeconds <= 0 {
+		return 0
+	}
+	const maxTLSHandshakeTimeoutSeconds = math.MaxInt64 / int64(time.Second)
+	if int64(c.TLSHandshakeTimeoutSeconds) > maxTLSHandshakeTimeoutSeconds {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(c.TLSHandshakeTimeoutSeconds) * time.Second
+}
+
+// ClientConfig configures client-facing compatibility behavior.
+type ClientConfig struct {
+	Codex  CodexClientConfig  `yaml:"codex" json:"codex"`
+	Claude ClaudeClientConfig `yaml:"claude" json:"claude"`
+}
+
+// ClaudeClientConfig controls client-facing Claude protocol compatibility.
+type ClaudeClientConfig struct {
+	ShowCodexCommentary bool `yaml:"show-codex-commentary" json:"show-codex-commentary"`
+}
+
+// CodexClientConfig configures Codex client compatibility and the model catalog.
+type CodexClientConfig struct {
+	OptimizeMultiAgentV2 bool                            `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
+	EnableApplyPatch     bool                            `yaml:"enable-apply-patch" json:"enable-apply-patch"`
+	WebSearchResultCache CodexWebSearchResultCacheConfig `yaml:"web-search-result-cache" json:"web-search-result-cache"`
+}
+
+const (
+	DefaultCodexWebSearchResultCacheTTL    = 24 * time.Hour
+	DefaultCodexWebSearchResultCacheLimit  = 1024
+	maxCodexWebSearchResultCacheTTLSeconds = int64(math.MaxInt64 / time.Second)
+)
+
+// CodexWebSearchResultCacheConfig configures the session-scoped web search result cache.
+type CodexWebSearchResultCacheConfig struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	TTL     string `yaml:"ttl" json:"ttl"`
+	Limit   int    `yaml:"limit" json:"limit"`
+}
+
+func (c CodexWebSearchResultCacheConfig) Validate() error {
+	if _, err := parseCodexWebSearchResultCacheTTL(c.TTL); err != nil {
+		return err
+	}
+	if c.Limit < 0 {
+		return fmt.Errorf("client.codex.web-search-result-cache.limit must not be negative")
+	}
+	return nil
+}
+
+func (c CodexWebSearchResultCacheConfig) EffectiveTTL() time.Duration {
+	d, err := parseCodexWebSearchResultCacheTTL(c.TTL)
+	if err != nil || d <= 0 {
+		return DefaultCodexWebSearchResultCacheTTL
+	}
+	return d
+}
+
+func (c CodexWebSearchResultCacheConfig) EffectiveLimit() int {
+	if c.Limit > 0 {
+		return c.Limit
+	}
+	return DefaultCodexWebSearchResultCacheLimit
+}
+
+func (c *CodexWebSearchResultCacheConfig) UnmarshalYAML(value *yaml.Node) error {
+	if c == nil || value == nil || value.Kind == 0 || value.Tag == "!!null" {
+		return nil
+	}
+	if value.Kind != yaml.MappingNode {
+		return fmt.Errorf("client.codex.web-search-result-cache must be a mapping")
+	}
+	var next CodexWebSearchResultCacheConfig
+	seen := map[string]bool{}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		keyNode, valueNode := value.Content[i], value.Content[i+1]
+		if keyNode == nil || valueNode == nil {
+			continue
+		}
+		key := keyNode.Value
+		if seen[key] {
+			return fmt.Errorf("client.codex.web-search-result-cache: duplicate field %q", key)
+		}
+		seen[key] = true
+		switch key {
+		case "enabled":
+			if valueNode.Tag != "!!null" && (valueNode.Kind != yaml.ScalarNode || valueNode.Tag != "!!bool") {
+				return fmt.Errorf("client.codex.web-search-result-cache.enabled must be a boolean")
+			}
+			_ = valueNode.Decode(&next.Enabled)
+		case "ttl":
+			if valueNode.Tag != "!!null" {
+				if valueNode.Kind != yaml.ScalarNode || (valueNode.Tag != "!!str" && valueNode.Tag != "!!int") {
+					return fmt.Errorf("client.codex.web-search-result-cache.ttl must be a duration string or integer seconds")
+				}
+				next.TTL = strings.TrimSpace(valueNode.Value)
+			}
+		case "limit":
+			if valueNode.Tag != "!!null" {
+				if valueNode.Kind != yaml.ScalarNode || valueNode.Tag != "!!int" {
+					return fmt.Errorf("client.codex.web-search-result-cache.limit must be an integer")
+				}
+				if err := valueNode.Decode(&next.Limit); err != nil {
+					return err
+				}
+			}
+		default:
+			return fmt.Errorf("client.codex.web-search-result-cache: unknown field %q", key)
+		}
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	*c = next
+	return nil
+}
+
+func (c *CodexWebSearchResultCacheConfig) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if c == nil || len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var raw struct {
+		Enabled bool            `json:"enabled"`
+		TTL     json.RawMessage `json:"ttl"`
+		Limit   int             `json:"limit"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	ttl, err := parseCodexWebSearchResultCacheTTLJSON(raw.TTL)
+	if err != nil {
+		return err
+	}
+	next := CodexWebSearchResultCacheConfig{Enabled: raw.Enabled, TTL: ttl, Limit: raw.Limit}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	*c = next
+	return nil
+}
+
+func parseCodexWebSearchResultCacheTTLJSON(raw json.RawMessage) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", nil
+	}
+	if trimmed[0] == '"' {
+		var value string
+		if err := json.Unmarshal(trimmed, &value); err != nil {
+			return "", fmt.Errorf("client.codex.web-search-result-cache.ttl: %w", err)
+		}
+		return strings.TrimSpace(value), nil
+	}
+	var seconds int64
+	if err := json.Unmarshal(trimmed, &seconds); err != nil {
+		return "", fmt.Errorf("client.codex.web-search-result-cache.ttl must be a duration string or integer seconds")
+	}
+	return strconv.FormatInt(seconds, 10), nil
+}
+
+func parseCodexWebSearchResultCacheTTL(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "0" {
+		return DefaultCodexWebSearchResultCacheTTL, nil
+	}
+	if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if seconds < 0 || seconds > maxCodexWebSearchResultCacheTTLSeconds {
+			return 0, fmt.Errorf("client.codex.web-search-result-cache.ttl is out of range")
+		}
+		return time.Duration(seconds) * time.Second, nil
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration < 0 {
+		return 0, fmt.Errorf("client.codex.web-search-result-cache.ttl %q is invalid", raw)
+	}
+	if duration == 0 {
+		return DefaultCodexWebSearchResultCacheTTL, nil
+	}
+	return duration, nil
 }
 
 // CacheTokenRewriteConfig chooses a percentage once per downstream request.

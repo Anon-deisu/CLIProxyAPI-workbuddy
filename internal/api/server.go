@@ -19,19 +19,21 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/agentworkspace"
-	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
-	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/agentworkspace"
+	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/githubauth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
@@ -80,7 +82,8 @@ type Server struct {
 	codexLiveHandler *codexlive.Handler
 
 	// cfg holds the current server configuration.
-	cfg *config.Config
+	cfgMu sync.RWMutex
+	cfg   *config.Config
 	// fakeModels holds an immutable copy of the panel's live synthetic models.
 	fakeModels atomic.Value // []config.FakeModelConfig
 
@@ -182,17 +185,40 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	envAdminPassword = strings.TrimSpace(envAdminPassword)
 	envManagementSecret := envAdminPasswordSet && envAdminPassword != ""
 
+	var requestLogger logging.RequestLogger
+	var loggerToggle func(bool)
+	if !cfg.CommercialMode && optionState.requestLoggerFactory != nil {
+		requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
+		if requestLogger != nil {
+			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
+				loggerToggle = setter.SetEnabled
+			}
+		}
+	}
+
 	// Create server instance
 	s := &Server{
 		engine:                       engine,
 		handlers:                     handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager),
 		cfg:                          cfg,
 		accessManager:                accessManager,
+		requestLogger:                requestLogger,
+		loggerToggle:                 loggerToggle,
 		configFilePath:               configFilePath,
 		currentPath:                  wd,
 		envManagementSecret:          envManagementSecret,
 		wsRoutes:                     make(map[string]struct{}),
 		pluginHost:                   optionState.pluginHost,
+		degradedHost:                 cfg.Host,
+		degradedTLS:                  cfg.TLS,
+		degradedMainPort:             cfg.Port,
+		degradedHomeEnabled:          cfg.Home.Enabled,
+		exoFreeHost:                  cfg.Host,
+		exoFreeTLS:                   cfg.TLS,
+		exoFreeUpstreamURL:           "https://opencode.ai/zen/v1/chat/completions",
+		exoFreeResponsesURL:          "https://opencode.ai/zen/v1/responses",
+		exoFreeHTTPClient:            http.DefaultClient,
+		exoFreeSelectNode:            rand.IntN,
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
 
@@ -204,21 +230,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Add request logging middleware before recovery and extra middleware so that
 	// any panic response written by GinLogrusRecovery or custom extraMiddleware is
 	// captured before request logging finalizes.
-	var requestLogger logging.RequestLogger
-	var toggle func(bool)
-	if !cfg.CommercialMode {
-		if optionState.requestLoggerFactory != nil {
-			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
-		}
-		if requestLogger != nil {
-			engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
-			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
-				toggle = setter.SetEnabled
-			}
-		}
+	if requestLogger != nil {
+		engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
 	}
-	s.requestLogger = requestLogger
-	s.loggerToggle = toggle
 
 	engine.Use(logging.GinLogrusRecovery())
 	for _, mw := range optionState.extraMiddleware {
@@ -226,42 +240,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	engine.Use(corsMiddleware())
-	wd, err := os.Getwd()
-	if err != nil {
-		wd = configFilePath
-	}
-
-	envAdminPassword, envAdminPasswordSet := os.LookupEnv("MANAGEMENT_PASSWORD")
-	envAdminPassword = strings.TrimSpace(envAdminPassword)
-	envManagementSecret := envAdminPasswordSet && envAdminPassword != ""
-
-	// Create server instance
-	s := &Server{
-		engine:              engine,
-		handlers:            handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager),
-		cfg:                 cfg,
-		accessManager:       accessManager,
-		requestLogger:       requestLogger,
-		loggerToggle:        toggle,
-		configFilePath:      configFilePath,
-		currentPath:         wd,
-		envManagementSecret: envManagementSecret,
-		wsRoutes:            make(map[string]struct{}),
-		pluginHost:          optionState.pluginHost,
-		degradedHost:        cfg.Host,
-		degradedTLS:         cfg.TLS,
-		degradedMainPort:    cfg.Port,
-		degradedHomeEnabled: cfg.Home.Enabled,
-		exoFreeHost:         cfg.Host,
-		exoFreeTLS:          cfg.TLS,
-		exoFreeUpstreamURL:  "https://opencode.ai/zen/v1/chat/completions",
-		exoFreeResponsesURL: "https://opencode.ai/zen/v1/responses",
-		exoFreeHTTPClient:   http.DefaultClient,
-		exoFreeSelectNode:   rand.IntN,
-
-		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
-	}
+	engine.Use(s.responseCompressionMiddleware())
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
+	openai.SetResponsesWebsocketCompressionEnabled(cfg.Codex.WebsocketCompressionEnabled())
 	s.fakeModels.Store(config.CloneFakeModels(cfg.Routing.FakeModels))
 	s.setExoFreePool(cfg.Routing.CodexStaticISP)
 	s.exampleAPIKeySafeModeActive.Store(s.exampleAPIKeySafeModeRequired(cfg))

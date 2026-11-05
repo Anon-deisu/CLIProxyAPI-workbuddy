@@ -13,7 +13,9 @@ import (
 // SaveConfigPreserveComments writes the config back to YAML while preserving existing comments
 // and key ordering by loading the original file into a yaml.Node tree and updating values in-place.
 func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...bool) error {
-	persistCfg := cfg
+	persisted := *cfg
+	persisted.ResponseCompression = cfg.EffectiveResponseCompression()
+	persistCfg := &persisted
 	migrating := len(migrateV8) > 0 && migrateV8[0]
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -28,6 +30,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...boo
 		return fmt.Errorf("invalid yaml document structure")
 	}
 	layout := deepCopyNode(original.Content[0])
+	migrating = migrating || IsV8ConfigLayout(layout)
 	flat, err := flattenV8(layout)
 	if err != nil {
 		return err
@@ -59,12 +62,12 @@ func SaveConfigPreserveComments(configFile string, cfg *Config, migrateV8 ...boo
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-request-scoped-errors")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-settings")
-	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "plugins", "configs")
 	mergeMappingPreserve(original.Content[0], generated.Content[0])
+	replacePluginConfigsSubtree(original.Content[0], generated.Content[0])
 	if err = restoreV8Layout(original.Content[0], layout, data, generated.Content[0]); err != nil {
 		return err
 	}
-	normalizeCollectionNodeStyles(original.Content[0])
+	NormalizeCollectionNodeStyles(original.Content[0])
 
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
@@ -385,6 +388,20 @@ func appendPath(path []string, key string) []string {
 // never carried it: pruning drops those zero-valued sub-keys. No management
 // endpoint mutates ProxyConnectionPool, so that path is reachable only from code.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
+	// Compression switches default to true, so an explicit false must survive
+	// both leaf pruning and the zero-value check on a newly added parent mapping.
+	switch strings.Join(path, ".") {
+	case "response-compression":
+		if yamlPath(node, "enabled") != nil {
+			return false
+		}
+	case "codex":
+		if yamlPath(node, "websocket-compression") != nil {
+			return false
+		}
+	case "response-compression.enabled", "codex.websocket-compression":
+		return false
+	}
 	// Saved panel overrides must retain explicit zero, false, empty and null values.
 	if len(path) > 0 && path[0] == "account-scheduling" {
 		return false

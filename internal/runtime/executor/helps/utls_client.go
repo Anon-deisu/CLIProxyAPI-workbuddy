@@ -104,19 +104,7 @@ func (t *utlsRoundTripper) createConnection(ctx context.Context, host, addr stri
 		return nil, fmt.Errorf("utls: TLS handshake: %w", errHandshake)
 	}
 
-	tr := &http2.Transport{}
-	if t.codexHTTP2 {
-		tr = codexHTTP2Transport()
-	}
-	h2Conn, errClientConn := tr.NewClientConn(tlsConn)
-	if errClientConn != nil {
-		if errClose := tlsConn.Close(); errClose != nil {
-			return nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w; close TLS connection: %v", errClientConn, errClose)
-		}
-		return nil, fmt.Errorf("utls: initialize HTTP/2 connection: %w", errClientConn)
-	}
-
-	return h2Conn, nil
+	return tlsConn, nil
 }
 
 func codexHTTP2Transport() *http2.Transport {
@@ -140,12 +128,16 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil {
 		return nil, err
 	}
-	return roundTripUtlsConnection(req, tlsConn)
+	return roundTripUtlsConnectionWithProfile(req, tlsConn, t.codexHTTP2)
 }
 
 // roundTripUtlsConnection selects the HTTP protocol before sending the request.
 // Empty ALPN is HTTP/1.1, including when a TLS-inspecting proxy omits ALPN.
 func roundTripUtlsConnection(req *http.Request, tlsConn *tls.UConn) (*http.Response, error) {
+	return roundTripUtlsConnectionWithProfile(req, tlsConn, false)
+}
+
+func roundTripUtlsConnectionWithProfile(req *http.Request, tlsConn *tls.UConn, codexHTTP2 bool) (*http.Response, error) {
 	closeConnection := func() error {
 		// The HTTP/1.1 transport may already have closed its non-pooled
 		// connection after reading the response or canceling the request.
@@ -158,7 +150,11 @@ func roundTripUtlsConnection(req *http.Request, tlsConn *tls.UConn) (*http.Respo
 	var err error
 	switch protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol {
 	case "h2":
-		h2Conn, errClientConn := (&http2.Transport{}).NewClientConn(tlsConn)
+		transport := &http2.Transport{}
+		if codexHTTP2 {
+			transport = codexHTTP2Transport()
+		}
+		h2Conn, errClientConn := transport.NewClientConn(tlsConn)
 		if errClientConn != nil {
 			err = fmt.Errorf("utls: initialize HTTP/2 connection: %w", errClientConn)
 			break
@@ -512,13 +508,10 @@ func NewCodexHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxya
 	return newUtlsHTTPClient(ctx, cfg, auth, timeout, true)
 }
 
-func newUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, codex bool) *http.Client {
-	var proxyURL string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+func newUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration, codex bool) (clientOut *http.Client) {
+	var handshakeTimeout time.Duration
+	if cfg != nil {
+		handshakeTimeout = cfg.TLSHandshakeTimeout()
 	}
 	defer func() {
 		clientOut = httptransport.Decorate(ctx, clientOut)

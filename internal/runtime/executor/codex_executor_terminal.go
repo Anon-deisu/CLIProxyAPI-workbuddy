@@ -140,8 +140,9 @@ func patchCodexCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]
 		outputArray = buf.Bytes()
 	}
 
-	completedDataPatched, _ := ojson.SetRawBytes(eventData, "response.output", outputArray)
-	return completedDataPatched
+	doc := ojson.NewDoc(eventData)
+	_ = doc.SetRawBytes("response.output", outputArray)
+	return doc.Bytes()
 }
 
 func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
@@ -181,7 +182,7 @@ func codexTerminalFailureErrWithCooling(eventData []byte, modelLevelCooling bool
 
 func codexTerminalFailureStatus(body []byte) int {
 	for _, path := range []string{"error.status_code", "error.status", "status_code", "status"} {
-		if status := int(gjson.GetBytes(body, path).Int()); status >= 400 && status <= 599 {
+		if status := int(ojson.GetBytesNoCopy(body, path).Int()); status >= 400 && status <= 599 {
 			return status
 		}
 	}
@@ -227,15 +228,16 @@ func codexTerminalFailureBody(eventData []byte) ([]byte, bool) {
 		body = []byte(`{"error":{"message":"upstream stream failed without error details"}}`)
 	}
 	// Preserve envelope statuses when extracting the nested error details.
+	doc := ojson.NewDoc(body)
 	for _, key := range []string{"status", "status_code"} {
-		if status := gjson.GetBytes(eventData, key); status.Exists() {
-			body, _ = sjson.SetRawBytes(body, key, []byte(status.Raw))
+		if status := ojson.GetBytesNoCopy(eventData, key); status.Exists() {
+			_ = doc.SetRaw(key, status.Raw)
 		}
 	}
-	if seq := gjson.GetBytes(eventData, "sequence_number"); seq.Exists() {
-		body, _ = sjson.SetBytes(body, "sequence_number", seq.Int())
+	if seq := ojson.GetBytesNoCopy(eventData, "sequence_number"); seq.Exists() {
+		_ = doc.Set("sequence_number", seq.Int())
 	}
-	return body, true
+	return doc.Bytes(), true
 }
 
 func codexTerminalStreamErrShouldHandle(body []byte) bool {
@@ -642,8 +644,58 @@ func isCodexBootstrapBufferableEvent(eventType string, payload []byte) bool {
 	}
 }
 
+// Only empty model-generated items may be buffered before committing a stream.
+// Hosted tool items may already have side effects and must be released immediately.
+func isCodexBufferableOutputItem(payload []byte) bool {
+	item := ojson.GetBytesNoCopy(payload, "item")
+	switch item.Get("type").String() {
+	case "message":
+		return isCodexEmptyContentList(item.Get("content"))
+	case "reasoning":
+		return item.Get("encrypted_content").String() == "" &&
+			isCodexEmptyContentList(item.Get("summary")) && isCodexEmptyContentList(item.Get("content"))
+	case "function_call":
+		return item.Get("arguments").String() == ""
+	case "custom_tool_call":
+		return item.Get("input").String() == ""
+	default:
+		return false
+	}
+}
+
+func isCodexEmptyContentList(list ojson.Result) bool {
+	for _, entry := range list.Array() {
+		switch entry.Get("type").String() {
+		case "output_text", "summary_text", "text", "reasoning_text":
+			if entry.Get("text").String() != "" {
+				return false
+			}
+		case "refusal":
+			if entry.Get("refusal").String() != "" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isCodexEmptyPart(payload []byte) bool {
+	part := ojson.GetBytesNoCopy(payload, "part")
+	switch part.Get("type").String() {
+	case "output_text", "summary_text", "text", "reasoning_text":
+		return part.Get("text").String() == ""
+	case "refusal":
+		return part.Get("refusal").String() == ""
+	default:
+		return false
+	}
+}
+
 // observeCodexTokenEvent records Codex TTFT on the first non-handshake response event.
 func observeCodexTokenEvent(reporter *helps.UsageReporter, payload []byte) {
+	reporter.ObserveResponseModel(payload)
 	helps.ObserveResponsesProgressEvent(reporter, payload)
 }
 

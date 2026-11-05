@@ -329,9 +329,7 @@ func publishCatalogBytes(data []byte) ([]string, error) {
 		return nil, errValidate
 	}
 	old := getModels()
-	if len(parsed.Meta) == 0 && old != nil {
-		parsed.Meta = old.Meta
-	}
+	preserveLocalModelSections(old, &parsed)
 	changed := detectChangedProviders(old, &parsed)
 	modelsCatalogStore.mu.Lock()
 	modelsCatalogStore.data = &parsed
@@ -385,6 +383,25 @@ func SetLocalModelCatalogs(local bool) {
 	catalogRuntime.Lock()
 	defer catalogRuntime.Unlock()
 	catalogRuntime.local = local
+}
+
+// Legacy entrypoints share the catalog workers until the service takes ownership.
+// Later legacy calls must not override custom sources, Home policy, or shutdown.
+func startLegacyCatalogUpdater(ctx context.Context, catalog string) {
+	catalogRuntime.Lock()
+	defer catalogRuntime.Unlock()
+	if catalogRuntime.ctx != nil {
+		return
+	}
+	sources := effectiveCatalogSources(catalogRuntime.sources, catalogRuntime.local, catalogRuntime.home)
+	switch catalog {
+	case "catalog":
+		generalCatalogUpdater.configure(ctx, sources.Catalog)
+	case "codex-catalog":
+		codexCatalogUpdater.configure(ctx, sources.CodexCatalog)
+	case "devin-catalog":
+		devinCatalogUpdater.configure(ctx, sources.DevinCatalog)
+	}
 }
 
 // StartModelCatalogUpdaters binds process-wide readers to the service lifetime.

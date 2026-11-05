@@ -796,6 +796,7 @@ func TestCodexClientModelsResponse_ExplicitRouteOverridesHonored(t *testing.T) {
 			MetadataModelID:  "gpt-5.6-sol",
 			DisplayName:      "Overridden Display Name",
 			MaxContextLength: 123456,
+			UserDefined:      true,
 			ExplicitThinking: true,
 			Thinking: &registry.ThinkingSupport{
 				Levels: []string{"low", "high"},
@@ -805,6 +806,7 @@ func TestCodexClientModelsResponse_ExplicitRouteOverridesHonored(t *testing.T) {
 			ID:               "custom-astra-explicit-no-ultra",
 			MetadataModelID:  "gpt-6-astra",
 			DisplayName:      "Astra Without Ultra",
+			UserDefined:      true,
 			ExplicitThinking: true,
 			Thinking: &registry.ThinkingSupport{
 				// Levels equal registry default (low..max) but explicitly defined by user
@@ -814,6 +816,7 @@ func TestCodexClientModelsResponse_ExplicitRouteOverridesHonored(t *testing.T) {
 		{
 			ID:               "gpt-6-astra",
 			DisplayName:      "Direct Canonical With Explicit Thinking",
+			UserDefined:      true,
 			ExplicitThinking: true,
 			Thinking: &registry.ThinkingSupport{
 				Levels: []string{"low", "high"},
@@ -1168,6 +1171,7 @@ func TestCodexClientModelsResponse_MixedProvidersIntersectCodexExplicitRestricti
 						ID:               aliasName,
 						MetadataModelID:  "gpt-6-astra",
 						DisplayName:      "Astra Mixed Explicit",
+						UserDefined:      true,
 						ExplicitThinking: true,
 						Thinking: &registry.ThinkingSupport{
 							// Codex explicitly restricted to low, high

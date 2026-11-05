@@ -10,8 +10,8 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
-	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
+	cursorauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
+	agentv1 "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/agent/v1"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )

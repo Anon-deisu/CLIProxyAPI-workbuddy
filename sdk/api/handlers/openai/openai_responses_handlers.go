@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
@@ -1012,8 +1011,14 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 
 	// New core execution path
-	modelName := gjson.GetBytes(rawJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	modelName := strings.Clone(ojson.GetBytesNoCopy(rawJSON, "model").String())
+	deliveryCtx, finishDelivery := usage.WithStreamDelivery(context.Background())
+	defer finishDelivery(context.Canceled)
+	cliCtx, cancelExecution := h.GetContextWithCancel(h, c, deliveryCtx)
+	cliCancel := func(err error) {
+		finishDelivery(err)
+		cancelExecution(err)
+	}
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -1047,7 +1052,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	defer stopKeepAlive()
 
 	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(
-		c, cliCtx, cliCancel, h.HandlerType(), modelName, rawJSON, "", keepAliveC, writeKeepAlive,
+		c, cliCtx, func(err error) { cliCancel(err) }, h.HandlerType(), modelName, rawJSON, "", keepAliveC, writeKeepAlive,
 	)
 	if !okBootstrap {
 		return
@@ -1059,27 +1064,13 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	if isCodexClient {
 		failureEvent = "response.failed"
 	}
-	framer := &responsesSSEFramer{failureEvent: failureEvent}
-	stopKeepAlive := h.StartStreamingKeepAlive(cliCtx, func() {
-		setSSEHeaders()
-		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-		flusher.Flush()
-	})
-	defer stopKeepAlive()
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
-	stopKeepAlive()
-	if c.Writer.Written() {
-		h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
-		return
+	framer := &responsesSSEFramer{
+		failureEvent:  failureEvent,
+		isCodexClient: isCodexClient,
+		canComplete:   func() bool { return usage.StreamDeliverySupported(cliCtx) },
 	}
 
 	var initialOutput bytes.Buffer
-	var keepAliveC <-chan time.Time
-	if interval := handlers.StreamingKeepAliveInterval(h.Cfg); interval > 0 {
-		keepAlive := time.NewTimer(interval)
-		defer keepAlive.Stop()
-		keepAliveC = keepAlive.C
-	}
 
 	// Preserve HTTP errors until either a complete data frame or a configured heartbeat commits SSE.
 	for {
@@ -1088,10 +1079,21 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-keepAliveC:
-			setSSEHeaders()
-			_, _ = c.Writer.Write(initialOutput.Bytes())
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-			flusher.Flush()
+			stopKeepAlive()
+			commitSSE()
+			if initialOutput.Len() > 0 {
+				if errWrite := writeResponsesSSEChunk(c.Writer, initialOutput.Bytes()); errWrite != nil {
+					cliCancel(errWrite)
+					return
+				}
+				if errFlush := flushResponsesSSE(c.Writer); errFlush != nil {
+					cliCancel(errFlush)
+					return
+				}
+			}
+			if !writeKeepAlive() {
+				return
+			}
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
 		case errMsg, ok := <-errChan:
@@ -1214,10 +1216,6 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
-		case <-keepAliveC:
-			if !writeKeepAlive() {
-				return
-			}
 		}
 	}
 }

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	aiserverv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1"
+	aiserverv1 "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/aiserver/v1"
 )
 
 func resetCatalogForTest() {

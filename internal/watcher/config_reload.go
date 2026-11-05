@@ -3,8 +3,10 @@
 package watcher
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"reflect"
 	"time"
@@ -17,7 +19,36 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-var loadConfigFileFunc = config.LoadConfig
+var loadConfigFileFunc = loadConfigFileWithSourceHash
+
+const maxConfigLoadAttempts = 3
+
+func loadConfigFileWithSourceHash(path string) (*config.Config, error) {
+	for attempt := 0; attempt < maxConfigLoadAttempts; attempt++ {
+		before, errRead := os.ReadFile(path)
+		if errRead != nil {
+			return nil, errRead
+		}
+
+		loaded, errLoad := config.LoadConfig(path)
+		if errLoad != nil {
+			return nil, errLoad
+		}
+
+		after, errRead := os.ReadFile(path)
+		if errRead != nil {
+			return nil, errRead
+		}
+		if !bytes.Equal(before, after) {
+			continue
+		}
+		if loaded.SourceHash == "" {
+			loaded.SourceHash = config.ComputeSourceHash(before)
+		}
+		return loaded, nil
+	}
+	return nil, fmt.Errorf("config file %q changed during each of %d load attempts", path, maxConfigLoadAttempts)
+}
 
 func (w *Watcher) stopConfigReloadTimer() {
 	w.configReloadMu.Lock()
@@ -100,6 +131,14 @@ func (w *Watcher) reloadConfig() bool {
 	if errLoadConfig != nil {
 		log.Errorf("failed to reload config: %v", errLoadConfig)
 		return false
+	}
+	if newConfig.SourceHash == "" {
+		// Fill a missing source hash before client callbacks can save a newer config.
+		if data, errRead := os.ReadFile(w.configPath); errRead == nil && len(data) > 0 {
+			newConfig.SourceHash = config.ComputeSourceHash(data)
+		} else if errRead != nil {
+			log.WithError(errRead).Debug("failed to compute loaded config hash")
+		}
 	}
 
 	if w.mirroredAuthDir != "" {

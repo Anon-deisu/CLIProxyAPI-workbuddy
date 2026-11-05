@@ -6,14 +6,14 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/relay"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/relay"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -21,6 +21,49 @@ type openAICompatibilityRegistrationCache struct {
 	cfg     *config.Config
 	byName  map[string]*openAICompatibilityRegistrationEntry
 	byIndex map[int]*openAICompatibilityRegistrationEntry
+}
+
+// codexServiceExecutor records the config snapshot used for service binding.
+// The runtime Codex constructor clones config, so its own pointer identity does
+// not identify the service snapshot that owns this binding.
+type codexServiceExecutor struct {
+	*executor.CodexAutoExecutor
+	cfg *config.Config
+}
+
+func (e *codexServiceExecutor) UsesConfig(cfg *config.Config) bool {
+	return e != nil && e.CodexAutoExecutor != nil && e.cfg == cfg
+}
+
+func (e *codexServiceExecutor) ForAPIKey() coreauth.ProviderExecutor {
+	if e == nil || e.CodexAutoExecutor == nil {
+		return nil
+	}
+	apiKeyExecutor, ok := e.CodexAutoExecutor.ForAPIKey().(*executor.CodexAutoExecutor)
+	if !ok || apiKeyExecutor == nil {
+		return nil
+	}
+	return &codexServiceExecutor{CodexAutoExecutor: apiKeyExecutor, cfg: e.cfg}
+}
+
+func (e *codexServiceExecutor) SharesExecutionSessionsWith(other coreauth.ProviderExecutor) bool {
+	if e == nil || e.CodexAutoExecutor == nil {
+		return false
+	}
+	if wrapped, ok := other.(*codexServiceExecutor); ok {
+		other = wrapped.CodexAutoExecutor
+	}
+	return e.CodexAutoExecutor.SharesExecutionSessionsWith(other)
+}
+
+func codexExecutorUsesConfig(current coreauth.ProviderExecutor, cfg *config.Config) bool {
+	if current == nil {
+		return false
+	}
+	if configured, ok := current.(interface{ UsesConfig(*config.Config) bool }); ok {
+		return configured.UsesConfig(cfg)
+	}
+	return false
 }
 
 // pluginHostHasAuthProvider is overridable in tests to avoid loading real plugins.
@@ -305,16 +348,13 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		}
 		if !forceReplace {
 			existingExecutor, hasExecutor := s.coreManager.Executor("codex")
-			if hasExecutor {
-				existingCodexAutoExecutor, isCodexAutoExecutor := existingExecutor.(*executor.CodexAutoExecutor)
-				if isCodexAutoExecutor && existingCodexAutoExecutor.UsesConfig(cfg) {
-					return
-				}
+			if hasExecutor && codexExecutorUsesConfig(existingExecutor, cfg) {
+				return
 			}
 		}
 		codexExecutor := executor.NewCodexAutoExecutor(cfg)
 		codexExecutor.SetEgressManager(s.codexEgress)
-		s.coreManager.RegisterExecutor(codexExecutor)
+		s.coreManager.RegisterExecutor(&codexServiceExecutor{CodexAutoExecutor: codexExecutor, cfg: cfg})
 		return
 	}
 	// Skip disabled auth entries when (re)binding executors.
@@ -695,11 +735,15 @@ func (s *Service) tryRegisterPluginModelsForAuthWithConfigFenced(ctx context.Con
 		return true, true
 	}
 	models := applyExcludedModels(result.Models, activeExcluded)
-	models = applyOAuthModelAliasForAuth(s.cfg, providerKey, activeAuthKind, activeAuth.Attributes, models)
-	models = applyOAuthSettingsForAuth(s.cfg, providerKey, activeAuthKind, models)
-	if len(models) > 0 {
-		s.registerResolvedModelsForAuth(activeAuth, providerKey, applyModelPrefixes(models, activeAuth.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
-		return true
+	models = applyOAuthModelAliasForAuth(cfg, providerKey, activeAuthKind, activeAuth.Attributes, models)
+	publicationFence := fence
+	if pluginAuthCommitted {
+		// A plugin-returned auth update is a deliberate identity transition,
+		// committed conditionally against the starting identity above.
+		// Refresh only the auth inputs after that commit; retain the
+		// starting exclusion summaries and registry epoch so newer global
+		// rules or publications cannot be adopted by this older computation.
+		publicationFence = fence.withAuth(activeAuth)
 	}
 	publicationFence.exclusionProvider = providerKey
 	publicationFence.fallbackExclusionProvider = fallbackExclusionProvider

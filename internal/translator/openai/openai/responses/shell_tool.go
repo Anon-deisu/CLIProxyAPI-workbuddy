@@ -14,9 +14,9 @@ import (
 var errInvalidShellAction = errors.New("invalid shell action: expected nonempty commands strings and optional positive integer limits")
 
 func convertResponsesShellToolToOpenAIChat(_ ojson.Result, name string) ([]byte, bool) {
-	tool := []byte(`{"type":"function","function":{"name":"","description":"Request commands to execute in the client-provided local shell environment. Each commands entry is a complete shell command, not an argv element.","parameters":{"type":"object","properties":{"commands":{"type":"array","items":{"type":"string"},"minItems":1},"timeout_ms":{"type":"integer","minimum":1},"max_output_length":{"type":"integer","minimum":1}},"required":["commands"],"additionalProperties":false}}}`)
-	tool, _ = ojson.SetBytes(tool, "function.name", name)
-	return tool, true
+	toolDoc := ojson.NewDocString(`{"type":"function","function":{"name":"","description":"Request commands to execute in the client-provided local shell environment. Each commands entry is a complete shell command, not an argv element.","parameters":{"type":"object","properties":{"commands":{"type":"array","items":{"type":"string"},"minItems":1},"timeout_ms":{"type":"integer","minimum":1},"max_output_length":{"type":"integer","minimum":1}},"required":["commands"],"additionalProperties":false}}}`)
+	_ = toolDoc.Set("function.name", name)
+	return toolDoc.Bytes(), true
 }
 
 func (idx *responsesToolIndex) isShell(name string) bool {
@@ -130,9 +130,9 @@ func shellCallPlaceholder(callID string) []byte {
 }
 
 func responsesToolInputFailure(responseID string, sequence int, err error) []byte {
-	failure := translatorcommon.ApplyPatchFailure(responseID, sequence)
+	failureDoc := translatorcommon.ApplyPatchFailureDoc(responseID, sequence)
 	if errors.Is(err, errInvalidShellAction) {
-		failure, _ = ojson.SetBytes(failure, "response.error.message", errInvalidShellAction.Error())
+		_ = failureDoc.Set("response.error.message", errInvalidShellAction.Error())
 	}
-	return failure
+	return failureDoc.Bytes()
 }

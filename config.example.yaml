@@ -194,98 +194,8 @@ routing:
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
 
-# The account scheduling panel can opt into saving its settings here.
-# Turning persistence off stops future writes and retains the last saved snapshot.
-# Static ISP node credentials are included when configured.
-# account-scheduling:
-#   persist-settings: true
-#   degraded-port: 9444
-#   exo-free-port: 0  # OpenCode Free Chat/Responses streaming API; legacy key, 0 disables it.
-#   auth-concurrency-limit: 0
-#   workbuddy-fingerprint-convergence: false # keep WorkBuddy's upstream account identity stable per UID/site
-#   codex-static-isp:
-#     enabled: false
-#     nodes:
-#       - id: isp-us-1
-#         scheme: socks5 # socks5 (default), socks5h, http or https
-#         host: 192.0.2.10
-#         port: 1080
-#         username: your-isp-username
-#         password: your-isp-password
-# A non-empty enabled pool overrides the account/global proxies for Codex
-# OAuth accounts. HTTP and WebSocket share the bound endpoint.
-# Node failures never fall back to direct or another proxy for the same account.
-# Stable assignments are stored in runtime/codex-static-isp-bindings.json beside this config.
-# Provision that runtime directory as service-owned (0700); config.yaml remains protected (0600).
-
-# Codex provider behavior.
-codex:
-  # Refresh active local OAuth accounts immediately and between completed polling rounds.
-  # Updates quota-based scheduling weights; does not generate model requests or bill usage.
-  # Disabled accounts and Home-managed credentials are not probed.
-  quota-refresh:
-    enabled: true
-    interval: 5m
-    concurrency: 2
-  # When true, and routing.strategy is fill-first or routing.session-affinity is true,
-  # remap Codex prompt_cache_key and installation identity per selected auth.
-  # Some superstitious users believe request tracking identifiers can be used
-  # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
-  identity-confuse: false
-  # Disable forcing the official Codex User-Agent and Originator headers on HTTP/SSE and WebSocket requests.
-  disable-codex-cloaking: false
-  # Hold back the initial handshake events (response.created, response.in_progress and the
-  # websocket metadata frames) until the upstream emits its first generated event.
-  # Why: the upstream smuggles `server_is_overloaded` rejections *inside* an HTTP 200 stream,
-  # right after those handshake events, instead of returning 503 on the wire. Buffering them
-  # keeps the downstream response headers uncommitted long enough to transparently retry on
-  # another credential. Only overload/rate-limit rejections trigger failover; every other
-  # terminal failure is still delivered in-stream exactly as before.
-  # Trade-off: response headers are delayed until generation starts, which can trip client or
-  # reverse-proxy read timeouts (e.g. nginx proxy_read_timeout) on long reasoning requests.
-  # Default: false
-  stream-bootstrap-buffering: false
-  # When true, optimize Codex Desktop, codex-tui, and codex_cli_rs requests for multi-agent v2.
-  # This refreshes Codex spawn_agent model details, removes message parameter encryption,
-  # normalizes encrypted agent_message content for Codex, and converts agent_message input
-  # into standard user messages for non-Codex upstream protocols.
-  optimize-multi-agent-v2: false
-  # When true, enable opt-in compatibility for orphan Codex delegation outputs.
-  # Converts orphan function_call_output items from codex_app/create_thread and
-  # codex_app/send_message_to_thread (which lack a valid call_id or matching function_call)
-  # into standard user messages across Responses and non-Codex protocols when the request
-  # header contains X-Openai-Subagent: collab_spawn.
-  orphan-delegation-compatibility: false
-  # When true, scope Codex usage_limit_reached quota cooldowns to the requested model rather
-  # than cooling down the entire credential across all sibling models.
-  # Default: false
-  model-level-cooling: false
-  # Terminate and relay Codex Live WebRTC audio and DataChannel traffic in this process.
-  # This requires inbound UDP reachability. Keep disabled to preserve direct media behavior.
-  live-media-relay:
-    enabled: false
-    # Maximum concurrent media sessions. Zero uses the default of 32.
-    max-sessions: 32
-    # Reject downstream SDP candidates that target private, loopback, link-local, or unspecified IPs.
-    # Keep false for local or trusted-network Codex Desktop connections.
-    disable-private-remote-ips: false
-    # Public IPv4 or IPv6 address advertised when CPA is behind 1:1 NAT.
-    public-ip: ""
-    # Optional UDP allocation range. Both values must be set together and provide at least two ports per session.
-    udp-port-min: 0
-    udp-port-max: 0
-    # Optional STUN/TURN servers. TURN credentials are never returned by the JSON config API.
-    # Without a concrete global/per-auth proxy-url, WebRTC uses normal direct ICE/STUN/TURN connectivity.
-    # With http, https, socks5, or socks5h proxy-url, the OpenAI-facing leg is forced through
-    # authenticated ICE-TCP over that proxy and never falls back to UDP or a direct connection.
-    # The Codex Desktop-facing leg remains direct, and configured ICE servers still apply to it.
-    # ice-servers:
-    #   - urls:
-    #       - "stun:stun.example.com:3478"
-    #   - urls:
-    #       - "turn:turn.example.com:3478?transport=udp"
-    #     username: "user"
-    #     credential: "secret"
+  # When true, unprefixed requests only use credentials without a prefix (except when prefix == model name).
+  force-model-prefix: false
 
   retry:
     # Number of additional credential retry rounds after the first round exhausts
@@ -311,14 +221,9 @@ codex:
     # Retry rounds that need no wait remain controlled by request-retry.
     max-retry-interval: 30
 
-# When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
-nonstream-keepalive-interval: 0
-# Streaming behavior (SSE keep-alives + safe bootstrap retries).
-# streaming:
-#   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
-#   # Responses and Chat Completions also send heartbeats during upstream setup and first-payload waits.
-#   # Once a heartbeat commits HTTP 200, later failures are returned as SSE errors, not HTTP error statuses.
-#   bootstrap-retries: 1    # Default: 0 (disabled). Retries before the first model payload is sent.
+  cooldown:
+    # A credential/provider disable-cooling value overrides this global value.
+    disable-cooling: false
 
     # When true, persist per-auth cooldown status as .cds files next to auth files.
     # Default is false; when false, cooldown status is kept in memory only.
@@ -327,6 +232,61 @@ nonstream-keepalive-interval: 0
     # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504/520-526).
     # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
     transient-error-cooldown-seconds: 0
+
+# The account scheduling panel can opt into saving its settings here.
+# Turning persistence off stops future writes and retains the last saved snapshot.
+# Static ISP node credentials are included when configured.
+# account-scheduling:
+#   persist-settings: true
+#   degraded-port: 9444
+#   exo-free-port: 0  # OpenCode Free Chat/Responses streaming API; legacy key, 0 disables it.
+#   auth-concurrency-limit: 0
+#   workbuddy-fingerprint-convergence: false # keep WorkBuddy's upstream account identity stable per UID/site
+#   codex-static-isp:
+#     enabled: false
+#     nodes:
+#       - id: isp-us-1
+#         scheme: socks5 # socks5 (default), socks5h, http or https
+#         host: 192.0.2.10
+#         port: 1080
+#         username: your-isp-username
+#         password: your-isp-password
+# A non-empty enabled pool overrides the account/global proxies for Codex
+# OAuth accounts. HTTP and WebSocket share the bound endpoint.
+# Node failures never fall back to direct or another proxy for the same account.
+# Stable assignments are stored in runtime/codex-static-isp-bindings.json beside this config.
+# Provision that runtime directory as service-owned (0700); config.yaml remains protected (0600).
+
+# Mode-B relay control plane (relay docs ch.6). In this fork the Claude provider has NO
+# direct Anthropic egress: tenant turns are admitted (custom system / custom tool
+# schemas / assistant prefill / json-mode / non-coding are rejected with a documented
+# 4xx), bound strictly 1 tenant : 1 account for life, gated by a fail-closed
+# ban/quarantine authority, rate-limited per account (concurrency=1, fixed seeded
+# budget at 25-35% of plan ceiling, timezone-derived quiet hours), then dispatched to
+# the account's REAL Claude Code agent over a local socket. The uTLS transport and the
+# credential refresh path are deleted from the fork (F3: the CC agent owns the OAuth
+# token lifecycle). Point each account at a relay/adapter (relay/adapter/adapter.mjs).
+# relay:
+#   agents:                        # auth-ID -> per-account agent endpoint (unix:// on Linux; loopback tcp:// dev-only)
+#     "claude-user@example.com.json": "unix:///run/relay/agent-claude.sock"
+#   store:                         # affinity + ban/quarantine authority (docs F8/F20, fail-closed)
+#     driver: "rqlite"             # "rqlite" (default, replicated Raft, linearizable reads) | "file" (dev/tests only)
+#     rqlite-url: "http://127.0.0.1:4001"
+#     path: ""                     # file driver only; default <auth-dir>/relay-store.json
+#   turn-timeout-seconds: 900      # hard per-turn wall-clock cap (F11)
+#   turn-max-output-tokens: 0      # per-turn output token cap, 0 = unlimited
+#   queue-depth: 8                 # bounded per-account FIFO; overflow = 429, never spills to another account
+#   admission:
+#     coding-gate: "strict"        # "strict" (default) rejects non-coding traffic; "off" disables the heuristic
+#     allow-tools: true            # tolerate exact-name default CC toolset schemas; custom schemas always rejected (docs 6.6.3)
+#   limits:
+#     plan-cap-5h: 220000          # assumed per-account 5h plan ceiling; enforced budget is a seeded 25-35% of this
+#     plan-cap-7d: 0               # 7d window cap; 0 disables
+#     opus-plan-cap-5h: 0          # separate Opus bucket cap; 0 routes Opus into the Sonnet bucket
+#     quiet-hours: true            # timezone-derived diurnal silence (no dispatch at local night)
+#     default-timezone: "UTC"
+#     account-timezone:            # per-account IANA timezone for quiet hours + pacing
+#       "claude-user@example.com.json": "America/Los_Angeles"
 
 # Shared request/response behavior.
 requests:
@@ -745,167 +705,6 @@ upstream:
 #
 #   # Vertex API keys (Vertex-compatible endpoints, base-url is optional)
 #
-# Default headers for Claude API requests. Update only after measuring a new Claude Code release.
-# Unconfirmed clients use this CLI baseline. Verified native Claude Code CLI, sdk-cli,
-# and VSCode requests preserve their measured entrypoint and software shape only when the
-# Claude Code version, package version, and runtime version exactly match this configured
-# baseline; unmeasured versions fall back to it. In legacy mode, timeout is a fallback and
-# verified native OS/arch values remain client-supplied. When stabilize-device-profile is
-# enabled, OS/arch are pinned to the values below and cached profiles remain constrained to
-# the same exact software baseline rather than learning newer client versions.
-# claude-header-defaults:
-#   user-agent: "claude-cli/2.1.258 (external, cli)"
-#   package-version: "0.112.1"
-#   runtime-version: "v26.3.0"
-#   os: "MacOS"
-#   arch: "arm64"
-#   timeout: "600"
-#   timezone: "Asia/Singapore"  # fallback IANA timezone for cloaked currentDate; a credential JSON "timezone" takes priority
-#   stabilize-device-profile: false  # optional, default false; set true to enable per-auth/API-key fingerprint pinning
-
-# Mode-B relay control plane (relay docs ch.6). In this fork the Claude provider has NO
-# direct Anthropic egress: tenant turns are admitted (custom system / custom tool
-# schemas / assistant prefill / json-mode / non-coding are rejected with a documented
-# 4xx), bound strictly 1 tenant : 1 account for life, gated by a fail-closed
-# ban/quarantine authority, rate-limited per account (concurrency=1, fixed seeded
-# budget at 25-35% of plan ceiling, timezone-derived quiet hours), then dispatched to
-# the account's REAL Claude Code agent over a local socket. The uTLS transport and the
-# credential refresh path are deleted from the fork (F3: the CC agent owns the OAuth
-# token lifecycle). Point each account at a relay/adapter (relay/adapter/adapter.mjs).
-# relay:
-#   agents:                        # auth-ID -> per-account agent endpoint (unix:// on Linux; loopback tcp:// dev-only)
-#     "claude-user@example.com.json": "unix:///run/relay/agent-claude.sock"
-#   store:                         # affinity + ban/quarantine authority (docs F8/F20, fail-closed)
-#     driver: "rqlite"             # "rqlite" (default, replicated Raft, linearizable reads) | "file" (dev/tests only)
-#     rqlite-url: "http://127.0.0.1:4001"
-#     path: ""                     # file driver only; default <auth-dir>/relay-store.json
-#   turn-timeout-seconds: 900      # hard per-turn wall-clock cap (F11)
-#   turn-max-output-tokens: 0      # per-turn output token cap, 0 = unlimited
-#   queue-depth: 8                 # bounded per-account FIFO; overflow = 429, never spills to another account
-#   admission:
-#     coding-gate: "strict"        # "strict" (default) rejects non-coding traffic; "off" disables the heuristic
-#     allow-tools: true            # tolerate exact-name default CC toolset schemas; custom schemas always rejected (docs 6.6.3)
-#   limits:
-#     plan-cap-5h: 220000          # assumed per-account 5h plan ceiling; enforced budget is a seeded 25-35% of this
-#     plan-cap-7d: 0               # 7d window cap; 0 disables
-#     opus-plan-cap-5h: 0          # separate Opus bucket cap; 0 routes Opus into the Sonnet bucket
-#     quiet-hours: true            # timezone-derived diurnal silence (no dispatch at local night)
-#     default-timezone: "UTC"
-#     account-timezone:            # per-account IANA timezone for quiet hours + pacing
-#       "claude-user@example.com.json": "America/Los_Angeles"
-
-# Default headers for Codex OAuth model requests.
-# These are used only for file-backed/OAuth Codex requests when the client
-# does not send the header. `user-agent` applies to HTTP and websocket requests;
-# `beta-features` only applies to websocket requests. They do not apply to codex-api-key entries.
-# codex-header-defaults:
-#   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
-#   beta-features: "multi_agent"
-
-# OpenAI compatibility providers
-# openai-compatibility:
-#   - name: "openrouter" # The name of the provider; it will be used in the user agent and other places.
-#     disabled: false # optional: set to true to disable this provider without removing it
-#     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
-#     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
-#     support-prompt-cache-key: false # optional: derive prompt_cache_key for requests from all input protocols
-#     disable-cooling: false # optional provider override: true disables cooling, false enables it; omit to inherit global
-#     request-retry: 3 # optional per-provider override; 0 disables additional rounds; omit or set < 0 to inherit global
-#     request-scoped-errors: # optional: custom rules to classify upstream errors by status and body patterns
-#       - status: 400
-#         match:
-#           - "maximum_context_length"
-#           - "context_length_exceeded"
-#         match-regexr:
-#           - "maximum_context_length$"
-#           - "^context_length_exceeded"
-#         action: "stop" # "stop", "stop-and-cooldown", "continue", "continue-and-cooldown"
-#     headers:
-#       X-Custom-Header: "custom-value"
-#       # Values starting with "$" dynamically copy the header value from downstream client requests.
-#       # If the client did not send the specified header, the header is omitted.
-#       # X-Claude-Code-Session-Id: "$ABC" # copies client's "ABC" header
-#     api-key-entries:
-#       - api-key: "sk-or-v1-...b780"
-#         weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
-#         proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
-#         # proxy-url: "direct" # optional: explicit direct connect for this credential
-#       - api-key: "sk-or-v1-...b781" # without proxy-url
-#     models: # The models supported by the provider.
-#       - name: "moonshotai/kimi-k2:free" # The actual model name.
-#         alias: "kimi-k2"               # The alias used in the API.
-#         display-name: "Kimi K2"         # optional catalog display name
-#         max-context-length: 1048576    # optional: override Codex client context window metadata
-#         image: false                   # optional: set true to allow this model on /v1/images/generations and /v1/images/edits (not chat/responses image input)
-#         input-modalities: [text, image] # optional: declare /v1/chat/completions and /v1/responses multimodal input for Codex clients. Use [text] for upstreams that reject multimodal tool result content.
-#         output-modalities: [text]       # optional: declare output modalities when known
-#         is-compat: false                # optional: preserve Claude thinking blocks for compatible upstreams
-#         thinking:                      # optional: omit to default to levels ["low","medium","high"]
-#           levels: ["low", "medium", "high"]
-#       # You may repeat the same alias to build an internal model pool.
-#       # The client still sees only one alias in the model list.
-#       # Requests to that alias will round-robin across the upstream names below,
-#       # and if the chosen upstream fails before producing output, the request will
-#       # continue with the next upstream model in the same alias pool.
-#       - name: "deepseek-v3.1"
-#         alias: "claude-opus-4.66"
-#       - name: "glm-5"
-#         alias: "claude-opus-4.66"
-#       - name: "kimi-k2.5"
-#         alias: "claude-opus-4.66"
-
-# Vertex API keys (Vertex-compatible endpoints, base-url is optional)
-# vertex-api-key:
-#   - api-key: "vk-123..."                        # x-goog-api-key header
-#     weight: 5                                    # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
-#     prefix: "test"                              # optional: require calls like "test/vertex-pro" to target this credential
-#     disable-cooling: false                       # optional override: true disables cooling, false enables it; omit to inherit global
-#     request-retry: 3                             # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
-#     base-url: "https://example.com/api"         # optional, e.g. https://zenmux.ai/api; falls back to Google Vertex when omitted
-#     proxy-url: "socks5://proxy.example.com:1080" # optional per-key proxy override
-#     # proxy-url: "direct" # optional: explicit direct connect for this credential
-#     headers:
-#       X-Custom-Header: "custom-value"
-#       # Values starting with "$" dynamically copy the header value from downstream client requests.
-#       # If the client did not send the specified header, the header is omitted.
-#       # X-Claude-Code-Session-Id: "$ABC" # copies client's "ABC" header
-#     models:                                     # optional: map aliases to upstream model names
-#       - name: "gemini-2.5-flash"                # upstream model name
-#         alias: "vertex-flash"                   # client-visible alias
-#         display-name: "Vertex Flash"            # optional catalog display name
-#         thinking:                                # optional: exact thinking capability for this configured model
-#           levels: ["high", "medium", "low", "none", "auto"]
-#       - name: "gemini-2.5-pro"
-#         alias: "vertex-pro"
-#     excluded-models:                            # optional: models to exclude from listing
-#       - "imagen-3.0-generate-002"
-#       - "imagen-*"
-
-# Global OAuth model name aliases (per channel)
-# These aliases rename model IDs for both model listing and request routing.
-# Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai.
-# NOTE: Aliases do not apply to gemini-api-key, interactions-api-key, codex-api-key, xai-api-key, claude-api-key, openai-compatibility, or vertex-api-key.
-# NOTE: Because aliases affect the merged /v1 model list and merged request routing, overlapping
-# client-visible names can become ambiguous across providers. For strict backend pinning, use
-# unique aliases/prefixes or avoid overlapping names.
-# You can repeat the same name with different aliases to expose multiple client model names.
-# Optional per-entry fields:
-#   fork: true                  # keep the upstream model and also expose the alias as a separate client-visible model
-#   display-name: "Model Name" # override the human-readable name shown in model catalogs
-#   force-mapping: true         # rewrite upstream response model fields back to the client-visible alias (example below uses antigravity only)
-# Per-auth OAuth aliases can also be stored in an OAuth auth JSON file as "model_aliases".
-# Legacy "model-aliases" credentials remain supported and are normalized at load time.
-# They apply only to that selected auth and take precedence over global aliases for the same client-visible alias.
-# Example auth JSON:
-# {
-#   "type": "codex",
-#   "email": "user@example.com",
-#   "model_aliases": [
-#     {"name": "gpt-5.3-codex-spark", "alias": "gpt-5.5"},
-#     {"name": "gpt-5.3-codex-spark", "alias": "gpt-5.4"}
-#   ]
-# }
-# oauth-model-alias:
 #   vertex:
 #     - name: vertex-1
 #       prefix: "test"                              # optional: require calls like "test/vertex-pro" to target this credential
@@ -1382,6 +1181,17 @@ oauth:
 
     # Codex provider behavior.
     codex:
+      # Refresh active local OAuth accounts immediately and between completed polling rounds.
+      # Updates quota-based scheduling weights without generating model requests.
+      # Disabled accounts and Home-managed credentials are not probed.
+      quota-refresh:
+        enabled: true
+        interval: 5m
+        concurrency: 2
+      # Remap prompt_cache_key and installation identity per selected OAuth account
+      # when routing.strategy is fill-first or routing.session-affinity is true.
+      identity-confuse: false
+
       # Terminate and relay Codex Live WebRTC audio and DataChannel traffic in this process.
       # This requires inbound UDP reachability. Keep disabled to preserve direct media behavior.
       live-media-relay:

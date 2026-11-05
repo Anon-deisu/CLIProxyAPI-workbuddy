@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/codexdata"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
@@ -18,7 +18,7 @@ import (
 // BindCodexSIWC explicitly replaces the SIWC partition of an existing file-backed
 // Codex registration. Unlike ordinary persistence, a failed write never publishes
 // credentials. expectedEpoch and expectedAccount must match the registration captured before OAuth.
-func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch uint64, expectedAccount string, tokenData *codex.CodexSIWCTokenData) (*Auth, error) {
+func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch uint64, expectedAccount string, tokenData *codexdata.CodexSIWCTokenData) (*Auth, error) {
 	if m == nil || strings.TrimSpace(id) == "" || expectedEpoch == 0 || tokenData == nil || strings.TrimSpace(tokenData.AccessToken) == "" || strings.TrimSpace(tokenData.RefreshToken) == "" || strings.TrimSpace(tokenData.ClientID) == "" {
 		return nil, fmt.Errorf("bind SIWC: invalid target or token data")
 	}
@@ -42,7 +42,7 @@ func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch ui
 	}
 	var committed *Auth
 	cooldownChanged := false
-	err = codex.WithFileLock(path, func() error {
+	err = codexdata.WithFileLock(path, func() error {
 		if errCtx := ctx.Err(); errCtx != nil {
 			return errCtx
 		}
@@ -97,7 +97,7 @@ func (m *Manager) BindCodexSIWC(ctx context.Context, id string, expectedEpoch ui
 		if errReadLatest != nil || !bytes.Equal(data, latestData) {
 			return fmt.Errorf("bind SIWC: backing file changed during binding")
 		}
-		if errWrite := codex.WriteJSONFileAtomic(path, out); errWrite != nil {
+		if errWrite := codexdata.WriteJSONFileAtomic(path, out); errWrite != nil {
 			return fmt.Errorf("bind SIWC: persist binding: %w", errWrite)
 		}
 		disk["siwc"] = replacement

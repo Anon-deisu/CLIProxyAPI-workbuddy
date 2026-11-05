@@ -10,17 +10,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
-	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	responsesconverter "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/responses"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	cursorauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	responsesconverter "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/openai/openai/responses"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -59,7 +61,10 @@ func (e *CursorExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	body := translateCursorRequest(from, baseModel, req.Payload, false)
+	body, err := translateCursorRequest(from, baseModel, req.Payload, false)
+	if err != nil {
+		return resp, cursorInvalidRequest(err)
+	}
 
 	// Keep hyphen variant suffixes (-thinking/-xhigh/…) for Cursor resolution.
 	// Public wire model id is the base name; parameters ride on RequestedModel.
@@ -137,7 +142,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	body := translateCursorRequest(from, baseModel, req.Payload, true)
+	body, err := translateCursorRequest(from, baseModel, req.Payload, true)
+	if err != nil {
+		return nil, cursorInvalidRequest(err)
+	}
 
 	upstreamModel := strings.TrimPrefix(baseModel, "cursor-")
 	if upstreamModel == "" {
@@ -613,13 +621,17 @@ func shouldRetryToolTailWithoutContinuation(usedContinuation bool, messages []cu
 // translateCursorRequest gives the Responses entrypoint a deterministic
 // conversion dependency. Relying on a process-wide init side effect allowed
 // embedded builds to pass the original `input` payload to the chat parser.
-func translateCursorRequest(from sdktranslator.Format, model string, payload []byte, stream bool) []byte {
+func translateCursorRequest(from sdktranslator.Format, model string, payload []byte, stream bool) ([]byte, error) {
 	if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
-		return responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(
+		converted, errConvert := responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(
 			model,
 			bytes.Clone(payload),
 			stream,
 		)
+		if errConvert != nil {
+			return nil, errConvert
+		}
+		return restoreCursorResponsesTypedTools(converted, payload), nil
 	}
 	return sdktranslator.TranslateRequest(
 		from,
@@ -627,7 +639,75 @@ func translateCursorRequest(from sdktranslator.Format, model string, payload []b
 		model,
 		bytes.Clone(payload),
 		stream,
-	)
+	), nil
+}
+
+// restoreCursorResponsesTypedTools keeps Responses built-in declarations that
+// do not have a complete Chat Completions equivalent in the shared converter.
+// Cursor still needs these tools in its MCP catalog so typed history and tool
+// choice metadata remain aligned with the original request.
+func restoreCursorResponsesTypedTools(body, original []byte) []byte {
+	doc := ojson.NewDoc(body)
+	tools := doc.Get("tools")
+	if !tools.IsArray() {
+		return body
+	}
+	hasShell := false
+	declaredShellName := false
+	for _, tool := range ojson.GetBytesNoCopy(original, "tools").Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "shell") {
+			hasShell = true
+		}
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		if strings.EqualFold(name, "shell") && tool.Get("type").String() != "shell" {
+			declaredShellName = true
+		}
+	}
+	if hasShell && !declaredShellName {
+		for messageIndex, message := range doc.Get("messages").Array() {
+			for callIndex, call := range message.Get("tool_calls").Array() {
+				if call.Get("function.name").String() == "__cpa_local_shell" {
+					_ = doc.Set(fmt.Sprintf("messages.%d.tool_calls.%d.function.name", messageIndex, callIndex), "shell")
+				}
+			}
+		}
+	}
+	existing := map[string]bool{}
+	for _, tool := range tools.Array() {
+		name := tool.Get("function.name").String()
+		if name == "" {
+			name = tool.Get("name").String()
+		}
+		existing[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	var typed [][]byte
+	for _, tool := range ojson.GetBytesNoCopy(original, "tools").Array() {
+		typ := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+		if typ != "shell" && typ != "local_shell" && typ != "apply_patch" {
+			continue
+		}
+		name := typ
+		if existing[name] {
+			continue
+		}
+		item := ojson.NewDocString(`{"type":"function","function":{"name":"","description":"","parameters":{}}}`)
+		_ = item.Set("function.name", name)
+		typed = append(typed, item.Bytes())
+		existing[name] = true
+	}
+	if len(typed) == 0 {
+		return body
+	}
+	merged := make([][]byte, 0, len(typed)+len(tools.Array()))
+	merged = append(merged, typed...)
+	for _, tool := range tools.Array() {
+		merged = append(merged, []byte(tool.Raw))
+	}
+	_ = doc.SetRawBytes("tools", translatorcommon.JoinRawArray(merged))
+	return doc.Bytes()
 }
 
 type cursorToolConstraint struct {

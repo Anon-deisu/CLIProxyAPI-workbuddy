@@ -18,6 +18,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -212,10 +213,10 @@ func TestCodexIdentityConfuseKeepsClientBodySeparateFromUpstreamBody(t *testing.
 	if identityState.promptCacheKey != expectedPromptCacheKey {
 		t.Fatalf("identity prompt_cache_key = %q, want %q", identityState.promptCacheKey, expectedPromptCacheKey)
 	}
-	if gotKey := gjson.GetBytes(upstreamBody, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
+	if gotKey := ojson.GetBytes(upstreamBody, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("upstream prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
-	if gotKey := gjson.GetBytes(clientBody, "prompt_cache_key").String(); gotKey != "cache-1" {
+	if gotKey := ojson.GetBytes(clientBody, "prompt_cache_key").String(); gotKey != "cache-1" {
 		t.Fatalf("client prompt_cache_key = %q, want cache-1", gotKey)
 	}
 }
@@ -247,9 +248,9 @@ func TestCodexFingerprintConvergenceUsesStableUniqueAccountIdentity(t *testing.T
 		t.Fatal("expected convergence state for Codex OAuth accounts")
 	}
 	for _, field := range []string{"x-codex-installation-id", "session_id", "thread_id", "x-codex-window-id"} {
-		firstValue := gjson.GetBytes(first, "client_metadata."+field).String()
-		secondValue := gjson.GetBytes(second, "client_metadata."+field).String()
-		otherValue := gjson.GetBytes(other, "client_metadata."+field).String()
+		firstValue := ojson.GetBytes(first, "client_metadata."+field).String()
+		secondValue := ojson.GetBytes(second, "client_metadata."+field).String()
+		otherValue := ojson.GetBytes(other, "client_metadata."+field).String()
 		if firstValue == "" || firstValue != secondValue {
 			t.Fatalf("client_metadata.%s is not stable: first=%q second=%q", field, firstValue, secondValue)
 		}
@@ -259,8 +260,8 @@ func TestCodexFingerprintConvergenceUsesStableUniqueAccountIdentity(t *testing.T
 	}
 	firstHeaders := make(http.Header)
 	applyCodexIdentityConfuseHeaders(firstHeaders, &firstState)
-	if got := firstHeaders.Get("X-Codex-Installation-Id"); got != gjson.GetBytes(first, "client_metadata.x-codex-installation-id").String() {
-		t.Fatalf("installation header=%q does not match body=%q", got, gjson.GetBytes(first, "client_metadata.x-codex-installation-id").String())
+	if got := firstHeaders.Get("X-Codex-Installation-Id"); got != ojson.GetBytes(first, "client_metadata.x-codex-installation-id").String() {
+		t.Fatalf("installation header=%q does not match body=%q", got, ojson.GetBytes(first, "client_metadata.x-codex-installation-id").String())
 	}
 }
 
@@ -284,10 +285,10 @@ func TestCodexFingerprintConvergencePreservesExplicitCacheKeysAndPayload(t *test
 	} {
 		body := []byte(payload)
 		updated, state := applyCodexIdentityConfuseBody(cfg, auth, body, body)
-		if got, want := gjson.GetBytes(updated, "prompt_cache_key").Raw, gjson.GetBytes(body, "prompt_cache_key").Raw; got != want {
+		if got, want := ojson.GetBytes(updated, "prompt_cache_key").Raw, ojson.GetBytes(body, "prompt_cache_key").Raw; got != want {
 			t.Fatalf("explicit or missing prompt_cache_key changed: got=%s want=%s", got, want)
 		}
-		if got, want := gjson.GetBytes(updated, "client_metadata.custom").Raw, gjson.GetBytes(body, "client_metadata.custom").Raw; got != want {
+		if got, want := ojson.GetBytes(updated, "client_metadata.custom").Raw, ojson.GetBytes(body, "client_metadata.custom").Raw; got != want {
 			t.Fatalf("unrelated metadata changed: got=%s want=%s", got, want)
 		}
 		if !state.convergence || string(body) != payload {
@@ -306,25 +307,26 @@ func TestCodexFingerprintConvergencePreservesUserPromptCacheSession(t *testing.T
 	}
 	clientBody := []byte(`{"model":"gpt-5-codex","prompt_cache_key":"user-cache-key","client_metadata":{"session_id":"user-cache-key","thread_id":"user-thread"}}`)
 	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: clientBody}
-	httpReq, body, state, err := executor.cacheHelper(context.Background(), sdktranslator.FormatOpenAIResponse, "https://example.test/responses", auth, req, clientBody, clientBody)
+	httpReq, body, err := executor.cacheHelper(context.Background(), sdktranslator.FormatOpenAIResponse, "https://example.test/responses", req, clientBody, auth)
 	if err != nil {
 		t.Fatalf("cacheHelper error: %v", err)
 	}
 	applyCodexHeaders(httpReq, auth, "oauth-token", true, executor.cfg)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &state)
+	state := codexIdentityStateForRequest(httpReq)
+	applyCodexIdentityConfuseHeaders(httpReq.Header, state)
 	if !state.convergence {
 		t.Fatal("expected Codex fingerprint convergence")
 	}
-	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "user-cache-key" {
+	if got := ojson.GetBytes(body, "prompt_cache_key").String(); got != "user-cache-key" {
 		t.Fatalf("prompt_cache_key = %q, want user-cache-key", got)
 	}
 	if got := httpReq.Header.Get("Session-Id"); got != "user-cache-key" {
 		t.Fatalf("Session-Id = %q, want user-cache-key", got)
 	}
-	if got := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); got == "" {
+	if got := ojson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); got == "" {
 		t.Fatal("missing account-scoped installation identity")
 	}
-	if got := gjson.GetBytes(body, "client_metadata.session_id").String(); got == "user-cache-key" || got == "" {
+	if got := ojson.GetBytes(body, "client_metadata.session_id").String(); got == "user-cache-key" || got == "" {
 		t.Fatalf("account fingerprint session_id = %q, want stable non-user identity", got)
 	}
 }
@@ -335,7 +337,11 @@ func TestCodexFingerprintConvergenceSkipsNonResponseEndpoints(t *testing.T) {
 	for _, path := range []string{"/responses/compact", "/images/generations", "/images/edits"} {
 		body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
 		req := cliproxyexecutor.Request{Model: "gpt-5.4", Payload: body}
-		_, updated, state, err := e.cacheHelper(context.Background(), sdktranslator.FormatOpenAIResponse, "https://example.test"+path, auth, req, body, body)
+		httpReq, updated, err := e.cacheHelper(context.Background(), sdktranslator.FormatOpenAIResponse, "https://example.test"+path, req, body, auth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := codexIdentityStateForRequest(httpReq)
 		if err != nil || state.convergence || !bytes.Equal(updated, body) {
 			t.Fatalf("unsupported endpoint %s changed: body=%s state=%+v err=%v", path, updated, state, err)
 		}

@@ -355,7 +355,7 @@ func TestCloneForReloadInheritsOnlySupportedRuntimeFields(t *testing.T) {
 	previous.Routing.AutoDisableUnauthorized = true
 	previous.Routing.AutoDisableQuota = true
 	previous.Home.Enabled = true
-	previous.CodexOptimizeMultiAgentV2 = true
+	previous.Client.Codex.OptimizeMultiAgentV2 = true
 	current := &Config{Debug: true}
 
 	clone := current.CloneForReload(previous)

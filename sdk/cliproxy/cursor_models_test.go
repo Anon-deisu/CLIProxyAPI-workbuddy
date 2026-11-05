@@ -3,11 +3,12 @@ package cliproxy
 import (
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 func TestFailedRefreshKeepsTheCatalogAlreadyRegistered(t *testing.T) {
 	const authID = "cursor-user_keepcatalog.json"
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
 	live := make([]*registry.ModelInfo, 0, 20)
 	for _, id := range []string{
 		"default", "claude-4.6-sonnet", "gpt-5.4", "claude-opus-5", "claude-fable-5",
@@ -34,6 +35,7 @@ func TestUnknownAuthStillGetsBuiltins(t *testing.T) {
 
 func TestSuccessfulFetchWins(t *testing.T) {
 	const authID = "cursor-user_fetchwins.json"
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
 	registry.GetGlobalRegistry().RegisterClient(authID, "cursor", []*registry.ModelInfo{
 		{ID: "stale-1", Object: "model", Type: "cursor"},
 		{ID: "stale-2", Object: "model", Type: "cursor"},

@@ -7,6 +7,93 @@ import (
 	"testing"
 )
 
+func TestModelInfoExplicitCapabilityFlagsAreInternalAndCloned(t *testing.T) {
+	model := &ModelInfo{
+		ID:                      "example",
+		ExplicitThinking:        true,
+		ExplicitInputModalities: true,
+	}
+
+	cloned := cloneModelInfo(model)
+	if !cloned.ExplicitThinking || !cloned.ExplicitInputModalities {
+		t.Fatalf("clone lost explicit capability flags: %+v", cloned)
+	}
+
+	raw, errMarshal := json.Marshal(model)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	if strings.Contains(string(raw), "ExplicitThinking") || strings.Contains(string(raw), "ExplicitInputModalities") ||
+		strings.Contains(string(raw), "explicit_thinking") || strings.Contains(string(raw), "explicit_input_modalities") {
+		t.Fatalf("explicit capability flags leaked into JSON: %s", raw)
+	}
+
+	var decoded ModelInfo
+	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if decoded.ExplicitThinking || decoded.ExplicitInputModalities {
+		t.Fatalf("explicit capability flags unexpectedly came from JSON: %+v", decoded)
+	}
+}
+
+func TestModelInfoUnmarshalSetsExplicitCapabilityFlagsFromFieldPresence(t *testing.T) {
+	for _, tt := range []struct {
+		name                string
+		raw                 string
+		wantThinking        bool
+		wantInputModalities bool
+		thinking            *ThinkingSupport
+		modalities          []string
+	}{
+		{name: "thinking present", raw: `{"id":"thinking","thinking":null}`, wantThinking: true},
+		{name: "empty thinking", raw: `{"thinking":{}}`, wantThinking: true, thinking: &ThinkingSupport{}},
+		{name: "modalities present", raw: `{"id":"modalities","supportedInputModalities":[]}`, wantInputModalities: true, modalities: []string{}},
+		{name: "null modalities", raw: `{"supportedInputModalities":null}`, wantInputModalities: true},
+		{name: "both present", raw: `{"thinking":null,"supportedInputModalities":[]}`, wantThinking: true, wantInputModalities: true, modalities: []string{}},
+		{name: "case insensitive", raw: `{"THINKING":{"levels":["high"]},"supportedinputmodalities":["text"]}`, wantThinking: true, wantInputModalities: true, thinking: &ThinkingSupport{Levels: []string{"high"}}, modalities: []string{"text"}},
+		{name: "fields absent", raw: `{"id":"absent"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			info := ModelInfo{ExplicitThinking: true, ExplicitInputModalities: true}
+			if errUnmarshal := json.Unmarshal([]byte(tt.raw), &info); errUnmarshal != nil {
+				t.Fatal(errUnmarshal)
+			}
+			if info.ExplicitThinking != tt.wantThinking || info.ExplicitInputModalities != tt.wantInputModalities {
+				t.Fatalf("explicit flags = thinking:%t modalities:%t, want thinking:%t modalities:%t", info.ExplicitThinking, info.ExplicitInputModalities, tt.wantThinking, tt.wantInputModalities)
+			}
+			if !reflect.DeepEqual(info.Thinking, tt.thinking) || !reflect.DeepEqual(info.SupportedInputModalities, tt.modalities) {
+				t.Fatalf("decoding changed null/empty/value semantics: %+v", info)
+			}
+			if cloned := cloneModelInfo(&info); !reflect.DeepEqual(cloned, &info) {
+				t.Fatal("clone changed explicit capability semantics")
+			}
+		})
+	}
+}
+
+func TestModelInfoRejectsInvalidCapabilityShapes(t *testing.T) {
+	for _, raw := range []string{`{"thinking":[]}`, `{"thinking":false}`, `{"supportedInputModalities":{}}`, `{"supportedInputModalities":false}`} {
+		var info ModelInfo
+		if err := json.Unmarshal([]byte(raw), &info); err == nil {
+			t.Fatalf("accepted invalid capability shape %s", raw)
+		}
+	}
+}
+
+func TestMetaMuseChannelAlias(t *testing.T) {
+	want := GetMetaModels()
+	for _, channel := range []string{"meta", "muse", " MUSE "} {
+		got := GetStaticModelDefinitionsByChannel(channel)
+		if len(got) == 0 || !reflect.DeepEqual(got, want) {
+			t.Fatalf("%q did not resolve to Meta models", channel)
+		}
+		if model := LookupStaticModelInfoByChannel(got[0].ID, channel); !reflect.DeepEqual(model, got[0]) {
+			t.Fatalf("%q did not resolve Meta metadata", channel)
+		}
+	}
+}
+
 func TestCodexConfigurationUpdateCapability(t *testing.T) {
 	// Counterexample: present in every tier without support_configuration_update.
 	const incapableModelID = "gpt-5.6-luna"

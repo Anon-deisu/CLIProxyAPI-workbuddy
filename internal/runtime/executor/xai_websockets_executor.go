@@ -1186,7 +1186,8 @@ func (e *XAIWebsocketsExecutor) prepareResponsesWebsocketRequestDoc(ctx context.
 func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
 	dialer := newProxyAwareWebsocketDialer(ctx, e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
-	dialer.EnableCompression = true
+	compressionEnabled := e.cfg == nil || e.cfg.Codex.WebsocketCompressionEnabled()
+	dialer.EnableCompression = compressionEnabled
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1196,9 +1197,8 @@ func (e *XAIWebsocketsExecutor) dialXAIWebsocket(ctx context.Context, auth *clip
 	}
 	closer := newWebsocketConnectionCloser(conn)
 	if conn != nil {
-		enabled := e.cfg == nil || e.cfg.Codex.WebsocketCompressionEnabled()
-		conn.EnableWriteCompression(enabled)
-		if enabled {
+		conn.EnableWriteCompression(compressionEnabled)
+		if compressionEnabled {
 			// Match Codex's stable flate level and shared compression escape hatch.
 			if errSetCompressionLevel := conn.SetCompressionLevel(flate.DefaultCompression); errSetCompressionLevel != nil {
 				log.Errorf("set xAI websocket compression level: %v", errSetCompressionLevel)

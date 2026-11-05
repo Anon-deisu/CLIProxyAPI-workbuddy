@@ -78,6 +78,17 @@ func applyCodexPromptCacheHeadersWithContextDoc(ctx context.Context, from sdktra
 	return headers, changed, nil
 }
 
+// Headers describe the final cache key, including a user override or filter.
+func alignCodexPromptCacheHeadersDoc(headers http.Header, doc *ojson.Doc) {
+	deleteHeaderCaseInsensitive(headers, "session_id")
+	deleteHeaderCaseInsensitive(headers, "Session-Id")
+	deleteHeaderCaseInsensitive(headers, "Conversation_id")
+	if key := doc.Get("prompt_cache_key").String(); key != "" {
+		setHeaderCasePreserved(headers, "session_id", key)
+		headers.Set("Conversation_id", key)
+	}
+}
+
 func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, nativeRequest bool, clientHeaders ...http.Header) http.Header {
 	if headers == nil {
 		headers = http.Header{}
@@ -184,7 +195,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	req := (&http.Request{Header: headers}).WithContext(ctx)
 	util.ApplyCustomHeadersFromAttrs(req, attrs, ginHeaders)
 	applyCodexCloakingHeaders(headers, cfg, auth)
-	if !isAPIKey {
+	if !isAPIKey && !(nativeRequest && isCodexCloakingDisabled(cfg, auth)) {
 		if hint := effectiveCodexRoutingHint(cfg); hint != "" {
 			headers.Set("x-codex-routing-hint", hint)
 		} else {

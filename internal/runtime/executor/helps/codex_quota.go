@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/MoeForge/moego/ojson"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
 const (
@@ -37,7 +36,7 @@ func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 	if eventKind == codexQuotaEventOther {
 		return nil
 	}
-	root := util.ParseGJSONBytesNoCopy(payload)
+	root := ojson.ParseBytes(payload)
 	if eventKind == codexQuotaEventError {
 		return parseCodexQuotaHeadersObject(root.Get("headers"))
 	}
@@ -48,17 +47,17 @@ func ParseCodexQuotaEventHeaders(payload []byte) http.Header {
 // quota observation headers. Missing or invalid windows return nil so callers
 // can retain the previous snapshot instead of treating absent usage as zero.
 func ParseCodexUsageQuotaHeaders(payload []byte) http.Header {
-	if !gjson.ValidBytes(payload) {
+	if !ojson.ValidBytes(payload) {
 		return nil
 	}
-	root := gjson.ParseBytes(payload)
+	root := ojson.ParseBytes(payload)
 	if !root.IsObject() {
 		return nil
 	}
 	return parseCodexQuotaSnapshotHeaders(root, true)
 }
 
-func parseCodexQuotaSnapshotHeaders(root gjson.Result, requireWindow bool) http.Header {
+func parseCodexQuotaSnapshotHeaders(root ojson.Result, requireWindow bool) http.Header {
 	headers := make(http.Header)
 	hasQuotaData := false
 
@@ -188,7 +187,7 @@ func codexQuotaEventKind(payload []byte) int {
 	return codexQuotaEventOther
 }
 
-func addCodexQuotaRateLimitHeaders(headers http.Header, prefix string, rateInfo gjson.Result, requireWindow bool) bool {
+func addCodexQuotaRateLimitHeaders(headers http.Header, prefix string, rateInfo ojson.Result, requireWindow bool) bool {
 	if !rateInfo.Exists() || !rateInfo.IsObject() {
 		return false
 	}
@@ -211,7 +210,7 @@ func addCodexQuotaRateLimitHeaders(headers http.Header, prefix string, rateInfo 
 	return changed
 }
 
-func addCodexQuotaWindowHeaders(headers http.Header, prefix string, window gjson.Result) bool {
+func addCodexQuotaWindowHeaders(headers http.Header, prefix string, window ojson.Result) bool {
 	if !window.IsObject() {
 		return false
 	}
@@ -239,15 +238,15 @@ func addCodexQuotaWindowHeaders(headers http.Header, prefix string, window gjson
 	return true
 }
 
-func codexQuotaNumber(value gjson.Result) (float64, bool) {
-	if value.Type != gjson.Number && value.Type != gjson.String {
+func codexQuotaNumber(value ojson.Result) (float64, bool) {
+	if value.Type != ojson.Number && value.Type != ojson.String {
 		return 0, false
 	}
 	number, errParse := strconv.ParseFloat(strings.TrimSpace(value.String()), 64)
 	return number, errParse == nil && !math.IsNaN(number) && !math.IsInf(number, 0)
 }
 
-func parseCodexQuotaHeadersObject(headersNode gjson.Result) http.Header {
+func parseCodexQuotaHeadersObject(headersNode ojson.Result) http.Header {
 	if !headersNode.Exists() || !headersNode.IsObject() {
 		return nil
 	}

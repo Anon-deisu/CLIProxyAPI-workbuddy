@@ -27,7 +27,7 @@ import (
 //     and executor.go whose usage is interface types ONLY — enforced by an AST scan
 //     below, so no future edit can construct an HTTP client outside the socket files).
 func TestDependencyClosure_NoEgressStacks(t *testing.T) {
-	graph := depGraph(t, "github.com/router-for-me/CLIProxyAPI/v7/internal/relay")
+	graph := depGraph(t, "github.com/router-for-me/CLIProxyAPI/v8/internal/relay")
 	for pkg := range graph {
 		if pkg == "github.com/refraction-networking/utls" || strings.HasPrefix(pkg, "github.com/refraction-networking/utls/") {
 			t.Fatalf("FATAL: utls reachable from relay invoke closure (dep %s) — deleted from fork, docs 6.6.2", pkg)
@@ -61,7 +61,7 @@ func TestDependencyClosure_NoEgressStacks(t *testing.T) {
 	}
 }
 
-const modulePath = "github.com/router-for-me/CLIProxyAPI/v7"
+const modulePath = "github.com/router-for-me/CLIProxyAPI/v8"
 
 // Per-file direct import scan: only whitelisted socket/stub files (and executor.go,
 // types-only) may import net/http; no relay source file (tests included) may import

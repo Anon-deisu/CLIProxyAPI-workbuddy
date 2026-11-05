@@ -718,6 +718,30 @@
       }
     },
     {
+      "id": "deepseek-v4-1-flash-1017",
+      "object": "model",
+      "type": "devin",
+      "owned_by": "deepseek",
+      "display_name": "DeepSeek V4.1 Flash",
+      "context_length": 1048576,
+      "max_completion_tokens": 64000,
+      "supportedInputModalities": [
+        "text",
+        "image"
+      ],
+      "supportedOutputModalities": [
+        "text"
+      ],
+      "thinking": {
+        "levels": [
+          "none",
+          "low",
+          "high",
+          "max"
+        ]
+      }
+    },
+    {
       "id": "swe-1-7",
       "object": "model",
       "type": "devin",

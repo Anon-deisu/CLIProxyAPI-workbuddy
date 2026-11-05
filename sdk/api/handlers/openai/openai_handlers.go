@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
@@ -490,26 +489,31 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
-	stopKeepAlive := h.StartStreamingKeepAlive(cliCtx, func() {
+	var upstreamHeaders http.Header
+	committed := false
+	commitSSE := func() {
+		if committed {
+			return
+		}
 		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		committed = true
+	}
+	writeKeepAlive := func() bool {
+		commitSSE()
 		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
 		flusher.Flush()
-	})
+		return true
+	}
+	keepAliveC, stopKeepAlive := handlers.NewPreFirstTokenKeepAliveTicker(h.CurrentConfig())
 	defer stopKeepAlive()
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
-	stopKeepAlive()
-	if c.Writer.Written() {
-		h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+	dataChan, resolvedHeaders, errChan, okBootstrap := h.ExecuteStreamWithPreFTKeepAlive(
+		c, cliCtx, func(err error) { cliCancel(err) }, h.HandlerType(), modelName, rawJSON, h.GetAlt(c), keepAliveC, writeKeepAlive,
+	)
+	if !okBootstrap {
 		return
 	}
-
-	var keepAliveC <-chan time.Time
-	if interval := handlers.StreamingKeepAliveInterval(h.Cfg); interval > 0 {
-		keepAlive := time.NewTimer(interval)
-		defer keepAlive.Stop()
-		keepAliveC = keepAlive.C
-	}
-
+	upstreamHeaders = resolvedHeaders
 	// Preserve HTTP errors until either model output or a configured heartbeat commits SSE.
 	for {
 		select {
@@ -517,10 +521,11 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			cliCancel(c.Request.Context().Err())
 			return
 		case <-keepAliveC:
-			setSSEHeaders()
-			_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-			flusher.Flush()
-			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			stopKeepAlive()
+			if !writeKeepAlive() {
+				return
+			}
+			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, false)
 			return
 		case errMsg, ok := <-errChan:
 			if !ok {
@@ -586,8 +591,6 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			// Continue streaming the rest
 			h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, initialHasFinishReason)
 			return
-		case <-keepAliveC:
-			writeKeepAlive()
 		}
 	}
 }

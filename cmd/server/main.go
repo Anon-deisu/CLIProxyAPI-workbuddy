@@ -119,6 +119,12 @@ func main() {
 	var metaLogin bool
 	var xaiLogin bool
 	var cursorLogin bool
+	var discoverGateways bool
+	var discoverTimeout int
+	var discoverJSON bool
+	var discoverServiceType string
+	var discoverInclude []string
+	var discoverExclude []string
 	var vertexImport string
 	var vertexImportPrefix string
 	var siwcBind string
@@ -148,6 +154,12 @@ func main() {
 	flag.BoolVar(&metaLogin, "meta-login", false, "Login to Meta using OAuth")
 	flag.BoolVar(&xaiLogin, "xai-login", false, "Login to xAI using OAuth")
 	flag.BoolVar(&cursorLogin, "cursor-login", false, "Login to Cursor using OAuth")
+	flag.BoolVar(&discoverGateways, "discover", false, "Discover local AI gateways and CPA instances on the LAN")
+	flag.IntVar(&discoverTimeout, "discover-timeout", 3, "Timeout in seconds for LAN discovery (default 3s)")
+	flag.BoolVar(&discoverJSON, "discover-json", false, "Output discovered gateways in JSON format")
+	flag.StringVar(&discoverServiceType, "discover-service-type", "", "DNS-SD service type for LAN discovery (default _ai-gateway._tcp)")
+	flag.Func("discover-include", "Comma-separated interface names to scan during LAN discovery", appendCSV(&discoverInclude))
+	flag.Func("discover-exclude", "Comma-separated interface names to skip during LAN discovery", appendCSV(&discoverExclude))
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
@@ -654,7 +666,7 @@ func main() {
 		CallbackPort: oauthCallbackPort,
 	}
 
-	commandMode := vertexImport != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || kimiAILogin || devinLogin || workBuddyLogin || workBuddyAILogin || qoderLogin || qoderCNLogin || metaLogin || xaiLogin || cursorLogin
+	commandMode := vertexImport != "" || siwcBind != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || kimiAILogin || devinLogin || workBuddyLogin || workBuddyAILogin || qoderLogin || qoderCNLogin || metaLogin || xaiLogin || cursorLogin
 	cloudConfigMissing := isCloudDeploy && !configFileExists
 	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
 	exampleAPIKeySafeMode := shouldEnableExampleAPIKeySafeMode(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode)
@@ -863,6 +875,15 @@ func resolveManagementBaseURL(flagURL string, cfg *config.Config) string {
 	return fmt.Sprintf("http://127.0.0.1:%d", port)
 }
 
+// modelCatalogUpdaterPlan keeps Home model IDs authoritative while allowing
+// edge-local Codex client templates to refresh unless local-model is enabled.
+func modelCatalogUpdaterPlan(localModel, homeEnabled bool) (startModels, startCodexClient bool) {
+	if localModel {
+		return false, false
+	}
+	return !homeEnabled, true
+}
+
 func startModelCatalogUpdaters(localModel, homeEnabled bool) {
 	startModels, startCodexClient := modelCatalogUpdaterPlan(localModel, homeEnabled)
 	if startCodexClient {
@@ -873,6 +894,17 @@ func startModelCatalogUpdaters(localModel, homeEnabled bool) {
 		registry.StartDevinModelsUpdater(context.Background())
 	} else if homeEnabled {
 		log.Info("Home mode: remote models.json updates disabled; Codex client model list follows Home model IDs")
+	}
+}
+
+// persistSeededConfig prepares a freshly copied config before uploading it.
+// If preparation fails, remove the copy so the next startup refuses it again.
+func persistSeededConfig(ctx context.Context, configFilePath string, persist func(context.Context) error) error {
+	if errPrepare := config.PrepareConfigFileForUpload(configFilePath); errPrepare != nil {
+		if errRemove := os.Remove(configFilePath); errRemove != nil {
+			log.WithError(errRemove).Warn("failed to remove the config copied from the template")
+		}
+		return fmt.Errorf("prepare config for upload: %w", errPrepare)
 	}
 	return persist(ctx)
 }
@@ -971,6 +1003,7 @@ func argvFlagConsumesValue(name string) bool {
 	switch name {
 	case "codex-login", "codex-device-login", "claude-login", "no-browser",
 		"antigravity-login", "kimi-login", "kimi-ai-login", "xai-login", "devin-login", "meta-login",
+		"workbuddy-login", "workbuddy-ai-login", "qoder-login", "qoder-cn-login", "cursor-login",
 		"discover", "discover-json", "home-disable-cluster-discovery",
 		"tui", "standalone", "local-model":
 		return false

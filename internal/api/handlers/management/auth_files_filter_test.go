@@ -266,7 +266,7 @@ func TestBuildAuthFileEntryExposesAutomaticDisableReason(t *testing.T) {
 		Attributes:        map[string]string{"path": filepath.Join(t.TempDir(), "auto-disabled.json")},
 	}
 	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	entry := h.buildAuthFileEntry(auth)
+	entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 	if entry == nil {
 		t.Fatal("entry is nil")
 	}
@@ -284,7 +284,7 @@ func TestBuildAuthFileEntryExposesQuotaPauseWithoutDisabling(t *testing.T) {
 		ID: "quota-paused", Provider: "codex", Status: coreauth.StatusActive, CodexQuotaResumeAt: time.Now().Add(time.Hour),
 		Attributes: map[string]string{"path": filepath.Join(t.TempDir(), "quota-paused.json")},
 	}
-	entry := h.buildAuthFileEntry(auth)
+	entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 	if entry["quota_paused"] != true || entry["disabled"] != false || entry["auto_disabled"] != false || entry["unavailable"] != true {
 		t.Fatalf("unexpected quota pause state: %#v", entry)
 	}
@@ -292,7 +292,7 @@ func TestBuildAuthFileEntryExposesQuotaPauseWithoutDisabling(t *testing.T) {
 		t.Fatalf("quota_resume_at = %v, want %v", got, auth.CodexQuotaResumeAt)
 	}
 	auth.CodexQuotaResumeAt = time.Now().Add(-time.Hour)
-	entry = h.buildAuthFileEntry(auth)
+	entry = h.buildAuthFileEntry(auth, authFileQuotaContext{})
 	if entry["quota_paused"] != false || entry["unavailable"] != false {
 		t.Fatal("expired quota pause was shown as unavailable")
 	}
@@ -313,7 +313,7 @@ func TestBuildAuthFileEntryExposesConcurrencyState(t *testing.T) {
 	defer auth.ReleaseDispatchSlot()
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	entry := h.buildAuthFileEntry(auth)
+	entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 	if entry == nil {
 		t.Fatal("entry is nil")
 	}

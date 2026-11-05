@@ -12,11 +12,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	kimiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -266,16 +266,16 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		UpdatedAt: now,
 	}
 	if provider == "kimi" || provider == "kimi-ai" || provider == "kimi.ai" {
-		domain := kimi.NormalizeKimiDomain(provider)
+		domain := kimiauth.NormalizeKimiDomain(provider)
 		if rawDomain, ok := metadata["domain"].(string); ok && strings.TrimSpace(rawDomain) != "" {
-			domain = kimi.NormalizeKimiDomain(rawDomain)
+			domain = kimiauth.NormalizeKimiDomain(rawDomain)
 		}
 		a.Provider = provider
 		a.Attributes["domain"] = domain
 		if rawBase, ok := metadata["base_url"].(string); ok && strings.TrimSpace(rawBase) != "" {
 			a.Attributes["base_url"] = strings.TrimSpace(rawBase)
 		} else {
-			a.Attributes["base_url"] = kimi.ResolveKimiAPIBaseURL(domain)
+			a.Attributes["base_url"] = kimiauth.ResolveKimiAPIBaseURL(domain)
 		}
 	}
 	// Read priority from auth file.
@@ -338,7 +338,6 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 // the management UI shows a distinct Cursor API Key category.
 func synthesizeCursorAPIKey(ctx *SynthesisContext, fullPath string, metadata map[string]any) *coreauth.Auth {
 	now := ctx.Now
-	cfg := ctx.Config
 
 	label := "cursor-api-key"
 	if email, _ := metadata["email"].(string); strings.TrimSpace(email) != "" {
@@ -377,7 +376,7 @@ func synthesizeCursorAPIKey(ctx *SynthesisContext, fullPath string, metadata map
 		}
 	}
 
-	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
+	perAccountExcluded, _ := ExtractExcludedModelsFromMetadata(metadata)
 
 	attributes := map[string]string{
 		coreauth.AttributeSource:        fullPath,
@@ -434,7 +433,7 @@ func synthesizeCursorAPIKey(ctx *SynthesisContext, fullPath string, metadata map
 	// Pass AuthKindAPIKey so the helper re-affirms the api-key kind rather than
 	// overwriting the attribute with an "oauth" kind (which would misroute the
 	// executor to the OAuth token branch).
-	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, coreauth.AuthKindAPIKey)
+	ApplyAuthExcludedModelsMeta(a, perAccountExcluded, coreauth.AuthKindAPIKey)
 	return a
 }
 

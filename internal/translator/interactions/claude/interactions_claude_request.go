@@ -115,9 +115,9 @@ func copyClaudeToolChoiceToInteractionsDoc(outDoc *ojson.Doc, toolChoice ojson.R
 		case "tool":
 			name := strings.TrimSpace(toolChoice.Get("name").String())
 			if name != "" {
-				choice := []byte(`{"type":"function","name":""}`)
-				choice, _ = ojson.SetBytes(choice, "name", name)
-				_ = outDoc.SetRawBytes("generation_config.tool_choice", choice)
+				choiceDoc := ojson.NewDocString(`{"type":"function","name":""}`)
+				_ = choiceDoc.Set("name", name)
+				_ = outDoc.SetRawBytes("generation_config.tool_choice", choiceDoc.Bytes())
 			}
 		}
 	}
@@ -138,8 +138,9 @@ func appendClaudeMessagesToInteractionsDoc(outDoc *ojson.Doc, messages ojson.Res
 		content := message.Get("content")
 		if role == "system" {
 			if reminderText, ok := translatorcommon.ClaudeMessageSystemReminderText(content); ok {
-				step := []byte(`{"type":"user_input","content":[{"type":"text","text":""}]}`)
-				step, _ = ojson.SetBytes(step, "content.0.text", reminderText)
+				stepDoc := ojson.NewDocString(`{"type":"user_input","content":[{"type":"text","text":""}]}`)
+				_ = stepDoc.Set("content.0.text", reminderText)
+				step := stepDoc.Bytes()
 				if len(pendingToolUseIDs) > 0 {
 					pendingSystemReminders = append(pendingSystemReminders, step)
 				} else {
@@ -214,9 +215,9 @@ func appendClaudeMessageToInteractions(items *[][]byte, pendingToolUseIDs *[]str
 					*items = append(*items, *pendingSystemReminders...)
 					*pendingSystemReminders = nil
 				}
-				contentPart := []byte(`{"type":"text","text":""}`)
-				contentPart, _ = ojson.SetBytes(contentPart, "text", text)
-				stepContent = append(stepContent, contentPart)
+				contentPartDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+				_ = contentPartDoc.Set("text", text)
+				stepContent = append(stepContent, contentPartDoc.Bytes())
 				if strings.TrimSpace(text) != "" {
 					sendable++
 				}
@@ -225,9 +226,9 @@ func appendClaudeMessageToInteractions(items *[][]byte, pendingToolUseIDs *[]str
 			flushContent()
 			text := part.Get("thinking").String()
 			if text != "" || preserveEmptyThinkingBlocks {
-				step := []byte(`{"type":"thought","content":[{"type":"text","text":""}]}`)
-				step, _ = ojson.SetBytes(step, "content.0.text", text)
-				*items = append(*items, step)
+				stepDoc := ojson.NewDocString(`{"type":"thought","content":[{"type":"text","text":""}]}`)
+				_ = stepDoc.Set("content.0.text", text)
+				*items = append(*items, stepDoc.Bytes())
 				sendable++
 			}
 		case "image", "document", "container_upload":
@@ -323,25 +324,38 @@ func claudeToolResultToInteractions(part ojson.Result, toolNamesByID map[string]
 			_ = stepDoc.Set("result", result.String())
 		case result.IsArray():
 			contentItems := make([][]byte, 0, 4)
-			var businessJSON []string
-			result.ForEach(func(_, item gjson.Result) bool {
-				if item.Get("type").String() == "text" {
-					contentPart := []byte(`{"type":"text","text":""}`)
-					contentPart, _ = sjson.SetBytes(contentPart, "text", item.Get("text").String())
-					contentItems = append(contentItems, contentPart)
-				} else if item.Get("type").String() != "image" && item.Raw != "" {
-					businessJSON = append(businessJSON, item.Raw)
+			result.ForEach(func(_, item ojson.Result) bool {
+				itemType := item.Get("type").String()
+				switch itemType {
+				case "text":
+					isPureText := true
+					item.ForEach(func(key, _ ojson.Result) bool {
+						switch key.String() {
+						case "type", "text", "cache_control":
+						default:
+							isPureText = false
+						}
+						return isPureText
+					})
+					if isPureText {
+						contentPartDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+						_ = contentPartDoc.Set("text", item.Get("text").String())
+						contentItems = append(contentItems, contentPartDoc.Bytes())
+						return true
+					}
+				case "image", "document", "container_upload":
+					if mediaPart, ok := claudeMediaPartToInteractions(item, itemType); ok {
+						contentItems = append(contentItems, mediaPart)
+						return true
+					}
+				}
+				// Preserve business fields, unsupported media and their original order.
+				if raw := strings.TrimSpace(item.Raw); raw != "" {
+					contentItems = append(contentItems, []byte(raw))
 				}
 				return true
 			})
-			if len(businessJSON) > 0 {
-				for _, raw := range businessJSON {
-					contentPart := []byte(`{"type":"text","text":""}`)
-					contentPart, _ = sjson.SetBytes(contentPart, "text", raw)
-					contentItems = append(contentItems, contentPart)
-				}
-			}
-			step, _ = sjson.SetRawBytes(step, "result", translatorcommon.JoinRawArray(contentItems))
+			_ = stepDoc.SetRawBytes("result", translatorcommon.JoinRawArray(contentItems))
 		default:
 			_ = stepDoc.SetRaw("result", result.Raw)
 		}

@@ -11,13 +11,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 func TestCodexExecutorExecute_NonEmptyCompletionOutputHydratesMissingItemID(t *testing.T) {
@@ -728,7 +728,7 @@ func TestCodexTerminalFailureErrAuthenticationStatusLayouts(t *testing.T) {
 					t.Errorf("status code = %d, want 401; err=%v", got, streamErr)
 				}
 				assertCodexErrorCode(t, streamErr.Error(), "authentication_error", "auth_unavailable")
-				if got := gjson.Get(streamErr.Error(), "error.message").String(); got != "Credential rejected." {
+				if got := ojson.Get(streamErr.Error(), "error.message").String(); got != "Credential rejected." {
 					t.Errorf("error message = %q, want upstream message", got)
 				}
 				if clienterror.IsRequestFault(streamErr.StatusCode(), streamErr) {

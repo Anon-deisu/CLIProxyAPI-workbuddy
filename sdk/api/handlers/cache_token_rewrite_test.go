@@ -7,12 +7,15 @@ import (
 	"strings"
 	"testing"
 
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/MoeForge/moego/ojson"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+func cacheRewriteGet(data []byte, path string) ojson.Result {
+	return ojson.GetBytesNoCopy(data, path)
+}
 
 func rewriteConfig(minimum float64, maximum *float64) *sdkconfig.SDKConfig {
 	return &sdkconfig.SDKConfig{CacheTokenRewrite: &sdkconfig.CacheTokenRewriteConfig{Enabled: true, MinPercent: &minimum, MaxPercent: maximum}}
@@ -42,7 +45,7 @@ func TestCacheTokenRewriteFormats(t *testing.T) {
 				t.Fatal("invalid JSON or mutated upstream bytes")
 			}
 			for path, want := range tc.want {
-				if got := gjson.GetBytes(output, tc.path+"."+path); !got.Exists() || got.Int() != want {
+				if got := cacheRewriteGet(output, tc.path+"."+path); !got.Exists() || got.Int() != want {
 					t.Errorf("%s = %s, want %d; %s", path, got.Raw, want, output)
 				}
 			}
@@ -54,7 +57,7 @@ func TestCacheTokenRewriteFixedRandomAndDisabled(t *testing.T) {
 	input := []byte(`{"usage":{"input_tokens":101,"output_tokens":7,"input_tokens_details":{"cached_tokens":101}}}`)
 	for _, percent := range []float64{0, 33.3, 95, 100} {
 		r := newCacheTokenRewriter(rewriteConfig(percent, nil), "openai-response")
-		got := gjson.GetBytes(r.rewriteJSON(input), "usage.input_tokens_details.cached_tokens").Int()
+		got := cacheRewriteGet(r.rewriteJSON(input), "usage.input_tokens_details.cached_tokens").Int()
 		if want := int64(101 * percent / 100); got != want {
 			t.Fatalf("percent %v: got %d want %d", percent, got, want)
 		}
@@ -62,7 +65,7 @@ func TestCacheTokenRewriteFixedRandomAndDisabled(t *testing.T) {
 	cfg := rewriteConfig(80, new(95.0))
 	r := newCacheTokenRewriter(cfg, "openai-response")
 	first := r.rewriteJSON([]byte(`{"usage":{"input_tokens":100000,"output_tokens":7,"input_tokens_details":{"cached_tokens":100000}}}`))
-	cache := gjson.GetBytes(first, "usage.input_tokens_details.cached_tokens").Int()
+	cache := cacheRewriteGet(first, "usage.input_tokens_details.cached_tokens").Int()
 	if cache < 80000 || cache > 95000 {
 		t.Fatalf("random ratio out of range: %d", cache)
 	}
@@ -104,10 +107,11 @@ func TestCacheTokenRewriteOnlyReducesExistingCachedReads(t *testing.T) {
 		{"interactions-read-below-target", "interactions", `{"total_input_tokens":100,"total_cached_tokens":94}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			input, err := sjson.SetRawBytes([]byte(`{"usage":{}}`), "usage", []byte(test.usage))
-			if err != nil {
+			inputDoc := ojson.NewDoc([]byte(`{"usage":{}}`))
+			if err := inputDoc.SetRawBytes("usage", []byte(test.usage)); err != nil {
 				t.Fatal(err)
 			}
+			input := inputDoc.Bytes()
 			got := newCacheTokenRewriter(rewriteConfig(95, nil), test.format).rewriteJSON(input)
 			if !bytes.Equal(got, input) {
 				t.Fatalf("usage without excess existing cache read was rewritten: %s", got)
@@ -135,7 +139,7 @@ func TestCacheTokenRewriteSplitStreamKeepsClaudeTotals(t *testing.T) {
 		if !json.Valid([]byte(data)) {
 			t.Fatalf("corrupted SSE: %s", line)
 		}
-		frame := gjson.Parse(data)
+		frame := ojson.Parse(data)
 		path := ""
 		switch frame.Get("type").String() {
 		case "message_start":
@@ -174,18 +178,18 @@ func TestCacheTokenRewriteDoesNotChangeInternalUsage(t *testing.T) {
 	if errMsg != nil {
 		t.Fatal(errMsg)
 	}
-	if gjson.GetBytes(body, "usage.prompt_tokens_details.cached_tokens").Int() != 95 {
+	if cacheRewriteGet(body, "usage.prompt_tokens_details.cached_tokens").Int() != 95 {
 		t.Fatalf("downstream not rewritten: %s", body)
 	}
 	record := plugin.waitRecord(t)
 	if record.Detail.InputTokens != 100 || record.Detail.CachedTokens != 98 || record.Detail.OutputTokens != 10 {
 		t.Fatalf("internal usage was overwritten: %+v", record.Detail)
 	}
-	if gjson.GetBytes(upstream, "usage.prompt_tokens_details.cached_tokens").Int() != 98 {
+	if cacheRewriteGet(upstream, "usage.prompt_tokens_details.cached_tokens").Int() != 98 {
 		t.Fatal("source buffer changed")
 	}
 	internal, errInternal := h.ExecuteModel(context.Background(), ModelExecutionRequest{EntryProtocol: "openai", Model: "test-model", Body: []byte(`{"model":"test-model"}`)})
-	if errInternal != nil || gjson.GetBytes(internal.Body, "usage.prompt_tokens_details.cached_tokens").Int() != 98 {
+	if errInternal != nil || cacheRewriteGet(internal.Body, "usage.prompt_tokens_details.cached_tokens").Int() != 98 {
 		t.Fatalf("internal model callback rewritten: %s %+v", internal.Body, errInternal)
 	}
 }
@@ -206,10 +210,10 @@ func TestCacheTokenRewriteScannerLines(t *testing.T) {
 				r.rewriteChunk([]byte("event: " + event.name))
 				out := r.rewriteChunk([]byte("data: " + event.body))
 				data, ok := sseJSONValidationDataPayload(out)
-				if !ok || !json.Valid(data) || gjson.GetBytes(data, "type").String() != event.name {
+				if !ok || !json.Valid(data) || cacheRewriteGet(data, "type").String() != event.name {
 					t.Fatalf("event %s was buffered or corrupted: %q", event.name, out)
 				}
-				if event.name == endType && gjson.GetBytes(data, usagePath).Int() != 95 {
+				if event.name == endType && cacheRewriteGet(data, usagePath).Int() != 95 {
 					t.Fatalf("usage was not rewritten: %s", data)
 				}
 			}

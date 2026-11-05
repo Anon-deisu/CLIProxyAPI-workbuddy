@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 // cacheTokenRewriter belongs to one downstream request, not to an upstream attempt.
@@ -43,26 +43,28 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 	if r == nil || !json.Valid(data) {
 		return data
 	}
-	root := gjson.ParseBytes(data)
+	doc := ojson.NewDoc(data)
+	root := ojson.Parse(string(data))
 	if root.IsArray() {
 		for index, item := range root.Array() {
-			rewritten := r.rewriteJSON([]byte(item.Raw))
-			if !bytes.Equal(rewritten, []byte(item.Raw)) {
-				data, _ = sjson.SetRawBytes(data, jsonIndex(index), rewritten)
+			itemBytes := []byte(item.Raw)
+			rewritten := r.rewriteJSON(itemBytes)
+			if !bytes.Equal(rewritten, itemBytes) {
+				_ = doc.SetRawBytes(strconv.Itoa(index), rewritten)
 			}
 		}
-		return data
+		return doc.Bytes()
 	}
-	if root.Get("type").String() == "message_start" {
+	if doc.Get("type").String() == "message_start" {
 		r.claudeInput, r.claudeRead, r.claudeWrite, r.claudeKnown = 0, 0, 0, false
 		r.claudeRewrite, r.claudeCached = false, 0
 	}
 	for _, path := range []string{"usage", "response.usage", "message.usage", "interaction.usage", "metadata.total_usage", "usageMetadata", "response.usageMetadata"} {
-		u := root.Get(path)
+		u := doc.Get(path)
 		if !u.IsObject() {
 			continue
 		}
-		set := func(key string, value int64) { data, _ = sjson.SetBytes(data, path+"."+key, value) }
+		set := func(key string, value int64) { _ = doc.Set(path+"."+key, value) }
 		zeroExisting := func(keys ...string) {
 			for _, key := range keys {
 				if u.Get(key).Exists() {
@@ -81,7 +83,7 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 		cachedRead := func() (int64, bool) {
 			for _, key := range []string{"input_tokens_details.cached_tokens", "prompt_tokens_details.cached_tokens", "cached_tokens", "cache_read_input_tokens", "cachedContentTokenCount", "total_cached_tokens"} {
 				value := u.Get(key)
-				if value.Type == gjson.Number {
+				if value.Type == ojson.Number {
 					return value.Int(), true
 				}
 			}
@@ -94,18 +96,18 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 		}
 		switch {
 		case r.format == "claude":
-			if v := u.Get("input_tokens"); v.Type == gjson.Number {
+			if v := u.Get("input_tokens"); v.Type == ojson.Number {
 				r.claudeInput = v.Int()
 				r.claudeKnown = true
 			}
 			cacheRead := u.Get("cache_read_input_tokens")
-			if cacheRead.Type == gjson.Number {
+			if cacheRead.Type == ojson.Number {
 				r.claudeRead = cacheRead.Int()
 			}
-			if v := u.Get("cache_creation_input_tokens"); v.Type == gjson.Number {
+			if v := u.Get("cache_creation_input_tokens"); v.Type == ojson.Number {
 				r.claudeWrite = v.Int()
 			}
-			if cacheRead.Type == gjson.Number && r.claudeKnown {
+			if cacheRead.Type == ojson.Number && r.claudeKnown {
 				total := r.claudeInput + r.claudeRead + r.claudeWrite
 				r.claudeCached = int64(float64(total) * r.ratio)
 				r.claudeRewrite = cacheRead.Int() > r.claudeCached
@@ -119,7 +121,7 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 			set("cache_read_input_tokens", cached)
 			set("cache_creation_input_tokens", 0)
 			zeroExisting("cache_creation.ephemeral_5m_input_tokens", "cache_creation.ephemeral_1h_input_tokens")
-		case u.Get("prompt_tokens").Type == gjson.Number:
+		case u.Get("prompt_tokens").Type == ojson.Number:
 			cached, rewrite := targetCached(u.Get("prompt_tokens").Int())
 			if !rewrite {
 				continue
@@ -127,17 +129,17 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 			set("prompt_tokens_details.cached_tokens", cached)
 			setCacheAliases(cached)
 			zeroExisting("prompt_tokens_details.cache_write_tokens", "prompt_tokens_details.cache_creation_tokens", "prompt_tokens_details.cached_creation_tokens")
-		case u.Get("total_input_tokens").Type == gjson.Number:
+		case u.Get("total_input_tokens").Type == ojson.Number:
 			cached, rewrite := targetCached(u.Get("total_input_tokens").Int())
 			if !rewrite {
 				continue
 			}
 			for _, key := range []string{"total_cached_tokens", "cached_tokens"} {
-				if u.Get(key).Type == gjson.Number {
+				if u.Get(key).Type == ojson.Number {
 					set(key, cached)
 				}
 			}
-		case u.Get("input_tokens").Type == gjson.Number:
+		case u.Get("input_tokens").Type == ojson.Number:
 			cached, rewrite := targetCached(u.Get("input_tokens").Int())
 			if !rewrite {
 				continue
@@ -152,7 +154,7 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 				set("input_token_details.cached_tokens", cached)
 			}
 			zeroExisting("input_tokens_details.cache_write_tokens", "input_tokens_details.cache_creation_tokens", "input_tokens_details.cached_creation_tokens")
-		case u.Get("promptTokenCount").Type == gjson.Number:
+		case u.Get("promptTokenCount").Type == ojson.Number:
 			cached, rewrite := targetCached(u.Get("promptTokenCount").Int())
 			if !rewrite {
 				continue
@@ -160,12 +162,7 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 			set("cachedContentTokenCount", cached)
 		}
 	}
-	return data
-}
-
-func jsonIndex(index int) string {
-	data, _ := json.Marshal(index)
-	return string(data)
+	return doc.Bytes()
 }
 
 func (r *cacheTokenRewriter) rewriteFrame(frame []byte) []byte {

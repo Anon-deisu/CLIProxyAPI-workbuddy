@@ -355,6 +355,7 @@ func completeResponsesWebsocketLocalInterrupt(
 ) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
 	responseID := strings.Clone(strings.TrimSpace(ojson.GetBytesNoCopy(payload, "response_id").String()))
 	output := responseCompletedOutputFromPayload([]byte(`{"response":{"output":[]}}`), outputItemsByIndex, outputItemsFallback)
+	cancel(context.Canceled)
 	incompleteDoc := ojson.NewDoc([]byte(`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"interrupted"}}}`))
 	if errSet := incompleteDoc.Set("response.id", responseID); errSet != nil {
 		cancel(errSet)
@@ -368,7 +369,6 @@ func completeResponsesWebsocketLocalInterrupt(
 		cancel(errWrite)
 		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
 	}
-	cancel(context.Canceled)
 	return output, responseID, sortedStringSet(pendingToolCallIDs), nil, nil
 }
 

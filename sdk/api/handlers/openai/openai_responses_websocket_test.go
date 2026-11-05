@@ -840,6 +840,9 @@ func (e *websocketDirectCaptureExecutor) ExecuteStream(ctx context.Context, auth
 	if len(e.responsePayload) > 0 {
 		responsePayload = bytes.Clone(e.responsePayload)
 	}
+	if e.streamItems {
+		chunks <- coreexecutor.StreamChunk{Payload: []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress","output":[]}}`, responseID))}
+	}
 	chunks <- coreexecutor.StreamChunk{Payload: responsePayload}
 	close(chunks)
 	if count >= 2 && e.done != nil {
@@ -3498,7 +3501,7 @@ func TestResponsesWebsocketRewritesCacheTokenUsageDownstream(t *testing.T) {
 	if errRead != nil {
 		t.Fatalf("read websocket response: %v", errRead)
 	}
-	usage := gjson.GetBytes(payload, "response.usage")
+	usage := ojson.GetBytes(payload, "response.usage")
 	if got := usage.Get("input_tokens_details.cached_tokens").Int(); got != 95 {
 		t.Fatalf("downstream cached tokens = %d, want 95: %s", got, payload)
 	}
@@ -3600,7 +3603,11 @@ func TestResponsesWebsocketFullRequestCanRouteFromNativeWebsocketToBuiltInProvid
 
 	const sourceModel = "codex-provider-route-source"
 	const targetModel = "claude-provider-route-target"
-	codexExecutor := &websocketDirectCaptureExecutor{provider: "codex", streamItems: true}
+	codexExecutor := &websocketDirectCaptureExecutor{
+		provider:        "codex",
+		streamItems:     true,
+		responsePayload: []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[]}}`),
+	}
 	claudeExecutor := &websocketDirectCaptureExecutor{provider: "claude", streamItems: true}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(codexExecutor)

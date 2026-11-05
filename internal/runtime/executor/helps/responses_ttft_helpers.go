@@ -15,7 +15,7 @@ func IsResponsesTokenEvent(payload []byte) bool {
 		return false
 	}
 
-	eventType := gjson.GetBytes(payload, "type").String()
+	eventType := ojson.GetBytesNoCopy(payload, "type").String()
 	switch eventType {
 	// Substantive text, reasoning, and tool argument streaming deltas
 	case "response.reasoning_summary_text.delta",
@@ -110,7 +110,7 @@ func IsResponsesProgressEvent(payload []byte) bool {
 		return false
 	}
 
-	switch gjson.GetBytes(payload, "type").String() {
+	switch ojson.GetBytesNoCopy(payload, "type").String() {
 	case "",
 		"response.created",
 		"response.in_progress",

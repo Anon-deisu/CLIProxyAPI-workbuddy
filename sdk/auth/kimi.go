@@ -62,6 +62,12 @@ func (a KimiAuthenticator) Login(ctx context.Context, cfg *config.Config, opts *
 
 	domain := kimi.NormalizeKimiDomain(a.domain)
 	provider := a.Provider()
+	displayName := "Kimi"
+	if kimi.IsKimiAIDomain(domain) {
+		displayName = "Kimi.ai"
+	}
+	isAI := kimi.IsKimiAIDomain(domain)
+	providerKey := provider
 	authSvc := kimi.NewKimiAuthWithDomain(cfg, domain)
 
 	// Start the device flow

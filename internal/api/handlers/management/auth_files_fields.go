@@ -93,7 +93,8 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 			return
 		}
-		if errPatch := h.patchPluginVirtualSourceStatus(ctx, targetAuth, *req.Disabled, degraded); errPatch != nil {
+		hookAuths, errPatch := h.patchPluginVirtualSourceStatus(ctx, targetAuth, *req.Disabled, degraded)
+		if errPatch != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(errPatch, errAuthFileNotFound) || os.IsNotExist(errPatch) {
 				status = http.StatusNotFound
@@ -147,11 +148,19 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	wasAutoDisabled := targetAuth.AutoDisabled
-	applyAuthDisabledState(targetAuth, *req.Disabled)
-	targetAuth.Metadata["degraded"] = degraded
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+	wasAutoDisabled := false
+	updatedAuth, committed, errModify := h.authManager.Modify(ctx, targetAuth.ID, targetAuth.RegistrationEpoch, func(current *coreauth.Auth) error {
+		wasAutoDisabled = current.AutoDisabled
+		applyAuthDisabledState(current, *req.Disabled)
+		current.Metadata["degraded"] = degraded
+		return nil
+	})
+	if errModify != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", errModify)})
+		return
+	}
+	if !committed || updatedAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
 	if !*req.Disabled && wasAutoDisabled {
@@ -161,12 +170,19 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled, "degraded": degraded, "scheduling_state": targetAuth.SchedulingState()})
+	locked = false
+	h.authStatusMu.Unlock()
+	if errHook := h.invokePostAuthPersistHooks(ctx, []*coreauth.Auth{updatedAuth}); errHook != nil {
+		log.Errorf("post-auth persist hook failed for status update on %s: %v", targetAuth.ID, errHook)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to synchronize auth runtime: %v", errHook)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled, "degraded": degraded, "scheduling_state": updatedAuth.SchedulingState()})
 }
 
 // patchPluginVirtualSourceStatus toggles disabled on a plugin multi-auth source file and all
 // runtime auths expanded from it. Virtual project children cannot be toggled independently.
-func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool, degraded ...bool) error {
+func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool, degraded ...bool) ([]*coreauth.Auth, error) {
 	if h == nil || h.authManager == nil || targetAuth == nil {
 		return nil, fmt.Errorf("core auth manager unavailable")
 	}
@@ -193,17 +209,40 @@ func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth
 			!sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), sourcePath) {
 			continue
 		}
-		wasAutoDisabled := auth.AutoDisabled
-		applyAuthDisabledState(auth, disabled)
-		auth.Metadata["degraded"] = len(degraded) > 0 && degraded[0]
-		auth.UpdatedAt = now
-		if _, errUpdate := h.authManager.Update(ctx, auth); errUpdate != nil {
-			return fmt.Errorf("failed to update auth %s: %w", auth.ID, errUpdate)
+		wasAutoDisabled := false
+		updated, committed, errUpdate := h.authManager.Modify(ctx, auth.ID, auth.RegistrationEpoch, func(current *coreauth.Auth) error {
+			wasAutoDisabled = current.AutoDisabled
+			applyAuthDisabledState(current, disabled)
+			current.Metadata["degraded"] = len(degraded) > 0 && degraded[0]
+			current.UpdatedAt = now
+			return nil
+		})
+		if errUpdate != nil {
+			return nil, fmt.Errorf("failed to update auth %s: %w", auth.ID, errUpdate)
+		}
+		if !committed || updated == nil {
+			continue
 		}
 		if !disabled && wasAutoDisabled {
 			if _, _, errReset := h.authManager.ResetQuota(ctx, auth.ID); errReset != nil {
-				return fmt.Errorf("failed to resume auth %s: %w", auth.ID, errReset)
+				return nil, fmt.Errorf("failed to resume auth %s: %w", auth.ID, errReset)
 			}
+		}
+		hookAuths = append(hookAuths, updated)
+	}
+	return hookAuths, nil
+}
+
+func (h *Handler) invokePostAuthPersistHooks(ctx context.Context, auths []*coreauth.Auth) error {
+	if h == nil || h.postAuthPersistHook == nil {
+		return nil
+	}
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if errHook := h.postAuthPersistHook(ctx, auth); errHook != nil {
+			return errHook
 		}
 	}
 	return nil
@@ -398,20 +437,17 @@ func applyAuthFileFieldsPatch(targetAuth *coreauth.Auth, req map[string]json.Raw
 			}
 		}
 		if fieldPath == "concurrency_limit" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "concurrency_limit is a global routing setting"})
-			return
+			return &authFileFieldPatchError{message: "concurrency_limit is a global routing setting"}
 		}
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
 		if rootAuthFileField(fieldPath) == "qoder_auto_checkin" {
 			if fieldPath != "qoder_auto_checkin" || (targetAuth.Provider != "qoder" && targetAuth.Provider != "qoder-cn") {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "qoder_auto_checkin is a Qoder account setting"})
-				return
+				return &authFileFieldPatchError{message: "qoder_auto_checkin is a Qoder account setting"}
 			}
 			if _, ok := value.(bool); !ok {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "qoder_auto_checkin must be a boolean"})
-				return
+				return &authFileFieldPatchError{message: "qoder_auto_checkin must be a boolean"}
 			}
 		}
 

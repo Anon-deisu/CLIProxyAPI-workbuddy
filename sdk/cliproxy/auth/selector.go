@@ -1252,10 +1252,11 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback         Selector
-	cache            *SessionCache
-	matcher          *cliproxysession.MerklePrefixMatcher
-	subagentAffinity bool
+	fallback          Selector
+	cache             *SessionCache
+	matcher           *cliproxysession.MerklePrefixMatcher
+	subagentAffinity  bool
+	rebindOnQuotaOnly bool
 	// providerFilter keeps protocol-required affinity narrow. Cursor's prompt
 	// cache is conversation/account scoped, so round-robin between Cursor
 	// accounts inside one client conversation forces a full prompt rewrite.
@@ -1264,11 +1265,119 @@ type SessionAffinitySelector struct {
 	providerFilter map[string]struct{}
 }
 
+const (
+	// SessionAffinityRebindOnAny rebinds on any credential-attributed failure.
+	SessionAffinityRebindOnAny = "any"
+	// SessionAffinityRebindOnQuota retains bindings across transient failures.
+	SessionAffinityRebindOnQuota = "quota"
+)
+
+func normalizeSessionAffinityRebindOn(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), SessionAffinityRebindOnQuota) {
+		return SessionAffinityRebindOnQuota
+	}
+	return SessionAffinityRebindOnAny
+}
+
+type sessionAffinityTransientAuthIDsKey struct{}
+
+func withSessionAffinityTransientAuthIDs(ctx context.Context, authIDs map[string]struct{}) context.Context {
+	if len(authIDs) == 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, sessionAffinityTransientAuthIDsKey{}, authIDs)
+}
+
+func sessionAffinityTransientAuthIDsFromContext(ctx context.Context) map[string]struct{} {
+	if ctx == nil {
+		return nil
+	}
+	authIDs, _ := ctx.Value(sessionAffinityTransientAuthIDsKey{}).(map[string]struct{})
+	return authIDs
+}
+
+func shouldRebindSessionAffinityOnError(err *Error) bool {
+	if err == nil || shouldSkipCredentialCooldown(err) {
+		return false
+	}
+	if isModelSupportResultError(err) || isCloudflareChallengeResultError(err) || isInvalidGrantResultError(err) || isCreditBalanceTooLowResultError(err) {
+		return true
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAuthBlockedByQuotaOrAuthForModel(auth *Auth, model string, now time.Time) bool {
+	if auth == nil || auth.IsDispatchDisabled() || auth.CodexQuotaResumeAt.After(now) || hasUnauthorizedAuthFailure(auth) {
+		return true
+	}
+	if exp, ok := auth.AccessTokenExpirationTime(); ok && !exp.IsZero() && !exp.After(now) {
+		return true
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && (auth.Quota.NextRecoverAt.IsZero() || auth.Quota.NextRecoverAt.After(now)) {
+		return true
+	}
+	if model != "" && len(auth.ModelStates) > 0 {
+		modelKey := canonicalModelKey(model)
+		for stateModel, state := range auth.ModelStates {
+			if state == nil || canonicalModelKey(stateModel) != modelKey {
+				continue
+			}
+			if state.Status == StatusDisabled || isStateBlockedByQuotaOrAuth(state.Unavailable, state.Quota, state.NextRetryAfter, state.LastError, now) {
+				return true
+			}
+		}
+		return false
+	}
+	quota := auth.Quota
+	if len(auth.ModelStates) > 0 && auth.Quota.Reason != "credential_quota" && !auth.Unavailable {
+		quota.Exceeded = false
+	}
+	return isStateBlockedByQuotaOrAuth(auth.Unavailable, quota, auth.NextRetryAfter, auth.LastError, now)
+}
+
+func isStateBlockedByQuotaOrAuth(unavailable bool, quota QuotaState, nextRetryAfter time.Time, lastErr *Error, now time.Time) bool {
+	if quota.Exceeded && (quota.NextRecoverAt.IsZero() || quota.NextRecoverAt.After(now)) {
+		return true
+	}
+	blocked, _, _ := availabilityBlock(unavailable, quota.Exceeded, nextRetryAfter, quota.NextRecoverAt, now)
+	if !blocked || lastErr != nil {
+		return lastErr != nil && shouldRebindSessionAffinityOnError(lastErr)
+	}
+	return nextRetryAfter.IsZero() && quota.NextRecoverAt.IsZero()
+}
+
+func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx context.Context, candidates []*Auth, model, authID string, now time.Time) bool {
+	if s == nil || !s.rebindOnQuotaOnly || authID == "" {
+		return false
+	}
+	if ctx != nil {
+		if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated {
+			_, ok := sessionAffinityTransientAuthIDsFromContext(ctx)[authID]
+			return ok
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate != nil && candidate.ID == authID {
+			return !isAuthBlockedByQuotaOrAuthForModel(candidate, model, now)
+		}
+	}
+	return false
+}
+
 // SessionAffinityConfig configures the session affinity selector.
 type SessionAffinityConfig struct {
 	Fallback         Selector
 	TTL              time.Duration
 	SubagentAffinity *bool
+	RebindOn         string
 	// ProviderFilters restricts affinity to the listed providers. Empty means
 	// affinity applies to every provider.
 	ProviderFilters []string
@@ -1301,11 +1410,12 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		}
 	}
 	return &SessionAffinitySelector{
-		fallback:         cfg.Fallback,
-		cache:            NewSessionCache(cfg.TTL),
-		matcher:          cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
-		subagentAffinity: subagentAffinity,
-		providerFilter:   providerFilter,
+		fallback:          cfg.Fallback,
+		cache:             NewSessionCache(cfg.TTL),
+		matcher:           cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
+		subagentAffinity:  subagentAffinity,
+		rebindOnQuotaOnly: normalizeSessionAffinityRebindOn(cfg.RebindOn) == SessionAffinityRebindOnQuota,
+		providerFilter:    providerFilter,
 	}
 }
 
@@ -1436,7 +1546,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
 		if auth := findAuthByID(available, cachedAuthID); auth != nil {
-			bind(auth.ID)
+			bind(auth.ID, true)
 			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 			return auth, nil
 		}
@@ -1683,6 +1793,20 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 
 func canonicalLCPProvider(provider string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
+	switch provider {
+	case "google", "gemini", "vertex", "aistudio":
+		return "google"
+	case "codex", "openai":
+		return "openai"
+	case "claude", "anthropic":
+		return "claude"
+	default:
+		return provider
+	}
+}
+
+func lcpAffinityNamespace(provider, model string, metadata map[string]any) string {
+	provider = canonicalLCPProvider(provider)
 	provider = affinityPoolNamespace(provider, metadata)
 	model = canonicalModelKey(model)
 	callerScope := sessionMetadataString(metadata, cliproxyexecutor.CallerScopeMetadataKey)
@@ -2128,10 +2252,10 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 	}
 	// Cursor conversation identity travels in the request body for clients
 	// whose transport does not carry an explicit session header.
-	if convID := gjson.GetBytes(payload, "cursor_conversation_id").String(); convID != "" {
+	if convID := ojson.GetBytesNoCopy(payload, "cursor_conversation_id").String(); convID != "" {
 		return "cursor:" + convID, ""
 	}
-	if convID := gjson.GetBytes(payload, "metadata.cursor_conversation_id").String(); convID != "" {
+	if convID := ojson.GetBytesNoCopy(payload, "metadata.cursor_conversation_id").String(); convID != "" {
 		return "cursor:" + convID, ""
 	}
 	return extractMessageHashIDs(payload)

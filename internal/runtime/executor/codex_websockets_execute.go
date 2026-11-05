@@ -111,12 +111,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if useSIWC {
 		applyCodexSIWCWebsocketBodyRulesDoc(doc, hasExplicitInstructions, cliproxyexecutor.Options{KeepTopLevelEffort: thinking.HasThinkingSuffix(req.Model)})
 	}
+	identityState := applyCodexIdentityConfuseBodyDoc(e.cfg, auth, originalPayloadSource, doc)
 	helps.FinalizePayloadDoc(ctx, doc)
+	identityState.recordFinalizedPayload(doc)
+	alignCodexPromptCacheHeadersDoc(wsHeaders, doc)
 	body = doc.Bytes()
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, nativeRequest, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, baseModel, body, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, baseModel)
+	applyCodexIdentityConfuseHeaders(wsHeaders, &identityState)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -165,13 +169,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	var errDial error
 	dialCtx := ctx
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
-		conn, closer = existingWebsocketSessionConnForEgress(sess, authID, wsURL, identityState.convergence, helps.CodexEgressFingerprint(auth))
+		conn, closer = existingWebsocketSessionConnForEgress(sess, authID, wsURL, executionProxyURL(ctx, sess.effectiveConfig(authID, e.cfg), auth), identityState.convergence, helps.CodexEgressFingerprint(auth), useSIWC)
 		if conn == nil {
 			return resp, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
 	} else {
 		dialCtx = cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
-		conn, closer, respHS, errDial = e.ensureUpstreamConnWithConvergence(dialCtx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence)
+		conn, closer, respHS, errDial = e.ensureUpstreamConnWithConvergence(dialCtx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence, useSIWC)
 	}
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
@@ -244,7 +248,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
 			// execution session.
-			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithConvergence(ctx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence)
+			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConnWithConvergence(ctx, auth, sess, authID, wsURL, wsHeaders, identityState.convergence, useSIWC)
 			if errDialRetry == nil && connRetry != nil {
 				previousConn, previousReadCh := conn, readCh
 				conn = connRetry
@@ -393,6 +397,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			}
 			publishCodexImageToolUsageWithOutputItems(ctx, reporter, body, payload, outputItemsByIndex, outputItemsFallback)
 			var param any
+			payload = applyCodexIdentityExposeResponsePayload(payload, identityState)
 			out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, payload, &param)
 			if responseFormat == sdktranslator.FormatOpenAIResponse {
 				out = helps.EnsureResponsesUsageDetails(out)

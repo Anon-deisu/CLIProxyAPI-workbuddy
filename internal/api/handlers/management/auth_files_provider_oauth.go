@@ -15,19 +15,21 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/antigravity"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
-	metaauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/meta"
-	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
-	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/antigravity"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	cursorauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
+	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -1079,62 +1081,6 @@ func (h *Handler) RequestMetaToken(c *gin.Context) {
 	c.JSON(200, response)
 }
 
-func (h *Handler) RequestMetaToken(c *gin.Context) {
-	ctx := PopulateAuthContext(context.Background(), c)
-	state := fmt.Sprintf("meta-%d", time.Now().UnixNano())
-	authSvc := metaauth.NewMetaAuth(h.cfg)
-	deviceFlow, errStart := authSvc.StartDeviceFlow(ctx)
-	if errStart != nil {
-		log.Errorf("Failed to start Meta device flow: %v", errStart)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start device authorization flow"})
-		return
-	}
-	authURL := strings.TrimSpace(deviceFlow.VerificationURIComplete)
-	if authURL == "" {
-		authURL = strings.TrimSpace(deviceFlow.VerificationURI)
-	}
-	RegisterOAuthSession(state, "meta")
-	go func() {
-		pollCtx, cancelPoll := context.WithCancel(ctx)
-		defer cancelPoll()
-		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, "meta")
-		bundle, errWait := authSvc.WaitForAuthorization(pollCtx, deviceFlow)
-		if errWait != nil {
-			if IsOAuthSessionPending(state, "meta") {
-				SetOAuthSessionError(state, oauthSessionErrorWithCause("Authentication failed", errWait))
-			}
-			return
-		}
-		if !IsOAuthSessionPending(state, "meta") {
-			return
-		}
-		storage := authSvc.CreateTokenStorage(bundle)
-		if storage == nil || strings.TrimSpace(storage.AccessToken) == "" {
-			SetOAuthSessionError(state, "Failed to exchange token")
-			return
-		}
-		record := buildMetaAuthRecord(bundle, storage)
-		if errGuard := guardOAuthSessionPendingForSave(state, "meta"); errGuard != nil {
-			return
-		}
-		if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
-			SetOAuthSessionError(state, "Failed to save token to file")
-			return
-		}
-		CompleteOAuthSession(state)
-	}()
-	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}
-	if code := strings.TrimSpace(deviceFlow.UserCode); code != "" {
-		response["user_code"] = code
-	}
-	if deviceFlow.ExpiresIn > 0 {
-		response["expires_in"] = deviceFlow.ExpiresIn
-	} else {
-		response["expires_in"] = int(metaauth.MaxPollDuration / time.Second)
-	}
-	c.JSON(http.StatusOK, response)
-}
-
 func buildMetaAuthRecord(bundle *metaauth.MetaAuthBundle, storage *metaauth.MetaTokenStorage) *coreauth.Auth {
 	fileName := metaauth.CredentialFileName(storage.Email, storage.DCAToken)
 	label := strings.TrimSpace(storage.Email)
@@ -1189,16 +1135,14 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		domain = value
 	} else if value := strings.TrimSpace(c.Query("channel")); value != "" {
 		domain = value
+	} else if value := oauthSessionDomainFromContext(c); value != "" {
+		domain = value
 	}
 	h.requestKimiTokenWithDomain(c, domain)
 }
 
 func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
 	domain = kimi.NormalizeKimiDomain(domain)
-	provider := "kimi"
-	if kimi.IsKimiAIDomain(domain) {
-		provider = "kimi-ai"
-	}
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
 
@@ -1216,9 +1160,12 @@ func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
 		baseURL = kimi.KimiAIAPIBaseURL
 	}
 
-	state := fmt.Sprintf("%s-%d", provider, time.Now().UnixNano())
+	fmt.Printf("Initializing %s authentication...\n", displayName)
+	sessionProxyURL := oauthSessionProxyURLFromContext(c)
+	cfg := h.oauthConfigWithProxy(sessionProxyURL)
+	state := fmt.Sprintf("%s-%d", statePrefix, time.Now().UnixNano())
 	// Initialize Kimi auth service
-	kimiAuth := kimi.NewKimiAuthWithDomain(h.cfg, domain)
+	kimiAuth := newKimiOAuthService(cfg, domain)
 
 	// Generate authorization URL
 	deviceFlow, errStartDeviceFlow := kimiAuth.StartDeviceFlow(ctx)
@@ -1232,24 +1179,32 @@ func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
 		authURL = deviceFlow.VerificationURI
 	}
 
-	RegisterOAuthSession(state, provider)
+	RegisterOAuthSessionWithProxy(state, providerName, sessionProxyURL)
+	response := gin.H{"status": "ok", "url": authURL, "state": state, "flow": "device"}
+	if userCode := strings.TrimSpace(deviceFlow.UserCode); userCode != "" {
+		response["user_code"] = userCode
+	}
+	if deviceFlow.ExpiresIn > 0 {
+		response["expires_in"] = deviceFlow.ExpiresIn
+	}
+	bindOAuthSessionTarget(c, state, response)
 
 	go func() {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
-		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, provider)
+		go watchOAuthSessionCancel(pollCtx, cancelPoll, state, providerName)
 
 		fmt.Printf("Waiting for %s authentication...\n", displayName)
 		authBundle, errWaitForAuthorization := kimiAuth.WaitForAuthorization(pollCtx, deviceFlow)
 		if errWaitForAuthorization != nil {
-			if !IsOAuthSessionPending(state, provider) {
+			if !IsOAuthSessionPending(state, providerName) {
 				return
 			}
 			SetOAuthSessionError(state, redactSessionProxyInString(oauthSessionErrorWithCause("Authentication failed", errWaitForAuthorization), sessionProxyURL))
 			fmt.Printf("%s authentication failed: %s\n", displayName, redactSessionProxyInString(errWaitForAuthorization.Error(), sessionProxyURL))
 			return
 		}
-		if !IsOAuthSessionPending(state, provider) {
+		if !IsOAuthSessionPending(state, providerName) {
 			return
 		}
 
@@ -1260,14 +1215,14 @@ func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
 		}
 
 		metadata := map[string]any{
-			"type":          provider,
+			"type":          providerName,
 			"access_token":  authBundle.TokenData.AccessToken,
 			"refresh_token": authBundle.TokenData.RefreshToken,
 			"token_type":    authBundle.TokenData.TokenType,
 			"scope":         authBundle.TokenData.Scope,
 			"timestamp":     time.Now().UnixMilli(),
 			"domain":        domain,
-			"base_url":      kimi.ResolveKimiAPIBaseURL(domain),
+			"base_url":      baseURL,
 		}
 		if authBundle.TokenData.ExpiresAt > 0 {
 			expired := time.Unix(authBundle.TokenData.ExpiresAt, 0).UTC().Format(time.RFC3339)
@@ -1277,23 +1232,18 @@ func (h *Handler) requestKimiTokenWithDomain(c *gin.Context, domain string) {
 			metadata["device_id"] = strings.TrimSpace(authBundle.DeviceID)
 		}
 
-		fileName := fmt.Sprintf("%s-%d.json", provider, time.Now().UnixMilli())
+		fileName := fmt.Sprintf("%s-%d.json", filePrefix, time.Now().UnixMilli())
 		record := &coreauth.Auth{
 			ID:         fileName,
-			Provider:   provider,
+			Provider:   providerName,
 			FileName:   fileName,
-			Label:      "Kimi User",
+			Label:      fmt.Sprintf("%s User", displayName),
 			Storage:    tokenStorage,
 			Metadata:   metadata,
-			Attributes: map[string]string{"domain": domain, "base_url": kimi.ResolveKimiAPIBaseURL(domain)},
+			Attributes: map[string]string{"domain": domain, "base_url": baseURL},
 		}
-		if errGuard := guardOAuthSessionPendingForSave(state, provider); errGuard != nil {
-			return
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
+		savedPath, okSaved := h.commitAndCompleteBuiltinOAuthSession(ctx, state, providerName, sessionProxyURL, record, "Failed to save authentication tokens", false)
+		if !okSaved {
 			return
 		}
 

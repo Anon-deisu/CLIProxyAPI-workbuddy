@@ -55,6 +55,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	if errContext := ctx.Err(); errContext != nil {
 		return false
 	}
+	cfg = cfg.CloneForRuntime()
 	if cfg.Routing.DegradedPort != nil {
 		if errDegraded := s.setDegradedPort(*cfg.Routing.DegradedPort); errDegraded != nil {
 			log.WithError(errDegraded).Error("failed to apply degraded listener config")
@@ -188,6 +189,7 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	}
 	s.cfgMu.Lock()
 	s.cfg = cfg
+	s.cfgMu.Unlock()
 	s.fakeModels.Store(config.CloneFakeModels(cfg.Routing.FakeModels))
 	s.setExoFreePool(cfg.Routing.CodexStaticISP)
 	if s.codexLiveHandler != nil {

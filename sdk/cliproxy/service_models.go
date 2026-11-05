@@ -6,12 +6,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/modelconfig"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/modelconfig"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -187,9 +187,6 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		models = registry.GetKimiModels()
 		models = applyExcludedModels(models, excluded)
-	case "kimi-ai":
-		models = registry.GetKimiModels()
-		models = applyExcludedModels(models, excluded)
 	case "meta":
 		models = registry.GetMetaModels()
 		if authKind == "apikey" {
@@ -218,6 +215,12 @@ func (s *Service) registerModelsForAuthWithConfigAndCache(ctx context.Context, c
 	case "qoder", "qoder-cn":
 		var errCatalog error
 		models, errCatalog = helps.FetchQoderModels(ctx, s.cfg, a)
+		if s.coreManager != nil {
+			if current, ok := s.coreManager.GetByID(a.ID); !ok || current == nil || !strings.EqualFold(current.Provider, provider) {
+				registry.DeleteQoderModelsForClient(a.ID, provider)
+				return true
+			}
+		}
 		if errCatalog != nil {
 			log.WithError(errCatalog).WithField("provider", provider).Warn("using previous or built-in Qoder model catalog")
 			var found bool
@@ -636,13 +639,6 @@ func resolveConfigMetaKeyForConfig(cfg *config.Config, auth *coreauth.Auth) *con
 		return nil
 	}
 	return resolveConfigCodexStyleKey(auth, cfg.MetaKey, false)
-}
-
-func (s *Service) resolveConfigMetaKey(auth *coreauth.Auth) *config.MetaKey {
-	if s == nil || s.cfg == nil {
-		return nil
-	}
-	return resolveConfigCodexStyleKey(auth, s.cfg.MetaKey, false)
 }
 
 func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey, validateIndexCredentials bool) *config.CodexKey {
@@ -1143,13 +1139,6 @@ func buildMetaConfigModels(entry *config.MetaKey) []*ModelInfo {
 	return buildConfigModels(entry.Models, "meta", "meta", "meta")
 }
 
-func buildMetaConfigModels(entry *config.MetaKey) []*ModelInfo {
-	if entry == nil {
-		return nil
-	}
-	return buildConfigModels(entry.Models, "meta", "meta")
-}
-
 func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	if entry == nil {
 		return nil
@@ -1412,4 +1401,8 @@ func applyOAuthSettingsForAuth(cfg *config.Config, provider, authKind string, mo
 		}
 	}
 	return out
+}
+
+func applyOAuthSettings(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
+	return applyOAuthSettingsForAuth(cfg, provider, authKind, models)
 }

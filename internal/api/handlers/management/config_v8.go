@@ -5,12 +5,12 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,6 +25,12 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	data, err := os.ReadFile(h.configFilePath)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read_failed"})
+		return
+	}
+	diskHash := config.ComputeSourceHash(data)
+	if c.Request.Method != http.MethodGet && !ifMatchSatisfied(c.Request.Header.Values("If-Match"), diskHash) {
+		c.Header("ETag", configV8ETag(diskHash))
+		c.JSON(http.StatusPreconditionFailed, gin.H{"error": "precondition_failed"})
 		return
 	}
 	data, _, err = config.NormalizeConfigLayout(data, true)
@@ -51,6 +57,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			return
 		}
 		root = doc.Content[0]
+		config.ProjectV8ConfigAliases(root, strings.Join(parts, "."))
 		if !yamlRequest {
 			if servers := configV8Node(root, v8ICEServersPath); servers != nil && servers.Kind == yaml.SequenceNode {
 				for _, server := range servers.Content {
@@ -58,6 +65,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 					deleteConfigV8Path(server, []string{"credential"})
 				}
 			}
+			h.injectV8APIKeyAuthIndexesLocked(root, data)
 		}
 		value := configV8Node(root, parts)
 		if value == nil {
@@ -65,6 +73,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			return
 		}
 		c.Header("Cache-Control", "no-store")
+		c.Header("ETag", configV8ETag(diskHash))
 		if yamlRequest {
 			c.Data(http.StatusOK, "application/yaml; charset=utf-8", data)
 			return
@@ -78,6 +87,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		return
 	}
 	before := cloneConfigV8Node(root)
+	config.ProjectV8ConfigAliases(root, strings.Join(parts, "."))
 	if c.Request.Method == http.MethodDelete {
 		if len(parts) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "cannot_delete_config"})
@@ -90,7 +100,7 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 	} else {
 		body, errRead := io.ReadAll(c.Request.Body)
 		if errRead != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+			c.JSON(clienterror.HTTPStatusFromErrorOr(errRead, http.StatusBadRequest), gin.H{"error": "invalid_body"})
 			return
 		}
 		if !yamlRequest && !json.Valid(body) {
@@ -102,9 +112,16 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
 			return
 		}
+		stripAPIKeysAuthIndexesFromUpdate(parts, &update)
 		if len(parts) == 0 && update.Content[0].Kind != yaml.MappingNode {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "config_must_be_object"})
 			return
+		}
+		if len(parts) == 0 {
+			if err = config.NormalizeV8ConfigAliases(update.Content[0]); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
+				return
+			}
 		}
 		// Paths identify YAML keys, never array indexes. Lists are replaced whole.
 		dst := root
@@ -123,8 +140,17 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		if c.Request.Method == http.MethodPatch {
 			mergeConfigV8Patch(dst, update.Content[0])
 		} else {
+			if dst.Kind == yaml.ScalarNode && update.Content[0].Kind == yaml.ScalarNode {
+				update.Content[0].HeadComment = dst.HeadComment
+				update.Content[0].LineComment = dst.LineComment
+				update.Content[0].FootComment = dst.FootComment
+			}
 			*dst = *update.Content[0]
 		}
+	}
+	if err = config.NormalizeV8ConfigAliases(root); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
+		return
 	}
 	if !yamlRequest && c.Request.Method != http.MethodDelete {
 		preserveV8TURNSecrets(root, before)
@@ -145,6 +171,8 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 			return
 		}
 	}
+	stripAPIKeysAuthIndexesFromRoot(root)
+	config.NormalizeCollectionNodeStyles(root)
 	data, err = yaml.Marshal(&doc)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
@@ -173,53 +201,77 @@ func (h *Handler) ConfigV8(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
 	}
-	// Prepare the normalized document before touching the live configuration.
-	tmp, err := os.CreateTemp(filepath.Dir(h.configFilePath), ".config-v8-*.yaml")
+	data, _, err = config.NormalizeConfigLayout(data, true)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
 	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-	var errWrite error
-	if _, errWrite = tmp.Write(data); errWrite == nil {
-		errWrite = tmp.Sync()
-	}
-	errClose := tmp.Close()
-	if errWrite == nil {
-		if next.AccountScheduling != nil && next.AccountScheduling.CodexStaticISP != nil && len(next.AccountScheduling.CodexStaticISP.Nodes) > 0 {
-			errWrite = os.Chmod(h.configFilePath, 0600)
+	if next.AccountScheduling != nil && next.AccountScheduling.CodexStaticISP != nil && len(next.AccountScheduling.CodexStaticISP.Nodes) > 0 {
+		if errChmod := os.Chmod(h.configFilePath, 0o600); errChmod != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": errChmod.Error()})
+			return
 		}
 	}
-	if errWrite == nil {
-		errWrite = errClose
-	}
-	// DELETE already has a normalized, validated document and its runtime snapshot.
-	// Persist that tree without projecting the typed config back onto it: the
-	// general saver materializes absent defaults and can change explicit nulls,
-	// empty maps, and opaque plugin settings. PUT/PATCH retain their saver behavior.
-	if errWrite == nil && c.Request.Method != http.MethodDelete {
-		errWrite = config.SaveConfigPreserveComments(tmpPath, next, true)
-	}
-	if errWrite == nil {
-		data, errWrite = os.ReadFile(tmpPath)
-	}
-
-	if errWrite == nil {
-		// Preserve the destination inode: the standard Docker deployment mounts
-		// config.yaml as a single file, which cannot be replaced with rename.
-		errWrite = WriteConfig(h.configFilePath, data)
-	}
-	if errWrite != nil {
+	// Persist the canonical tree so explicit nulls, empty maps, and plugin settings
+	// survive. WriteConfig retains the inode of a mounted configuration file.
+	h.noteConfigMutationLocked()
+	if errWrite := WriteConfig(h.configFilePath, data); errWrite != nil {
+		h.pendingConfigFileHash = ""
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": errWrite.Error()})
 		return
 	}
+	h.recordConfigFileSnapshotLocked()
 	// Runtime-only ownership state is never sourced from an uploaded YAML document.
 	next.Home = h.cfg.Home
+	if saved, errSaved := os.ReadFile(h.configFilePath); errSaved == nil {
+		c.Header("ETag", configV8ETag(config.ComputeSourceHash(saved)))
+	}
 	h.cfg = next.CloneForReload(h.cfg)
 	snapshot := h.reloadSnapshotConfigLocked()
 	h.reloadConfigAfterManagementSaveAsync(c.Request.Context(), snapshot)
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "config-version": 8})
+}
+
+// configV8ETag renders a config source hash as a strong ETag.
+func configV8ETag(hash string) string {
+	return `"` + hash + `"`
+}
+
+// ifMatchSatisfied applies RFC 9110 strong comparison to an optional If-Match.
+func ifMatchSatisfied(values []string, currentHash string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	field := strings.TrimSpace(strings.Join(values, ","))
+	if field == "*" {
+		return true
+	}
+	for _, tag := range splitEntityTagList(field) {
+		tag = strings.TrimSpace(tag)
+		if len(tag) >= 2 && tag[0] == '"' && tag[len(tag)-1] == '"' && !strings.Contains(tag[1:len(tag)-1], `"`) && tag[1:len(tag)-1] == currentHash {
+			return true
+		}
+	}
+	return false
+}
+
+// splitEntityTagList keeps commas inside quoted entity tags intact.
+func splitEntityTagList(field string) []string {
+	parts := []string{}
+	start := 0
+	quoted := false
+	for i := 0; i < len(field); i++ {
+		switch field[i] {
+		case '"':
+			quoted = !quoted
+		case ',':
+			if !quoted {
+				parts = append(parts, field[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, field[start:])
 }
 
 var v8ICEServersPath = []string{"oauth", "providers", "codex", "live-media-relay", "ice-servers"}
@@ -321,6 +373,12 @@ func cloneConfigV8Node(node *yaml.Node) *yaml.Node {
 // inherit the group value. DELETE is the explicit field-removal operation.
 func mergeConfigV8Patch(dst, src *yaml.Node) {
 	if dst.Kind != yaml.MappingNode || src.Kind != yaml.MappingNode {
+		if dst.Kind == yaml.ScalarNode && src.Kind == yaml.ScalarNode {
+			copy := *src
+			copy.HeadComment, copy.LineComment, copy.FootComment = dst.HeadComment, dst.LineComment, dst.FootComment
+			*dst = copy
+			return
+		}
 		*dst = *src
 		return
 	}

@@ -138,9 +138,9 @@ func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {
 
 func normalizeCodexWebsocketCompletion(payload []byte) []byte {
 	if strings.TrimSpace(ojson.GetBytesNoCopy(payload, "type").String()) == "response.done" {
-		updated, err := ojson.SetBytes(payload, "type", "response.completed")
-		if err == nil && len(updated) > 0 {
-			return updated
+		doc := ojson.NewDoc(payload)
+		if errSet := doc.Set("type", "response.completed"); errSet == nil {
+			return doc.Bytes()
 		}
 	}
 	return payload

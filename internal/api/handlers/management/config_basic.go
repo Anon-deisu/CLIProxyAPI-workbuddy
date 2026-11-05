@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -183,22 +183,27 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.noteConfigMutationLocked()
 	if cfg.AccountScheduling != nil && cfg.AccountScheduling.CodexStaticISP != nil && len(cfg.AccountScheduling.CodexStaticISP.Nodes) > 0 {
 		if errMode := os.Chmod(h.configFilePath, 0600); errMode != nil {
+			h.pendingConfigFileHash = ""
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "cannot protect static ISP credentials"})
 			return
 		}
 	}
 	if WriteConfig(h.configFilePath, body) != nil {
+		h.pendingConfigFileHash = ""
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "failed to write config"})
 		return
 	}
 	// Reload into handler to keep memory in sync
 	newCfg, err := config.LoadConfig(h.configFilePath)
 	if err != nil {
+		h.pendingConfigFileHash = ""
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "reload_failed", "message": err.Error()})
 		return
 	}
+	h.recordConfigFileSnapshotLocked()
 	h.cfg = newCfg.CloneForReload(h.cfg)
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
@@ -308,7 +313,7 @@ func (h *Handler) GetRequestRetry(c *gin.Context) {
 	c.JSON(200, gin.H{"request-retry": h.cfg.RequestRetry})
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
+	h.updateIntFieldAt(c, func(v int) { h.cfg.RequestRetry = v }, []string{"request-retry"})
 }
 
 // Max retry credentials
@@ -316,7 +321,7 @@ func (h *Handler) GetMaxRetryCredentials(c *gin.Context) {
 	c.JSON(200, gin.H{"max-retry-credentials": h.cfg.MaxRetryCredentials})
 }
 func (h *Handler) PutMaxRetryCredentials(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.MaxRetryCredentials = v })
+	h.updateIntFieldAt(c, func(v int) { h.cfg.MaxRetryCredentials = v }, []string{"max-retry-credentials"})
 }
 
 // Max retry interval
@@ -324,7 +329,7 @@ func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
 	c.JSON(200, gin.H{"max-retry-interval": h.cfg.MaxRetryInterval})
 }
 func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
-	h.updateIntField(c, func(v int) { h.cfg.MaxRetryInterval = v })
+	h.updateIntFieldAt(c, func(v int) { h.cfg.MaxRetryInterval = v }, []string{"max-retry-interval"})
 }
 
 // ForceModelPrefix
@@ -702,7 +707,7 @@ func (h *Handler) PutRoutingStrategy(c *gin.Context) {
 	defer h.mu.Unlock()
 	h.cfg.Routing.Strategy = normalized
 	h.cfg.Routing.SchedulerMode = ""
-	h.persist(c)
+	h.persistLocked(c)
 }
 
 // Proxy URL

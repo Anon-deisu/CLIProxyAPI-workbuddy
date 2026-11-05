@@ -51,10 +51,15 @@ func applyPatchEventIdentityDoc(doc *ojson.Doc, s *ApplyPatchCallState, sequence
 
 // ApplyPatchFailure builds a terminal Responses failure without exposing upstream arguments.
 func ApplyPatchFailure(responseID string, sequence int) []byte {
+	return ApplyPatchFailureDoc(responseID, sequence).Bytes()
+}
+
+// ApplyPatchFailureDoc allows callers to specialize a failure before serialization.
+func ApplyPatchFailureDoc(responseID string, sequence int) *ojson.Doc {
 	doc := ojson.NewDoc([]byte(`{"type":"response.failed","sequence_number":0,"response":{"id":"","object":"response","status":"failed","error":{"type":"server_error","code":"invalid_tool_arguments","message":"Invalid apply_patch tool arguments received from upstream.","param":null}}}`))
 	_ = doc.Set("response.id", responseID)
 	_ = doc.Set("sequence_number", sequence)
-	return doc.Bytes()
+	return doc
 }
 
 // ApplyPatchErrorState retains a conversion error for the caller.

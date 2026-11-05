@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,16 +17,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	"github.com/tidwall/gjson"
+	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	log "github.com/sirupsen/logrus"
 )
 
 var benchmarkBuildCodexWebsocketRequestBodyOutput []byte
@@ -62,7 +63,7 @@ func TestCodexWebsocketPassesClientStateWithoutProbes(t *testing.T) {
 					t.Error(errRead)
 					return
 				}
-				if gjson.GetBytes(payload, "client_metadata.x-codex-turn-state").String() != clientState {
+				if ojson.GetBytes(payload, "client_metadata.x-codex-turn-state").String() != clientState {
 					t.Error("native client state was changed")
 				}
 				completed := []byte(`{"type":"response.completed","response":{"id":"resp-state","model":"gpt-6-astra","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
@@ -695,20 +696,20 @@ func TestExistingWebsocketSessionConnRequiresMatchingHealthyConnection(t *testin
 	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://other.test/responses", ""); got != nil {
 		t.Fatal("websocket session matched a different URL")
 	}
-	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", true); got != nil {
+	if got, _ := existingWebsocketSessionConnForEgress(sess, "auth-a", "ws://example.test/responses", "", true, ""); got != nil {
 		t.Fatal("native websocket session matched convergence mode")
 	}
 	sess.connMu.Lock()
 	sess.convergence = true
 	sess.connMu.Unlock()
-	if gotConn, gotCloser := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", true); gotConn != conn || gotCloser != closer {
+	if gotConn, gotCloser := existingWebsocketSessionConnForEgress(sess, "auth-a", "ws://example.test/responses", "", true, ""); gotConn != conn || gotCloser != closer {
 		t.Fatal("matching converged websocket session was not reusable")
 	}
-	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses"); got != nil {
+	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", ""); got != nil {
 		t.Fatal("converged websocket session matched the default native mode")
 	}
 	sess.setUpstreamDisconnectError(conn, errors.New("upstream disconnected"))
-	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", true); got != nil {
+	if got, _ := existingWebsocketSessionConnForEgress(sess, "auth-a", "ws://example.test/responses", "", true, ""); got != nil {
 		t.Fatal("disconnected websocket session remained reusable")
 	}
 }
@@ -783,7 +784,7 @@ func TestCodexWebsocketFingerprintConvergenceSessionIsolation(t *testing.T) {
 				if !cliproxyexecutor.IsUpstreamWebsocketReplayRequired(errExecute) {
 					t.Fatalf("mode mismatch error = %T %v, want typed replay-required", errExecute, errExecute)
 				}
-				if got, _ := existingWebsocketSessionConn(sess, auth.ID, wsURL, !tt.wantConvergence); got != conn {
+				if got, _ := existingWebsocketSessionConnForEgress(sess, auth.ID, wsURL, "", !tt.wantConvergence, ""); got != conn {
 					t.Fatal("required mode mismatch detached or replaced the retained connection")
 				}
 			}
@@ -1875,9 +1876,9 @@ func TestCodexFingerprintConvergenceWebsocketPreservesUserCacheSession(t *testin
 		req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: payload}
 		body, headers := applyCodexPromptCacheHeaders(sdktranslator.FormatOpenAIResponse, req, payload)
 		body, state := applyCodexIdentityConfuseBody(cfg, auth, payload, body)
-		headers = applyCodexWebsocketHeaders(context.Background(), headers, auth, "test-token", cfg)
+		headers = applyCodexWebsocketHeaders(context.Background(), headers, auth, "test-token", cfg, false)
 		applyCodexIdentityConfuseHeaders(headers, &state)
-		if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != key {
+		if got := ojson.GetBytes(body, "prompt_cache_key").String(); got != key {
 			t.Fatalf("prompt_cache_key = %q, want %q", got, key)
 		}
 		if got := headerValueCaseInsensitive(headers, "session_id"); got != key {
@@ -1916,12 +1917,12 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 		"X-Codex-Turn-Metadata": `{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","window_id":"cache-ws-1:0"}`,
 		"X-Client-Request-Id":   "client-request-1",
 	})
-	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg)
+	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg, false)
 	applyCodexIdentityConfuseHeaders(headers, &identityState)
 
 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1")
 	expectedTurnID := codexIdentityConfuseUUID("auth-ws-1", "turn", "turn-ws-1")
-	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
+	if gotKey := ojson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
 	if gotSession := headers["session_id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
@@ -1943,17 +1944,17 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
 	}
 	gotMetadata := headers.Get("X-Codex-Turn-Metadata")
-	if gotMetadataPromptCacheKey := gjson.Get(gotMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
+	if gotMetadataPromptCacheKey := ojson.Get(gotMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
 		t.Fatalf("X-Codex-Turn-Metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
 	}
-	if gotMetadataTurnID := gjson.Get(gotMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
+	if gotMetadataTurnID := ojson.Get(gotMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
 		t.Fatalf("X-Codex-Turn-Metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
 	}
-	if gotMetadataWindowID := gjson.Get(gotMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
+	if gotMetadataWindowID := ojson.Get(gotMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
 		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
 	}
 	expectedInstallationID := codexIdentityConfuseUUID("auth-ws-1", "installation", "install-ws-1")
-	if gotInstallationID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); gotInstallationID != expectedInstallationID {
+	if gotInstallationID := ojson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); gotInstallationID != expectedInstallationID {
 		t.Fatalf("installation id = %q, want %q", gotInstallationID, expectedInstallationID)
 	}
 }
@@ -2057,7 +2058,7 @@ func TestParseCodexWebsocketErrorNormalizesAuthentication(t *testing.T) {
 							t.Errorf("authentication failure must not be request-scoped: %v", err)
 						}
 						assertCodexErrorCode(t, err.Error(), "authentication_error", "auth_unavailable")
-						if got := gjson.Get(err.Error(), "error.message").String(); got != "Credential rejected." {
+						if got := ojson.Get(err.Error(), "error.message").String(); got != "Credential rejected." {
 							t.Errorf("error message = %q, want upstream message", got)
 						}
 						withHeaders, ok := err.(interface{ Headers() http.Header })
@@ -2117,7 +2118,7 @@ func TestParseCodexWebsocketErrorPreservesNonAuthenticationFailures(t *testing.T
 			if got := clienterror.IsRequestFault(status, err); got != tc.requestFault {
 				t.Errorf("request fault = %t, want %t; err=%v", got, tc.requestFault, err)
 			}
-			if tc.requestFault && gjson.Get(err.Error(), "error.param").String() != "input" {
+			if tc.requestFault && ojson.Get(err.Error(), "error.param").String() != "input" {
 				t.Errorf("request parameter was not preserved: %v", err)
 			}
 		})
@@ -2283,7 +2284,7 @@ func TestCodexOAuthPersonaAndRoutingHintAreStableAcrossHTTPAndWebsocket(t *testi
 		t.Fatal(errRequest)
 	}
 	applyCodexHeadersFromSources(req, auth, "oauth-token", false, cfg, nil)
-	wsHeaders := applyCodexWebsocketHeaders(context.Background(), nil, auth, "oauth-token", cfg)
+	wsHeaders := applyCodexWebsocketHeaders(context.Background(), nil, auth, "oauth-token", cfg, false)
 	if req.Header.Get("User-Agent") == codexUserAgent {
 		t.Fatalf("HTTP request unexpectedly used legacy Codex User-Agent: %q", req.Header.Get("User-Agent"))
 	}

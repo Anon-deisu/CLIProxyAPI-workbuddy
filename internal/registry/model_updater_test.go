@@ -18,6 +18,19 @@ func TestDetectChangedProviders_CodexConfigurationUpdate(t *testing.T) {
 	}
 }
 
+func TestDetectChangedProvidersExplicitCapabilities(t *testing.T) {
+	for _, model := range []*ModelInfo{
+		{ID: "example", ExplicitThinking: true},
+		{ID: "example", ExplicitInputModalities: true},
+	} {
+		before := &staticModelsJSON{Cursor: []*ModelInfo{{ID: "example"}}}
+		after := &staticModelsJSON{Cursor: []*ModelInfo{model}}
+		if changed := detectChangedProviders(before, after); len(changed) != 1 || changed[0] != "cursor" {
+			t.Fatalf("explicit capability change was not published: %v", changed)
+		}
+	}
+}
+
 func TestDetectChangedProviders_KimiAliases(t *testing.T) {
 	oldData := &staticModelsJSON{
 		Kimi: []*ModelInfo{{ID: "kimi-k2"}},

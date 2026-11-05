@@ -7,8 +7,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/tidwall/gjson"
+	"github.com/MoeForge/moego/ojson"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func TestSessionJSONObjectPreservesLookupSemantics(t *testing.T) {
@@ -18,7 +18,7 @@ func TestSessionJSONObjectPreservesLookupSemantics(t *testing.T) {
 		`{"metadata":{"parent_session_id":"one","parent_session_id":"two"},"contents":[]}`,
 		`{}`, `null`, `[]`,
 	} {
-		root := gjson.Parse(body)
+		root := ojson.Parse(body)
 		indexed := indexSessionJSONObject(root)
 		if root.Exists() != indexed.Exists() {
 			t.Fatalf("existence changed for %s", body)

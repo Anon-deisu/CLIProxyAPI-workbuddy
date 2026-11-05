@@ -117,11 +117,12 @@ func (e *KimiExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth,
 func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	from := opts.SourceFormat
 	if from.String() == "claude" {
-		base := helps.ResolveKimiClaudeBaseURL(auth)
-		if auth.Attributes == nil {
-			auth.Attributes = make(map[string]string)
+		if auth != nil {
+			if auth.Attributes == nil {
+				auth.Attributes = make(map[string]string)
+			}
+			auth.Attributes["base_url"] = helps.ResolveKimiClaudeBaseURL(auth)
 		}
-		auth.Attributes["base_url"] = base
 		preparedReq, replayScope := prepareKimiThinkingReplayRequest(ctx, req, opts)
 		claudeResp, errExecute := e.ClaudeExecutor.Execute(ctx, auth, preparedReq, opts)
 		if errExecute != nil {
@@ -165,8 +166,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
 	}
 
-	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), "kimi", e.thinkingProvider())
-	if err != nil {
+	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), "kimi", e.thinkingProvider()); err != nil {
 		return resp, err
 	}
 
@@ -179,6 +179,9 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	normalizeKimiTemperatureDoc(doc)
 
 	url := helps.ResolveKimiChatURL(auth)
+	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = doc.Bytes()
+	reporter.SetTranslatedReasoningEffort(body, e.thinkingProvider())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return resp, err
@@ -253,11 +256,12 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	from := opts.SourceFormat
 	if from.String() == "claude" {
-		base := helps.ResolveKimiClaudeBaseURL(auth)
-		if auth.Attributes == nil {
-			auth.Attributes = make(map[string]string)
+		if auth != nil {
+			if auth.Attributes == nil {
+				auth.Attributes = make(map[string]string)
+			}
+			auth.Attributes["base_url"] = helps.ResolveKimiClaudeBaseURL(auth)
 		}
-		auth.Attributes["base_url"] = base
 		preparedReq, replayScope := prepareKimiThinkingReplayRequest(ctx, req, opts)
 		claudeResult, errExecute := e.ClaudeExecutor.ExecuteStream(ctx, auth, preparedReq, opts)
 		if errExecute != nil {
@@ -286,16 +290,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
 	originalTranslated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, true)
-	body := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), true)
-
-	// Strip kimi- prefix and any [1m] suffix for upstream API
-	upstreamModel := normalizeKimiUpstreamModel(baseModel)
-	body, err = sjson.SetBytes(body, "model", upstreamModel)
-	if err != nil {
-		return nil, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
-	}
-
-	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), "kimi", e.thinkingProvider())
+	body, err := helps.TranslateRequestReturningError(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +303,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, fmt.Errorf("kimi executor: failed to set model in payload: %w", err)
 	}
 
-	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), "kimi", e.Identifier()); err != nil {
+	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), "kimi", e.thinkingProvider()); err != nil {
 		return nil, err
 	}
 
@@ -324,6 +319,9 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	normalizeKimiTemperatureDoc(doc)
 
 	url := helps.ResolveKimiChatURL(auth)
+	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, to.String(), from.String(), "", doc, originalTranslated, requestedModel, requestPath, opts.Headers)
+	body = doc.Bytes()
+	reporter.SetTranslatedReasoningEffort(body, e.thinkingProvider())
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -460,9 +458,7 @@ func (e *KimiExecutor) executeResponses(ctx context.Context, auth *cliproxyauth.
 
 	helps.SetBoolIfDifferentDoc(doc, "stream", false)
 
-	var errThinking error
-	body, errThinking = helps.ApplyRequestThinking(body, req, opts, opts.SourceFormat.String(), sdktranslator.FormatCodex.String(), e.thinkingProvider())
-	if errThinking != nil {
+	if errThinking := helps.ApplyRequestThinkingDoc(doc, req, opts, opts.SourceFormat.String(), sdktranslator.FormatCodex.String(), e.thinkingProvider()); errThinking != nil {
 		return resp, errThinking
 	}
 
@@ -480,7 +476,7 @@ func (e *KimiExecutor) executeResponses(ctx context.Context, auth *cliproxyauth.
 	url := helps.ResolveKimiResponsesURL(auth)
 	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, "openai-response", opts.SourceFormat.String(), "", doc, req.Payload, requestedModel, requestPath, opts.Headers)
 	body := doc.Bytes()
-	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
+	reporter.SetTranslatedReasoningEffort(body, e.thinkingProvider())
 	httpReq, errNewRequest := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewRequest != nil {
 		return resp, errNewRequest
@@ -593,9 +589,7 @@ func (e *KimiExecutor) executeResponsesStream(ctx context.Context, auth *cliprox
 
 	helps.SetBoolIfDifferentDoc(doc, "stream", true)
 
-	var errThinking error
-	body, errThinking = helps.ApplyRequestThinking(body, req, opts, opts.SourceFormat.String(), sdktranslator.FormatCodex.String(), e.thinkingProvider())
-	if errThinking != nil {
+	if errThinking := helps.ApplyRequestThinkingDoc(doc, req, opts, opts.SourceFormat.String(), sdktranslator.FormatCodex.String(), e.thinkingProvider()); errThinking != nil {
 		return nil, errThinking
 	}
 
@@ -613,7 +607,7 @@ func (e *KimiExecutor) executeResponsesStream(ctx context.Context, auth *cliprox
 	url := helps.ResolveKimiResponsesURL(auth)
 	helps.ApplyPayloadConfigWithRequestDoc(e.cfg, baseModel, "openai-response", opts.SourceFormat.String(), "", doc, req.Payload, requestedModel, requestPath, opts.Headers)
 	body := doc.Bytes()
-	reporter.SetTranslatedReasoningEffort(body, e.Identifier())
+	reporter.SetTranslatedReasoningEffort(body, e.thinkingProvider())
 	httpReq, errNewRequest := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if errNewRequest != nil {
 		return nil, errNewRequest
@@ -833,11 +827,22 @@ func (e *KimiExecutor) executeKimiResponsesCompactionStream(ctx context.Context,
 
 // CountTokens estimates token count for Kimi requests.
 func (e *KimiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	base := helps.ResolveKimiClaudeBaseURL(auth)
-	if auth.Attributes == nil {
-		auth.Attributes = make(map[string]string)
+	if opts.SourceFormat == sdktranslator.FormatOpenAIResponse {
+		if errExpand := helps.ExpandResponsesCompactionCapsules(&req, &opts, "kimi"); errExpand != nil {
+			return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadRequest, msg: errExpand.Error()}
+		}
+		var errNormalize error
+		req.Payload, errNormalize = helps.NormalizeApplyPatchResponsesRequest(req.Payload)
+		if errNormalize != nil {
+			return cliproxyexecutor.Response{}, errNormalize
+		}
 	}
-	auth.Attributes["base_url"] = base
+	if auth != nil {
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string)
+		}
+		auth.Attributes["base_url"] = helps.ResolveKimiClaudeBaseURL(auth)
+	}
 	return e.ClaudeExecutor.countTokensUpstream(ctx, auth, req, opts)
 }
 

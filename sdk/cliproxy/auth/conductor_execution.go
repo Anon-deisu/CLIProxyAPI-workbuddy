@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -431,16 +430,12 @@ func requestToFormat(provider string, executor ProviderExecutor, req cliproxyexe
 		return sdktranslator.FormatGemini
 	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		return sdktranslator.FormatOpenAI
-	case "kimi-ai":
-		return sdktranslator.FormatOpenAI
 	case "meta":
 		return sdktranslator.FormatOpenAIResponse
 	case "devin":
 		return sdktranslator.FormatInteractions
 	case "antigravity":
 		return sdktranslator.FormatAntigravity
-	case "devin":
-		return sdktranslator.FormatInteractions
 	default:
 		return sdktranslator.FormatOpenAI
 	}
@@ -489,15 +484,6 @@ func mergeRequestHeaders(current, updates http.Header, clear []string) http.Head
 		}
 	}
 	return out
-}
-
-func executorForAuth(executor ProviderExecutor, auth *Auth) ProviderExecutor {
-	if auth.AuthKind() == AuthKindAPIKey {
-		if scoped, ok := executor.(APIKeyConfigExecutor); ok {
-			return scoped.ForAPIKey()
-		}
-	}
-	return executor
 }
 
 // syncPreferredUpstreamError refreshes the error that terminal selection
@@ -1565,9 +1551,7 @@ func hasRequestedModelMetadata(meta map[string]any) bool {
 	}
 }
 
-type requestAuthPrepareLock struct {
-	mu sync.Mutex
-}
+type requestAuthPrepareLock = authRefreshLock
 
 // prepareHomeRequestAuth prepares a dispatch auth without reading or updating local auth state.
 func (m *Manager) prepareHomeRequestAuth(ctx context.Context, executor ProviderExecutor, selection *HomeDispatchSelection) (*Auth, error) {
@@ -1585,6 +1569,9 @@ func (m *Manager) prepareHomeRequestAuth(ctx context.Context, executor ProviderE
 func (m *Manager) prepareHomeAuthSnapshot(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, error) {
 	if m == nil || executor == nil || auth == nil {
 		return auth, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	preparer, ok := executor.(RequestAuthPreparer)
 	if !ok || preparer == nil || !preparer.ShouldPrepareRequestAuth(auth) {
@@ -1615,8 +1602,13 @@ func (m *Manager) prepareHomeAuthSnapshot(ctx context.Context, executor Provider
 	if !ok || lock == nil {
 		return prepare()
 	}
-	lock.mu.Lock()
-	defer lock.mu.Unlock()
+	if !lock.acquire(ctx) {
+		return auth, ctx.Err()
+	}
+	defer func() { <-lock.busy }()
+	if errCtx := ctx.Err(); errCtx != nil {
+		return auth, errCtx
+	}
 	return prepare()
 }
 
@@ -1635,23 +1627,31 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 	if m == nil || preparer == nil || auth == nil || !preparer.ShouldPrepareRequestAuth(auth) {
 		return auth, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	id := strings.TrimSpace(auth.ID)
 	if id == "" {
 		return preparer.PrepareRequestAuth(ctx, auth.Clone())
 	}
 
-	var prepareMu *sync.Mutex
+	var prepareLock *authRefreshLock
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
 		// Meta also mints on 401 recovery. Serialize both paths per credential.
 		lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
-		prepareMu = &lockValue.(*authRefreshLock).mu
+		prepareLock = lockValue.(*authRefreshLock)
 	} else {
 		lockValue, _ := m.requestPrepareLocks.LoadOrStore(id, &requestAuthPrepareLock{})
-		prepareMu = &lockValue.(*requestAuthPrepareLock).mu
+		prepareLock = lockValue.(*requestAuthPrepareLock)
 	}
-	prepareMu.Lock()
-	defer prepareMu.Unlock()
+	if !prepareLock.acquire(ctx) {
+		return auth, ctx.Err()
+	}
+	defer func() { <-prepareLock.busy }()
+	if errCtx := ctx.Err(); errCtx != nil {
+		return auth, errCtx
+	}
 
 	target := auth.Clone()
 	m.mu.RLock()

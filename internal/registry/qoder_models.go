@@ -140,8 +140,18 @@ func GetQoderCatalogForClient(clientID, provider string) ([]*ModelInfo, []map[st
 
 // DeleteQoderModelsForClient releases the retained catalog when an account is removed.
 func DeleteQoderModelsForClient(clientID, provider string) {
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		return
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
 	qoderClientCatalogs.Lock()
-	delete(qoderClientCatalogs.entries, qoderCatalogKey{clientID, strings.ToLower(strings.TrimSpace(provider))})
+	if provider == "" {
+		delete(qoderClientCatalogs.entries, qoderCatalogKey{clientID, "qoder"})
+		delete(qoderClientCatalogs.entries, qoderCatalogKey{clientID, "qoder-cn"})
+	} else {
+		delete(qoderClientCatalogs.entries, qoderCatalogKey{clientID, provider})
+	}
 	qoderClientCatalogs.Unlock()
 }
 

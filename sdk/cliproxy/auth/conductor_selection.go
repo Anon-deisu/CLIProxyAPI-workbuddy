@@ -145,6 +145,43 @@ func (m *Manager) currentVersion() uint64 {
 	return m.structuralEpoch.Load() + registry.GetGlobalRegistry().RegistrationEpoch()
 }
 
+func (m *Manager) checkAndSyncScheduler() bool {
+	if m == nil || m.scheduler == nil {
+		return false
+	}
+	m.syncSchedulerMu.Lock()
+	defer m.syncSchedulerMu.Unlock()
+	currentVer := m.currentVersion()
+	if currentVer == m.syncedVersion.Load() {
+		return true
+	}
+	if m.schedulerNeedsSync() {
+		m.syncSchedulerFromSnapshot(m.snapshotAuths())
+	}
+	// A rebuild can race an auth or registry change. Do not claim the observed
+	// version until the rebuilt scheduler is verified against current state.
+	if m.schedulerNeedsSync() {
+		return false
+	}
+	for {
+		current := m.syncedVersion.Load()
+		if current >= currentVer || m.syncedVersion.CompareAndSwap(current, currentVer) {
+			break
+		}
+	}
+	return true
+}
+
+func (m *Manager) schedulerNeedsSync() bool {
+	if m == nil || m.scheduler == nil {
+		return false
+	}
+	m.mu.RLock()
+	needsSync := m.scheduler.needsSyncFromMap(m.auths)
+	m.mu.RUnlock()
+	return needsSync
+}
+
 func (m *Manager) syncScheduler() {
 	if m == nil || m.scheduler == nil {
 		return
@@ -633,25 +670,37 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 // unless session affinity is active, in which case the selector additionally receives lower
 // priority tiers so an established binding can be validated instead of being preempted by a
 // recovered higher-priority credential.
-func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time) (priorityAuths, selectorAuths []*Auth, err error) {
+func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, provider, routeModel string, now time.Time, schedulerAcrossValues ...bool) (priorityAuths, selectorAuths []*Auth, err error) {
 	_, sessionAffinity := selector.(*SessionAffinitySelector)
-	available, err := m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, sessionAffinity)
+	schedulerAcross := len(schedulerAcrossValues) > 0 && schedulerAcrossValues[0]
+	allPriorities := sessionAffinity || schedulerAcross
+	available, err := m.availableAuthsForRouteModelWithPriorityMode(auths, provider, routeModel, now, allPriorities)
 	if err != nil {
 		return nil, nil, err
 	}
 	// Skip full credentials before cloning or invoking a selector; otherwise each
 	// rejected reservation recursively repeats the entire pool scan and clone.
 	// TryAcquireDispatchSlot still arbitrates races after this snapshot is taken.
-	selectorAuths = make([]*Auth, 0, len(available))
+	availableAuths := make([]*Auth, 0, len(available))
 	for _, candidate := range available {
 		if candidate.DispatchSlotAvailable() {
-			selectorAuths = append(selectorAuths, candidate.Clone())
+			availableAuths = append(availableAuths, candidate.Clone())
 		}
+	}
+	if schedulerAcross {
+		priorityAuths = availableAuths
+	} else {
+		priorityAuths = highestPriorityAuths(availableAuths)
+	}
+	if sessionAffinity {
+		selectorAuths = availableAuths
+	} else {
+		selectorAuths = highestPriorityAuths(availableAuths)
 	}
 	if len(selectorAuths) == 0 {
 		return nil, nil, NewConcurrencyLimitError()
 	}
-	return highestPriorityAuths(selectorAuths), selectorAuths, nil
+	return priorityAuths, selectorAuths, nil
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
@@ -1852,6 +1901,23 @@ func shouldRetrySchedulerPick(err error) bool {
 		return false
 	}
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
+}
+
+func (m *Manager) shouldRetrySchedulerPick(err error, beforeVersion uint64) bool {
+	if m == nil || m.scheduler == nil || err == nil {
+		return false
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) && !shouldRetrySchedulerPick(err) {
+		return false
+	}
+	if m.syncedVersion.Load() > beforeVersion {
+		return true
+	}
+	if m.currentVersion() == m.syncedVersion.Load() {
+		return false
+	}
+	return m.checkAndSyncScheduler()
 }
 
 func hasDispatchCapacity(auths []*Auth, excludedAuthID string) bool {

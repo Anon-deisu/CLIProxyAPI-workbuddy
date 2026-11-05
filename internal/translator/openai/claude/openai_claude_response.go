@@ -136,19 +136,14 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 		}
 	}
 
-	// Accept both "data: [DONE]" and bare "[DONE]" (some executors emit either).
-	trimmedDone := bytes.TrimSpace(rawJSON)
-	if bytes.HasPrefix(trimmedDone, dataTag) {
-		trimmedDone = bytes.TrimSpace(trimmedDone[len(dataTag):])
-	}
-	if bytes.Equal(trimmedDone, []byte("[DONE]")) {
-		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
-	}
-
 	if !bytes.HasPrefix(rawJSON, dataTag) {
+		trimmedDone := bytes.TrimSpace(rawJSON)
+		if bytes.Equal(trimmedDone, []byte("[DONE]")) {
+			return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
+		}
 		return [][]byte{}
 	}
-	rawJSON = bytes.TrimSpace(rawJSON[5:])
+	rawJSON = bytes.TrimSpace(rawJSON[len(dataTag):])
 
 	state := (*param).(*ConvertOpenAIResponseToAnthropicParams)
 	if !state.ToolNameMapResolved {
@@ -158,11 +153,15 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 		state.ToolNameMapResolved = true
 	}
 
-	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
-	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
-	} else {
-		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+	// Accept the SSE form as well as the bare marker emitted by some executors.
+	if bytes.Equal(bytes.TrimSpace(rawJSON), []byte("[DONE]")) {
+		return convertOpenAIDoneToAnthropic(state)
+	}
+
+	if !state.StreamResolved {
+		streamResult := ojson.GetBytesNoCopy(originalRequestRawJSON, "stream")
+		state.StreamRequested = streamResult.Exists() && streamResult.Type != ojson.False
+		state.StreamResolved = true
 	}
 	if !state.StreamRequested {
 		return convertOpenAINonStreamingToAnthropic(rawJSON)
@@ -1012,21 +1011,22 @@ func extractOpenAIUsage(usage ojson.Result) (int64, int64, int64, int64) {
 		cacheWriteTokens = usage.Get("input_tokens_details.cache_write_tokens").Int()
 	}
 
-	// The reported prompt_tokens may take one of two shapes:
-	//   - OpenAI-style: prompt_tokens already contains the cache buckets, so
-	//     stripping them exposes the genuinely fresh input.
-	//   - Split-style (this proxy's Cursor path): prompt_tokens is the fresh
-	//     portion only, cache read/write reported as parallel buckets. The
-	//     cache can then legitimately exceed the fresh input.
-	//
-	// Both are distinguishable locally: if the cache buckets fit within
-	// prompt_tokens, subtract; if they exceed it, prompt_tokens is already
-	// fresh and must be kept. Without this, a split-style prompt (e.g. 2 fresh
-	// vs 25117 cached) was stripped again, driving the reported input_tokens
-	// to zero.
-	cachedInput := cachedTokens + cacheWriteTokens
-	if cachedInput > 0 && inputTokens >= cachedInput {
-		inputTokens -= cachedInput
+	if cacheWriteTokens < 0 {
+		cacheWriteTokens = 0
+	}
+
+	// A cache bucket exceeding prompt_tokens is the compatibility signal for
+	// split usage (e.g. Cursor reports 2 fresh tokens alongside 25117 cached).
+	// A combined overage alone still uses inclusive accounting and clamps at
+	// zero. Reject an overflowing cache total before considering split usage.
+	cachedInput := max(cachedTokens, 0)
+	if math.MaxInt64-cachedInput < cacheWriteTokens {
+		inputTokens = 0
+	} else {
+		cachedInput += cacheWriteTokens
+		if cachedTokens <= inputTokens && cacheWriteTokens <= inputTokens {
+			inputTokens -= cachedInput
+		}
 	}
 	if inputTokens < 0 {
 		inputTokens = 0

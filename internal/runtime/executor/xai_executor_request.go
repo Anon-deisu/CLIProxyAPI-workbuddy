@@ -355,6 +355,10 @@ func logXAIResolvedBaseURL(ctx context.Context, baseURL string) {
 	helps.LogWithRequestID(ctx).Infof("xai: using base_url=%s source=%s", baseURL, xaiBaseURLSource(baseURL))
 }
 
+func xaiClientVersion() string {
+	return helps.GetXAIClientVersion()
+}
+
 func xaiDefaultUserAgent() string {
 	return "xai-grok-workspace/" + xaiClientVersion()
 }

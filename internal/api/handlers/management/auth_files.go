@@ -14,12 +14,13 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/credentialweight"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/antigravity"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/credentialweight"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -129,12 +130,38 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	auths := h.authManager.List()
 	observedAt := time.Now().UTC()
 	cooldownsKnown := !h.authManager.HomeEnabled()
+	if pagination.enabled {
+		matching := make([]*coreauth.Auth, 0, len(auths))
+		for _, auth := range auths {
+			if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) || !isAuthFileListable(auth) {
+				continue
+			}
+			matching = append(matching, auth)
+		}
+		sort.Slice(matching, func(i, j int) bool {
+			return compareAuthFileListOrder(matching[i], matching[j]) < 0
+		})
+		total := len(matching)
+		start, end := pagination.bounds(total)
+		files := make([]gin.H, 0, end-start)
+		for _, auth := range matching[start:end] {
+			if entry := h.buildAuthFileEntry(auth, quota); entry != nil {
+				entry["cooldowns"] = nil
+				if cooldownsKnown {
+					entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
+				}
+				files = append(files, entry)
+			}
+		}
+		c.JSON(200, authFilesListResponse(observedAt, files, pagination, total, end))
+		return
+	}
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if !matchesAuthFileLookup(auth, nameFilter, authIndexFilter) {
 			continue
 		}
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntry(auth, quota); entry != nil {
 			entry["cooldowns"] = nil
 			if cooldownsKnown {
 				entry["cooldowns"] = coreauth.CooldownSnapshotForAuth(auth, observedAt)
@@ -148,6 +175,113 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"observed_at": observedAt, "files": files})
+}
+
+func parseAuthFilesPagination(c *gin.Context) (authFilesPagination, error) {
+	pageRaw, hasPage := c.GetQuery("page")
+	pageSizeRaw, hasPageSize := c.GetQuery("page_size")
+	if !hasPage && !hasPageSize {
+		return authFilesPagination{}, nil
+	}
+	pagination := authFilesPagination{enabled: true, page: 1, pageSize: defaultAuthFilesPageSize}
+	if hasPage {
+		page, errParse := strconv.Atoi(strings.TrimSpace(pageRaw))
+		if errParse != nil || page <= 0 {
+			return authFilesPagination{}, errors.New("page must be a positive integer")
+		}
+		pagination.page = page
+	}
+	if hasPageSize {
+		pageSize, errParse := strconv.Atoi(strings.TrimSpace(pageSizeRaw))
+		if errParse != nil || pageSize <= 0 {
+			return authFilesPagination{}, errors.New("page_size must be a positive integer")
+		}
+		pagination.pageSize = pageSize
+	}
+	return pagination, nil
+}
+
+func (p authFilesPagination) bounds(total int) (int, int) {
+	if !p.enabled || total <= 0 {
+		return 0, total
+	}
+	if p.page > 1 && p.page-1 > total/p.pageSize {
+		return total, total
+	}
+	start := (p.page - 1) * p.pageSize
+	if start >= total {
+		return total, total
+	}
+	remaining := total - start
+	if p.pageSize >= remaining {
+		return start, total
+	}
+	return start, start + p.pageSize
+}
+
+func authFilesListResponse(observedAt time.Time, files []gin.H, pagination authFilesPagination, total, end int) gin.H {
+	response := gin.H{"observed_at": observedAt, "files": files}
+	if pagination.enabled {
+		response["total"] = total
+		response["page"] = pagination.page
+		response["page_size"] = pagination.pageSize
+		response["has_more"] = end < total
+	}
+	return response
+}
+
+func authFileListName(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(auth.FileName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(auth.ID)
+}
+
+func compareAuthFileListOrder(left, right *coreauth.Auth) int {
+	leftName := authFileListName(left)
+	rightName := authFileListName(right)
+	if cmp := strings.Compare(strings.ToLower(leftName), strings.ToLower(rightName)); cmp != 0 {
+		return cmp
+	}
+	if cmp := strings.Compare(leftName, rightName); cmp != 0 {
+		return cmp
+	}
+	leftID, rightID := "", ""
+	leftIndex, rightIndex := "", ""
+	if left != nil {
+		leftID = strings.TrimSpace(left.ID)
+		leftIndex = strings.TrimSpace(left.Index)
+	}
+	if right != nil {
+		rightID = strings.TrimSpace(right.ID)
+		rightIndex = strings.TrimSpace(right.Index)
+	}
+	if cmp := strings.Compare(leftID, rightID); cmp != 0 {
+		return cmp
+	}
+	return strings.Compare(leftIndex, rightIndex)
+}
+
+func isAuthFileListable(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	runtimeOnly := isRuntimeOnlyAuth(auth)
+	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+		return false
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		return runtimeOnly
+	}
+	if _, errStat := os.Stat(path); os.IsNotExist(errStat) && !runtimeOnly &&
+		(auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+		return false
+	}
+	return true
 }
 
 func lockedAuthIndex(auth *coreauth.Auth) string {
@@ -257,8 +391,6 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
 	}
-	files := make([]gin.H, 0)
-	observedAt := time.Now().UTC()
 	if authIndexFilter != "" {
 		c.JSON(200, authFilesListResponse(observedAt, []gin.H{}, pagination, 0, 0))
 		return
@@ -276,89 +408,99 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 			continue
 		}
 		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime(), "cooldowns": nil}
-
-			// Read file to get type field
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if data, errRead := os.ReadFile(full); errRead == nil {
-				typeValue := gjson.GetBytes(data, "type").String()
-				emailValue := gjson.GetBytes(data, "email").String()
-				fileData["type"] = typeValue
-				fileData["email"] = emailValue
-				if typeValue == "qoder" || typeValue == "qoder-cn" {
-					for _, key := range []string{"label", "nickname", "uid", "realm", "organization_id", "organization_name"} {
-						if value := gjson.GetBytes(data, key).String(); value != "" {
-							fileData[key] = value
-						}
-					}
-					fileData["qoder_auto_checkin"] = gjson.GetBytes(data, "qoder_auto_checkin").Bool()
-					for _, key := range []string{"qoder_checkin_last_attempt", "qoder_checkin_last_success", "qoder_checkin_next_attempt"} {
-						if value := gjson.GetBytes(data, key); value.Exists() {
-							fileData[key] = value.Value()
-						}
-					}
-					if value := gjson.GetBytes(data, "qoder_checkin_last_result"); value.Exists() {
-						fileData["qoder_checkin_last_result"] = value.Value()
-					}
-				}
-				degraded := gjson.GetBytes(data, "degraded").Bool()
-				disabled := gjson.GetBytes(data, "disabled").Bool()
-				fileData["degraded"] = degraded
-				fileData["disabled"] = disabled
-				fileData["scheduling_state"] = (&coreauth.Auth{Disabled: disabled, Metadata: map[string]any{"degraded": degraded}}).SchedulingState()
-				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
-					fileData["project_id"] = projectID
-				}
-				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
-					switch pv.Type {
-					case gjson.Number:
-						fileData["priority"] = int(pv.Int())
-					case gjson.String:
-						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
-							fileData["priority"] = parsed
-						}
-					}
-				}
-				if wv := gjson.GetBytes(data, coreauth.AttributeWeight); wv.Exists() {
-					var rawWeight string
-					switch wv.Type {
-					case gjson.Number:
-						rawWeight = wv.Raw
-					case gjson.String:
-						rawWeight = wv.String()
-					}
-					if rawWeight != "" {
-						if weight, errWeight := credentialweight.ParseString(rawWeight); errWeight == nil {
-							fileData[coreauth.AttributeWeight] = weight
-						}
-					}
-				}
-				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
-					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
-						fileData["note"] = trimmed
-					}
-				}
-				if wv := gjson.GetBytes(data, "websockets"); wv.Exists() {
-					switch wv.Type {
-					case gjson.True:
-						fileData["websockets"] = true
-					case gjson.False:
-						fileData["websockets"] = false
-					case gjson.String:
-						if parsed, errParse := strconv.ParseBool(strings.TrimSpace(wv.String())); errParse == nil {
-							fileData["websockets"] = parsed
-						}
-					}
-				}
-				if requestRetry, okRetry := authFileRequestRetryFromJSON(data); okRetry {
-					fileData["request_retry"] = requestRetry
-				}
-			}
-
-			files = append(files, fileData)
+			matching = append(matching, diskAuthFileCandidate{entry: e, info: info})
 		}
 	}
-	c.JSON(200, gin.H{"observed_at": observedAt, "files": files})
+	total := len(matching)
+	start, end := 0, total
+	if pagination.enabled {
+		start, end = pagination.bounds(total)
+	}
+	files := make([]gin.H, 0, end-start)
+	for _, candidate := range matching[start:end] {
+		name := candidate.entry.Name()
+		fileData := gin.H{"name": name, "size": candidate.info.Size(), "modtime": candidate.info.ModTime(), "cooldowns": nil}
+
+		// Read file to get type field
+		full := filepath.Join(h.cfg.AuthDir, name)
+		if data, errRead := os.ReadFile(full); errRead == nil {
+			typeValue := ojson.GetBytes(data, "type").String()
+			emailValue := ojson.GetBytes(data, "email").String()
+			fileData["type"] = typeValue
+			fileData["email"] = emailValue
+			if typeValue == "qoder" || typeValue == "qoder-cn" {
+				for _, key := range []string{"label", "nickname", "uid", "realm", "organization_id", "organization_name"} {
+					if value := ojson.GetBytes(data, key).String(); value != "" {
+						fileData[key] = value
+					}
+				}
+				fileData["qoder_auto_checkin"] = ojson.GetBytes(data, "qoder_auto_checkin").Bool()
+				for _, key := range []string{"qoder_checkin_last_attempt", "qoder_checkin_last_success", "qoder_checkin_next_attempt"} {
+					if value := ojson.GetBytes(data, key); value.Exists() {
+						fileData[key] = value.Value()
+					}
+				}
+				if value := ojson.GetBytes(data, "qoder_checkin_last_result"); value.Exists() {
+					fileData["qoder_checkin_last_result"] = value.Value()
+				}
+			}
+			degraded := ojson.GetBytes(data, "degraded").Bool()
+			disabled := ojson.GetBytes(data, "disabled").Bool()
+			fileData["degraded"] = degraded
+			fileData["disabled"] = disabled
+			fileData["scheduling_state"] = (&coreauth.Auth{Disabled: disabled, Metadata: map[string]any{"degraded": degraded}}).SchedulingState()
+			if projectID := strings.TrimSpace(ojson.GetBytes(data, "project_id").String()); projectID != "" {
+				fileData["project_id"] = projectID
+			}
+			if pv := ojson.GetBytes(data, "priority"); pv.Exists() {
+				switch pv.Type {
+				case ojson.Number:
+					fileData["priority"] = int(pv.Int())
+				case ojson.String:
+					if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
+						fileData["priority"] = parsed
+					}
+				}
+			}
+			if wv := ojson.GetBytes(data, coreauth.AttributeWeight); wv.Exists() {
+				var rawWeight string
+				switch wv.Type {
+				case ojson.Number:
+					rawWeight = wv.Raw
+				case ojson.String:
+					rawWeight = wv.String()
+				}
+				if rawWeight != "" {
+					if weight, errWeight := credentialweight.ParseString(rawWeight); errWeight == nil {
+						fileData[coreauth.AttributeWeight] = weight
+					}
+				}
+			}
+			if nv := ojson.GetBytes(data, "note"); nv.Exists() && nv.Type == ojson.String {
+				if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
+					fileData["note"] = trimmed
+				}
+			}
+			if wv := ojson.GetBytes(data, "websockets"); wv.Exists() {
+				switch wv.Type {
+				case ojson.True:
+					fileData["websockets"] = true
+				case ojson.False:
+					fileData["websockets"] = false
+				case ojson.String:
+					if parsed, errParse := strconv.ParseBool(strings.TrimSpace(wv.String())); errParse == nil {
+						fileData["websockets"] = parsed
+					}
+				}
+			}
+			if requestRetry, okRetry := authFileRequestRetryFromJSON(data); okRetry {
+				fileData["request_retry"] = requestRetry
+			}
+		}
+
+		files = append(files, fileData)
+	}
+	c.JSON(200, authFilesListResponse(observedAt, files, pagination, total, end))
 }
 
 // authFileQuotaContext carries request-scoped quota capability data for auth file entries.
@@ -547,6 +689,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		name = auth.ID
 	}
 	quotaPaused := auth.CodexQuotaResumeAt.After(time.Now())
+	unavailable, status, statusMessage, nextRetryAfter := reconcileAuthFileCooldownState(auth, time.Now().UTC())
 	entry := gin.H{
 		"id":                auth.ID,
 		"auth_index":        auth.Index,
@@ -554,8 +697,8 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		"type":              strings.TrimSpace(auth.Provider),
 		"provider":          strings.TrimSpace(auth.Provider),
 		"label":             auth.Label,
-		"status":            auth.Status,
-		"status_message":    auth.StatusMessage,
+		"status":            status,
+		"status_message":    statusMessage,
 		"disabled":          auth.Disabled || auth.AutoDisabled,
 		"manual_disabled":   auth.Disabled,
 		"degraded":          auth.IsDegraded(),
@@ -563,7 +706,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		"auto_disabled":     auth.AutoDisabled,
 		"concurrency_limit": auth.EffectiveConcurrencyLimit(),
 		"active_requests":   auth.ActiveDispatchRequests(),
-		"unavailable":       auth.Unavailable || quotaPaused,
+		"unavailable":       unavailable || quotaPaused,
 		"quota_paused":      quotaPaused,
 		"runtime_only":      runtimeOnly,
 		"source":            "memory",

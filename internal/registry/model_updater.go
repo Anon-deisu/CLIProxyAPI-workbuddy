@@ -70,9 +70,7 @@ func init() {
 // immediately on startup and then refreshes the model catalog every 3 hours.
 // Safe to call multiple times; only one updater will run.
 func StartModelsUpdater(ctx context.Context) {
-	updaterOnce.Do(func() {
-		go runModelsUpdater(ctx)
-	})
+	startLegacyCatalogUpdater(ctx, "catalog")
 }
 
 func runModelsUpdater(ctx context.Context) {
@@ -81,9 +79,9 @@ func runModelsUpdater(ctx context.Context) {
 }
 
 func periodicRefresh(ctx context.Context) {
-	ticker := time.NewTicker(modelsRefreshInterval)
+	ticker := time.NewTicker(ModelsRefreshInterval)
 	defer ticker.Stop()
-	log.Infof("periodic model refresh started (interval=%s)", modelsRefreshInterval)
+	log.Infof("periodic model refresh started (interval=%s)", ModelsRefreshInterval)
 	for {
 		select {
 		case <-ctx.Done():
@@ -139,35 +137,12 @@ func tryRefreshModels(ctx context.Context, label string) {
 // fetchModelsFromRemote tries all remote URLs and returns the parsed model catalog
 // along with the URL it was fetched from. Returns (nil, "") if all fetches fail.
 func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
-	client := &http.Client{Timeout: modelsFetchTimeout}
 	for _, url := range modelsURLs {
-		reqCtx, cancel := context.WithTimeout(ctx, modelsFetchTimeout)
-		req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
+		data, err := readCatalogSource(ctx, url)
 		if err != nil {
-			cancel()
-			log.Debugf("models fetch request creation failed for %s: %v", url, err)
-			continue
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			cancel()
-			log.Debugf("models fetch failed from %s: %v", url, err)
-			continue
-		}
-
-		if resp.StatusCode != 200 {
-			resp.Body.Close()
-			cancel()
-			log.Debugf("models fetch returned %d from %s", resp.StatusCode, url)
-			continue
-		}
-
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		cancel()
-
-		if err != nil {
+			if ctx.Err() != nil {
+				break
+			}
 			log.Debugf("models fetch read error from %s: %v", url, err)
 			continue
 		}
@@ -195,6 +170,12 @@ func preserveLocalModelSections(oldData, newData *staticModelsJSON) {
 	}
 	if len(newData.Cursor) == 0 && len(oldData.Cursor) > 0 {
 		newData.Cursor = oldData.Cursor
+	}
+	if len(newData.Devin) == 0 && len(oldData.Devin) > 0 {
+		newData.Devin = oldData.Devin
+	}
+	if len(newData.Meta) == 0 && len(oldData.Meta) > 0 {
+		newData.Meta = oldData.Meta
 	}
 }
 
@@ -229,6 +210,8 @@ func detectChangedProviders(oldData, newData *staticModelsJSON) []string {
 		{"antigravity", oldData.Antigravity, newData.Antigravity},
 		{"xai", oldData.XAI, newData.XAI},
 		{"cursor", oldData.Cursor, newData.Cursor},
+		{"devin", oldData.Devin, newData.Devin},
+		{"meta", oldData.Meta, newData.Meta},
 	}
 
 	seen := make(map[string]bool, len(sections))
@@ -256,7 +239,10 @@ func modelSectionChanged(a, b []*ModelInfo) bool {
 	}
 	for i := range a {
 		if a[i] != nil && b[i] != nil {
-			if !reflect.DeepEqual(a[i].NativeCapabilities, b[i].NativeCapabilities) || a[i].SupportConfigurationUpdate != b[i].SupportConfigurationUpdate {
+			if !reflect.DeepEqual(a[i].NativeCapabilities, b[i].NativeCapabilities) ||
+				a[i].SupportConfigurationUpdate != b[i].SupportConfigurationUpdate ||
+				a[i].ExplicitThinking != b[i].ExplicitThinking ||
+				a[i].ExplicitInputModalities != b[i].ExplicitInputModalities {
 				return true
 			}
 		}
@@ -358,6 +344,8 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "antigravity", models: data.Antigravity},
 		{name: "xai", models: data.XAI},
 		{name: "cursor", models: data.Cursor},
+		{name: "devin", models: data.Devin},
+		{name: "meta", models: data.Meta},
 	}
 
 	for _, section := range requiredSections {

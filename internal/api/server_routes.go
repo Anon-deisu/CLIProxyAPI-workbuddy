@@ -16,24 +16,26 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
-	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
-	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
-	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/client/grokbuild"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/gemini"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/openai"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/middleware"
+	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/live"
+	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/client/grokbuild"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	responsesclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/claude/openai/responses"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/gemini"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -69,6 +71,10 @@ func (s *Server) setupRoutes() {
 	v1.Use(AuthMiddleware(s.accessManager))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
+		v1.GET("/models/*model", func(c *gin.Context) {
+			c.Set(handlers.ModelDetailIDContextKey, strings.TrimPrefix(c.Param("model"), "/"))
+			s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers)(c)
+		})
 		v1.POST("/chat/completions", s.fakeModelHandler("chat", openaiHandlers.ChatCompletions))
 		v1.POST("/completions", s.fakeModelHandler("completion", openaiHandlers.Completions))
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
@@ -202,17 +208,26 @@ func (s *Server) setupRoutes() {
 	})
 
 	devinCallbackHandler := func(c *gin.Context) {
-		code := c.Query("code")
-		state := c.Query("state")
-		errStr := c.Query("error")
+		c.Header("Cache-Control", "no-store")
+		code := strings.TrimSpace(c.Query("code"))
+		state := strings.TrimSpace(c.Query("state"))
+		errStr := strings.TrimSpace(c.Query("error"))
 		if errStr == "" {
-			errStr = c.Query("error_description")
+			errStr = strings.TrimSpace(c.Query("error_description"))
+		}
+		if code == "" && errStr == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "code or error is required"})
+			return
 		}
 		if state == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
 			return
 		}
-		if _, errWrite := managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "devin", state, code, errStr); errWrite != nil {
+		authDir := ""
+		if cfg := s.getConfig(); cfg != nil {
+			authDir = cfg.AuthDir
+		}
+		if _, errWrite := managementHandlers.WriteOAuthCallbackFileForPendingSession(authDir, "devin", state, code, errStr); errWrite != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
 			return
 		}
@@ -628,7 +643,22 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 				return
 			}
 			models := s.appendFakeModels(openaiHandler.Models())
-			c.JSON(http.StatusOK, codexmodels.BuildResponseForClient(models, registry.GetGlobalRegistry().GetModelProviders, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
+			var applyPatchCapabilityForModel codexmodels.ApplyPatchCapabilityForModelFunc
+			if cfg != nil && cfg.Client.Codex.EnableApplyPatch {
+				applyPatchCapabilityForModel = openaiHandler.SupportsApplyPatchModel
+			}
+			var toolSearchCapabilityForModel codexmodels.ToolSearchCapabilityForModelFunc
+			if responsesclaude.ClientToolSearchEnabled() {
+				toolSearchCapabilityForModel = openaiHandler.SupportsNativeToolSearchModel
+			}
+			modelRegistry := registry.GetGlobalRegistry()
+			payload := codexmodels.BuildResponseForClientWithToolCapabilities(models, modelRegistry.GetModelProviders, modelRegistry.GetResponsesWebSearchCapability, applyPatchCapabilityForModel, toolSearchCapabilityForModel, cfg != nil && cfg.Client.Codex.OptimizeMultiAgentV2, clientVersion)
+			body, errMarshal := codexmodels.MarshalCompact(payload)
+			if errMarshal != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": errMarshal.Error()})
+				return
+			}
+			s.writeModelListResponse(c, "openai", body)
 			return
 		}
 
@@ -655,7 +685,7 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 				}
 				models = append(models, entry)
 			}
-			c.JSON(http.StatusOK, gin.H{"object": "list", "data": s.appendFakeModels(models)})
+			s.writeModelListResponse(c, "openai", gin.H{"object": "list", "data": s.appendFakeModels(models)})
 		}
 	}
 }
@@ -727,7 +757,91 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context, clientVersion strin
 		models = append(models, formatHomeCodexModelWithSettings(entry, cfg))
 	}
 
-	c.JSON(http.StatusOK, codexmodels.BuildResponseForClient(s.appendFakeModels(models), nil, s.cfg.Codex.OptimizeMultiAgentV2, clientVersion))
+	models = s.appendFakeModels(models)
+	var webSearchCapabilityForModel codexmodels.WebSearchCapabilityForModelFunc
+	if clientVersion == "cpa" {
+		webSearchCapabilityForModel = homeWebSearchCapabilityForModel(entries)
+	}
+	var manager *auth.Manager
+	if s.handlers != nil {
+		manager = s.handlers.AuthManager
+	}
+	var applyPatchCapabilityForModel codexmodels.ApplyPatchCapabilityForModelFunc
+	if cfg != nil && cfg.Client.Codex.EnableApplyPatch {
+		applyPatchCapabilityForModel = homeApplyPatchCapabilityForModel(entries, manager)
+	}
+	optimizeMultiAgentV2 := cfg != nil && cfg.Client.Codex.OptimizeMultiAgentV2
+	var payload map[string]any
+	if responsesclaude.ClientToolSearchEnabled() {
+		payload = codexmodels.BuildResponseForClientWithSearchToolRoutes(models, nil, homeProvidersForModel(entries), webSearchCapabilityForModel, applyPatchCapabilityForModel, homeToolSearchCapabilityForModel(entries), optimizeMultiAgentV2, clientVersion)
+	} else {
+		payload = codexmodels.BuildResponseForClientWithToolCapabilities(models, nil, webSearchCapabilityForModel, applyPatchCapabilityForModel, nil, optimizeMultiAgentV2, clientVersion)
+	}
+	body, errMarshal := codexmodels.MarshalCompact(payload)
+	if errMarshal != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errMarshal.Error()})
+		return
+	}
+	s.writeModelListResponse(c, "openai", body)
+}
+
+// homeApplyPatchCapabilityForModel uses Home's exact public routing evidence.
+func homeApplyPatchCapabilityForModel(entries []homeModelEntry, manager *auth.Manager) codexmodels.ApplyPatchCapabilityForModelFunc {
+	providersForModel := homeProvidersForModel(entries)
+	return func(id string) bool {
+		return manager.SupportsApplyPatchForProviders(providersForModel(id))
+	}
+}
+
+// homeProvidersForModel retains unknown routes so they can veto support.
+func homeProvidersForModel(entries []homeModelEntry) codexmodels.ProvidersForModelFunc {
+	providersByID := make(map[string][]string, len(entries))
+	for _, entry := range entries {
+		id := strings.TrimSpace(entry.id)
+		providersByID[id] = append(providersByID[id], entry.providers...)
+		if len(entry.providers) == 0 {
+			providersByID[id] = append(providersByID[id], "")
+		}
+		for _, route := range entry.nativeCapabilityRoutes {
+			if strings.TrimSpace(route.Provider) == "" {
+				providersByID[id] = append(providersByID[id], "")
+			}
+		}
+	}
+	return func(id string) []string {
+		return providersByID[strings.TrimSpace(id)]
+	}
+}
+
+// homeToolSearchCapabilityForModel requires support on every Home route.
+func homeToolSearchCapabilityForModel(entries []homeModelEntry) codexmodels.ToolSearchCapabilityForModelFunc {
+	routesByID := make(map[string][]registry.NativeCapabilityRoute, len(entries))
+	for _, entry := range entries {
+		id := strings.TrimSpace(entry.id)
+		routesByID[id] = append(routesByID[id], entry.nativeCapabilityRoutes...)
+	}
+	return func(id string) bool {
+		routes := routesByID[strings.TrimSpace(id)]
+		if len(routes) == 0 {
+			return false
+		}
+		for _, route := range routes {
+			if route.NativeCapabilities == nil || route.NativeCapabilities.ToolSearch == nil || !*route.NativeCapabilities.ToolSearch {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+func homeWebSearchCapabilityForModel(entries []homeModelEntry) codexmodels.WebSearchCapabilityForModelFunc {
+	routesByID := make(map[string][]registry.NativeCapabilityRoute, len(entries))
+	for _, entry := range entries {
+		routesByID[entry.id] = append([]registry.NativeCapabilityRoute(nil), entry.nativeCapabilityRoutes...)
+	}
+	return func(id string) *bool {
+		return registry.ResolveResponsesWebSearchCapability(routesByID[strings.TrimSpace(id)])
+	}
 }
 
 func formatHomeCodexModel(entry homeModelEntry) map[string]any {
@@ -858,7 +972,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		filtered = append(filtered, model)
 	}
 	filtered = s.appendFakeModels(filtered)
-	c.JSON(http.StatusOK, gin.H{
+	s.writeModelListResponse(c, "openai", gin.H{
 		"object": "list",
 		"data":   filtered,
 	})

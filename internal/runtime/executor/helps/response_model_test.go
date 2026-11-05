@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
@@ -199,7 +200,10 @@ func setupResponseModelLoggerHook(t *testing.T) *logtest.Hook {
 	savedHooks := logger.ReplaceHooks(make(log.LevelHooks))
 	hook := new(logtest.Hook)
 	logger.AddHook(hook)
+	oldThrottle := codexModelSubstitutionWarns
+	codexModelSubstitutionWarns = newCodexModelSubstitutionThrottle(time.Now)
 	t.Cleanup(func() {
+		codexModelSubstitutionWarns = oldThrottle
 		logger.SetLevel(oldLevel)
 		logger.ReplaceHooks(savedHooks)
 	})
@@ -362,9 +366,11 @@ func TestUsageReporterWarnsOnceUnderConcurrentObservationsAndPublishes(t *testin
 }
 
 // Relies on the global logrus logger; do not add t.Parallel.
-func TestUsageReporterEmitsWarningOnRepeatedSubstitutionsWithoutThrottle(t *testing.T) {
+func TestUsageReporterThrottlesRepeatedSubstitutionsPerCredential(t *testing.T) {
 	hook := setupResponseModelLoggerHook(t)
 	ctx := context.Background()
+	now := time.Date(2026, time.November, 4, 0, 0, 0, 0, time.UTC)
+	codexModelSubstitutionWarns.nowFunc = func() time.Time { return now }
 
 	publishSubstitutedAttempt := func(authID, authIndex string) {
 		auth := &cliproxyauth.Auth{ID: authID, Index: authIndex, Provider: "codex"}
@@ -375,19 +381,24 @@ func TestUsageReporterEmitsWarningOnRepeatedSubstitutionsWithoutThrottle(t *test
 
 	publishSubstitutedAttempt("codex-auth-1", "auth-index-7")
 	publishSubstitutedAttempt("codex-auth-1", "auth-index-7")
-	if warnings := substitutionWarnings(hook); len(warnings) != 2 {
-		t.Fatalf("substitution warnings = %d, want 2 without throttle: %#v", len(warnings), warnings)
+	if warnings := substitutionWarnings(hook); len(warnings) != 1 {
+		t.Fatalf("substitution warnings = %d, want 1 within the throttle window: %#v", len(warnings), warnings)
 	}
 
-	// A different credential is also recorded without throttle.
+	// A different credential has an independent throttle window.
 	publishSubstitutedAttempt("codex-auth-2", "auth-index-8")
+	if warnings := substitutionWarnings(hook); len(warnings) != 2 {
+		t.Fatalf("substitution warnings = %d, want 2 for distinct credentials: %#v", len(warnings), warnings)
+	}
+	now = now.Add(codexModelSubstitutionWarnWindow)
+	publishSubstitutedAttempt("codex-auth-1", "auth-index-7")
 	if warnings := substitutionWarnings(hook); len(warnings) != 3 {
-		t.Fatalf("substitution warnings = %d, want 3: %#v", len(warnings), warnings)
+		t.Fatalf("substitution warnings = %d, want 3 after the throttle window: %#v", len(warnings), warnings)
 	}
 }
 
 // Relies on the global logrus logger; do not add t.Parallel.
-func TestUsageReporterEmitsWarningAcrossServedModelCaseWithoutThrottle(t *testing.T) {
+func TestUsageReporterThrottlesSubstitutionsAcrossServedModelCase(t *testing.T) {
 	hook := setupResponseModelLoggerHook(t)
 	ctx := context.Background()
 
@@ -399,8 +410,8 @@ func TestUsageReporterEmitsWarningAcrossServedModelCaseWithoutThrottle(t *testin
 	}
 
 	warnings := substitutionWarnings(hook)
-	if len(warnings) != 2 {
-		t.Fatalf("substitution warnings = %d, want 2 without throttle: %#v", len(warnings), warnings)
+	if len(warnings) != 1 {
+		t.Fatalf("substitution warnings = %d, want 1 across model spelling variants: %#v", len(warnings), warnings)
 	}
 }
 

@@ -8,8 +8,54 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
-	"golang.org/x/net/context"
 )
+
+// ExecuteStreamWithPreFTKeepAlive runs upstream setup while optionally emitting pre-first-token heartbeats.
+func (h *BaseAPIHandler) ExecuteStreamWithPreFTKeepAlive(
+	c *gin.Context,
+	cliCtx context.Context,
+	cliCancel func(error),
+	handlerType, modelName string,
+	rawJSON []byte,
+	alt string,
+	keepAliveC <-chan time.Time,
+	writeKeepAlive func() bool,
+) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage, bool) {
+	if keepAliveC == nil {
+		data, headers, errs := h.ExecuteStreamWithAuthManager(cliCtx, handlerType, modelName, rawJSON, alt)
+		return data, headers, errs, true
+	}
+	type bootstrapResult struct {
+		data    <-chan []byte
+		headers http.Header
+		errs    <-chan *interfaces.ErrorMessage
+	}
+	result := make(chan bootstrapResult, 1)
+	go func() {
+		data, headers, errs := h.ExecuteStreamWithAuthManager(cliCtx, handlerType, modelName, rawJSON, alt)
+		result <- bootstrapResult{data: data, headers: headers, errs: errs}
+	}()
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			if cliCancel != nil {
+				cliCancel(c.Request.Context().Err())
+			}
+			<-result
+			return nil, nil, nil, false
+		case ready := <-result:
+			return ready.data, ready.headers, ready.errs, true
+		case <-keepAliveC:
+			if writeKeepAlive != nil && !writeKeepAlive() {
+				if cliCancel != nil {
+					cliCancel(context.Canceled)
+				}
+				<-result
+				return nil, nil, nil, false
+			}
+		}
+	}
+}
 
 // StartStreamingKeepAlive covers synchronous upstream setup and bootstrap retries.
 // Call the returned stop function before writing or inspecting the response writer.

@@ -11,13 +11,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/qoder"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	sdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/qoder"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 type qoderServiceTransport func(*http.Request) (*http.Response, error)
@@ -229,6 +229,10 @@ func TestQoderServiceModelCatalogFallbackAndRemoval(t *testing.T) {
 			qoderServiceAssertModels(t, auth, map[string]string{"Replacement": "service-new"})
 			other := qoderServiceAuth(t, provider)
 			other.ID += "-other"
+			other, errRegister := s.coreManager.Register(ctx, other)
+			if errRegister != nil {
+				t.Fatal(errRegister)
+			}
 			s.registerModelsForAuth(ctx, other)
 			otherRegion := qoder.ProviderIntl
 			if provider == otherRegion {
@@ -238,15 +242,31 @@ func TestQoderServiceModelCatalogFallbackAndRemoval(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { registry.DeleteQoderModelsForClient(auth.ID, otherRegion) })
-			auth.Disabled = true
+			current, found := s.coreManager.GetByID(auth.ID)
+			if !found || current == nil {
+				t.Fatal("registered account disappeared before disable")
+			}
+			disabled := current.Clone()
+			disabled.Disabled = true
+			disabled.Status = coreauth.StatusDisabled
+			disabled, errUpdate := s.coreManager.Update(ctx, disabled)
+			if errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
 			before := calls
-			s.registerModelsForAuth(ctx, auth)
+			s.registerModelsForAuth(ctx, disabled)
 			qoderServiceAssertModels(t, auth, map[string]string{})
 			if calls != before {
 				t.Fatal("disabled account fetched models")
 			}
-			auth.Disabled = false
-			s.registerModelsForAuth(ctx, auth)
+			enabled := disabled.Clone()
+			enabled.Disabled = false
+			enabled.Status = coreauth.StatusActive
+			enabled, errUpdate = s.coreManager.Update(ctx, enabled)
+			if errUpdate != nil {
+				t.Fatal(errUpdate)
+			}
+			s.registerModelsForAuth(ctx, enabled)
 			s.applyCoreAuthRemoval(ctx, auth.ID)
 			qoderServiceAssertModels(t, auth, map[string]string{})
 			if _, ok := s.coreManager.GetByID(auth.ID); ok {

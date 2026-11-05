@@ -222,7 +222,12 @@ func (cfg *Config) SanitizeOAuthSettings() {
 				continue
 			}
 			seen[key] = struct{}{}
-			reversed = append(reversed, OAuthModelSetting{Name: name, Alias: alias, MaxContextLength: entry.MaxContextLength})
+			var openAPI *bool
+			if entry.OpenAPI != nil {
+				value := *entry.OpenAPI
+				openAPI = &value
+			}
+			reversed = append(reversed, OAuthModelSetting{Name: name, Alias: alias, MaxContextLength: entry.MaxContextLength, OpenAPI: openAPI})
 		}
 		if len(reversed) == 0 {
 			continue

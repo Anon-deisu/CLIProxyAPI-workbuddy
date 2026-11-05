@@ -387,12 +387,12 @@ func hasExplicitSession(headers map[string][]string, payload []byte) bool {
 	}
 	// Parsing without copying matters here: this runs on every request and the
 	// payload can be multiple megabytes.
-	root := newSessionObject(util.ParseGJSONBytesNoCopy(payload))
+	root := indexSessionJSONObject(util.ParseGJSONBytesNoCopy(payload))
 	reqRoot := root
 	req := root.Get("request")
 	hasNestedReq := req.Exists() && !root.Get("contents").Exists()
 	if hasNestedReq {
-		reqRoot = newSessionObject(req)
+		reqRoot = indexSessionJSONObject(req)
 	}
 	for _, path := range []string{
 		"session_id",

@@ -35,6 +35,83 @@ func TestNewKimiExecutorInitializesDelegatedClaudeConfig(t *testing.T) {
 	}
 }
 
+func TestKimiPayloadRulesRunOnceAfterNormalization(t *testing.T) {
+	for _, provider := range []string{"kimi", "kimi-ai"} {
+		for _, format := range []sdktranslator.Format{sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse} {
+			for _, stream := range []bool{false, true} {
+				for _, configured := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/%s/stream=%v/configured=%v", provider, format, stream, configured), func(t *testing.T) {
+						listPath := "messages"
+						payload := []byte(`{"model":"kimi-k3","temperature":0.25,"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"second"},{"role":"user","content":"third"}]}`)
+						if format == sdktranslator.FormatOpenAIResponse {
+							listPath = "input"
+							payload = []byte(`{"model":"kimi-k3","temperature":0.25,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"third"}]}]}`)
+						}
+						cfg := &config.Config{}
+						if configured {
+							cfg.Payload = config.PayloadConfig{
+								Override: []config.PayloadRule{{
+									Models: []config.PayloadModelRule{{Name: "kimi-k3", Match: []map[string]any{{"model": "k3"}}}},
+									Params: map[string]any{"temperature": 0.25, "service_tier": "priority"},
+								}},
+								Filter: []config.PayloadFilterRule{{
+									Models: []config.PayloadModelRule{{Name: "kimi-k3"}},
+									Params: []string{listPath + ".0", "stream_options"},
+								}},
+							}
+						}
+						var upstreamBody []byte
+						ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+							var errRead error
+							upstreamBody, errRead = io.ReadAll(req.Body)
+							if errRead != nil {
+								return nil, errRead
+							}
+							return &http.Response{
+								StatusCode: http.StatusTeapot,
+								Header:     http.Header{"Content-Type": {"application/json"}},
+								Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"captured"}}`)),
+							}, nil
+						}))
+						exec := NewKimiExecutorForProvider(cfg, provider)
+						auth := &cliproxyauth.Auth{Provider: provider, Attributes: map[string]string{"api_key": "test"}}
+						req := cliproxyexecutor.Request{Model: "kimi-k3", Payload: payload}
+						opts := cliproxyexecutor.Options{SourceFormat: format, Stream: stream}
+						var errExecute error
+						if stream {
+							_, errExecute = exec.ExecuteStream(ctx, auth, req, opts)
+						} else {
+							_, errExecute = exec.Execute(ctx, auth, req, opts)
+						}
+						var statusCoder interface{ StatusCode() int }
+						if !errors.As(errExecute, &statusCoder) || statusCoder.StatusCode() != http.StatusTeapot {
+							t.Fatalf("request did not reach capture transport: %v", errExecute)
+						}
+						if got := ojson.GetBytes(upstreamBody, "model").String(); got != "k3" {
+							t.Fatalf("upstream model = %q, want k3", got)
+						}
+						wantItems := int64(3)
+						if configured {
+							wantItems = 2
+							if ojson.GetBytes(upstreamBody, "temperature").Float() != 0.25 || ojson.GetBytes(upstreamBody, "service_tier").String() != "priority" {
+								t.Fatalf("payload override was lost or ran before normalization: %s", upstreamBody)
+							}
+							if ojson.GetBytes(upstreamBody, "stream_options").Exists() {
+								t.Fatalf("filtered stream options were restored: %s", upstreamBody)
+							}
+						} else if ojson.GetBytes(upstreamBody, "temperature").Exists() {
+							t.Fatalf("built-in temperature normalization did not reach the wire: %s", upstreamBody)
+						}
+						if got := ojson.GetBytes(upstreamBody, listPath+".#").Int(); got != wantItems {
+							t.Fatalf("message count = %d, want %d after one filter pass: %s", got, wantItems, upstreamBody)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
 func TestKimiExecutorRequestToFormatMatchesWireProtocol(t *testing.T) {
 	type requestToFormatReporter interface {
 		RequestToFormat(cliproxyexecutor.Request, cliproxyexecutor.Options) sdktranslator.Format

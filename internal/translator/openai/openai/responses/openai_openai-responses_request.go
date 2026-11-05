@@ -29,15 +29,18 @@ import (
 //   - []byte: The transformed request data in OpenAI chat completions format
 func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	return convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, inputRawJSON, stream)
+}
 
-	root := gjson.ParseBytes(rawJSON)
-	var toolIndex *responsesToolIdentityIndex
-	canonicalToolName := func(name string) string {
-		if toolIndex == nil {
-			toolIndex = newResponsesToolIdentityIndex(root)
-		}
-		return toolIndex.canonical(name)
-	}
+// convertOpenAIResponsesRequestToOpenAIChatCompletions also reports a file or
+// audio part Chat Completions cannot receive when it leaves a user turn with
+// nothing to send.
+func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
+	var drops translatorcommon.UserTurnDrops
+	// Base OpenAI chat completions template with default values
+	outDoc := ojson.NewDocString(`{"model":"","messages":[],"stream":false}`)
+
+	root := util.ParseGJSONBytesNoCopy(inputRawJSON)
+	toolIndex := newResponsesToolIndex(root)
 
 	messages := make([][]byte, 0)
 	appendMessage := func(message []byte) {
@@ -68,9 +71,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Convert instructions to system message
 	if instructions := root.Get("instructions"); instructions.Exists() {
-		systemMessage := []byte(`{"role":"system","content":""}`)
-		systemMessage, _ = ojson.SetBytes(systemMessage, "content", instructions.String())
-		appendMessage(systemMessage)
+		systemMessageDoc := ojson.NewDocString(`{"role":"system","content":""}`)
+		_ = systemMessageDoc.Set("content", instructions.String())
+		appendMessage(systemMessageDoc.Bytes())
 	}
 
 	duplicateOutputIDs := make(map[string]struct{})
@@ -85,12 +88,18 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if !isResponsesToolOutputType(itemType) {
 				continue
 			}
+			id := translatorcommon.ExtractResponsesCallID(item)
+			if id != "" {
+				explicitOutputCounts[id]++
+			} else {
+				missingIDOutputsCount++
+			}
 		}
 
 		unclaimedCalls := make(map[string]bool)
 		for _, item := range rawInputArray {
 			itemType := item.Get("type").String()
-			if itemType == "function_call" || itemType == "custom_tool_call" {
+			if isResponsesToolCallType(itemType) {
 				id := translatorcommon.ExtractResponsesCallID(item)
 				if id != "" && explicitOutputCounts[id] == 0 {
 					unclaimedCalls[id] = true
@@ -102,7 +111,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		if missingIDOutputsCount > 1 || (missingIDOutputsCount > 0 && len(unclaimedCalls) > 1) {
 			for idx, item := range inputItems {
 				itemType := item.Get("type").String()
-				if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
+				if isResponsesToolOutputType(itemType) {
 					if idx < len(rawInputArray) && translatorcommon.ExtractResponsesCallID(rawInputArray[idx]) == "" {
 						rawDoc := ojson.NewDocString(item.Raw)
 						_ = rawDoc.Delete("call_id")
@@ -225,9 +234,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if isUsableResponsesReasoning(reasoningContent) {
 				latestReasoningContent = reasoningContent
 			}
-			message := []byte(`{"role":"assistant","content":"","reasoning_content":""}`)
-			message, _ = ojson.SetBytes(message, "reasoning_content", reasoningContent)
-			appendRegularMessage(message)
+			messageDoc := ojson.NewDocString(`{"role":"assistant","content":"","reasoning_content":""}`)
+			_ = messageDoc.Set("reasoning_content", reasoningContent)
+			appendRegularMessage(messageDoc.Bytes())
 		}
 
 		for _, item := range inputItems {
@@ -268,9 +277,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 						switch contentType {
 						case "input_text", "output_text":
 							text := contentItem.Get("text").String()
-							contentPart := []byte(`{"type":"text","text":""}`)
-							contentPart, _ = ojson.SetBytes(contentPart, "text", text)
-							contentItems = append(contentItems, contentPart)
+							contentPartDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+							_ = contentPartDoc.Set("text", text)
+							contentItems = append(contentItems, contentPartDoc.Bytes())
 							if text != "" {
 								turnSendable++
 							}
@@ -347,7 +356,11 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				}
 
 			case "function_call", "shell_call", "local_shell_call", "apply_patch_call":
-				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, item.Get("reasoning_content").String())
+				rc := item.Get("reasoning_content").String()
+				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, rc)
+				if isUsableResponsesReasoning(rc) {
+					latestReasoningContent = rc
+				}
 				// Buffer consecutive function calls and emit them as one assistant message.
 				toolCallDoc := ojson.NewDocString(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
@@ -360,14 +373,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					if namespace := strings.TrimSpace(item.Get("namespace").String()); namespace != "" {
 						functionName = toolIndex.namespaceName(namespace, functionName)
 					} else {
-						functionName = canonicalToolName(functionName)
+						functionName = toolIndex.canonicalName(functionName)
 					}
 				}
 				if functionName != "" {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.name", functionName)
+					_ = toolCallDoc.Set("function.name", functionName)
 				}
 				if arguments != "" {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments)
+					_ = toolCallDoc.Set("function.arguments", arguments)
 				}
 				pendingToolCalls = append(pendingToolCalls, util.ParseGJSONBytesNoCopy(toolCallDoc.Bytes()).Value())
 				if callID := translatorcommon.ExtractResponsesCallID(item); callID != "" {
@@ -413,11 +426,12 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if namespace := item.Get("namespace").String(); namespace != "" {
 					functionName = toolIndex.namespaceName(namespace, functionName)
 				} else {
-					functionName = canonicalToolName(functionName)
+					functionName = toolIndex.canonicalName(functionName)
 				}
 				_ = toolCallDoc.Set("function.name", functionName)
-				wrappedArgs, _ := ojson.SetBytes([]byte(`{"input":""}`), "input", item.Get("input").String())
-				_ = toolCallDoc.Set("function.arguments", string(wrappedArgs))
+				wrappedArgsDoc := ojson.NewDocString(`{"input":""}`)
+				_ = wrappedArgsDoc.Set("input", item.Get("input").String())
+				_ = toolCallDoc.Set("function.arguments", wrappedArgsDoc.String())
 				pendingToolCalls = append(pendingToolCalls, util.ParseGJSONBytesNoCopy(toolCallDoc.Bytes()).Value())
 				if callID := translatorcommon.ExtractResponsesCallID(item); callID != "" {
 					pendingToolCallIDs = append(pendingToolCallIDs, callID)
@@ -552,8 +566,9 @@ func convertResponsesToolChoiceWithIndex(toolChoice ojson.Result, toolIndex *res
 	choiceType := toolChoice.Get("type").String()
 	if choiceType == "shell" {
 		if name := toolIndex.shellName(); name != "" {
-			converted, _ := ojson.SetBytes([]byte(`{"type":"function","function":{}}`), "function.name", name)
-			return converted
+			convertedDoc := ojson.NewDocString(`{"type":"function","function":{}}`)
+			_ = convertedDoc.Set("function.name", name)
+			return convertedDoc.Bytes()
 		}
 	}
 	if choiceType != "function" && choiceType != "custom" {
@@ -584,18 +599,18 @@ func convertResponsesToolChoiceWithIndex(toolChoice ojson.Result, toolIndex *res
 		name = toolIndex.canonicalName(name)
 	}
 
-	converted := []byte(`{"type":"function","function":{"name":""}}`)
-	converted, _ = ojson.SetBytes(converted, "function.name", name)
-	return converted
+	convertedDoc := ojson.NewDocString(`{"type":"function","function":{"name":""}}`)
+	_ = convertedDoc.Set("function.name", name)
+	return convertedDoc.Bytes()
 }
 
 func convertResponsesTextFormatToChatResponseFormat(textFormat ojson.Result) []byte {
 	formatType := textFormat.Get("type").String()
 	switch formatType {
 	case "text", "json_object":
-		responseFormat := []byte(`{"type":""}`)
-		responseFormat, _ = ojson.SetBytes(responseFormat, "type", formatType)
-		return responseFormat
+		responseFormatDoc := ojson.NewDocString(`{"type":""}`)
+		_ = responseFormatDoc.Set("type", formatType)
+		return responseFormatDoc.Bytes()
 	case "json_schema":
 		responseFormatDoc := ojson.NewDocString(`{"type":"json_schema","json_schema":{}}`)
 		for _, field := range []string{"name", "description", "strict"} {
@@ -670,9 +685,9 @@ func chatToolOutputContentPart(item ojson.Result) []byte {
 	itemType := item.Get("type").String()
 	switch itemType {
 	case "text", "input_text", "output_text":
-		part := []byte(`{"type":"text","text":""}`)
-		part, _ = ojson.SetBytes(part, "text", item.Get("text").String())
-		return part
+		partDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+		_ = partDoc.Set("text", item.Get("text").String())
+		return partDoc.Bytes()
 	case "image_url", "input_image":
 		imageURL, detail, ok := chatToolOutputImageFields(item)
 		if !ok {
@@ -769,9 +784,9 @@ func chatToolOutputFallbackPart(item ojson.Result) []byte {
 	if item.Type == ojson.String || text == "" {
 		text = item.String()
 	}
-	part := []byte(`{"type":"text","text":""}`)
-	part, _ = ojson.SetBytes(part, "text", text)
-	return part
+	partDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+	_ = partDoc.Set("text", text)
+	return partDoc.Bytes()
 }
 
 func collectOpenAIResponsesReasoningContent(item ojson.Result) string {
@@ -817,14 +832,15 @@ func isResponsesToolOutputType(itemType string) bool {
 // name and JSON arguments used by the chat-completions representation. Built-in
 // typed tools (shell/local_shell/apply_patch) carry their payload in dedicated
 // fields instead of name/arguments.
-func responsesToolCallNameAndArguments(itemType string, item gjson.Result) (string, string) {
+func responsesToolCallNameAndArguments(itemType string, item ojson.Result) (string, string) {
 	name := strings.TrimSpace(item.Get("name").String())
 	arguments := item.Get("arguments").String()
 	switch itemType {
 	case "custom_tool_call":
 		if arguments == "" {
-			raw, _ := sjson.Set(`{"input":""}`, "input", item.Get("input").String())
-			arguments = raw
+			argsDoc := ojson.NewDocString(`{"input":""}`)
+			_ = argsDoc.Set("input", item.Get("input").String())
+			arguments = argsDoc.String()
 		}
 	case "shell_call":
 		name = "shell"
@@ -836,8 +852,9 @@ func responsesToolCallNameAndArguments(itemType string, item gjson.Result) (stri
 		name = "apply_patch"
 		operation := item.Get("operation")
 		if operation.Exists() {
-			raw, _ := sjson.SetRaw(`{"operation":{}}`, "operation", operation.Raw)
-			arguments = raw
+			argsDoc := ojson.NewDocString(`{"operation":{}}`)
+			_ = argsDoc.SetRaw("operation", operation.Raw)
+			arguments = argsDoc.String()
 		}
 	}
 	return name, arguments

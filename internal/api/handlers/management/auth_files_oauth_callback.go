@@ -170,12 +170,17 @@ func pluginAuthProviderFromURL(requestURL *url.URL) (string, bool) {
 }
 
 func pluginAuthProviderFromRequest(c *gin.Context) (string, bool) {
-	if c != nil && c.Request != nil {
-		if provider := strings.ToLower(strings.TrimSpace(c.Query("provider"))); provider != "" {
-			return provider, true
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return "", false
+	}
+	provider, ok := pluginAuthProviderFromURL(c.Request.URL)
+	if !ok && strings.TrimSpace(c.Request.URL.Path) == "/v8/management/oauth/auth-url" {
+		normalized, errNormalize := NormalizePluginOAuthCallbackProvider(oauthSessionProviderFromContext(c))
+		if errNormalize == nil {
+			return normalized, true
 		}
 	}
-	return pluginAuthProviderFromPath(c.Request.URL.Path)
+	return provider, ok
 }
 
 func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
@@ -195,9 +200,14 @@ func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
 
 	sessionProxyURL := oauthSessionProxyURLFromContext(c)
 	ctx := PopulateAuthContext(context.Background(), c)
+	if sessionProxyURL != "" {
+		ctx = pluginhost.WithOAuthProxyURL(ctx, sessionProxyURL)
+	}
 	callbackPath := "/v0/management/oauth-callback"
+	query := c.Request.URL.Query()
 	if strings.HasPrefix(c.Request.URL.Path, "/v8/management/") {
 		callbackPath = "/v8/management/oauth/callback"
+		query.Del("provider")
 	}
 	baseURL, errBaseURL := h.managementCallbackURL(callbackPath)
 	if errBaseURL != nil {

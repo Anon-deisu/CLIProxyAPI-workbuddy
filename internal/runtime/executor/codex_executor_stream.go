@@ -115,11 +115,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	body = upstreamBody
+	identityState := codexIdentityStateForRequest(httpReq)
 	reporter.SetTranslatedReasoningEffort(upstreamBody, to.String())
 	prepareHeaders := func(request *http.Request) {
 		applyCodexHeaders(request, auth, apiKey, true, e.cfg, opts.Headers)
 		applyCodexRoutingHint(ctx, request.Header, auth, baseModel, upstreamBody, opts.Headers)
 		applyModelHeaderOverrides(request.Header, baseModel)
+		applyCodexIdentityConfuseHeaders(request.Header, identityState)
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
@@ -327,6 +329,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				isHandshake = true
 			}
 
+			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, *identityState)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
 			if isHandshake && !terminalSuccess {
 				rawLineCount := scanner.RawLines()
@@ -509,6 +512,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				translatedLine = bytes.Clone(line)
 			}
 
+			translatedLine = applyCodexIdentityExposeResponsePayload(translatedLine, *identityState)
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, body, translatedLine, &param, claudeInputTokens)
 			for i := range chunks {
 				select {

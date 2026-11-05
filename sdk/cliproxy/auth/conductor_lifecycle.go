@@ -134,6 +134,11 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	releaseMutation, errMutation := m.lockAuthMutationContext(ctx, auth.ID)
+	if errMutation != nil {
+		return nil, errMutation
+	}
+	defer releaseMutation()
 	auth.ensureDispatchState()
 	now := time.Now()
 	if auth.Generation == 0 {
@@ -373,6 +378,13 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		m.mu.Unlock()
 		return nil, false, false, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
 	}
+	if quotaRecovery != nil && (!quotaRefreshCredentialMatches(existing, base) || !quotaRefreshAccountMatches(auth, base) || authAccessToken(auth) == "") {
+		// Validate under the same lock as the token-priority three-way merge.
+		// A canceled probe may save a completed rotation, but never replace a
+		// deleted/re-registered account or credentials changed in the meantime.
+		m.mu.Unlock()
+		return nil, false, false, fmt.Errorf("update auth: quota recovery credential identity changed")
+	}
 	// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
 	if mode == updateModeRefresh && base != nil && (existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing)) {
 		if auth.CodexRefreshPatch == nil || !auth.CodexRefreshPatch.CanApplyTo(existing.Metadata) {
@@ -382,13 +394,6 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			// run finishAuthUpdate for a state this call did not change.
 			return current, false, false, nil
 		}
-	}
-	if quotaRecovery != nil && (!quotaRefreshCredentialMatches(existing, base) || !quotaRefreshAccountMatches(auth, base) || authAccessToken(auth) == "") {
-		// Validate under the same lock as the token-priority three-way merge.
-		// A canceled probe may save a completed rotation, but never replace a
-		// deleted/re-registered account or credentials changed in the meantime.
-		m.mu.Unlock()
-		return nil, fmt.Errorf("update auth: quota recovery credential identity changed")
 	}
 	if mode == updateModeRefresh {
 		var merged *Auth
@@ -421,6 +426,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if auth.dispatchState == nil {
 		auth.ensureDispatchState()
 	}
+	explicitlyEnabledUnauthorized := existing.AutoDisabled &&
+		existing.AutoDisableReason == AutoDisableReasonUnauthorized && !auth.AutoDisabled &&
+		!(shouldSkipPersist(ctx) && sameAuthCredential(existing, auth))
 	if auth.RegistrationEpoch != 0 && auth.RegistrationEpoch < m.authEpochs[auth.ID] {
 		m.mu.Unlock()
 		return nil, false, false, fmt.Errorf("update auth %s: stale registration epoch %d < %d", auth.ID, auth.RegistrationEpoch, m.authEpochs[auth.ID])
@@ -465,8 +473,39 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	} else {
 		auth.Generation++
 	}
-	if !existing.IsDispatchDisabled() && !auth.IsDispatchDisabled() {
-		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+	existingVersion := existing.CredentialVersion
+	if existingVersion == 0 {
+		existingVersion = 1
+	}
+	credChanged := CredentialsChanged(existing, auth)
+	if credChanged {
+		if quotaRecovery != nil {
+			// Quota recovery rotates the stored grant without creating a new
+			// request-visible credential generation. The recovery identity guard
+			// still prevents the rotation from crossing an account replacement.
+			auth.CredentialVersion = existingVersion
+		} else {
+			auth.CredentialVersion = max(auth.CredentialVersion, existingVersion) + 1
+		}
+	} else {
+		auth.CredentialVersion = existingVersion
+	}
+	cooldownStateChanged := false
+	now := time.Now()
+	if quotaRecovery != nil {
+		applyPreservedRejectedTokens(existing, auth, true)
+		applyPreservedRenewalState(existing, auth, mode, now)
+		auth.RenewalVerified = existing.RenewalVerified
+		auth.LastRenewalVerifiedAt = existing.LastRenewalVerifiedAt
+	} else if !existing.IsDispatchDisabled() && !auth.IsDispatchDisabled() {
+		if isFileSnapshot {
+			auth.ModelStates = existing.ModelStates
+			auth.LastRefreshedAt = existing.LastRefreshedAt
+			if !credChanged {
+				auth.NextRefreshAfter = existing.NextRefreshAfter
+				auth.RefreshFailures = existing.RefreshFailures
+			}
+		} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
 		}
 		if isFileSnapshot || (credChanged && mode == updateModeReplace && existing.Quota.Exceeded && existing.Quota.NextRecoverAt.After(now) && !auth.Quota.NextRecoverAt.After(now)) {
@@ -591,8 +630,24 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 	}
+	if explicitlyEnabledUnauthorized {
+		clearUnauthorizedModelStates(auth, now)
+		auth.RejectedAccessToken = ""
+		auth.RejectedSIWCAccessToken = ""
+		existing.RejectedAccessToken = ""
+		existing.RejectedSIWCAccessToken = ""
+		if auth.LastError != nil && (isUnauthorizedError(auth.LastError) || isInvalidGrantResultError(auth.LastError)) {
+			auth.LastError = nil
+		}
+		if !hasModelError(auth, now) {
+			auth.Unavailable = false
+			auth.NextRetryAfter = time.Time{}
+			auth.Status = StatusActive
+			auth.StatusMessage = ""
+		}
+	}
 	auth.UpdatedAt = now
-	cooldownStateChanged := normalizeModelStates(auth)
+	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if quotaRecovery == nil && (m.cooldownDisabledForAuth(auth) || auth.IsDispatchDisabled()) {
 		cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
 	}

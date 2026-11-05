@@ -3,26 +3,29 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/buildinfo"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginstore"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v3"
 )
 
 type attemptInfo struct {
@@ -41,6 +44,8 @@ const attemptMaxIdleTime = 2 * time.Hour
 type Handler struct {
 	cfg                     *config.Config
 	configFilePath          string
+	staleConfigFileHashes   []string
+	pendingConfigFileHash   string
 	mu                      sync.Mutex
 	authStatusMu            sync.Mutex
 	reloadMu                sync.Mutex
@@ -67,6 +72,9 @@ type Handler struct {
 	pluginReleases          pluginReleaseCache
 	autoOAuthJobsMu         sync.Mutex
 	autoOAuthJobs           map[string]*codexAutoOAuthJob
+	siwcOAuthFactory        func(*config.Config) siwcOAuthService
+	siwcCommitMu            sync.Mutex
+	pluginLoginSaveMu       sync.Mutex
 }
 
 type configReloadSnapshot struct {
@@ -80,7 +88,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg.CloneForRuntime(),
+		cfg:                 cfg,
 		configFilePath:      configFilePath,
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
@@ -88,6 +96,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 		autoOAuthJobs:       make(map[string]*codexAutoOAuthJob),
+	}
+	if h.cfg == nil {
+		h.cfg = &config.Config{}
 	}
 	h.startAttemptCleanup()
 	return h
@@ -135,8 +146,69 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 	}
 	cloned := cfg.CloneForRuntime()
 	h.mu.Lock()
-	h.cfg = cfg.CloneForReload(h.cfg)
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	if h.isStaleConfigFileSnapshotLocked(cloned) {
+		log.Debug("management: ignoring config reload parsed from an older config file version")
+		return
+	}
+	h.cfg = cloned.CloneForReload(h.cfg)
+}
+
+// configSnapshot reads h.cfg under h.mu, for code that runs outside the request holding it.
+func (h *Handler) configSnapshot() *config.Config {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cfg
+}
+
+// oauthConfigWithProxy returns a configuration snapshot for an OAuth session.
+// A session proxy overrides the global proxy without mutating the shared config.
+func (h *Handler) oauthConfigWithProxy(proxyURL string) *config.Config {
+	cfg := h.configSnapshot()
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return cfg
+	}
+	if cfg == nil {
+		return &config.Config{SDKConfig: config.SDKConfig{ProxyURL: proxyURL}}
+	}
+	cloned := cfg.CloneForRuntime()
+	if cloned == nil {
+		copied := *cfg
+		cloned = &copied
+	}
+	cloned.ProxyURL = proxyURL
+	return cloned
+}
+
+// isStaleConfigFileSnapshotLocked checks the source version while h.mu is held.
+func (h *Handler) isStaleConfigFileSnapshotLocked(cfg *config.Config) bool {
+	if cfg == nil || h.configFilePath == "" {
+		return false
+	}
+	data, errRead := os.ReadFile(h.configFilePath)
+	if errRead != nil {
+		return false
+	}
+	if cfg.SourceHash != "" {
+		return config.ComputeSourceHash(data) != cfg.SourceHash
+	}
+
+	diskCfg, errLoad := config.ParseConfigBytes(data)
+	if errLoad != nil {
+		return false
+	}
+	candidateHash := managementConfigHash(cfg)
+	diskHash := managementConfigHash(diskCfg)
+	if candidateHash == "" || candidateHash == diskHash {
+		return false
+	}
+	for _, hash := range h.staleConfigFileHashes {
+		if hash != "" && hash == candidateHash {
+			return true
+		}
+	}
+	return false
 }
 
 // SetAuthManager updates the auth manager reference used by management endpoints.
@@ -210,7 +282,9 @@ func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
 		return false
 	}
+	h.noteConfigMutationLocked()
 	if errMutate := mutate(h.cfg); errMutate != nil {
+		h.pendingConfigFileHash = ""
 		h.mu.Unlock()
 		c.JSON(http.StatusBadRequest, gin.H{"error": errMutate.Error()})
 		return false
@@ -222,9 +296,13 @@ func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config)
 		persistCfg.AccountScheduling = h.cfg.AccountSchedulingSnapshot()
 		errSave = config.SaveConfigPreserveComments(h.configFilePath, persistCfg)
 		if errSave == nil {
+			h.recordConfigFileSnapshotLocked()
 			h.cfg.AccountScheduling = persistCfg.AccountScheduling
 			persisted = true
 		}
+	}
+	if !persisted {
+		h.pendingConfigFileHash = ""
 	}
 	snapshot := h.cfg.CloneForRuntime()
 	hook := h.runtimeConfigHook
@@ -256,6 +334,47 @@ func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config)
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "applied": true, "persisted": persisted, "runtime_only": !persisted})
 	return true
+}
+
+// noteConfigMutationLocked records the file-backed state before a management
+// mutation. It is used as a fallback reload fence when SourceHash is absent.
+// Callers must hold h.mu.
+func (h *Handler) noteConfigMutationLocked() {
+	if h == nil || h.configFilePath == "" || h.cfg == nil {
+		return
+	}
+	data, errRead := os.ReadFile(h.configFilePath)
+	if errRead != nil {
+		return
+	}
+	snapshot, errParse := config.ParseConfigBytes(data)
+	if errParse != nil {
+		return
+	}
+	h.pendingConfigFileHash = managementConfigHash(snapshot)
+}
+
+func (h *Handler) recordConfigFileSnapshotLocked() {
+	if h.pendingConfigFileHash == "" {
+		return
+	}
+	h.staleConfigFileHashes = append(h.staleConfigFileHashes, h.pendingConfigFileHash)
+	h.pendingConfigFileHash = ""
+	const maxTrackedSnapshots = 256
+	if len(h.staleConfigFileHashes) > maxTrackedSnapshots {
+		h.staleConfigFileHashes = append([]string(nil), h.staleConfigFileHashes[len(h.staleConfigFileHashes)-maxTrackedSnapshots:]...)
+	}
+}
+
+func managementConfigHash(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	data, errMarshal := yaml.Marshal(cfg)
+	if errMarshal != nil {
+		return ""
+	}
+	return config.ComputeSourceHash(data)
 }
 
 // reloadSnapshotConfigLocked clones the runtime config and assigns a reload generation.
@@ -501,9 +620,17 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 func (h *Handler) persistLocked(c *gin.Context) bool {
 	// Preserve comments when writing
 	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); err != nil {
+		h.pendingConfigFileHash = ""
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
+	h.recordConfigFileSnapshotLocked()
+	return h.finishPersistLocked(c)
+}
+
+// finishPersistLocked publishes the post-save snapshot and response. Callers
+// must hold h.mu and must have already persisted h.cfg successfully.
+func (h *Handler) finishPersistLocked(c *gin.Context) bool {
 	snapshot := h.reloadSnapshotConfigLocked()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	var reqCtx context.Context
@@ -526,11 +653,16 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.noteConfigMutationLocked()
 	set(*body.Value)
 	h.persistLocked(c)
 }
 
 func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
+	h.updateIntFieldAt(c, set, nil)
+}
+
+func (h *Handler) updateIntFieldAt(c *gin.Context, set func(int), legacyPath []string) {
 	var body struct {
 		Value *int `json:"value"`
 	}
@@ -540,7 +672,12 @@ func (h *Handler) updateIntField(c *gin.Context, set func(int)) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.noteConfigMutationLocked()
 	set(*body.Value)
+	if len(legacyPath) > 0 {
+		h.persistLegacyScalarLocked(c, legacyPath, strconv.Itoa(*body.Value))
+		return
+	}
 	h.persistLocked(c)
 }
 
@@ -554,6 +691,112 @@ func (h *Handler) updateStringField(c *gin.Context, set func(string)) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.noteConfigMutationLocked()
 	set(*body.Value)
 	h.persistLocked(c)
+}
+
+// persistLegacyScalarLocked updates a legacy v0 scalar in place. The generic
+// typed saver is intentionally retained for v8 documents and for callers that
+// do not identify a scalar path.
+func (h *Handler) persistLegacyScalarLocked(c *gin.Context, path []string, value string) bool {
+	data, errRead := os.ReadFile(h.configFilePath)
+	if errRead != nil {
+		return h.persistLocked(c)
+	}
+	var doc yaml.Node
+	if errUnmarshal := yaml.Unmarshal(data, &doc); errUnmarshal != nil || len(doc.Content) == 0 || isV8ManagementConfigRoot(doc.Content[0]) {
+		return h.persistLocked(c)
+	}
+	updated, errUpdate := updateLegacyTopLevelScalar(data, doc.Content[0], path, value)
+	if errUpdate != nil {
+		return h.persistLocked(c)
+	}
+	f, errOpen := os.OpenFile(h.configFilePath, os.O_WRONLY|os.O_TRUNC, 0)
+	if errOpen != nil {
+		h.pendingConfigFileHash = ""
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errOpen)})
+		return false
+	}
+	_, errWrite := f.Write(updated)
+	if errWrite == nil {
+		errWrite = f.Sync()
+	}
+	if errClose := f.Close(); errWrite == nil {
+		errWrite = errClose
+	}
+	if errWrite != nil {
+		h.pendingConfigFileHash = ""
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", errWrite)})
+		return false
+	}
+	h.recordConfigFileSnapshotLocked()
+	return h.finishPersistLocked(c)
+}
+
+func isV8ManagementConfigRoot(root *yaml.Node) bool {
+	if root == nil || root.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		switch root.Content[i].Value {
+		case "config-version", "upstream", "oauth", "server", "credentials", "observability", "management", "providers":
+			return true
+		case "api-keys":
+			if root.Content[i+1].Kind == yaml.MappingNode {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func updateLegacyTopLevelScalar(data []byte, root *yaml.Node, path []string, value string) ([]byte, error) {
+	if root == nil || root.Kind != yaml.MappingNode || root.Style&yaml.FlowStyle != 0 || len(path) != 1 {
+		return nil, fmt.Errorf("unsupported legacy scalar path")
+	}
+	var target *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == path[0] {
+			target = root.Content[i+1]
+			break
+		}
+	}
+	if target == nil || target.Kind != yaml.ScalarNode || target.Line < 1 {
+		return nil, fmt.Errorf("legacy scalar path not found")
+	}
+	lines := bytes.SplitAfter(data, []byte("\n"))
+	key := append([]byte(nil), path[0]...)
+	lineIndex := target.Line - 1
+	if lineIndex >= len(lines) {
+		return nil, fmt.Errorf("legacy scalar line out of range")
+	}
+	line := lines[lineIndex]
+	content := bytes.TrimSuffix(line, []byte("\n"))
+	content = bytes.TrimSuffix(content, []byte("\r"))
+	if len(content) == 0 || len(content) != len(bytes.TrimLeft(content, " \t")) {
+		return nil, fmt.Errorf("legacy scalar path not found")
+	}
+	colon := bytes.IndexByte(content, ':')
+	if colon < 0 || !bytes.Equal(bytes.TrimSpace(content[:colon]), key) {
+		return nil, fmt.Errorf("legacy scalar path not found")
+	}
+	start := colon + 1
+	for start < len(content) && (content[start] == ' ' || content[start] == '\t') {
+		start++
+	}
+	end := start
+	for end < len(content) && content[end] != ' ' && content[end] != '\t' && content[end] != '#' {
+		end++
+	}
+	if end == start {
+		return nil, fmt.Errorf("legacy scalar token is empty")
+	}
+	updatedLine := make([]byte, 0, len(content)-end+start+len(value)+len(line)-len(content))
+	updatedLine = append(updatedLine, content[:start]...)
+	updatedLine = append(updatedLine, value...)
+	updatedLine = append(updatedLine, content[end:]...)
+	updatedLine = append(updatedLine, line[len(content):]...)
+	lines[lineIndex] = updatedLine
+	return bytes.Join(lines, nil), nil
 }

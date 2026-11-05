@@ -22,7 +22,6 @@ func (s *Server) registerManagementRoutes() {
 	log.Info("management routes registered after secret key configuration")
 	s.registerManagementV8Routes()
 
-	s.registerManagementV8Routes()
 	s.engine.POST("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.PostOAuthCallback)
 	s.engine.GET("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.GetOAuthCallback)
 
@@ -161,11 +160,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/xai-api-key", s.mgmt.PutXAIKeys)
 		mgmt.PATCH("/xai-api-key", s.mgmt.PatchXAIKey)
 		mgmt.DELETE("/xai-api-key", s.mgmt.DeleteXAIKey)
-		mgmt.GET("/meta-api-key", s.mgmt.GetMetaKeys)
-		mgmt.PUT("/meta-api-key", s.mgmt.PutMetaKeys)
-		mgmt.PATCH("/meta-api-key", s.mgmt.PatchMetaKey)
-		mgmt.DELETE("/meta-api-key", s.mgmt.DeleteMetaKey)
-
 		mgmt.GET("/meta-api-key", s.mgmt.GetMetaKeys)
 		mgmt.PUT("/meta-api-key", s.mgmt.PutMetaKeys)
 		mgmt.PATCH("/meta-api-key", s.mgmt.PatchMetaKey)

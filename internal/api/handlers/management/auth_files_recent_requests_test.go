@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
@@ -183,7 +183,7 @@ func TestAuthFileModelTokenUsageIsCumulativeAndResetsByAccount(t *testing.T) {
 	coreusage.PublishRecord(t.Context(), coreusage.Record{AuthID: id, Model: "failed-model", Failed: true})
 	coreusage.PublishRecord(t.Context(), coreusage.Record{AuthID: id + "-other", Model: "unrelated", Detail: coreusage.Detail{InputTokens: 7}})
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
-	entry := h.buildAuthFileEntry(auth)
+	entry := h.buildAuthFileEntry(auth, authFileQuotaContext{})
 	models := entry["model_token_usage"].([]coreusage.AuthModelTokenUsage)
 	if len(models) != 2 || models[0] != (coreusage.AuthModelTokenUsage{Model: "unpriced-model", InputTokens: 200, CachedInputTokens: 50, OutputTokens: 20}) || models[1].Model != "failed-model" {
 		t.Fatalf("account model token totals = %+v", models)
@@ -191,7 +191,7 @@ func TestAuthFileModelTokenUsageIsCumulativeAndResetsByAccount(t *testing.T) {
 	if _, _, errReset := manager.ResetQuota(t.Context(), auth.ID); errReset != nil {
 		t.Fatal(errReset)
 	}
-	entry = h.buildAuthFileEntry(auth)
+	entry = h.buildAuthFileEntry(auth, authFileQuotaContext{})
 	if models := entry["model_token_usage"].([]coreusage.AuthModelTokenUsage); len(models) != 0 {
 		t.Fatalf("manual reset retained models: %+v", models)
 	}

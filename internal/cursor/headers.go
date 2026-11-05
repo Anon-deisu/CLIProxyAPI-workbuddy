@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
+	cursorauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
 )
 
 var (

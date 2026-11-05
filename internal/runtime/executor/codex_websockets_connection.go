@@ -36,9 +36,10 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	if errBinding != nil {
 		return nil, nil, nil, errBinding
 	}
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer := newProxyAwareWebsocketDialer(ctx, e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
-	dialer.EnableCompression = true
+	compressionEnabled := e.cfg == nil || e.cfg.Codex.WebsocketCompressionEnabled()
+	dialer.EnableCompression = compressionEnabled
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -53,9 +54,13 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 			_ = closer.Close()
 			return nil, nil, resp, errTrack
 		}
-		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
-		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
-		conn.EnableWriteCompression(false)
+		conn.EnableWriteCompression(compressionEnabled)
+		if compressionEnabled {
+			// Use the stable flate level shared by Codex and xAI connections.
+			if errSetCompressionLevel := conn.SetCompressionLevel(flate.DefaultCompression); errSetCompressionLevel != nil {
+				log.Errorf("set Codex websocket compression level: %v", errSetCompressionLevel)
+			}
+		}
 	}
 	return conn, closer, resp, err
 }
@@ -195,9 +200,9 @@ func frameCodexWebsocketRequestBody(body []byte) []byte {
 	if len(body) == 0 {
 		return nil
 	}
-	wsReqBody, errSet := ojson.SetBytes(body, "type", "response.create")
-	if errSet == nil && len(wsReqBody) > 0 {
-		return wsReqBody
+	doc := ojson.NewDoc(body)
+	if errSet := doc.Set("type", "response.create"); errSet == nil {
+		return doc.Bytes()
 	}
 	return body
 }
@@ -251,7 +256,7 @@ func newProxyAwareWebsocketDialer(ctx context.Context, cfg *config.Config, auth 
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
-		EnableCompression: true,
+		EnableCompression: cfg == nil || cfg.Codex.WebsocketCompressionEnabled(),
 		NetDialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,

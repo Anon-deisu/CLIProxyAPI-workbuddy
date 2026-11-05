@@ -763,12 +763,12 @@ func codexAlignReasoningReplayToolCallIDs(inputItems []ojson.Result, replayItems
 			continue
 		}
 
-		updated, err := ojson.SetBytes(replayItem, "call_id", outputCallID)
-		if err != nil {
+		doc := ojson.NewDoc(replayItem)
+		if errSet := doc.Set("call_id", outputCallID); errSet != nil {
 			aligned = append(aligned, replayItem)
 			continue
 		}
-		aligned = append(aligned, updated)
+		aligned = append(aligned, doc.Bytes())
 	}
 	return aligned
 }

@@ -6,11 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
-	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
+	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 )
 
 type CodexCache struct {
@@ -165,53 +163,32 @@ func codexFingerprintUUID(authID, kind string) string {
 
 // TurnMetadata preserves unrelated fields while normalizing embedded identity.
 func (f *CodexFingerprint) TurnMetadata(raw string) string {
-	if !gjson.Valid(raw) || !gjson.Parse(raw).IsObject() {
+	if !ojson.Valid(raw) || !ojson.Parse(raw).IsObject() {
 		raw = "{}"
 	}
-	raw, _ = sjson.Set(raw, "installation_id", f.InstallationID)
-	raw, _ = sjson.Set(raw, "session_id", f.SessionID)
-	raw, _ = sjson.Set(raw, "thread_id", f.SessionID)
-	raw, _ = sjson.Set(raw, "turn_id", f.TurnID)
-	raw, _ = sjson.Set(raw, "window_id", f.SessionID+":0")
-	raw, _ = sjson.Set(raw, "turn_started_at_unix_ms", f.StartedAt)
-	return raw
+	doc := ojson.NewDocString(raw)
+	_ = doc.Set("installation_id", f.InstallationID)
+	_ = doc.Set("session_id", f.SessionID)
+	_ = doc.Set("thread_id", f.SessionID)
+	_ = doc.Set("turn_id", f.TurnID)
+	_ = doc.Set("window_id", f.SessionID+":0")
+	_ = doc.Set("turn_started_at_unix_ms", f.StartedAt)
+	return doc.String()
 }
 
 // ApplyBody changes only client metadata. Explicit prompt cache keys remain
 // client-owned so upstream prompt caching survives account fingerprint convergence.
 // It never decodes or copies the full input tree.
 func (f *CodexFingerprint) ApplyBody(body []byte) []byte {
-	root := util.ParseGJSONBytesNoCopy(body)
-	metadata := root.Get("client_metadata")
-	f.originalMetadata = metadata.Raw
-	raw := metadata.Raw
-	if !metadata.IsObject() {
-		raw = "{}"
-	}
-	raw, _ = sjson.Set(raw, "x-codex-installation-id", f.InstallationID)
-	raw, _ = sjson.Set(raw, "session_id", f.SessionID)
-	raw, _ = sjson.Set(raw, "thread_id", f.SessionID)
-	raw, _ = sjson.Set(raw, "turn_id", f.TurnID)
-	raw, _ = sjson.Set(raw, "x-codex-window-id", f.SessionID+":0")
-	raw, _ = sjson.Set(raw, "x-codex-turn-metadata", f.TurnMetadata(metadata.Get("x-codex-turn-metadata").String()))
-	body, _ = sjson.SetRawBytes(body, "client_metadata", []byte(raw))
-	return body
+	doc := ojson.NewDoc(body)
+	f.ApplyBodyDoc(doc)
+	return doc.Bytes()
 }
 
 // RestoreResponse restores echoed request metadata without replacing matching
 // strings inside generated text, tool output, or unrelated response fields.
 func (f *CodexFingerprint) RestoreResponse(payload []byte) []byte {
-	for _, prefix := range []string{"", "response."} {
-		if f.originalPromptCacheKey != "" && gjson.GetBytes(payload, prefix+"prompt_cache_key").String() == f.SessionID {
-			payload, _ = sjson.SetBytes(payload, prefix+"prompt_cache_key", f.originalPromptCacheKey)
-		}
-		if gjson.GetBytes(payload, prefix+"client_metadata").Exists() {
-			if f.originalMetadata == "" {
-				payload, _ = sjson.DeleteBytes(payload, prefix+"client_metadata")
-			} else {
-				payload, _ = sjson.SetRawBytes(payload, prefix+"client_metadata", []byte(f.originalMetadata))
-			}
-		}
-	}
-	return payload
+	doc := ojson.NewDoc(payload)
+	f.RestoreResponseDoc(doc)
+	return doc.Bytes()
 }

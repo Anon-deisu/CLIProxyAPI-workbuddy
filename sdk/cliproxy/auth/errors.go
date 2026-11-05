@@ -30,6 +30,17 @@ const transientTransportErrorCode = ErrorCodeTransientTransport
 // ErrorCodeForceCooldown marks failures that must enforce credential cooldown.
 const ErrorCodeForceCooldown = "force_cooldown"
 
+// ErrorCodeStreamTruncated identifies accepted streams that ended without a terminal frame.
+// Such generations must not be replayed or cool the credential.
+const ErrorCodeStreamTruncated = "stream_truncated"
+
+const streamTruncatedErrorCode = ErrorCodeStreamTruncated
+
+// ErrorCodeTransientRateLimit identifies model capacity rejections without quota exhaustion.
+const ErrorCodeTransientRateLimit = "transient_rate_limit"
+
+const transientRateLimitErrorCode = ErrorCodeTransientRateLimit
+
 // ErrorCodeWorkBuddyRateLimit identifies WorkBuddy's account-wide 6004 usage limit.
 const ErrorCodeWorkBuddyRateLimit = "workbuddy_rate_limit"
 

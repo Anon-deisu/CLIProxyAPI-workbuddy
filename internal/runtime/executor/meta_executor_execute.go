@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -28,6 +28,7 @@ type metaPreparedRequest struct {
 	to              sdktranslator.Format
 	originalPayload []byte
 	body            []byte
+	applyPatch      *helps.ApplyPatchResponsesState
 }
 
 func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*metaPreparedRequest, error) {
@@ -44,6 +45,11 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, req cliproxy
 	isCompat := helps.APIKeyModelIsCompat(req)
 	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, stream, isCompat)
 	body := helps.TranslateRequestWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), stream, isCompat)
+	applyPatch := helps.NewApplyPatchResponsesState(from, originalPayload, originalTranslated)
+	body, err := helps.NormalizeApplyPatchResponsesRequest(body, originalPayload)
+	if err != nil {
+		return nil, fmt.Errorf("meta executor: normalize apply_patch request: %w", err)
+	}
 
 	var errThinking error
 	body, errThinking = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
@@ -53,7 +59,6 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, req cliproxy
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, e.Identifier(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "generate")
@@ -63,7 +68,9 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, req cliproxy
 	body, _ = sjson.DeleteBytes(body, "client_metadata")
 	body = normalizeCodexInstructions(body)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "meta executor", body)
+	body = helps.EnsureMetaMuseToolNamespace(body)
 	body = helps.SanitizeMetaWebSearchTools(body)
+	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, e.Identifier(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
 
 	return &metaPreparedRequest{
 		baseModel:       baseModel,
@@ -72,6 +79,7 @@ func (e *MetaExecutor) prepareResponsesRequest(ctx context.Context, req cliproxy
 		to:              to,
 		originalPayload: originalPayload,
 		body:            body,
+		applyPatch:      applyPatch,
 	}, nil
 }
 
@@ -133,9 +141,32 @@ func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		return resp, wrapMetaUpstreamError(httpResp.StatusCode, data)
 	}
+	var upstreamUsage helps.StreamUsageBuffer
+	upstreamUsage.ObserveResponsesStream(data)
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if bytes.HasPrefix(trimmed, dataTag) {
+			upstreamUsage.ObserveResponsesStream(trimmed)
+		}
+	}
+	if completedData, ok := metaAsCompletedEvent(data); ok {
+		if detail, okUsage := helps.ParseCodexUsage(completedData); okUsage {
+			upstreamUsage.Observe(detail, true)
+		}
+	}
+	if prepared.applyPatch != nil && prepared.applyPatch.Active() {
+		converted, errBridge := transformMetaApplyPatchResponse(data, prepared.applyPatch)
+		if errBridge != nil || (len(converted) == 0 && helps.ApplyPatchRequested(prepared.originalPayload)) {
+			errPatch := statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+			upstreamUsage.PublishFailure(ctx, reporter, errPatch)
+			return resp, errPatch
+		}
+		data = converted
+	}
 
 	out, errCompleted := e.translateMetaCompleted(ctx, req, prepared, data)
 	if errCompleted != nil {
+		upstreamUsage.PublishFailure(ctx, reporter, errCompleted)
 		return resp, errCompleted
 	}
 	if len(out.sourceEvent) > 0 {
@@ -151,6 +182,41 @@ func (e *MetaExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		payload = helps.EnsureResponsesUsageDetails(payload)
 	}
 	return cliproxyexecutor.Response{Payload: payload, Headers: httpResp.Header.Clone()}, nil
+}
+
+func transformMetaApplyPatchResponse(data []byte, state *helps.ApplyPatchResponsesState) ([]byte, error) {
+	if state == nil || !state.Active() {
+		return data, nil
+	}
+	if !bytes.Contains(data, dataTag) {
+		return state.Bridge.TransformNonStream(data)
+	}
+
+	var output bytes.Buffer
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trimmed, dataTag) {
+			continue
+		}
+		payload := bytes.TrimSpace(trimmed[len(dataTag):])
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		converted, errTransform := state.Transform(payload)
+		if errTransform != nil {
+			return nil, errTransform
+		}
+		for _, event := range converted {
+			output.Write(dataTag)
+			output.WriteByte(' ')
+			output.Write(event)
+			output.WriteString("\n\n")
+		}
+	}
+	if errFinish := state.Finish(); errFinish != nil {
+		return nil, errFinish
+	}
+	return output.Bytes(), nil
 }
 
 type metaCompletedTranslation struct {
@@ -177,6 +243,9 @@ func (e *MetaExecutor) translateMetaCompleted(ctx context.Context, req cliproxye
 			completedData := patchCodexCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, completedData, &param)
+			if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
+				return metaCompletedTranslation{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+			}
 			return metaCompletedTranslation{payload: out, sourceEvent: completedData}, nil
 		}
 	}
@@ -185,6 +254,9 @@ func (e *MetaExecutor) translateMetaCompleted(ctx context.Context, req cliproxye
 		completedData = patchCodexCompletedOutput(completedData, outputItemsByIndex, outputItemsFallback)
 		var param any
 		out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, completedData, &param)
+		if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
+			return metaCompletedTranslation{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+		}
 		return metaCompletedTranslation{payload: out, sourceEvent: completedData}, nil
 	}
 

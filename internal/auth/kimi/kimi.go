@@ -314,11 +314,6 @@ func NewDeviceFlowClientWithDeviceIDAndProxyURL(cfg *config.Config, deviceID str
 	return NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg, KimiDefaultDomain, deviceID, proxyURL)
 }
 
-// NewDeviceFlowClientWithDomain selects the authorization domain explicitly.
-func NewDeviceFlowClientWithDomain(cfg *config.Config, domain string) *DeviceFlowClient {
-	return NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg, domain, "", "")
-}
-
 // NewDeviceFlowClientWithDomainDeviceIDAndProxyURL keeps token acquisition domain-scoped.
 func NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg *config.Config, domain, deviceID, proxyURL string) *DeviceFlowClient {
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -344,7 +339,7 @@ func NewDeviceFlowClientWithDomainDeviceIDAndProxyURL(cfg *config.Config, domain
 		cfg:        cfg,
 		deviceID:   resolvedDeviceID,
 		domain:     NormalizeKimiDomain(domain),
-		oauthHost:  ResolveKimiOAuthHost(domain),
+		oauthHost:  oauthHost,
 	}
 }
 
@@ -586,7 +581,7 @@ func (c *DeviceFlowClient) RefreshToken(ctx context.Context, refreshToken string
 	refreshToken = strings.TrimSpace(refreshToken)
 	flightKey := c.tokenURL() + ":" + refreshToken
 
-	result, err, _ := kimiRefreshGroup.Do(c.tokenURL()+":"+refreshToken, func() (interface{}, error) {
+	result, err, _ := kimiRefreshGroup.Do(flightKey, func() (interface{}, error) {
 		return c.refreshTokenSingleFlight(context.WithoutCancel(ctx), refreshToken)
 	})
 	if err != nil {

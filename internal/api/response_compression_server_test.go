@@ -48,10 +48,23 @@ func TestResponseCompressionServerHotReload(t *testing.T) {
 
 func TestWebsocketCompressionServerHotReload(t *testing.T) {
 	cfg := &config.Config{}
+	startupCompressionEnabled := false
+	cfg.Codex.WebsocketCompression = &startupCompressionEnabled
 	server := newTestServerWithConfig(t, cfg)
 	httpServer := httptest.NewServer(server.engine)
 	defer httpServer.Close()
 	dialer := websocket.Dialer{EnableCompression: true}
+	conn, response, errDial := dialer.Dial("ws"+strings.TrimPrefix(httpServer.URL, "http")+"/v1/responses", nil)
+	if errDial != nil {
+		t.Fatal(errDial)
+	}
+	startupNegotiated := strings.Contains(response.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate")
+	if errClose := conn.Close(); errClose != nil {
+		log.Errorf("close server startup compression test websocket: %v", errClose)
+	}
+	if startupNegotiated != startupCompressionEnabled {
+		t.Fatalf("at startup compression negotiated = %v, want %v", startupNegotiated, startupCompressionEnabled)
+	}
 	for _, enabled := range []bool{true, false, true} {
 		cfg.Codex.WebsocketCompression = &enabled
 		server.UpdateClients(cfg)

@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"github.com/MoeForge/moego/base64"
 	"io"
 	"net/http"
 	"net/url"
@@ -18,9 +17,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/gin-gonic/gin"
 	baseauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth"
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/codexdata"
 )
 
 // PostAuthHook defines a function that is called after an Auth record is created
@@ -71,7 +71,7 @@ type Auth struct {
 	// Storage holds the token persistence implementation used during login flows.
 	Storage baseauth.TokenStorage `json:"-"`
 	// CodexRefreshPatch carries an immutable pending credential update, never configuration.
-	CodexRefreshPatch *codex.CredentialRefreshPatch `json:"-"`
+	CodexRefreshPatch *codexdata.CredentialRefreshPatch `json:"-"`
 	// Label is an optional human readable label for logging.
 	Label string `json:"label,omitempty"`
 	// Status is the lifecycle status managed by the AuthManager.
@@ -161,10 +161,118 @@ type Auth struct {
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`
 
+	// cooldownRecordedSeq prevents older in-flight successes from clearing a newer cooldown.
+	// It is runtime only so restored cooldowns can be cleared after restart.
+	cooldownRecordedSeq uint64 `json:"-"`
+
 	recentRequests      recentRequestRing      `json:"-"`
 	recentModelRequests recentModelRequestRing `json:"-"`
 	indexAssigned       bool                   `json:"-"`
 	dispatchState       *authDispatchState     `json:"-"`
+	// File observations are cleared after publication to runtime state.
+	fileSnapshotPath   string `json:"-"`
+	fileSnapshotDigest string `json:"-"`
+}
+
+var readAuthSnapshotFileFunc = os.ReadFile
+
+func canonicalAuthFileDigest(data []byte) string {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	var parsed any
+	if errDecode := decoder.Decode(&parsed); errDecode == nil {
+		var trailing any
+		if errTrailing := decoder.Decode(&trailing); errTrailing == io.EOF {
+			if canonical, errMarshal := json.Marshal(parsed); errMarshal == nil {
+				sum := sha256.Sum256(canonical)
+				return hex.EncodeToString(sum[:])
+			}
+		}
+	}
+	sum := sha256.Sum256(trimmed)
+	return hex.EncodeToString(sum[:])
+}
+
+// BindFileSnapshot binds a file-synthesized snapshot to the bytes it observed.
+func (a *Auth) BindFileSnapshot(path string, data []byte) {
+	if a == nil || len(data) == 0 {
+		return
+	}
+	digest := canonicalAuthFileDigest(data)
+	if digest == "" {
+		return
+	}
+	a.fileSnapshotPath = strings.TrimSpace(path)
+	a.fileSnapshotDigest = digest
+}
+
+const invalidatedFileSnapshotDigest = "invalidated"
+
+// ClearFileSnapshot removes the file-observation binding after a runtime commit.
+func (a *Auth) ClearFileSnapshot() {
+	if a == nil {
+		return
+	}
+	a.fileSnapshotPath = ""
+	a.fileSnapshotDigest = ""
+}
+
+// InvalidateFileSnapshot permits re-reading a discarded file observation.
+func (a *Auth) InvalidateFileSnapshot() {
+	if a.HasFileSnapshot() {
+		a.fileSnapshotDigest = invalidatedFileSnapshotDigest
+	}
+}
+
+// HasFileSnapshot reports an unversioned snapshot with a bound file digest.
+func (a *Auth) HasFileSnapshot() bool {
+	return a != nil && a.Generation == 0 && a.RegistrationEpoch == 0 && a.fileSnapshotDigest != ""
+}
+
+// FileSnapshotPath returns the source path for this file observation.
+func (a *Auth) FileSnapshotPath() string {
+	if a == nil {
+		return ""
+	}
+	path := strings.TrimSpace(a.fileSnapshotPath)
+	if path == "" {
+		path = strings.TrimSpace(a.Attributes[AttributePath])
+		if path == "" {
+			path = strings.TrimSpace(a.Attributes[AttributeSource])
+		}
+	}
+	return path
+}
+
+// SameFileSnapshot compares two live, unversioned file observations.
+func (a *Auth) SameFileSnapshot(other *Auth) bool {
+	if !a.HasFileSnapshot() || !other.HasFileSnapshot() {
+		return false
+	}
+	if a.fileSnapshotDigest == invalidatedFileSnapshotDigest || other.fileSnapshotDigest == invalidatedFileSnapshotDigest {
+		return false
+	}
+	return a.fileSnapshotDigest == other.fileSnapshotDigest && a.fileSnapshotPath == other.fileSnapshotPath
+}
+
+// FileSnapshotMatchesDisk verifies freshness before publishing a file snapshot.
+func (a *Auth) FileSnapshotMatchesDisk() bool {
+	if !a.HasFileSnapshot() {
+		return true
+	}
+	path := a.FileSnapshotPath()
+	if path == "" {
+		return false
+	}
+	data, errRead := readAuthSnapshotFileFunc(path)
+	if errRead != nil || len(data) == 0 {
+		return false
+	}
+	return canonicalAuthFileDigest(data) == a.fileSnapshotDigest
 }
 
 type authDispatchState struct {

@@ -11,7 +11,6 @@ import (
 
 func ConvertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON []byte, stream bool) ([]byte, error) {
 	return convertOpenAIResponsesRequestToInteractions(modelName, inputRawJSON, stream)
-
 }
 
 // convertOpenAIResponsesRequestToInteractions also reports a file, audio or video
@@ -42,32 +41,32 @@ func convertOpenAIResponsesRequestToInteractions(modelName string, inputRawJSON 
 	if input := root.Get("input"); input.Exists() {
 		setResponsesInputOnInteractionsDoc(outDoc, input, forAntigravity, &drops)
 	}
-	out = appendResponsesToolsToInteractions(out, root.Get("tools"), forAntigravity, forDevin)
+	appendResponsesToolsToInteractionsDoc(outDoc, root, forAntigravity, forDevin)
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
 		if toolChoice.IsObject() {
-			tcRaw := []byte(toolChoice.Raw)
+			tcDoc := ojson.NewDocString(toolChoice.Raw)
 			fnName := firstNonEmpty(toolChoice.Get("function.name").String(), toolChoice.Get("name").String(), toolChoice.Get("custom.name").String())
 			ns := firstNonEmpty(toolChoice.Get("namespace").String(), toolChoice.Get("function.namespace").String(), toolChoice.Get("custom.namespace").String())
 			if ns != "" && fnName != "" {
 				fnName = util.QualifyResponsesNamespaceToolName(ns, fnName)
 			}
 			if forDevin && (translatorcommon.IsDevinCodexAppAutomationUpdate(ns, fnName) || translatorcommon.IsDevinCodexAppAutomationUpdate("", fnName)) {
-				tcRaw = nil
+				tcDoc = nil
 			}
 			if forAntigravity && fnName != "" {
 				fnName = translatorcommon.AntigravityToolNameToUpstream(fnName)
 			}
-			if fnName != "" && tcRaw != nil {
+			if fnName != "" && tcDoc != nil {
 				if toolChoice.Get("function.name").Exists() {
-					tcRaw, _ = ojson.SetBytes(tcRaw, "function.name", fnName)
+					_ = tcDoc.Set("function.name", fnName)
 				} else if toolChoice.Get("name").Exists() {
-					tcRaw, _ = ojson.SetBytes(tcRaw, "name", fnName)
+					_ = tcDoc.Set("name", fnName)
 				} else if toolChoice.Get("custom.name").Exists() {
-					tcRaw, _ = ojson.SetBytes(tcRaw, "custom.name", fnName)
+					_ = tcDoc.Set("custom.name", fnName)
 				}
 			}
-			if tcRaw != nil {
-				_ = outDoc.SetRawBytes("generation_config.tool_choice", tcRaw)
+			if tcDoc != nil {
+				_ = outDoc.SetRawBytes("generation_config.tool_choice", tcDoc.Bytes())
 			}
 		} else {
 			_ = outDoc.SetRaw("generation_config.tool_choice", toolChoice.Raw)
@@ -356,9 +355,9 @@ func appendResponsesContentToInteractionsDoc(stepDoc *ojson.Doc, content ojson.R
 		}
 	}
 	if content.Type == ojson.String {
-		part := []byte(`{"type":"text","text":""}`)
-		part, _ = ojson.SetBytes(part, "text", content.String())
-		contentItems = append(contentItems, part)
+		partDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+		_ = partDoc.Set("text", content.String())
+		contentItems = append(contentItems, partDoc.Bytes())
 		if content.String() != "" {
 			sendable++
 		}
@@ -392,9 +391,9 @@ func isResponsesUnsendableAttachmentType(partType string) bool {
 func responsesContentPartToInteractions(part ojson.Result) ([]byte, bool) {
 	switch part.Get("type").String() {
 	case "input_text", "output_text", "text":
-		out := []byte(`{"type":"text","text":""}`)
-		out, _ = ojson.SetBytes(out, "text", part.Get("text").String())
-		return out, true
+		outDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+		_ = outDoc.Set("text", part.Get("text").String())
+		return outDoc.Bytes(), true
 	case "input_image", "output_image":
 		return responsesImagePartToInteractions(part), true
 	case "input_file":
@@ -403,9 +402,9 @@ func responsesContentPartToInteractions(part ojson.Result) ([]byte, bool) {
 		return responsesAudioPartToInteractions(part)
 	}
 	if text := part.Get("text"); text.Exists() {
-		out := []byte(`{"type":"text","text":""}`)
-		out, _ = ojson.SetBytes(out, "text", text.String())
-		return out, true
+		outDoc := ojson.NewDocString(`{"type":"text","text":""}`)
+		_ = outDoc.Set("text", text.String())
+		return outDoc.Bytes(), true
 	}
 	return nil, false
 }
@@ -550,50 +549,19 @@ func responsesFunctionOutputToInteractions(item ojson.Result, functionNamesByCal
 	return outDoc.Bytes()
 }
 
-func interactionsTextStep(stepType, text string) []byte {
-	step := []byte(`{"type":"","content":[{"type":"text","text":""}]}`)
-	step, _ = sjson.SetBytes(step, "type", stepType)
-	step, _ = sjson.SetBytes(step, "content.0.text", text)
-	return step
-}
-
-func appendResponsesToolsToInteractions(out []byte, tools gjson.Result, forAntigravity, forDevin bool) []byte {
-	if !tools.Exists() || !tools.IsArray() {
-		return out
+// responsesReasoningToInteractions carries a Devin-sealed reasoning item back
+// upstream as a thought step so the model keeps its own earlier thinking across
+// tool-call turns. Reasoning items without a Devin signature are left out, as
+// before, because other providers cannot read them.
+func responsesReasoningToInteractions(item ojson.Result) []byte {
+	sig := strings.TrimSpace(item.Get("encrypted_content").String())
+	if !strings.HasPrefix(sig, "sealed.v1.") {
+		return nil
 	}
-	var toolItems [][]byte
-	tools.ForEach(func(_, tool gjson.Result) bool {
-		switch tool.Get("type").String() {
-		case "function", "":
-			name := firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String())
-			if forDevin && translatorcommon.IsDevinCodexAppAutomationUpdate("", name) {
-				return true
-			}
-			if converted, ok := functionToolToInteractions(tool, forAntigravity, forDevin); ok {
-				toolItems = append(toolItems, converted)
-			}
-		case "namespace":
-			namespace := firstNonEmpty(tool.Get("name").String(), tool.Get("namespace").String())
-			declarationItems := make([][]byte, 0, 4)
-			children := tool.Get("children")
-			if !children.Exists() {
-				children = tool.Get("tools")
-			}
-			children.ForEach(func(_, child gjson.Result) bool {
-				name := firstNonEmpty(child.Get("name").String(), child.Get("function.name").String())
-				if forDevin && translatorcommon.IsDevinCodexAppAutomationUpdate(namespace, name) {
-					return true
-				}
-				if converted, ok := functionDeclarationFromTool(child, forAntigravity, forDevin); ok {
-					declarationItems = append(declarationItems, converted)
-				}
-				return true
-			})
-			if len(declarationItems) > 0 {
-				group := []byte(`{"function_declarations":[]}`)
-				group, _ = sjson.SetRawBytes(group, "function_declarations", translatorcommon.JoinRawArray(declarationItems))
-				toolItems = append(toolItems, group)
-			}
+	var texts []string
+	item.Get("summary").ForEach(func(_, part ojson.Result) bool {
+		if text := part.Get("text").String(); text != "" {
+			texts = append(texts, text)
 		}
 		return true
 	})
@@ -680,47 +648,7 @@ func appendResponsesToolsToInteractionsDoc(outDoc *ojson.Doc, root ojson.Result,
 	}
 }
 
-func functionToolToInteractions(tool gjson.Result, forAntigravity, forDevin bool) ([]byte, bool) {
-	name := firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String())
-	if name == "" {
-		return nil, false
-	}
-	if forAntigravity {
-		name = translatorcommon.AntigravityToolNameToUpstream(name)
-	}
-	out := []byte(`{"type":"function","name":""}`)
-	out, _ = sjson.SetBytes(out, "name", name)
-	description := firstExisting(tool.Get("description"), tool.Get("function.description"))
-	if description.Exists() && forDevin {
-		out, _ = sjson.SetBytes(out, "description", translatorcommon.SanitizeDevinToolDescription(name, description.String()))
-	} else {
-		copyOptionalString(&out, "description", description)
-	}
-	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
-	return out, true
-}
-
-func functionDeclarationFromTool(tool gjson.Result, forAntigravity, forDevin bool) ([]byte, bool) {
-	name := firstNonEmpty(tool.Get("name").String(), tool.Get("function.name").String())
-	if name == "" {
-		return nil, false
-	}
-	if forAntigravity {
-		name = translatorcommon.AntigravityToolNameToUpstream(name)
-	}
-	out := []byte(`{"name":""}`)
-	out, _ = sjson.SetBytes(out, "name", name)
-	description := firstExisting(tool.Get("description"), tool.Get("function.description"))
-	if description.Exists() && forDevin {
-		out, _ = sjson.SetBytes(out, "description", translatorcommon.SanitizeDevinToolDescription(name, description.String()))
-	} else {
-		copyOptionalString(&out, "description", description)
-	}
-	copyOptionalRaw(&out, "parameters", firstExisting(tool.Get("parameters"), tool.Get("function.parameters")))
-	return out, true
-}
-
-func setInteractionsInputOnResponses(out []byte, input gjson.Result, forAntigravity bool) []byte {
+func setInteractionsInputOnResponsesDoc(outDoc *ojson.Doc, input ojson.Result, forAntigravity bool) {
 	items := make([][]byte, 0)
 	if input.Type == ojson.String {
 		items = append(items, interactionsTextMessage(input.String()))
@@ -742,9 +670,9 @@ func setInteractionsInputOnResponses(out []byte, input gjson.Result, forAntigrav
 }
 
 func interactionsTextMessage(text string) []byte {
-	item := []byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}`)
-	item, _ = ojson.SetBytes(item, "content.0.text", text)
-	return item
+	itemDoc := ojson.NewDocString(`{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}`)
+	_ = itemDoc.Set("content.0.text", text)
+	return itemDoc.Bytes()
 }
 
 func interactionsInputItemToResponses(item ojson.Result, forAntigravity bool) []byte {
@@ -796,13 +724,13 @@ func interactionsMessageToResponses(item ojson.Result, role string) []byte {
 func interactionsThoughtToResponses(item ojson.Result) []byte {
 	var summaryItems [][]byte
 	for _, text := range interactionsContentTexts(item.Get("content")) {
-		part := []byte(`{"type":"summary_text","text":""}`)
-		part, _ = ojson.SetBytes(part, "text", text)
-		summaryItems = append(summaryItems, part)
+		partDoc := ojson.NewDocString(`{"type":"summary_text","text":""}`)
+		_ = partDoc.Set("text", text)
+		summaryItems = append(summaryItems, partDoc.Bytes())
 	}
-	out := []byte(`{"type":"reasoning","summary":[]}`)
-	out = translatorcommon.SetRawArrayItems(out, "summary", summaryItems)
-	return out
+	outDoc := ojson.NewDocString(`{"type":"reasoning","summary":[]}`)
+	translatorcommon.SetRawArrayItemsDoc(outDoc, "summary", summaryItems)
+	return outDoc.Bytes()
 }
 
 func interactionsContentPartToResponses(part ojson.Result, role string) ([]byte, bool) {
@@ -833,10 +761,10 @@ func interactionsContentPartToResponses(part ojson.Result, role string) ([]byte,
 		}
 		return outDoc.Bytes(), true
 	case "audio":
-		out := []byte(`{"type":"output_text","text":""}`)
+		outDoc := ojson.NewDocString(`{"type":"output_text","text":""}`)
 		format := mediaFormat(part.Get("mime_type").String())
-		out, _ = ojson.SetBytes(out, "text", "Audio content: inline data (Format: "+format+")")
-		return out, true
+		_ = outDoc.Set("text", "Audio content: inline data (Format: "+format+")")
+		return outDoc.Bytes(), true
 	case "video", "document":
 		outType := "input_file"
 		if role == "assistant" {
@@ -1067,7 +995,7 @@ func isDevinModel(model string) bool {
 	return strings.HasPrefix(clean, "devin/") || strings.Contains(clean, "devin")
 }
 
-func firstExisting(values ...gjson.Result) gjson.Result {
+func firstExisting(values ...ojson.Result) ojson.Result {
 	for _, value := range values {
 		if value.Exists() {
 			return value

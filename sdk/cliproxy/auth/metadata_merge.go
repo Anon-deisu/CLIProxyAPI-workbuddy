@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/codexdata"
 )
 
 // IsAuthTokenPayloadKey returns true if key is a credential or token lifecycle field
@@ -242,7 +242,7 @@ func mergeAuthContent(base, current, updated *Auth) *Auth {
 			if strings.EqualFold(strings.TrimSpace(k), "proxy_url") {
 				continue
 			}
-			if updated.CodexRefreshPatch != nil && codex.IsCodexCredentialKey(strings.ToLower(strings.TrimSpace(k))) {
+			if updated.CodexRefreshPatch != nil && codexdata.IsCodexCredentialKey(strings.ToLower(strings.TrimSpace(k))) {
 				continue
 			}
 			if strings.EqualFold(strings.TrimSpace(k), "siwc") {

@@ -247,7 +247,19 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 		}
 		if !failed {
 			if ephemeralResult || claudeOAuthRequestCancellation(ctx, auth, nil) == nil {
-				m.recordExecutionResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: true, Options: opts}, auth, ephemeralResult)
+				m.recordExecutionResult(ctx, Result{
+					AuthID:            auth.ID,
+					Provider:          provider,
+					Model:             resultModel,
+					RouteModel:        routeModel,
+					Success:           true,
+					CompletedResponse: sawCompleted && !sawIncomplete,
+					AccessToken:       accessToken,
+					CredentialVersion: auth.CredentialVersion,
+					RegistrationEpoch: auth.RegistrationEpoch,
+					ExecutionSeq:      executionSeq,
+					Options:           opts,
+				}, auth, ephemeralResult)
 			} else {
 				// Downstream cancellation ends the stream without a result callback.
 				// Release the local dispatch reservation explicitly in that case.
@@ -463,6 +475,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		durationStream := time.Since(startStream)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				m.recordCanceledUpstreamCooldown(ctx, auth, provider, resultModel, routeModel, execOpts, errStream, ephemeralResult, executionSeq)
 				auth.ReleaseDispatchSlot()
 				return nil, errCtx
 			}
@@ -486,6 +499,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					if errStream != nil {
 						warnLogUpstreamFailure(ctx, entry, provider, execModel, auth, durationRetry, errStream)
 						if errCtx := ctx.Err(); errCtx != nil {
+							m.recordCanceledUpstreamCooldown(ctx, auth, provider, resultModel, routeModel, execOpts, errStream, ephemeralResult, executionSeq)
 							auth.ReleaseDispatchSlot()
 							return nil, errCtx
 						}
@@ -566,6 +580,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					retryErr = markUpstreamExecutionAttemptFromContext(ctx, retryErr)
 					if retryErr != nil {
 						if errCtx := ctx.Err(); errCtx != nil {
+							m.recordCanceledUpstreamCooldown(ctx, auth, provider, resultModel, routeModel, execOpts, retryErr, ephemeralResult, executionSeq)
 							auth.ReleaseDispatchSlot()
 							return nil, errCtx
 						}

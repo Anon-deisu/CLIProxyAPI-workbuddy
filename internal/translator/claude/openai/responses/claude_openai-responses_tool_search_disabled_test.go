@@ -1,6 +1,7 @@
 package responses
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -66,6 +67,9 @@ func loadToolSearchGolden(t *testing.T) (toolSearchGoldenFixtures, map[string]to
 		if errRead != nil {
 			t.Fatalf("read %s: %v", name, errRead)
 		}
+		// RawMessage preserves fixture whitespace. Normalize checkout line endings
+		// before decoding so the byte-for-byte golden remains portable to Windows.
+		raw = bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
 		if errUnmarshal := json.Unmarshal(raw, target); errUnmarshal != nil {
 			t.Fatalf("decode %s: %v", name, errUnmarshal)
 		}

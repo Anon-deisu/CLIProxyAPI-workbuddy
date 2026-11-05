@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor"
 )
 
 const rateLimitTrailer = `cursor connect end-stream error: {"code":"resource_exhausted",` +

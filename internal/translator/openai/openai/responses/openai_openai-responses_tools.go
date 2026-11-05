@@ -23,71 +23,36 @@ type responsesToolDeclaration struct {
 	shell     bool
 }
 
-// responsesToolIdentityIndex caches the request's first-wins tool namespace
-// mapping so stream chunks do not repeatedly walk the full request.
-type responsesToolIdentityIndex struct {
-	exact     map[string]responsesToolDeclaration
-	local     map[string]string
-	ambiguous map[string]bool
-	custom    map[string]struct{}
+// responsesToolIdentityIndex retains the legacy name while sharing the request
+// index used for namespace resolution, custom tools, and local shell conversion.
+type responsesToolIdentityIndex = responsesToolIndex
+
+func newResponsesToolIdentityIndex(root ojson.Result) *responsesToolIdentityIndex {
+	return newResponsesToolIndex(root)
 }
 
-func newResponsesToolIdentityIndex(root gjson.Result) *responsesToolIdentityIndex {
-	index := &responsesToolIdentityIndex{
-		exact:     make(map[string]responsesToolDeclaration),
-		local:     make(map[string]string),
-		ambiguous: make(map[string]bool),
-		custom:    make(map[string]struct{}),
-	}
-	walkResponsesToolDeclarations(root, func(declaration responsesToolDeclaration) bool {
-		if _, duplicate := index.exact[declaration.chatName]; duplicate {
-			return true
-		}
-		index.exact[declaration.chatName] = declaration
-		if declaration.custom {
-			index.custom[declaration.chatName] = struct{}{}
-		}
-		if previous, exists := index.local[declaration.localName]; exists && previous != declaration.chatName {
-			index.ambiguous[declaration.localName] = true
-		} else if !exists {
-			index.local[declaration.localName] = declaration.chatName
-		}
-		return true
-	})
-	return index
-}
-
-func (index *responsesToolIdentityIndex) canonical(name string) string {
+func (index *responsesToolIndex) canonical(name string) string {
 	if index == nil {
 		return name
 	}
-	if _, found := index.exact[name]; found {
-		return name
-	}
-	if candidate, found := index.local[name]; found && !index.ambiguous[name] {
-		return candidate
-	}
-	return name
+	return index.canonicalName(name)
 }
 
-func (index *responsesToolIdentityIndex) split(qualifiedName string) (name, namespace string) {
+func (index *responsesToolIndex) split(qualifiedName string) (name, namespace string) {
 	if index == nil {
 		return qualifiedName, ""
 	}
-	if declaration, found := index.exact[qualifiedName]; found {
+	if declaration, found := index.byChat[qualifiedName]; found {
 		return declaration.localName, declaration.namespace
 	}
 	return qualifiedName, ""
 }
 
-func (index *responsesToolIdentityIndex) singleCustomToolName() (string, bool) {
-	if index == nil || len(index.custom) != 1 || len(index.exact) != 1 {
+func (index *responsesToolIndex) singleCustomToolName() (string, bool) {
+	if index == nil {
 		return "", false
 	}
-	for name := range index.custom {
-		return name, true
-	}
-	return "", false
+	return index.singleCustomName()
 }
 
 // walkResponsesToolDeclarations visits the tool declarations of a Responses
@@ -96,28 +61,34 @@ func (index *responsesToolIdentityIndex) singleCustomToolName() (string, bool) {
 // children in declaration order. Declarations that produce no Chat Completions
 // tool are skipped. Visiting stops early once visit returns false.
 //
-// Request conversion, reverse name resolution and freeform tool classification
-// all traverse through here, so they cannot disagree about which declaration
-// backs a given Chat Completions tool name.
-func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDeclaration) bool) {
-	proceed := true
-	emit := func(tool gjson.Result, namespaceName string) {
-		if !proceed {
-			return
-		}
-		var custom bool
+// The emitted chatName is namespace-qualified, capped to the Chat Completions
+// function-name limit, and disambiguated when two distinct declarations flatten
+// onto the same name. Request conversion, reverse name resolution and freeform
+// tool classification all traverse through here, so they cannot disagree about
+// which declaration backs a given Chat Completions tool name.
+func walkResponsesToolDeclarations(root ojson.Result, visit func(responsesToolDeclaration) bool) {
+	var declarations []responsesToolDeclaration
+	emit := func(tool ojson.Result, namespaceName string) {
+		var custom, shell bool
 		toolType := strings.TrimSpace(tool.Get("type").String())
 		switch toolType {
 		case "", "function":
 		case "custom":
 			custom = true
-		case "shell", "local_shell", "apply_patch":
+		case "shell":
+			if namespaceName != "" || tool.Get("environment.type").String() != "local" {
+				return
+			}
+			shell = true
+		case "local_shell", "apply_patch":
 			// Built-in typed tools carry no "name" field; their type is the name.
 		default:
 			return
 		}
 		localName := responsesToolName(tool)
-		if localName == "" && toolType != "" && toolType != "function" && toolType != "custom" {
+		if shell {
+			localName = "__cpa_local_shell"
+		} else if localName == "" && toolType != "" && toolType != "function" && toolType != "custom" {
 			localName = toolType
 		}
 		if localName == "" {
@@ -413,11 +384,11 @@ func responsesToolOutputText(output ojson.Result) string {
 // a discarded custom declaration must not turn a surviving ordinary function
 // into a custom_tool_call.
 func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
-	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).custom
+	return newResponsesToolIndex(util.ParseGJSONBytesNoCopy(requestRawJSON)).custom
 }
 
 func responsesSingleCustomToolName(requestRawJSON []byte) (string, bool) {
-	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).singleCustomToolName()
+	return newResponsesToolIndex(util.ParseGJSONBytesNoCopy(requestRawJSON)).singleCustomName()
 }
 
 // unwrapCustomToolInput extracts the freeform input from the {"input": "..."}
@@ -513,7 +484,7 @@ func chatNameForResponsesNamespaceToolCall(requestRawJSON []byte, namespace, loc
 // also another namespace's declared child. Ambiguous names remain unresolved
 // rather than being dispatched to another tool.
 func canonicalResponsesToolName(requestRawJSON []byte, name string) string {
-	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).canonical(name)
+	return newResponsesToolIndex(util.ParseGJSONBytesNoCopy(requestRawJSON)).canonicalName(name)
 }
 
 func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, qualifiedName string) (name, namespace string) {
@@ -522,7 +493,7 @@ func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, quali
 		return "", ""
 	}
 
-	return newResponsesToolIdentityIndex(gjson.ParseBytes(requestRawJSON)).split(qualifiedName)
+	return newResponsesToolIndex(util.ParseGJSONBytesNoCopy(requestRawJSON)).split(qualifiedName)
 }
 
 func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
@@ -537,10 +508,14 @@ func pickRequestJSON(originalRequestRawJSON, requestRawJSON []byte) []byte {
 
 func applyResponsesFunctionCallNamespaceFields(item []byte, requestRawJSON []byte, qualifiedName string, itemPath string) []byte {
 	name, namespace := splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON, qualifiedName)
-	return translatorcommon.SetResponsesToolCallIdentity(item, name, namespace, itemPath)
+	doc := ojson.NewDoc(item)
+	translatorcommon.SetResponsesToolCallIdentityDoc(doc, name, namespace, itemPath)
+	return doc.Bytes()
 }
 
 func applyResponsesFunctionCallNamespaceFieldsWithIndex(item []byte, index *responsesToolIdentityIndex, qualifiedName string, itemPath string) []byte {
 	name, namespace := index.split(qualifiedName)
-	return translatorcommon.SetResponsesToolCallIdentity(item, name, namespace, itemPath)
+	doc := ojson.NewDoc(item)
+	translatorcommon.SetResponsesToolCallIdentityDoc(doc, name, namespace, itemPath)
+	return doc.Bytes()
 }

@@ -414,7 +414,7 @@ func TestStreamingTool_StopReasonWithEmittedTool(t *testing.T) {
 }
 
 func TestExtractOpenAIUsageSeparatesCacheReadAndWrite(t *testing.T) {
-	usage := gjson.Parse(`{"prompt_tokens":9000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":8000,"cache_creation_tokens":200}}`)
+	usage := ojson.Parse(`{"prompt_tokens":9000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":8000,"cache_creation_tokens":200}}`)
 	input, output, cached, cacheWrite := extractOpenAIUsage(usage)
 	if input != 800 || output != 50 || cached != 8000 || cacheWrite != 200 {
 		t.Fatalf("input=%d output=%d cached=%d cacheWrite=%d", input, output, cached, cacheWrite)
@@ -426,7 +426,7 @@ func TestExtractOpenAIUsageSeparatesCacheReadAndWrite(t *testing.T) {
 // It must NOT be stripped again, or the genuinely-fresh input is lost and the
 // reported input_tokens collapses to 0.
 func TestExtractOpenAIUsageKeepsSplitStyleFreshInput(t *testing.T) {
-	usage := gjson.Parse(`{"prompt_tokens":2,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":25117}}`)
+	usage := ojson.Parse(`{"prompt_tokens":2,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":25117}}`)
 	input, output, cached, _ := extractOpenAIUsage(usage)
 	if input != 2 || output != 50 || cached != 25117 {
 		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
@@ -435,7 +435,7 @@ func TestExtractOpenAIUsageKeepsSplitStyleFreshInput(t *testing.T) {
 
 // Cache is absent entirely: nothing to strip, fresh input passes through.
 func TestExtractOpenAIUsageNoCache(t *testing.T) {
-	usage := gjson.Parse(`{"prompt_tokens":300,"completion_tokens":50,"prompt_tokens_details":{}}`)
+	usage := ojson.Parse(`{"prompt_tokens":300,"completion_tokens":50,"prompt_tokens_details":{}}`)
 	input, output, cached, _ := extractOpenAIUsage(usage)
 	if input != 300 || output != 50 || cached != 0 {
 		t.Fatalf("input=%d output=%d cached=%d", input, output, cached)
@@ -453,7 +453,7 @@ func TestStreamingTool_MissingIDGetsFallbackWithoutRewritingRealIDs(t *testing.T
 	if len(starts) != 1 {
 		t.Fatalf("missing upstream id should get one fallback tool_use, got %d", len(starts))
 	}
-	if id := gjson.Get(starts[0].Payload, "content_block.id").String(); !strings.HasPrefix(id, "toolu_") {
+	if id := ojson.Get(starts[0].Payload, "content_block.id").String(); !strings.HasPrefix(id, "toolu_") {
 		t.Fatalf("fallback id = %q", id)
 	}
 	if got := lastStopReason(events); got != "tool_use" {
@@ -477,7 +477,7 @@ func TestStreamingTool_FallbackStartsUseOpenAIToolIndexOrder(t *testing.T) {
 	}
 	wantNames := []string{"first_tool", "second_tool", "third_tool"}
 	for i, wantName := range wantNames {
-		if name := gjson.Get(starts[i].Payload, "content_block.name").String(); name != wantName {
+		if name := ojson.Get(starts[i].Payload, "content_block.name").String(); name != wantName {
 			t.Fatalf("tool_use start %d name = %q, want %q", i, name, wantName)
 		}
 	}
@@ -997,7 +997,7 @@ func TestNonStreamingUsage_PreservesCacheWriteTokens(t *testing.T) {
 
 func TestNonStreamingToolMissingIDGetsFallbackAndRealIDPassesThrough(t *testing.T) {
 	out := convertOpenAINonStreamingToAnthropic([]byte(`{"id":"m","model":"test","choices":[{"message":{"tool_calls":[{"function":{"name":"missing","arguments":"{}"}},{"id":"toolu:raw\nid","function":{"name":"real","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`))[0]
-	content := gjson.GetBytes(out, "content").Array()
+	content := ojson.GetBytesNoCopy(out, "content").Array()
 	if len(content) != 2 {
 		t.Fatalf("content=%s", out)
 	}
@@ -1484,6 +1484,21 @@ func TestExtractOpenAIUsage(t *testing.T) {
 			wantOutputTokens:     50,
 			wantCachedTokens:     9223372036854775800,
 			wantCacheWriteTokens: 100,
+		},
+		{
+			name:                 "keeps split-style fresh input with a larger cache write bucket",
+			rawUsage:             `{"prompt_tokens":2,"completion_tokens":50,"input_tokens_details":{"cache_write_tokens":1000}}`,
+			wantInputTokens:      2,
+			wantOutputTokens:     50,
+			wantCacheWriteTokens: 1000,
+		},
+		{
+			name:                 "negative cached tokens do not offset valid cache writes",
+			rawUsage:             `{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":-10,"cache_write_tokens":40}}`,
+			wantInputTokens:      60,
+			wantOutputTokens:     50,
+			wantCachedTokens:     -10,
+			wantCacheWriteTokens: 40,
 		},
 	}
 

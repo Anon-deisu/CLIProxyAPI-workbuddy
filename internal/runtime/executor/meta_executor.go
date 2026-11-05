@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	metaauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/meta"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/singleflight"
@@ -46,6 +46,9 @@ func (e *MetaExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {
 func (e *MetaExecutor) Identifier() string {
 	return "meta"
 }
+
+// SupportsApplyPatch reports that Meta can carry the translated apply_patch tool.
+func (e *MetaExecutor) SupportsApplyPatch() bool { return e != nil }
 
 // PrepareRequest injects Meta credentials into the outgoing HTTP request.
 func (e *MetaExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {

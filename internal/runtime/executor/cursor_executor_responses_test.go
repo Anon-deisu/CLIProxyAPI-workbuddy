@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -22,7 +22,10 @@ func TestTranslateCursorRequestConvertsResponsesInputDirectly(t *testing.T) {
 		"parallel_tool_calls":true
 	}`)
 
-	out := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "gpt-5.6-sol", payload, true)
+	out, errTranslate := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "gpt-5.6-sol", payload, true)
+	if errTranslate != nil {
+		t.Fatal(errTranslate)
+	}
 	if !gjson.GetBytes(out, "messages").IsArray() {
 		t.Fatalf("Responses input was not converted: %s", out)
 	}
@@ -61,7 +64,10 @@ func TestTranslateCursorRequestPreservesTypedAndCustomTools(t *testing.T) {
 		]
 	}`)
 
-	out := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "gpt-5.6-sol", payload, true)
+	out, errTranslate := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "gpt-5.6-sol", payload, true)
+	if errTranslate != nil {
+		t.Fatal(errTranslate)
+	}
 	if got := gjson.GetBytes(out, "tools.#").Int(); got != 4 {
 		t.Fatalf("typed tools were lost: count=%d body=%s", got, out)
 	}
@@ -86,7 +92,10 @@ func TestExtractCursorToolsPreservesResponsesKinds(t *testing.T) {
 			{"type":"namespace","name":"codex_app","tools":[{"type":"function","name":"Read"}]}
 		]
 	}`)
-	translated := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "gpt-5.6-sol", append([]byte(nil), original...), true)
+	translated, errTranslate := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "gpt-5.6-sol", append([]byte(nil), original...), true)
+	if errTranslate != nil {
+		t.Fatal(errTranslate)
+	}
 	tools := extractCursorTools(translated, original, sdktranslator.FormatOpenAIResponse)
 	if len(tools) != 3 {
 		t.Fatalf("tools=%#v translated=%s", tools, translated)
@@ -118,7 +127,10 @@ func TestExtractCursorChatMessagesPreservesResponsesHistoryKinds(t *testing.T) {
 			{"type":"custom_tool_call_output","call_id":"call_custom","output":"ok"}
 		]
 	}`)
-	translated := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "model", original, true)
+	translated, errTranslate := translateCursorRequest(sdktranslator.FormatOpenAIResponse, "model", original, true)
+	if errTranslate != nil {
+		t.Fatal(errTranslate)
+	}
 	messages, err := extractCursorChatMessages(translated, original, sdktranslator.FormatOpenAIResponse)
 	if err != nil {
 		t.Fatal(err)

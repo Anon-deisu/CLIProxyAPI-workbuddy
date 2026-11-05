@@ -26,6 +26,10 @@ func DoKimiAILogin(cfg *config.Config, options *LoginOptions) {
 }
 
 func doKimiLogin(cfg *config.Config, options *LoginOptions, provider string) {
+	displayName := "Kimi"
+	if provider == "kimi-ai" || provider == "kimi.ai" {
+		displayName = "Kimi.ai"
+	}
 	if options == nil {
 		options = &LoginOptions{}
 	}

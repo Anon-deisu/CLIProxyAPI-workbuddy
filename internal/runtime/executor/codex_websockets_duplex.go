@@ -3,7 +3,6 @@ package executor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -136,10 +135,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			cancel()
 		}
 		reject := func(message string) bool {
-			payload, _ := json.Marshal(map[string]any{
-				"type": "error", "status": http.StatusBadRequest,
-				"error": map[string]string{"type": "invalid_request_error", "message": message},
-			})
+			doc := ojson.NewDocString(`{"type":"error","error":{"type":"invalid_request_error"}}`)
+			_ = doc.Set("status", http.StatusBadRequest)
+			_ = doc.Set("error.message", message)
+			payload := doc.Bytes()
 			// Reader cleanup joins this writer before closing out. Cancellation must
 			// also release a local error blocked behind a disconnected downstream.
 			select {
@@ -161,9 +160,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 		authorizePayload := func(payload []byte, forceBoundModel bool) (allowed bool, keepOpen bool) {
 			authPayload := payload
 			explicitModel := strings.TrimSpace(ojson.GetBytesNoCopy(authPayload, "model").String())
-			if boundModel != "" && json.Valid(authPayload) && (forceBoundModel || explicitModel == "" || explicitModel == req.Model) {
-				if withModel, errSet := ojson.SetBytes(bytes.Clone(authPayload), "model", boundModel); errSet == nil {
-					authPayload = withModel
+			if boundModel != "" && ojson.ValidBytes(authPayload) && (forceBoundModel || explicitModel == "" || explicitModel == req.Model) {
+				doc := ojson.NewDoc(authPayload)
+				if errSet := doc.Set("model", boundModel); errSet == nil {
+					authPayload = doc.Bytes()
 				}
 			}
 			errPayload, errAuth := cliproxyexecutor.AuthorizeWebsocketTurn(streamCtx, authPayload)
@@ -239,10 +239,10 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 					msg = trimmed
 				}
 			}
-			payload, _ := json.Marshal(map[string]any{
-				"type": "error", "status": status,
-				"error": map[string]string{"type": "invalid_request_error", "message": msg},
-			})
+			doc := ojson.NewDocString(`{"type":"error","error":{"type":"invalid_request_error"}}`)
+			_ = doc.Set("status", status)
+			_ = doc.Set("error.message", msg)
+			payload := doc.Bytes()
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
 				consumedPayload = nil
@@ -303,7 +303,9 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 			prevID := strings.TrimSpace(ojson.GetBytesNoCopy(payload, "previous_response_id").String())
 			if isAppend && prevID == "" && responseID != "" {
 				prevID = responseID
-				payload, _ = ojson.SetBytes(payload, "previous_response_id", prevID)
+				doc := ojson.NewDoc(payload)
+				_ = doc.Set("previous_response_id", prevID)
+				payload = doc.Bytes()
 			}
 			wrongParent := false
 			for _, accepted := range acceptedSteers {
@@ -372,7 +374,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				fail(errPrepare)
 				return false
 			}
-			if prepared.wsURL != initial.wsURL {
+			if prepared.wsURL != initial.wsURL || prepared.useSIWC != initial.useSIWC || prepared.identityState.convergence != initial.identityState.convergence {
 				fail(cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError())
 				return false
 			}
@@ -448,7 +450,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				}
 				payload := message.Payload
 				consumedPayload = payload
-				if !json.Valid(payload) {
+				if !ojson.ValidBytes(payload) {
 					if !reject("invalid websocket request JSON") {
 						return
 					}
@@ -888,6 +890,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				}
 				publishCodexImageToolUsageWithOutputItems(ctx, reporter, current.clientBody, payload, outputItems, outputFallback)
 			}
+			payload = applyCodexIdentityExposeResponsePayload(payload, eventPrepared.identityState)
 			if !send(cliproxyexecutor.StreamChunk{Payload: helps.EnsureResponsesUsageDetails(payload), Incomplete: eventType == "response.incomplete"}) {
 				return
 			}

@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -300,14 +300,21 @@ func TestV8MigrationReloadSnapshotMatchesDisk(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			saved, errRead := os.ReadFile(path)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			if migrated := strings.Contains(string(saved), "config-version: 8"); migrated != tc.migrated {
+				t.Fatalf("config migration = %v, want %v", migrated, tc.migrated)
+			}
 			select {
 			case snapshot := <-reloads:
 				if !reflect.DeepEqual(snapshot.OAuthOnlyFields, disk.OAuthOnlyFields) {
 					t.Fatal("reload snapshot has different OAuth scope from the saved file")
 				}
 				api := snapshot.ForAPIKey()
-				if api.Codex.DisableCodexCloaking == tc.migrated || api.XAI.InjectXSearch == tc.migrated {
-					t.Fatal("reload snapshot applied the wrong API-key configuration")
+				if !api.Codex.DisableCodexCloaking || !api.XAI.InjectXSearch {
+					t.Fatal("reload snapshot lost shared upstream settings from the API-key configuration")
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("missing config reload")

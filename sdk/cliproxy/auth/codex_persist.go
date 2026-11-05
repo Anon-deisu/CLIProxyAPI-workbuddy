@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/codexdata"
 )
 
 // IsCodexAuthRecord reports whether auth represents a Codex credential record.
@@ -23,7 +23,7 @@ func IsCodexAuthRecord(auth *Auth) bool {
 			return true
 		}
 	}
-	if _, ok := auth.Storage.(*codex.CodexTokenStorage); ok {
+	if _, ok := auth.Storage.(*codexdata.CodexTokenStorage); ok {
 		return true
 	}
 	return false
@@ -43,7 +43,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 
 	switch {
 	case auth.CodexRefreshPatch != nil:
-		errRefresh := codex.WithFileLock(path, func() error {
+		errRefresh := codexdata.WithFileLock(path, func() error {
 			existing, errRead := os.ReadFile(path)
 			if errRead != nil {
 				if os.IsNotExist(errRead) {
@@ -52,7 +52,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 					}
 					auth.Metadata["disabled"] = auth.Disabled
 					NormalizeCredentialMetadata(auth.Metadata)
-					return codex.WriteJSONFileAtomic(path, auth.Metadata)
+					return codexdata.WriteJSONFileAtomic(path, auth.Metadata)
 				}
 				return fmt.Errorf("auth filestore: read refresh source failed: %w", errRead)
 			}
@@ -62,7 +62,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 			}
 			merged := auth.CodexRefreshPatch.Apply(diskMap)
 			NormalizeCredentialMetadata(merged)
-			if errWrite := codex.WriteJSONFileAtomic(path, merged); errWrite != nil {
+			if errWrite := codexdata.WriteJSONFileAtomic(path, merged); errWrite != nil {
 				return errWrite
 			}
 			auth.Metadata = merged
@@ -83,7 +83,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 			auth.Metadata = make(map[string]any)
 		}
 		auth.Metadata["disabled"] = auth.Disabled
-		if storage, ok := auth.Storage.(*codex.CodexTokenStorage); ok && storage != nil {
+		if storage, ok := auth.Storage.(*codexdata.CodexTokenStorage); ok && storage != nil {
 			clonedStorage := *storage
 			clonedStorage.ReplaceCredentials = HasAuthCreationIntent(ctx)
 			auth.Storage = &clonedStorage
@@ -97,7 +97,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 		if persistedBytes, errReadPersisted := os.ReadFile(path); errReadPersisted == nil && len(persistedBytes) > 0 {
 			var diskMap map[string]any
 			if errUnmarshal := json.Unmarshal(persistedBytes, &diskMap); errUnmarshal == nil && len(diskMap) > 0 {
-				auth.Metadata = codex.MergeCodexCredentialsFromDisk(diskMap, auth.Metadata)
+				auth.Metadata = codexdata.MergeCodexCredentialsFromDisk(diskMap, auth.Metadata)
 				NormalizeCredentialMetadata(auth.Metadata)
 			}
 		}
@@ -105,13 +105,13 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 
 	case auth.Metadata != nil:
 		auth.Metadata["disabled"] = auth.Disabled
-		errLock := codex.WithFileLock(path, func() error {
+		errLock := codexdata.WithFileLock(path, func() error {
 			existing, errRead := os.ReadFile(path)
 			if errRead == nil && len(existing) > 0 {
 				var diskMap map[string]any
 				if errUnmarshal := json.Unmarshal(existing, &diskMap); errUnmarshal == nil && len(diskMap) > 0 {
 					if !HasAuthCreationIntent(ctx) {
-						auth.Metadata = codex.MergeCodexCredentialsFromDisk(diskMap, auth.Metadata)
+						auth.Metadata = codexdata.MergeCodexCredentialsFromDisk(diskMap, auth.Metadata)
 					}
 					auth.Metadata["disabled"] = auth.Disabled
 					NormalizeCredentialMetadata(auth.Metadata)
@@ -122,7 +122,7 @@ func PersistCodexAuthFile(ctx context.Context, path string, auth *Auth) (bool, e
 			} else if errRead != nil && !os.IsNotExist(errRead) {
 				return fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 			}
-			return codex.WriteJSONFileAtomic(path, auth.Metadata)
+			return codexdata.WriteJSONFileAtomic(path, auth.Metadata)
 		})
 		if errLock != nil {
 			return true, errLock

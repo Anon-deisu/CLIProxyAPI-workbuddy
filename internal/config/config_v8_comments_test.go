@@ -82,3 +82,22 @@ func TestV8MigrationCarriesProviderKeyFootComments(t *testing.T) {
 		}
 	}
 }
+
+func TestV8ConflictCleanupPreservesEachCommentOnce(t *testing.T) {
+	raw := []byte("# LEGACY HEAD\nport: 8316 # LEGACY INLINE\n# SERVER HEAD\nserver: # SERVER INLINE\n  # CANONICAL HEAD\n  port: 8317 # CANONICAL INLINE\n")
+	for _, migrate := range []bool{false, true} {
+		data, _, err := NormalizeConfigLayout(raw, migrate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, marker := range []string{"LEGACY HEAD", "LEGACY INLINE", "SERVER HEAD", "SERVER INLINE", "CANONICAL HEAD", "CANONICAL INLINE"} {
+			if count := strings.Count(string(data), marker); count != 1 {
+				t.Fatalf("comment %q occurs %d times after conflict cleanup:\n%s", marker, count, data)
+			}
+		}
+		cfg, err := ParseConfigBytes(data)
+		if err != nil || cfg.Port != 8317 {
+			t.Fatalf("canonical value changed: %v", err)
+		}
+	}
+}

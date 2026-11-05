@@ -806,7 +806,7 @@ const file_aiserver_v1_available_models_mvp_proto_rawDesc = "" +
 	"\x16_is_default_max_configB\x1c\n" +
 	"\x1a_is_default_non_max_configB \n" +
 	"\x1e_variant_string_representationB\x0e\n" +
-	"\f_legacy_slugBVZTgithub.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1;aiserverv1b\x06proto3"
+	"\f_legacy_slugBVZTgithub.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/aiserver/v1;aiserverv1b\x06proto3"
 
 var (
 	file_aiserver_v1_available_models_mvp_proto_rawDescOnce sync.Once

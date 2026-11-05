@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	cursorauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/cursor"
+	cursorauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
 )
 
 // CredentialsFromAPIKey exchanges a Cursor API key and builds the stable

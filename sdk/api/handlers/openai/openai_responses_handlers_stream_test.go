@@ -13,13 +13,12 @@ import (
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	"github.com/tidwall/gjson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 type cacheRewriteStreamExecutor struct {
@@ -50,7 +49,11 @@ func TestCacheTokenRewriteHTTPStreamsComplete(t *testing.T) {
 			case "responses-multiline":
 				chunks = []string{"event: response.output_item.done\ndata: " + item + "\n\n", "event: response.completed\ndata: {\"type\":\"response.completed\",\n", "data: \"response\":{\"id\":\"r1\",\"output\":[],\"usage\":{\"input_tokens\":100,\"output_tokens\":9,\"total_tokens\":109,\"input_tokens_details\":{\"cached_tokens\":98}}}}\n\n"}
 			case "chat":
-				chunks = []string{`{"choices":[{"index":0,"delta":{"content":"hello"}}]}`, `{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":9,"total_tokens":109,"prompt_tokens_details":{"cached_tokens":98}}}`}
+				chunks = []string{
+					`{"choices":[{"index":0,"delta":{"content":"hello"}}]}`,
+					`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+					`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":9,"total_tokens":109,"prompt_tokens_details":{"cached_tokens":98}}}`,
+				}
 			}
 			executor := &cacheRewriteStreamExecutor{chunks: chunks}
 			manager := coreauth.NewManager(nil, nil, nil)
@@ -92,20 +95,20 @@ func TestCacheTokenRewriteHTTPStreamsComplete(t *testing.T) {
 					terminal++
 					continue
 				}
-				if !json.Valid([]byte(data)) || gjson.Get(data, "error").Exists() {
+				if !json.Valid([]byte(data)) || ojson.Get(data, "error").Exists() {
 					t.Fatalf("invalid stream payload: %s", data)
 				}
 				path := "usage"
 				if wire != "chat" {
 					path = "response.usage"
-					if gjson.Get(data, "type").String() == "response.completed" {
+					if ojson.Get(data, "type").String() == "response.completed" {
 						terminal++
-						if gjson.Get(data, "response.output.0.call_id").String() != "call1" {
+						if ojson.Get(data, "response.output.0.call_id").String() != "call1" {
 							t.Fatalf("tool call was lost: %s", data)
 						}
 					}
 				}
-				if usage := gjson.Get(data, path); usage.IsObject() {
+				if usage := ojson.Get(data, path); usage.IsObject() {
 					usageCount++
 					inputPath, cachedPath := "input_tokens", "input_tokens_details.cached_tokens"
 					if wire == "chat" {
@@ -517,7 +520,6 @@ func TestForwardResponsesStreamErrorEventPreservesNestedError(t *testing.T) {
 			StatusCode: http.StatusBadRequest,
 			Error:      errors.New(errText),
 		}
-		close(data)
 		close(errs)
 		// Match the producer contract: publish the error before closing data.
 		close(data)

@@ -12,8 +12,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 
-	agentv1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	agentv1 "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/agent/v1"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 )
 
 // Native conversation continuation.

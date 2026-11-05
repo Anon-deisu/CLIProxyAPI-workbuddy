@@ -13,9 +13,9 @@ import (
 	"testing"
 
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 func TestCodexStaticISPWebsocketRouteAndRebind(t *testing.T) {
@@ -96,7 +96,7 @@ func TestCodexStaticISPWebsocketRouteAndRebind(t *testing.T) {
 	if _, _, err := serverConn.ReadMessage(); err == nil {
 		t.Fatal("old websocket survived the proxy rebind")
 	}
-	if reused, _ := existingWebsocketSessionConnForEgress(sess, auth.ID, wsURL, false, "different-binding"); reused != nil {
+	if reused, _ := existingWebsocketSessionConnForEgress(sess, auth.ID, wsURL, old.ProxyURL, false, "different-binding"); reused != nil {
 		t.Fatal("connection matched a different egress fingerprint")
 	}
 	if _, _, _, err := exec.ensureUpstreamConn(t.Context(), old, sess, auth.ID, wsURL, nil); err == nil {

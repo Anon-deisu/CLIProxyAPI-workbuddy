@@ -7,7 +7,7 @@
 package agentv1
 
 import (
-	v1 "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1"
+	v1 "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/aiserver/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	structpb "google.golang.org/protobuf/types/known/structpb"
@@ -70778,7 +70778,7 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\aConnect\x12\x0f.agent.v1.Frame\x1a\x0f.agent.v1.Frame2x\n" +
 	"\x10LifecycleService\x121\n" +
 	"\rResetInstance\x12\x0f.agent.v1.Empty\x1a\x0f.agent.v1.Empty\x121\n" +
-	"\rRenewInstance\x12\x0f.agent.v1.Empty\x1a\x0f.agent.v1.EmptyBPZNgithub.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/agent/v1;agentv1b\x06proto3"
+	"\rRenewInstance\x12\x0f.agent.v1.Empty\x1a\x0f.agent.v1.EmptyBPZNgithub.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/agent/v1;agentv1b\x06proto3"
 
 var (
 	file_agent_v1_agent_proto_rawDescOnce sync.Once

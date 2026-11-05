@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -18,10 +17,11 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
-	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
@@ -88,6 +88,7 @@ type DevinPrompt struct {
 	Source             int // 1=user, 2=assistant, 4=tool
 	Content            string
 	Images             []DevinImage
+	DroppedPart        string // Unsupported user content retained for empty-turn validation.
 	ToolCalls          []DevinToolCall
 	ToolCallID         string // For source=4 (tool result)
 	OriginalToolCallID string // Retained when downgraded from source=4 to source=1
@@ -1223,15 +1224,16 @@ func BuildDevinUpstreamLogBody(
 
 // DevinUpstreamResponseLog represents the decoded response frames from Devin Connect-RPC.
 type DevinUpstreamResponseLog struct {
-	Status        string          `json:"status,omitempty"`
-	FramesCount   int             `json:"frames_count"`
-	Content       string          `json:"content,omitempty"`
-	Thinking      string          `json:"thinking,omitempty"`
-	Signature     string          `json:"signature,omitempty"`
-	SignatureType string          `json:"signature_type,omitempty"`
-	ToolCalls     []DevinToolCall `json:"tool_calls,omitempty"`
-	Usage         *DevinUsage     `json:"usage,omitempty"`
-	UnknownFields []int           `json:"unknown_fields,omitempty"`
+	Status                string                      `json:"status,omitempty"`
+	FramesCount           int                         `json:"frames_count"`
+	Content               string                      `json:"content,omitempty"`
+	Thinking              string                      `json:"thinking,omitempty"`
+	Signature             string                      `json:"signature,omitempty"`
+	SignatureType         string                      `json:"signature_type,omitempty"`
+	ToolCalls             []DevinToolCall             `json:"tool_calls,omitempty"`
+	Usage                 *DevinUsage                 `json:"usage,omitempty"`
+	UnknownFields         []int                       `json:"unknown_fields,omitempty"`
+	ApplyPatchDiagnostics *DevinApplyPatchDiagnostics `json:"-"`
 }
 
 // BuildDevinUpstreamResponseLogBody formats the decoded Devin response and the intermediate

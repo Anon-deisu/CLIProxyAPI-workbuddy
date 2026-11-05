@@ -33,32 +33,137 @@ func codexUseSIWC(auth *cliproxyauth.Auth) bool {
 			}
 		}
 	}
-	if refreshToken == "" {
-		if tokenData, errRelogin := e.reloginAutoOAuth(ctx, auth, ""); errRelogin == nil {
-			applyCodexTokenData(auth, tokenData)
-			return auth, nil
-		} else if _, okAuto := codexauth.AutoOAuthCredentials(auth.Metadata); okAuto {
-			return nil, errRelogin
+	if !enabled && auth.Metadata != nil {
+		switch v := auth.Metadata["use_siwc"].(type) {
+		case bool:
+			enabled = v
+		case string:
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(v)); errParse == nil {
+				enabled = parsed
+			}
 		}
-		return auth, nil
 	}
-	bound, errBinding := e.bindEgress(auth)
-	if errBinding != nil {
-		return nil, errBinding
+	return enabled
+}
+
+func codexUseSIWCForRequest(ctx context.Context, auth *cliproxyauth.Auth, clientHeaders ...http.Header) bool {
+	return cliproxyauth.IsCodexUseSIWCForRequest(ctx, auth, clientHeaders...)
+}
+
+func ensureCodexSIWCCredentials(auth *cliproxyauth.Auth, apiKey string) error {
+	return ensureCodexSIWCCredentialsForRequest(context.Background(), auth, apiKey)
+}
+
+func ensureCodexSIWCCredentialsForRequest(ctx context.Context, auth *cliproxyauth.Auth, apiKey string, clientHeaders ...http.Header) error {
+	if !codexUseSIWC(auth) {
+		return nil
 	}
-	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, bound.ProxyURL)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
-	if err != nil {
-		if tokenData, errRelogin := e.reloginAutoOAuth(ctx, auth, bound.ProxyURL); errRelogin == nil {
-			applyCodexTokenData(auth, tokenData)
-			return auth, nil
-		} else if _, okAuto := codexauth.AutoOAuthCredentials(auth.Metadata); okAuto {
-			return nil, errRelogin
+	if cliproxyauth.IsCodexClientRequest(ctx, clientHeaders...) {
+		if strings.TrimSpace(apiKey) == "" {
+			return statusErr{code: http.StatusUnauthorized, msg: "codex executor: original OAuth access_token is required for Codex client requests"}
 		}
-		return nil, err
+		return nil
 	}
-	applyCodexTokenData(auth, td)
-	return auth, nil
+	if strings.TrimSpace(apiKey) == "" {
+		return statusErr{code: http.StatusUnauthorized, msg: "codex executor: use_siwc is enabled but siwc access_token is missing"}
+	}
+	return nil
+}
+
+func codexSIWCAccessToken(auth *cliproxyauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	siwc, _ := auth.Metadata["siwc"].(map[string]any)
+	for _, key := range []string{"access_token", "access"} {
+		if token, ok := siwc[key].(string); ok && strings.TrimSpace(token) != "" {
+			return strings.TrimSpace(token)
+		}
+	}
+	return ""
+}
+
+func cloneSIWCMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		switch typed := value.(type) {
+		case []string:
+			dst[key] = append([]string(nil), typed...)
+		case []any:
+			dst[key] = append([]any(nil), typed...)
+		default:
+			dst[key] = value
+		}
+	}
+	return dst
+}
+
+func resolveCodexAuthDiskPath(cfg *config.Config, auth *cliproxyauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	var candidates []string
+	if p := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributePath]); p != "" {
+		candidates = append(candidates, p)
+	}
+	if source := strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeSource]); source != "" && !strings.Contains(source, ":") {
+		candidates = append(candidates, source)
+	}
+	for _, name := range []string{strings.TrimSpace(auth.FileName), strings.TrimSpace(auth.ID)} {
+		if name == "" {
+			continue
+		}
+		if filepath.IsAbs(name) {
+			candidates = append(candidates, name)
+		} else if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
+			candidates = append(candidates, filepath.Join(strings.TrimSpace(cfg.AuthDir), name))
+		}
+	}
+	for _, candidate := range candidates {
+		info, errStat := os.Stat(candidate)
+		if errStat != nil {
+			if os.IsNotExist(errStat) {
+				continue
+			}
+			return "", fmt.Errorf("codex executor: stat credential file %s: %w", candidate, errStat)
+		}
+		if !info.IsDir() {
+			return candidate, nil
+		}
+	}
+	return "", nil
+}
+
+func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
+	log.Debug("codex executor: refresh called")
+	var cfg *config.Config
+	if e != nil {
+		cfg = e.cfg
+	}
+	homeEnabled := cfg != nil && cfg.Home.Enabled
+	if auth == nil {
+		if refreshed, handled, errHome := helps.RefreshAuthViaHome(ctx, cfg, auth); handled {
+			return refreshed, errHome
+		}
+		return nil, statusErr{code: http.StatusInternalServerError, msg: "codex executor: auth is nil"}
+	}
+	diskPath, errPath := resolveCodexAuthDiskPath(cfg, auth)
+	if errPath != nil {
+		return nil, errPath
+	}
+	if diskPath != "" {
+		var refreshed *cliproxyauth.Auth
+		errLock := codexauth.WithFileLock(diskPath, func() error {
+			var errRefresh error
+			refreshed, errRefresh = e.refreshLocked(ctx, auth, diskPath, homeEnabled)
+			return errRefresh
+		})
+		return refreshed, errLock
+	}
+	return e.refreshLocked(ctx, auth, "", homeEnabled)
 }
 
 func (e *CodexExecutor) reloginAutoOAuth(ctx context.Context, auth *cliproxyauth.Auth, proxyURL string) (*codexauth.CodexTokenData, error) {
@@ -89,6 +194,30 @@ func applyCodexTokenData(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) 
 	if auth == nil || td == nil {
 		return
 	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["id_token"] = td.IDToken
+	auth.Metadata["access_token"] = td.AccessToken
+	if td.RefreshToken != "" {
+		auth.Metadata["refresh_token"] = td.RefreshToken
+	}
+	if td.AccountID != "" {
+		auth.Metadata["account_id"] = td.AccountID
+	}
+	auth.Metadata["email"] = td.Email
+	auth.Metadata["expired"] = td.Expire
+	auth.Metadata["type"] = "codex"
+	auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+}
+
+func (e *CodexExecutor) refreshLocked(ctx context.Context, auth *cliproxyauth.Auth, diskPath string, homeEnabled bool) (*cliproxyauth.Auth, error) {
+	var cfg *config.Config
+	if e != nil {
+		cfg = e.cfg
+	}
+	beforeRefresh := auth.Clone()
+	auth.CodexRefreshPatch = nil
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
@@ -172,9 +301,13 @@ func applyCodexTokenData(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) 
 	}
 
 	_, hasOuter, needOuter := cliproxyauth.CodexOuterNeedsRefresh(auth, now)
-	if outerRefreshToken == "" && !homeEnabled {
+	_, autoOAuth := codexauth.AutoOAuthCredentials(auth.Metadata)
+	if outerRefreshToken == "" && !homeEnabled && !autoOAuth {
 		hasOuter = false
 		needOuter = false
+	} else if outerRefreshToken == "" && autoOAuth && !homeEnabled {
+		hasOuter = true
+		needOuter = true
 	} else if homeEnabled && !hasOuter {
 		hasOuter = true
 		if outerExp, okExp := auth.OuterExpirationTime(); okExp && !outerExp.IsZero() && !outerExp.After(now.Add(cliproxyauth.CodexOuterRefreshLead)) {
@@ -234,7 +367,15 @@ func applyCodexTokenData(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) 
 		return auth, nil
 	}
 
-	svc := codexauth.NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)
+	proxyURL := auth.ProxyURL
+	if e != nil {
+		bound, errBinding := e.bindEgress(auth)
+		if errBinding != nil {
+			return nil, errBinding
+		}
+		proxyURL = bound.ProxyURL
+	}
+	svc := codexauth.NewCodexAuthWithProxyURL(cfg, proxyURL)
 
 	outerRefreshed := false
 	var outerErr error
@@ -284,23 +425,19 @@ func applyCodexTokenData(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) 
 				}
 			}
 		} else {
-			td, errOuter := svc.RefreshTokensWithRetry(ctx, outerRefreshToken, 3)
+			var td *codexauth.CodexTokenData
+			var errOuter error
+			if outerRefreshToken != "" {
+				td, errOuter = svc.RefreshTokensWithRetry(ctx, outerRefreshToken, 3)
+			}
+			if autoOAuth && (outerRefreshToken == "" || errOuter != nil) {
+				td, errOuter = e.reloginAutoOAuth(ctx, auth, proxyURL)
+			}
 			if errOuter != nil {
 				outerErr = errOuter
 			} else if td != nil {
 				outerRefreshed = true
-				auth.Metadata["id_token"] = td.IDToken
-				auth.Metadata["access_token"] = td.AccessToken
-				if td.RefreshToken != "" {
-					auth.Metadata["refresh_token"] = td.RefreshToken
-				}
-				if td.AccountID != "" {
-					auth.Metadata["account_id"] = td.AccountID
-				}
-				auth.Metadata["email"] = td.Email
-				auth.Metadata["expired"] = td.Expire
-				auth.Metadata["type"] = "codex"
-				auth.Metadata["last_refresh"] = time.Now().Format(time.RFC3339)
+				applyCodexTokenData(auth, td)
 
 				planType := strings.TrimSpace(td.PlanType)
 				if planType == "" && td.IDToken != "" {
@@ -403,12 +540,7 @@ func applyCodexTokenData(auth *cliproxyauth.Auth, td *codexauth.CodexTokenData) 
 		}
 		auth.Metadata = mergedDisk
 	}
-	auth.Metadata["email"] = td.Email
-	// Use unified key in files
-	auth.Metadata["expired"] = td.Expire
-	auth.Metadata["type"] = "codex"
-	now := time.Now().Format(time.RFC3339)
-	auth.Metadata["last_refresh"] = now
+	return auth, nil
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

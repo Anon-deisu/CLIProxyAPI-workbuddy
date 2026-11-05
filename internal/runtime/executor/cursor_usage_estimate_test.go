@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor"
 )
 
 var estimateMessages = []cursorlib.ChatMessage{

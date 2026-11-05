@@ -1525,7 +1525,7 @@ const file_aiserver_v1_aiserver_common_proto_rawDesc = "" +
 	"\x18_has_uncommitted_changes2\\\n" +
 	"\vBidiService\x12M\n" +
 	"\n" +
-	"BidiAppend\x12\x1e.aiserver.v1.BidiAppendRequest\x1a\x1f.aiserver.v1.BidiAppendResponseBVZTgithub.com/router-for-me/CLIProxyAPI/v7/internal/cursor/proto/aiserver/v1;aiserverv1b\x06proto3"
+	"BidiAppend\x12\x1e.aiserver.v1.BidiAppendRequest\x1a\x1f.aiserver.v1.BidiAppendResponseBVZTgithub.com/router-for-me/CLIProxyAPI/v8/internal/cursor/proto/aiserver/v1;aiserverv1b\x06proto3"
 
 var (
 	file_aiserver_v1_aiserver_common_proto_rawDescOnce sync.Once

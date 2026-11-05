@@ -7,8 +7,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/workbuddy"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/workbuddy"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestWorkBuddyAccountCatalogIsRegionalAndEnterpriseScoped(t *testing.T) {

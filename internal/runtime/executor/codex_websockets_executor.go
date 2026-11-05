@@ -9,10 +9,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/MoeForge/moego/ojson"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -36,13 +38,24 @@ type CodexAutoExecutor struct {
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
+	httpExec := NewCodexExecutor(cfg)
+	wsExec := NewCodexWebsocketsExecutor(cfg)
+	if cfg != nil {
+		httpExec.cfg = cfg
+		wsExec.CodexExecutor.cfg = cfg
+	}
 	return &CodexAutoExecutor{
-		httpExec: NewCodexExecutor(cfg),
-		wsExec:   NewCodexWebsocketsExecutor(cfg),
+		httpExec: httpExec,
+		wsExec:   wsExec,
 	}
 }
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
+
+// UsesConfig reports whether the executor was created for cfg.
+func (e *CodexAutoExecutor) UsesConfig(cfg *config.Config) bool {
+	return e != nil && e.httpExec != nil && e.httpExec.cfg == cfg
+}
 
 // ForAPIKey retains WebSocket sessions and the shared proxy binding manager.
 func (e *CodexAutoExecutor) ForAPIKey() cliproxyauth.ProviderExecutor {

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	cursorlib "github.com/router-for-me/CLIProxyAPI/v7/internal/cursor"
+	cursorlib "github.com/router-for-me/CLIProxyAPI/v8/internal/cursor"
 )
 
 func TestTurnsWithNothingForTheClientAreFailures(t *testing.T) {

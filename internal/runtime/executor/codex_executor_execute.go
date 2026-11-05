@@ -103,11 +103,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	body = upstreamBody
+	identityState := codexIdentityStateForRequest(httpReq)
 	reporter.SetTranslatedReasoningEffort(upstreamBody, to.String())
 	prepareHeaders := func(request *http.Request) {
 		applyCodexHeaders(request, auth, apiKey, true, e.cfg, opts.Headers)
 		applyCodexRoutingHint(ctx, request.Header, auth, baseModel, upstreamBody, opts.Headers)
 		applyModelHeaderOverrides(request.Header, baseModel)
+		applyCodexIdentityConfuseHeaders(request.Header, identityState)
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
@@ -211,6 +213,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		var param any
+		completedData = applyCodexIdentityExposeResponsePayload(completedData, *identityState)
 		out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, completedData, &param)
 		if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
 			return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
@@ -298,11 +301,13 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	body = upstreamBody
+	identityState := codexIdentityStateForRequest(httpReq)
 	reporter.SetTranslatedReasoningEffort(upstreamBody, to.String())
 	prepareHeaders := func(request *http.Request) {
 		applyCodexHeaders(request, auth, apiKey, false, e.cfg, opts.Headers)
 		applyCodexRoutingHint(ctx, request.Header, auth, baseModel, upstreamBody, opts.Headers)
 		applyModelHeaderOverrides(request.Header, baseModel)
+		applyCodexIdentityConfuseHeaders(request.Header, identityState)
 		alignCodexContentEncoding(request)
 	}
 	prepareHeaders(httpReq)
@@ -351,6 +356,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	upstreamData := helps.RestoreCodexMultiAgentV2Response(data, optimizeMultiAgentV2)
+	upstreamData = applyCodexIdentityExposeResponsePayload(upstreamData, *identityState)
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, upstreamData, &param)
 	if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {

@@ -7,12 +7,12 @@ import (
 	"path/filepath"
 	"testing"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 type serviceTestPluginExecutor struct{}
@@ -122,7 +122,8 @@ func TestCodexEgressManagerSurvivesExecutorReplacement(t *testing.T) {
 	if replacement == initial {
 		t.Fatal("executor was not replaced")
 	}
-	if replacement.(*runtimeexecutor.CodexAutoExecutor).CodexEgressManager() != keeper {
+	codexReplacement, ok := replacement.(*codexServiceExecutor)
+	if !ok || codexReplacement.CodexEgressManager() != keeper {
 		t.Fatal("config reload lost the service-owned egress manager")
 	}
 	service.cfg = &config.Config{}
