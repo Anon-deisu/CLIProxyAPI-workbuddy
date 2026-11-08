@@ -54,9 +54,22 @@ func (cfg *Config) CloneForReload(previous *Config) *Config {
 		value := *previous.Routing.WorkBuddyFingerprintConvergence
 		cloned.Routing.WorkBuddyFingerprintConvergence = &value
 	}
+	for _, setting := range []struct{ current, previous **bool }{
+		{&cloned.Routing.WorkBuddyAutoCheckin, &previous.Routing.WorkBuddyAutoCheckin},
+		{&cloned.Routing.WorkBuddyAutoTasks, &previous.Routing.WorkBuddyAutoTasks},
+	} {
+		if *setting.current == nil && *setting.previous != nil {
+			value := **setting.previous
+			*setting.current = &value
+		}
+	}
 	if cloned.Routing.CodexRoutingHint == nil && previous.Routing.CodexRoutingHint != nil {
 		value := *previous.Routing.CodexRoutingHint
 		cloned.Routing.CodexRoutingHint = &value
+	}
+	if cloned.Routing.WorkBuddyCheckinIntervalSeconds == nil && previous.Routing.WorkBuddyCheckinIntervalSeconds != nil {
+		value := *previous.Routing.WorkBuddyCheckinIntervalSeconds
+		cloned.Routing.WorkBuddyCheckinIntervalSeconds = &value
 	}
 	if cloned.Routing.CodexStaticISP == nil && previous.Routing.CodexStaticISP != nil {
 		cloned.Routing.CodexStaticISP = cloneRuntimeValue(reflect.ValueOf(previous.Routing.CodexStaticISP)).Interface().(*CodexStaticISPConfig)

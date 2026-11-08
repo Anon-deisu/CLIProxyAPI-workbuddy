@@ -36,6 +36,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.POST("/models/refresh", s.mgmt.RefreshModelDefinitions)
 
 	v8.GET("/observability/logs", s.mgmt.GetLogs)
+	v8.GET("/observability/performance", s.mgmt.GetPerformance)
 	v8.DELETE("/observability/logs", s.mgmt.DeleteLogs)
 	v8.GET("/observability/logs/errors", s.mgmt.GetRequestErrorLogs)
 	v8.GET("/observability/logs/errors/:name", s.mgmt.DownloadRequestErrorLog)
@@ -49,6 +50,8 @@ func (s *Server) registerManagementV8Routes() {
 	v8.DELETE("/credentials", s.mgmt.DeleteAuthFileV8)
 	v8.GET("/credentials/models", s.mgmt.GetAuthFileModels)
 	v8.GET("/credentials/workbuddy-quota", s.mgmt.GetWorkBuddyQuota)
+	v8.GET("/credentials/workbuddy-tasks", s.mgmt.GetWorkBuddyTasks)
+	v8.POST("/credentials/workbuddy-tasks/run", s.mgmt.RunWorkBuddyTasks)
 	v8.GET("/credentials/qoder-quota", s.mgmt.GetQoderQuota)
 	v8.POST("/credentials/qoder-checkin", s.mgmt.PostQoderCheckIn)
 	v8.GET("/credentials/download", s.mgmt.DownloadAuthFile)

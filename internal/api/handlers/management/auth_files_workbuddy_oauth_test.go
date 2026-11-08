@@ -105,6 +105,267 @@ func TestWorkBuddyQuotaRejectsMissingAndUnrelatedCredentials(t *testing.T) {
 	}
 }
 
+func TestWorkBuddyTaskServicePersistsWithoutOverwritingConcurrentChanges(t *testing.T) {
+	reportStarted := make(chan struct{})
+	releaseReport := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseReport) })
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/activity/growth/streak":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"streak":{"days":1}}}`))
+		case "/v2/report":
+			close(reportStarted)
+			select {
+			case <-releaseReport:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0}`))
+		default:
+			t.Errorf("unexpected task endpoint: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	record := workbuddy.NewAuthRecord(workbuddy.ProviderAI, workbuddy.Credentials{UID: "uid", AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()})
+	record.Metadata["base_url"] = upstream.URL
+	auth, errRegister := manager.Register(t.Context(), record)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	service := NewWorkBuddyTaskService(&config.Config{}, manager)
+	defer service.Close()
+	if !service.execute(auth, false, true, "manual") {
+		t.Fatal("task execution did not start")
+	}
+	<-reportStarted
+	done, acquired := service.acquire(auth.ID)
+	if acquired || service.execute(auth, false, true, "manual") {
+		t.Fatal("duplicate task execution started")
+	}
+	_, _, errModify := manager.Modify(t.Context(), auth.ID, auth.RegistrationEpoch, func(current *coreauth.Auth) error {
+		current.Disabled = true
+		current.Prefix = "changed-during-task"
+		current.Metadata["access_token"] = "new-access"
+		return nil
+	})
+	if errModify != nil {
+		t.Fatal(errModify)
+	}
+	releaseOnce.Do(func() { close(releaseReport) })
+	<-done
+	status := service.Cached(auth)
+	if status.Running || status.LastRun == nil || !status.LastRun.OK || !status.Activity.Completed {
+		t.Fatalf("completed task status is stale: %+v", status)
+	}
+	current, _ := manager.GetByID(auth.ID)
+	if !current.Disabled || current.Prefix != "changed-during-task" || current.Metadata["access_token"] != "new-access" || current.Metadata["workbuddy_last_activity_at"] == nil {
+		t.Fatal("task persistence overwrote concurrent account changes or lost activity")
+	}
+}
+
+func TestWorkBuddyTaskServiceCloseWaitsForActiveTasks(t *testing.T) {
+	service := NewWorkBuddyTaskService(&config.Config{}, nil)
+	done, acquired := service.acquire("account")
+	if !acquired {
+		t.Fatal("task slot was not acquired")
+	}
+	closed := make(chan struct{})
+	go func() {
+		service.Close()
+		close(closed)
+	}()
+	<-service.ctx.Done()
+	select {
+	case <-closed:
+		t.Fatal("service closed before its task finished")
+	default:
+	}
+	service.release("account", done)
+	<-closed
+	if _, acquired := service.acquire("another-account"); acquired {
+		t.Fatal("closed service accepted a new task")
+	}
+}
+
+func TestWorkBuddyAutomaticCheckinsRespectConfiguredInterval(t *testing.T) {
+	for _, stop := range []bool{false, true} {
+		t.Run(map[bool]string{false: "complete", true: "cancel"}[stop], func(t *testing.T) {
+			var checkins, requests atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				switch r.URL.Path {
+				case "/v2/billing/meter/checkin-activity-status":
+					_, _ = w.Write([]byte(`{"code":0,"data":{"today_checked_in":false}}`))
+				case "/v2/billing/meter/daily-checkin":
+					checkins.Add(1)
+					_, _ = w.Write([]byte(`{"code":0,"msg":"checked","data":{"credit":30}}`))
+				case "/activity/growth/streak":
+					_, _ = w.Write([]byte(`{"code":0,"data":{"streak":{"days":1}}}`))
+				case "/v2/activity/growth/tasks":
+					_, _ = w.Write([]byte(`{"code":0,"data":{"tasks":[]}}`))
+				default:
+					t.Errorf("unexpected request: %s", r.URL.Path)
+				}
+			}))
+			defer upstream.Close()
+			manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+			var accounts []*coreauth.Auth
+			for _, uid := range []string{"first", "second"} {
+				auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: uid, AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()})
+				auth.Metadata["base_url"], auth.Metadata["billing_url"] = upstream.URL, upstream.URL
+				registered, errRegister := manager.Register(t.Context(), auth)
+				if errRegister != nil {
+					t.Fatal(errRegister)
+				}
+				accounts = append(accounts, registered)
+			}
+			service := NewWorkBuddyTaskService(&config.Config{Routing: config.RoutingConfig{WorkBuddyAutoCheckin: new(true), WorkBuddyCheckinIntervalSeconds: new(12)}}, manager)
+			defer service.Close()
+			waits := 0
+			service.wait = func(ctx context.Context, interval time.Duration) error {
+				waits++
+				if interval != 12*time.Second || checkins.Load() != 1 {
+					t.Fatalf("accounts were not spaced: interval=%v checkins=%d", interval, checkins.Load())
+				}
+				if stop {
+					service.cancel()
+					return ctx.Err()
+				}
+				return nil
+			}
+			service.runAutomatic()
+			want := int32(2)
+			if stop {
+				want = 1
+			}
+			if waits != 1 || checkins.Load() != want {
+				t.Fatalf("unexpected batch: waits=%d checkins=%d", waits, checkins.Load())
+			}
+			if !stop {
+				for _, auth := range accounts {
+					current, _ := manager.GetByID(auth.ID)
+					if !service.Cached(current).Checkin.CheckedIn {
+						t.Fatal("confirmed checkin regressed while upstream status was stale")
+					}
+				}
+				beforeRequests := requests.Load()
+				beforeRun := service.Cached(accounts[0]).LastRun
+				service.runAutomatic()
+				if requests.Load() != beforeRequests || waits != 1 {
+					t.Fatal("completed accounts performed another automatic task cycle")
+				}
+				if service.execute(accounts[0], true, false, "auto") {
+					t.Fatal("a stale account snapshot restarted a completed checkin")
+				}
+				afterRun := service.Cached(accounts[0]).LastRun
+				if afterRun.StartedAt != beforeRun.StartedAt || afterRun.EarnedCredit != beforeRun.EarnedCredit {
+					t.Fatal("a skipped checkin replaced the successful task result")
+				}
+				restarted := NewWorkBuddyTaskService(&config.Config{Routing: config.RoutingConfig{WorkBuddyAutoCheckin: new(true)}}, manager)
+				defer restarted.Close()
+				restarted.runAutomatic()
+				if requests.Load() != beforeRequests {
+					t.Fatal("service restart forgot persisted checkin completion")
+				}
+				current, _ := manager.GetByID(accounts[0].ID)
+				_, _, errModify := manager.Modify(t.Context(), current.ID, current.RegistrationEpoch, func(updated *coreauth.Auth) error {
+					updated.Metadata["workbuddy_last_checkin_at"] = time.Now().AddDate(0, 0, -1).UTC().Format(time.RFC3339)
+					return nil
+				})
+				if errModify != nil {
+					t.Fatal(errModify)
+				}
+				restarted.runAutomatic()
+				if checkins.Load() != 3 {
+					t.Fatal("a previous-day checkin prevented the next daily checkin")
+				}
+			}
+		})
+	}
+}
+
+func TestWorkBuddyAutomaticCheckinPreservesEnabledGrowth(t *testing.T) {
+	var checkins, reports atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/billing/meter/checkin-activity-status":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"today_checked_in":false}}`))
+		case "/v2/billing/meter/daily-checkin":
+			checkins.Add(1)
+			_, _ = w.Write([]byte(`{"code":0}`))
+		case "/activity/growth/streak":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"streak":{"days":1}}}`))
+		case "/v2/activity/growth/tasks":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"tasks":[]}}`))
+		case "/v2/report":
+			reports.Add(1)
+			_, _ = w.Write([]byte(`{"code":0}`))
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: "uid", AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()})
+	auth.Metadata["base_url"], auth.Metadata["billing_url"] = upstream.URL, upstream.URL
+	auth.Metadata["workbuddy_last_checkin_at"] = time.Now().UTC().Format(time.RFC3339)
+	registered, errRegister := manager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	service := NewWorkBuddyTaskService(&config.Config{Routing: config.RoutingConfig{WorkBuddyAutoCheckin: new(true), WorkBuddyAutoTasks: new(true)}}, manager)
+	defer service.Close()
+	service.runAutomatic()
+	result := service.Cached(registered).LastRun
+	if checkins.Load() != 0 || reports.Load() != 1 || result == nil || !result.OK {
+		t.Fatalf("checkin suppression stopped enabled growth: checkins=%d reports=%d result=%+v", checkins.Load(), reports.Load(), result)
+	}
+	for _, task := range result.Results {
+		if task.Code == "checkin" {
+			t.Fatal("automatic execution re-enabled an already completed checkin")
+		}
+	}
+}
+
+func TestWorkBuddyAutomaticCheckinRemembersUpstreamCompletion(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		switch r.URL.Path {
+		case "/v2/billing/meter/checkin-activity-status":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"today_checked_in":true}}`))
+		case "/activity/growth/streak":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"streak":{"days":1}}}`))
+		case "/v2/activity/growth/tasks":
+			_, _ = w.Write([]byte(`{"code":0,"data":{"tasks":[]}}`))
+		default:
+			t.Errorf("completed upstream checkin made an unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+	manager := coreauth.NewManager(&memoryAuthStore{}, nil, nil)
+	auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: "uid", AccessToken: "access", RefreshToken: "refresh", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()})
+	auth.Metadata["base_url"], auth.Metadata["billing_url"] = upstream.URL, upstream.URL
+	registered, errRegister := manager.Register(t.Context(), auth)
+	if errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	service := NewWorkBuddyTaskService(&config.Config{Routing: config.RoutingConfig{WorkBuddyAutoCheckin: new(true)}}, manager)
+	defer service.Close()
+	service.runAutomatic()
+	current, _ := manager.GetByID(registered.ID)
+	if !workbuddy.CheckinCompletedToday(current, time.Now()) {
+		t.Fatal("upstream checkin completion was not persisted")
+	}
+	before := requests.Load()
+	service.runAutomatic()
+	if requests.Load() != before {
+		t.Fatal("confirmed upstream checkin was queried by another automatic cycle")
+	}
+}
+
 func (f *fakeWorkBuddyOAuth) Start(context.Context) (*workbuddy.LoginSession, error) {
 	return &workbuddy.LoginSession{State: "private-upstream-state", URL: "https://login.example/workbuddy"}, nil
 }

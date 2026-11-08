@@ -45,7 +45,7 @@ func TestManagementV8RoutesShareAccessControl(t *testing.T) {
 			s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
 			s.managementRoutesEnabled.Store(tc.enabled)
 			s.registerManagementRoutes()
-			for _, route := range []string{"/v0/management/config", "/v8/management/config", "/v0/management/plugins", "/v8/management/plugins"} {
+			for _, route := range []string{"/v0/management/config", "/v8/management/config", "/v0/management/plugins", "/v8/management/plugins", "/v8/management/observability/performance"} {
 				req := httptest.NewRequest(http.MethodGet, route, nil)
 				req.RemoteAddr = "127.0.0.1:1234"
 				if tc.authorized {
@@ -88,7 +88,9 @@ func TestManagementV8IndependentContract(t *testing.T) {
 	for _, route := range []string{
 		"GET /v0/management/debug", "PUT /v0/management/request-retry", "GET /v0/management/auth-files",
 		"GET /v8/management/observability/logs", "GET /v8/management/observability/usage/queue",
+		"GET /v8/management/observability/performance",
 		"GET /v8/management/credentials", "POST /v8/management/credentials", "POST /v8/management/credentials/verify",
+		"GET /v8/management/credentials/workbuddy-tasks", "POST /v8/management/credentials/workbuddy-tasks/run",
 		"GET /v8/management/oauth/auth-url", "POST /v8/management/oauth/auth-url", "POST /v8/management/oauth/import", "POST /v8/management/oauth/callback",
 		"POST /v8/management/routing/cooldown/reset",
 		"POST /v8/management/routing/model-definitions/refresh",
@@ -115,6 +117,8 @@ func TestManagementV8IndependentContract(t *testing.T) {
 	for _, legacy := range []string{"debug", "request-retry", "api-keys", "codex-api-key", "auth-files", "codex-auth-url", "oauth/providers/codex/auth-url", "plugins/test-plugin/config"} {
 		request(http.MethodGet, "/v8/management/"+legacy, "", http.StatusNotFound)
 	}
+	request(http.MethodGet, "/v0/management/workbuddy-tasks", "", http.StatusNotFound)
+	request(http.MethodPost, "/v0/management/workbuddy-tasks/run", `{}`, http.StatusNotFound)
 	for _, route := range []struct{ method, path string }{
 		{http.MethodGet, "/v8/management/credentials/quota/providers"},
 		{http.MethodPost, "/v8/management/credentials/quota/fetch"},

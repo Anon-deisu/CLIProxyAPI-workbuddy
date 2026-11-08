@@ -532,6 +532,12 @@ type RoutingConfig struct {
 	// WorkBuddyFingerprintConvergence pins WorkBuddy conversation identity per account.
 	// Nil inherits across reloads; false restores caller-owned conversation headers.
 	WorkBuddyFingerprintConvergence *bool `yaml:"-" json:"workbuddy-fingerprint-convergence,omitempty"`
+	// WorkBuddyAutoCheckin enables daily check-in for personal China-region accounts.
+	WorkBuddyAutoCheckin *bool `yaml:"-" json:"workbuddy-auto-checkin,omitempty"`
+	// WorkBuddyCheckinIntervalSeconds spaces automatic account check-ins.
+	WorkBuddyCheckinIntervalSeconds *int `yaml:"-" json:"workbuddy-checkin-interval-seconds,omitempty"`
+	// WorkBuddyAutoTasks enables supported growth tasks and daily activity for both regions.
+	WorkBuddyAutoTasks *bool `yaml:"-" json:"workbuddy-auto-tasks,omitempty"`
 	// CodexStaticISP pins inference to a fixed per-account proxy.
 	CodexStaticISP *CodexStaticISPConfig `yaml:"-" json:"codex-static-isp,omitempty"`
 	// CodexRoutingHint is a runtime-only upstream routing hint for Codex OAuth requests.
@@ -680,6 +686,9 @@ type AccountSchedulingConfig struct {
 	C2AMaxRetryCredentials          *int                     `yaml:"c2a-max-retry-credentials"`
 	CodexFingerprintConvergence     *bool                    `yaml:"codex-fingerprint-convergence"`
 	WorkBuddyFingerprintConvergence *bool                    `yaml:"workbuddy-fingerprint-convergence"`
+	WorkBuddyAutoCheckin            *bool                    `yaml:"workbuddy-auto-checkin"`
+	WorkBuddyCheckinIntervalSeconds *int                     `yaml:"workbuddy-checkin-interval-seconds"`
+	WorkBuddyAutoTasks              *bool                    `yaml:"workbuddy-auto-tasks"`
 	CodexRoutingHint                *string                  `yaml:"codex-routing-hint"`
 	CodexStaticISP                  *CodexStaticISPConfig    `yaml:"codex-static-isp"`
 	CacheTokenRewrite               *CacheTokenRewriteConfig `yaml:"cache-token-rewrite"`
@@ -697,6 +706,9 @@ func (cfg *Config) AccountSchedulingSnapshot() *AccountSchedulingConfig {
 		C2AMaxRetryCount: routing.C2AMaxRetryCount, C2AMaxRetryInterval: routing.C2AMaxRetryInterval, C2AMaxRetryCredentials: routing.C2AMaxRetryCredentials,
 		CodexFingerprintConvergence:     routing.CodexFingerprintConvergence,
 		WorkBuddyFingerprintConvergence: routing.WorkBuddyFingerprintConvergence,
+		WorkBuddyAutoCheckin:            routing.WorkBuddyAutoCheckin,
+		WorkBuddyCheckinIntervalSeconds: routing.WorkBuddyCheckinIntervalSeconds,
+		WorkBuddyAutoTasks:              routing.WorkBuddyAutoTasks,
 		CodexRoutingHint:                routing.CodexRoutingHint,
 		CodexStaticISP:                  routing.CodexStaticISP, CacheTokenRewrite: cloned.CacheTokenRewrite,
 		FakeModels: routing.FakeModels,
@@ -718,6 +730,9 @@ func (settings *AccountSchedulingConfig) apply(cfg *Config) {
 	cfg.Routing.C2AMaxRetryCredentials = settings.C2AMaxRetryCredentials
 	cfg.Routing.CodexFingerprintConvergence = settings.CodexFingerprintConvergence
 	cfg.Routing.WorkBuddyFingerprintConvergence = settings.WorkBuddyFingerprintConvergence
+	cfg.Routing.WorkBuddyAutoCheckin = settings.WorkBuddyAutoCheckin
+	cfg.Routing.WorkBuddyCheckinIntervalSeconds = settings.WorkBuddyCheckinIntervalSeconds
+	cfg.Routing.WorkBuddyAutoTasks = settings.WorkBuddyAutoTasks
 	cfg.Routing.CodexRoutingHint = settings.CodexRoutingHint
 	cfg.Routing.CodexStaticISP = settings.CodexStaticISP
 	cfg.CacheTokenRewrite = settings.CacheTokenRewrite
@@ -746,6 +761,9 @@ func (cfg *Config) restoreAccountScheduling() error {
 	}
 	if settings.C2AMaxRetryInterval != nil && *settings.C2AMaxRetryInterval < 0 {
 		return fmt.Errorf("account-scheduling.c2a-max-retry-interval must be non-negative")
+	}
+	if settings.WorkBuddyCheckinIntervalSeconds != nil && (*settings.WorkBuddyCheckinIntervalSeconds < 1 || *settings.WorkBuddyCheckinIntervalSeconds > 86400) {
+		return fmt.Errorf("account-scheduling.workbuddy-checkin-interval-seconds must be between 1 and 86400")
 	}
 	if settings.CacheTokenRewrite != nil {
 		if errValidate := settings.CacheTokenRewrite.Validate(); errValidate != nil {

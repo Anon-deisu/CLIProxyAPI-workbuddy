@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,10 +31,12 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/openai"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
@@ -111,7 +114,8 @@ type Server struct {
 	wsAuthEnabled atomic.Bool
 
 	// management handler
-	mgmt *managementHandlers.Handler
+	mgmt        *managementHandlers.Handler
+	requestRate coreusage.RequestRate
 
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
@@ -225,6 +229,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Add middleware
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.CPATraceIDMiddleware())
+	engine.Use(s.trackInferenceArrivals())
 	engine.Use(s.maxRequestBodyBytesMiddleware())
 
 	// Add request logging middleware before recovery and extra middleware so that
@@ -265,6 +270,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applyClaudeToolSearchConfig(cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetRequestRate(&s.requestRate)
+	if configFilePath != "" {
+		base := filepath.Dir(configFilePath)
+		if writable := util.WritablePath(); writable != "" {
+			base = writable
+		}
+		if errStore := s.mgmt.SetPerformanceStore(filepath.Join(base, "runtime", "network-traffic.json")); errStore != nil {
+			log.WithError(errStore).Warn("performance: daily traffic persistence unavailable")
+		}
+	}
 
 	// One-time first-boot migration: the old standalone-page manager persisted
 	// Cursor API keys inside config.yaml ("cursor-api-key" block). The current
@@ -441,6 +456,16 @@ func (s *Server) Start() error {
 
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)
+	monitorCtx, stopMonitor := context.WithCancel(context.Background())
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		s.mgmt.RunPerformance(monitorCtx)
+	}()
+	defer func() {
+		stopMonitor()
+		<-monitorDone
+	}()
 
 	go func() {
 		httpErrCh <- s.server.Serve(httpListener)
@@ -549,6 +574,9 @@ func (s *Server) Stop(ctx context.Context) error {
 		if errors.Is(errCloseServer, http.ErrServerClosed) || errors.Is(errCloseServer, net.ErrClosed) {
 			errCloseServer = nil
 		}
+	}
+	if s.mgmt != nil {
+		s.mgmt.CloseWorkBuddyTasks()
 	}
 	if s.codexLiveHandler != nil {
 		s.codexLiveHandler.Close()

@@ -436,6 +436,11 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		data = patched
 	}
 	c.Header("Pragma", "no-cache")
+	if patched, errPerformance := managementasset.AddPerformanceToManagementHTML(data); errPerformance != nil {
+		log.WithError(errPerformance).Warn("management control panel does not support performance monitoring")
+	} else {
+		data = patched
+	}
 	c.Header("Expires", "0")
 	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }

@@ -3,6 +3,7 @@ package workbuddy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -96,6 +97,24 @@ func TestRefreshPreservesIdentityAndRotatesTokens(t *testing.T) {
 	}
 	if got.AccessToken != "new-access" || got.RefreshToken != "new-refresh" || got.UID != "uid" || got.Domain != "account.example" || got.EnterpriseID != "team" {
 		t.Fatal("refresh lost identity or token rotation")
+	}
+}
+
+func TestRefreshReportsUpstreamRevokedGrant(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Refresh-Token") != "revoked-refresh" {
+			t.Error("refresh request lost the stored grant")
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":12153,"msg":"12153:refresh token failed:idsvc token: invalid_grant: refresh token revoked (http 401)"}`))
+	}))
+	defer server.Close()
+	service := NewService(ProviderCN, server.Client())
+	service.SetEndpoint(server.URL)
+	_, err := service.Refresh(t.Context(), Credentials{RefreshToken: "revoked-refresh", RefreshExpiresAt: time.Now().Add(time.Hour).UnixMilli()})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != 12153 || apiErr.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("revoked grant did not preserve the upstream failure: %v", err)
 	}
 }
 

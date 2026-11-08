@@ -26,6 +26,7 @@ func TestQoderManagementCompletePatchChain(t *testing.T) {
 		{"Codex auto OAuth", AddCodexAutoOAuthToManagementHTML},
 		{"Agent workspace", AddAgentWorkspaceToManagementHTML},
 		{"Rolling usage", AddRollingTokenUsageToManagementHTML},
+		{"Performance", AddPerformanceToManagementHTML},
 	}
 	for _, patch := range patches {
 		var errPatch error
@@ -173,6 +174,23 @@ for (const provider of ['qoder','qoder-cn','workbuddy','workbuddy-ai','claude','
   assert(context.OM.includes(provider), 'quota tab missing: ' + provider);
 }
 for (const provider of ['qoder','qoder-cn','workbuddy','workbuddy-ai']) assert.equal(typeof context.Wk[provider].storeSelector,'function',provider+' store selector is not callable');
+const pickerStart = source.indexOf('(0,U.jsxs)(\x60div\x60,{className:\x60cpa-quota-provider-picker\x60');
+assert(pickerStart >= 0, 'quota provider picker must separate the fixed All button');
+const pickerEnd = source.indexOf(']})', pickerStart) + 3;
+context.VA = 'native-provider-tabs';
+context.SN = ['all', ...context.OM];
+context.R = Object.fromEntries(context.SN.map((type, index) => [type,index+1]));
+context.l = 'workbuddy'; context.n = 'dark'; context.ie = type => {context.l=type;};
+const picker = run(source.slice(pickerStart, pickerEnd));
+const [allTabs, providerTabs] = picker.props.children;
+assert.deepEqual(Array.from(allTabs.props.types), ['all']);
+assert.deepEqual(Array.from(providerTabs.props.types), Array.from(context.OM));
+assert.equal(providerTabs.props.active, 'workbuddy');
+assert.equal(providerTabs.props.counts.workbuddy, context.R.workbuddy);
+providerTabs.props.onChange('workbuddy-ai');
+assert.equal(context.l, 'workbuddy-ai', 'provider selection must retain the native change handler');
+allTabs.props.onChange('all');
+assert.equal(context.l, 'all', 'fixed All must still reset the native filter');
 assert.equal(context.Wk.claude.Body, 'KO');
 for (const [provider, site] of [['qoder','Qoder International'],['qoder-cn','Qoder China'],['workbuddy','workbuddy_quota.site_cn'],['workbuddy-ai','workbuddy_quota.site_ai']]) {
   assert.equal(context.PD(translate,provider), site);

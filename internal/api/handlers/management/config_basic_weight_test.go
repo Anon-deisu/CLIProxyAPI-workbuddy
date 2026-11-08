@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -129,6 +130,80 @@ func TestWorkBuddyFingerprintRoutingSettings(t *testing.T) {
 	}
 	if get(NewHandlerWithoutConfigFilePath(fresh, nil)) {
 		t.Fatal("explicit false did not persist")
+	}
+}
+
+func TestWorkBuddyTaskRoutingSettings(t *testing.T) {
+	for _, key := range []string{"workbuddy-auto-checkin", "workbuddy-auto-tasks"} {
+		t.Run(key, func(t *testing.T) {
+			path := writeTestConfigFile(t)
+			h := NewHandler(&config.Config{}, path, nil)
+			defer h.CloseWorkBuddyTasks()
+			patch := func(body string, want int) {
+				t.Helper()
+				rec := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(rec)
+				ctx.Request = httptest.NewRequest(http.MethodPatch, "/v8/management/routing/settings", strings.NewReader(body))
+				h.PutRoutingSettings(ctx)
+				if rec.Code != want {
+					t.Fatalf("PATCH: %d %s", rec.Code, rec.Body.String())
+				}
+			}
+			get := func() bool {
+				t.Helper()
+				rec := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(rec)
+				h.GetRoutingSettings(ctx)
+				return ojson.GetBytes(rec.Body.Bytes(), key).Bool()
+			}
+			if get() {
+				t.Fatal("automatic tasks must default to off")
+			}
+			patch(`{"`+key+`":true,"codex-routing-hint":"invalid"}`, http.StatusBadRequest)
+			if get() {
+				t.Fatal("invalid settings changed the task switch")
+			}
+			patch(`{"`+key+`":true,"workbuddy-checkin-interval-seconds":12}`, http.StatusOK)
+			if !get() {
+				t.Fatal("task switch was not enabled")
+			}
+			select {
+			case <-h.workBuddyTasks.wake:
+			default:
+				t.Fatal("enabling tasks did not wake the task service")
+			}
+			h.SetConfig(&config.Config{})
+			if !get() {
+				t.Fatal("reload lost the task switch")
+			}
+			if h.cfg.Routing.WorkBuddyCheckinIntervalSeconds == nil || *h.cfg.Routing.WorkBuddyCheckinIntervalSeconds != 12 {
+				t.Fatal("reload lost the checkin interval")
+			}
+			patch(`{"persist-settings":true}`, http.StatusOK)
+			fresh, errLoad := config.LoadConfig(path)
+			if errLoad != nil {
+				t.Fatal(errLoad)
+			}
+			value := fresh.Routing.WorkBuddyAutoCheckin
+			if key == "workbuddy-auto-tasks" {
+				value = fresh.Routing.WorkBuddyAutoTasks
+			}
+			if value == nil || !*value {
+				t.Fatal("task switch was not persisted")
+			}
+			if fresh.Routing.WorkBuddyCheckinIntervalSeconds == nil || *fresh.Routing.WorkBuddyCheckinIntervalSeconds != 12 {
+				t.Fatal("checkin interval was not persisted")
+			}
+			patch(`{"workbuddy-checkin-interval-seconds":0}`, http.StatusBadRequest)
+			patch(`{"workbuddy-checkin-interval-seconds":-1}`, http.StatusBadRequest)
+			patch(`{"workbuddy-checkin-interval-seconds":86401}`, http.StatusBadRequest)
+			patch(`{"`+key+`":false}`, http.StatusOK)
+			h.SetConfig(&config.Config{})
+			_, checkin, growth := h.workBuddyTasks.configuration()
+			if get() || checkin || growth {
+				t.Fatal("disabled tasks were re-enabled on reload")
+			}
+		})
 	}
 }
 

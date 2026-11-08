@@ -398,6 +398,9 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	exoFreePort := 0
 	codexFingerprintConvergence := false
 	workBuddyFingerprintConvergence := false
+	workBuddyAutoCheckin := false
+	workBuddyCheckinInterval := workBuddyDefaultCheckinIntervalSeconds
+	workBuddyAutoTasks := false
 	staticISPEnabled := false
 	staticISPNodes := make([]gin.H, 0)
 	fakeModels := make([]config.FakeModelConfig, 0)
@@ -426,6 +429,15 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 		if cfg.Routing.WorkBuddyFingerprintConvergence != nil {
 			workBuddyFingerprintConvergence = *cfg.Routing.WorkBuddyFingerprintConvergence
 		}
+		if cfg.Routing.WorkBuddyAutoCheckin != nil {
+			workBuddyAutoCheckin = *cfg.Routing.WorkBuddyAutoCheckin
+		}
+		if cfg.Routing.WorkBuddyCheckinIntervalSeconds != nil {
+			workBuddyCheckinInterval = *cfg.Routing.WorkBuddyCheckinIntervalSeconds
+		}
+		if cfg.Routing.WorkBuddyAutoTasks != nil {
+			workBuddyAutoTasks = *cfg.Routing.WorkBuddyAutoTasks
+		}
 		if cfg.Routing.CodexStaticISP != nil {
 			staticISPEnabled = cfg.Routing.CodexStaticISP.Enabled
 			for _, node := range cfg.Routing.CodexStaticISP.Nodes {
@@ -452,26 +464,29 @@ func (h *Handler) GetRoutingSettings(c *gin.Context) {
 	h.mu.Unlock()
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{
-		"persist-settings":                  persistSettings,
-		"strategy":                          strategy,
-		"scheduler-mode":                    strategy,
-		"auto-disable-unauthorized":         unauthorized,
-		"auto-disable-quota":                quota,
-		"disable-cooling":                   disableCooling,
-		"c2a-max-retry-count":               c2aRetryCount,
-		"c2a-max-retry-interval":            c2aRetryInterval,
-		"c2a-max-retry-credentials":         c2aRetryCredentials,
-		"auth-concurrency-limit":            authConcurrencyLimit,
-		"degraded-port":                     degradedPort,
-		"degraded-port-configured":          degradedPortConfigured,
-		"exo-free-port":                     exoFreePort,
-		"codex-fingerprint-convergence":     codexFingerprintConvergence,
-		"workbuddy-fingerprint-convergence": workBuddyFingerprintConvergence,
-		"codex-routing-hint":                codexRoutingHint,
-		"codex-static-isp":                  gin.H{"enabled": staticISPEnabled, "nodes": staticISPNodes},
-		"cache-token-rewrite":               cacheTokenRewrite,
-		"fake-models":                       fakeModels,
-		"runtime_only":                      !persistSettings,
+		"persist-settings":                   persistSettings,
+		"strategy":                           strategy,
+		"scheduler-mode":                     strategy,
+		"auto-disable-unauthorized":          unauthorized,
+		"auto-disable-quota":                 quota,
+		"disable-cooling":                    disableCooling,
+		"c2a-max-retry-count":                c2aRetryCount,
+		"c2a-max-retry-interval":             c2aRetryInterval,
+		"c2a-max-retry-credentials":          c2aRetryCredentials,
+		"auth-concurrency-limit":             authConcurrencyLimit,
+		"degraded-port":                      degradedPort,
+		"degraded-port-configured":           degradedPortConfigured,
+		"exo-free-port":                      exoFreePort,
+		"codex-fingerprint-convergence":      codexFingerprintConvergence,
+		"workbuddy-fingerprint-convergence":  workBuddyFingerprintConvergence,
+		"workbuddy-auto-checkin":             workBuddyAutoCheckin,
+		"workbuddy-checkin-interval-seconds": workBuddyCheckinInterval,
+		"workbuddy-auto-tasks":               workBuddyAutoTasks,
+		"codex-routing-hint":                 codexRoutingHint,
+		"codex-static-isp":                   gin.H{"enabled": staticISPEnabled, "nodes": staticISPNodes},
+		"cache-token-rewrite":                cacheTokenRewrite,
+		"fake-models":                        fakeModels,
+		"runtime_only":                       !persistSettings,
 	})
 }
 
@@ -517,6 +532,9 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		ExoFreePort                     *int                            `json:"exo-free-port"`
 		CodexFingerprintConvergence     *bool                           `json:"codex-fingerprint-convergence"`
 		WorkBuddyFingerprintConvergence *bool                           `json:"workbuddy-fingerprint-convergence"`
+		WorkBuddyAutoCheckin            *bool                           `json:"workbuddy-auto-checkin"`
+		WorkBuddyCheckinIntervalSeconds *int                            `json:"workbuddy-checkin-interval-seconds"`
+		WorkBuddyAutoTasks              *bool                           `json:"workbuddy-auto-tasks"`
 		CodexStaticISP                  *staticISPConfigPatch           `json:"codex-static-isp"`
 		CodexRoutingHint                *string                         `json:"codex-routing-hint"`
 		CacheTokenRewrite               *config.CacheTokenRewriteConfig `json:"cache-token-rewrite"`
@@ -587,7 +605,11 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		}
 		body.CodexRoutingHint = &value
 	}
-	if body.PersistSettings == nil && mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.ExoFreePort == nil && body.CodexFingerprintConvergence == nil && body.WorkBuddyFingerprintConvergence == nil && body.CodexStaticISP == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil && body.FakeModels == nil {
+	if body.WorkBuddyCheckinIntervalSeconds != nil && (*body.WorkBuddyCheckinIntervalSeconds < 1 || *body.WorkBuddyCheckinIntervalSeconds > 86400) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "workbuddy-checkin-interval-seconds must be between 1 and 86400"})
+		return
+	}
+	if body.PersistSettings == nil && mode == nil && body.AutoDisableUnauthorized == nil && body.AutoDisableQuota == nil && body.DisableCooling == nil && body.C2AMaxRetryCount == nil && body.C2AMaxRetryInterval == nil && body.C2AMaxRetryCredentials == nil && body.AuthConcurrencyLimit == nil && body.DegradedPort == nil && body.ExoFreePort == nil && body.CodexFingerprintConvergence == nil && body.WorkBuddyFingerprintConvergence == nil && body.WorkBuddyAutoCheckin == nil && body.WorkBuddyCheckinIntervalSeconds == nil && body.WorkBuddyAutoTasks == nil && body.CodexStaticISP == nil && body.CodexRoutingHint == nil && body.CacheTokenRewrite == nil && body.FakeModels == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no settings to update"})
 		return
 	}
@@ -676,6 +698,18 @@ func (h *Handler) PutRoutingSettings(c *gin.Context) {
 		if body.WorkBuddyFingerprintConvergence != nil {
 			value := *body.WorkBuddyFingerprintConvergence
 			cfg.Routing.WorkBuddyFingerprintConvergence = &value
+		}
+		if body.WorkBuddyAutoCheckin != nil {
+			value := *body.WorkBuddyAutoCheckin
+			cfg.Routing.WorkBuddyAutoCheckin = &value
+		}
+		if body.WorkBuddyCheckinIntervalSeconds != nil {
+			value := *body.WorkBuddyCheckinIntervalSeconds
+			cfg.Routing.WorkBuddyCheckinIntervalSeconds = &value
+		}
+		if body.WorkBuddyAutoTasks != nil {
+			value := *body.WorkBuddyAutoTasks
+			cfg.Routing.WorkBuddyAutoTasks = &value
 		}
 		if body.CodexRoutingHint != nil {
 			value := *body.CodexRoutingHint

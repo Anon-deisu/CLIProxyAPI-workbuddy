@@ -1,0 +1,97 @@
+.cpa-performance-layout {
+  align-items: start !important;
+  row-gap: 12px !important;
+  padding-top: 8px !important;
+  padding-bottom: 12px !important;
+}
+.cpa-performance-layout > [class*="heroCopy"] { grid-column: 1 / -1; gap: 6px; }
+.cpa-performance-layout > [class*="heroWire"] { display: none; }
+.cpa-performance {
+  --perf-cpu: #23864b;
+  --perf-memory: #9d670b;
+  --perf-down: #087e9b;
+  --perf-up: #b14180;
+  --perf-rpm: #5e63b8;
+  --perf-grid: var(--border-color, #d5d9d7);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 123px;
+  gap: 2px;
+  min-width: 0;
+  width: 100%;
+  max-width: 570px;
+  justify-self: end;
+  position: relative;
+  inset-inline-start: calc(clamp(24px, 4vw, 56px) - 8px);
+  color: var(--text-primary, #24292d);
+  font: 16.5px/1.2 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+[data-theme="dark"] .cpa-performance {
+  --perf-cpu: #76d795;
+  --perf-memory: #e9bd62;
+  --perf-down: #60cddd;
+  --perf-up: #e18fc2;
+  --perf-rpm: #aba5f1;
+}
+.cpa-performance *, .cpa-performance *::before, .cpa-performance *::after { box-sizing: border-box; letter-spacing: 0; }
+.cpa-performance-status { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.cpa-performance[data-state="stale"] fieldset,
+.cpa-performance[data-state="unavailable"] fieldset { border-color: var(--perf-memory); }
+.cpa-performance[data-state="stale"] .cpa-performance-value { opacity: .5; }
+.cpa-performance fieldset { margin: 0; padding: 0 10.5px 4.5px; min-width: 0; border: 1px solid var(--perf-grid); border-radius: 4.5px; background: var(--bg-primary); }
+.cpa-performance legend { padding: 0 6px; font-size: 13.5px; font-weight: 700; }
+.cpa-performance-cpu, .cpa-performance-net { grid-column: 1 / -1; }
+.cpa-performance .cpa-performance-cpu { padding-top: 4.5px; }
+.cpa-performance-cpu legend, .cpa-performance-cpu .cpa-performance-value { color: var(--perf-cpu); }
+.cpa-performance-memory legend, .cpa-performance-memory .cpa-performance-value { color: var(--perf-memory); }
+.cpa-performance-rpm legend, .cpa-performance-rpm .cpa-performance-value { color: var(--perf-rpm); }
+.cpa-performance-net legend { color: var(--perf-down); }
+.cpa-performance-row { display: flex; align-items: center; justify-content: space-between; gap: 7.5px; min-width: 0; }
+.cpa-performance-value { font-weight: 600; white-space: nowrap; }
+.cpa-performance-total { font-size: 21px; }
+.cpa-performance-muted { color: var(--text-secondary); font-size: 13.5px; }
+.cpa-performance-meter { height: 7.5px; flex: 1; min-width: 18px; overflow: hidden; background: color-mix(in srgb, var(--perf-grid) 55%, transparent); }
+.cpa-performance-meter i { display: block; height: 100%; width: 0; background: repeating-linear-gradient(90deg, currentColor 0 1.5px, transparent 1.5px 2px); }
+.cpa-performance-cpu .cpa-performance-meter { color: var(--perf-cpu); }
+.cpa-performance .cpa-performance-memory { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 7.5px; padding-top: 4.5px; align-content: center; }
+.cpa-performance-memory .cpa-performance-row { justify-content: flex-start; }
+.cpa-performance-memory-label { font-size: 13.5px; color: var(--perf-memory); }
+.cpa-performance-memory .cpa-performance-meter { color: var(--perf-memory); grid-column: 1 / -1; grid-row: 2; height: 6px; }
+.cpa-performance-cores { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 15px; max-height: 36px; overflow: auto; scrollbar-width: thin; margin-top: 4.5px; }
+.cpa-performance-core { display: grid; grid-template-columns: 34.5px minmax(18px, 1fr) 48px; gap: 6px; align-items: center; font-size: 13.5px; }
+.cpa-performance-core b { text-align: right; font-weight: 500; }
+.cpa-performance-rpm { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 4.5px; }
+.cpa-performance-rpm .cpa-performance-value { font-size: 21px; line-height: 1.1; }
+.cpa-performance-rpm .cpa-performance-muted { white-space: nowrap; font-size: 12px; }
+.cpa-performance-memory-detail { display: block; grid-row: 1; grid-column: 2; align-self: center; text-align: right; font-size: 13.5px; overflow-wrap: anywhere; }
+.cpa-performance-net-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 3px 9px; }
+.cpa-performance .cpa-performance-net { padding-top: 4.5px; }
+.cpa-performance-net-selector { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--perf-down); font-size: 13.5px; }
+.cpa-performance select { max-width: 135px; min-width: 0; height: 25.5px; padding: 0 21px 0 4.5px; border: 1px solid var(--perf-grid); border-radius: 3px; color: var(--text-primary); background: var(--bg-primary); font: inherit; font-size: 13.5px; }
+.cpa-performance-rates { display: flex; flex-wrap: wrap; gap: 3px 12px; font-size: 15px; }
+.cpa-performance-down { color: var(--perf-down); }
+.cpa-performance-up { color: var(--perf-up); }
+.cpa-performance-plot { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px; margin-top: 3px; }
+.cpa-performance-y-axis { display: flex; flex-direction: column; justify-content: space-between; min-width: 72px; text-align: right; white-space: nowrap; font-size: 12px; line-height: 12px; color: var(--text-secondary); }
+.cpa-performance canvas { display: block; width: 100%; height: 48px; }
+.cpa-performance-axis { display: flex; justify-content: space-between; padding-left: 78px; font-size: 12px; color: var(--text-secondary); }
+.cpa-performance-daily { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 12px; margin-top: 3px; padding-top: 3px; border-top: 1px solid var(--perf-grid); }
+.cpa-performance-daily .cpa-performance-row { flex-wrap: wrap; font-size: 15px; }
+.cpa-performance-daily-note { grid-column: 1 / -1; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 3px 12px; font-size: 12px; color: var(--text-secondary); }
+.cpa-performance select:focus-visible, .cpa-performance-cores:focus-visible { outline: 2px solid var(--perf-down); outline-offset: 2px; }
+@media (max-width: 900px) {
+  .cpa-performance { justify-self: start; inset-inline-start: 0; }
+  .cpa-performance-layout { row-gap: 8px !important; }
+}
+@media (max-width: 420px) {
+  .cpa-performance { grid-template-columns: minmax(0, 1fr) 114px; }
+  .cpa-performance fieldset { padding-left: 7.5px; padding-right: 7.5px; }
+  .cpa-performance-cores { gap: 3px 12px; }
+  .cpa-performance-core { grid-template-columns: 34.5px minmax(12px, 1fr) 43.5px; gap: 4.5px; }
+  .cpa-performance-rates { gap: 3px 9px; font-size: 13.5px; }
+  .cpa-performance-daily { gap: 3px 9px; }
+  .cpa-performance-memory .cpa-performance-row { grid-column: 1 / -1; }
+  .cpa-performance-memory .cpa-performance-memory-detail { grid-column: 1 / -1; grid-row: 2; text-align: left; }
+  .cpa-performance-memory .cpa-performance-meter { grid-row: 3; }
+}

@@ -460,6 +460,18 @@ func TestWorkBuddyFingerprintConfigSnapshots(t *testing.T) {
 			snapshot := cloned.AccountSchedulingSnapshot()
 			restored := &Config{}
 			snapshot.apply(restored)
+			previous.Routing.WorkBuddyAutoCheckin = new(true)
+			previous.Routing.WorkBuddyAutoTasks = new(false)
+			cloned = current.CloneForReload(previous)
+			if cloned.Routing.WorkBuddyAutoCheckin == nil || !*cloned.Routing.WorkBuddyAutoCheckin || cloned.Routing.WorkBuddyAutoTasks == nil || *cloned.Routing.WorkBuddyAutoTasks {
+				t.Fatal("WorkBuddy task switches were not inherited")
+			}
+			snapshot = cloned.AccountSchedulingSnapshot()
+			restored = &Config{}
+			snapshot.apply(restored)
+			if !reflect.DeepEqual(restored.Routing.WorkBuddyAutoCheckin, cloned.Routing.WorkBuddyAutoCheckin) || !reflect.DeepEqual(restored.Routing.WorkBuddyAutoTasks, cloned.Routing.WorkBuddyAutoTasks) {
+				t.Fatal("account scheduling snapshot lost WorkBuddy task switches")
+			}
 			if !reflect.DeepEqual(restored.Routing.WorkBuddyFingerprintConvergence, tc.want) || restored.Routing.CodexFingerprintConvergence != nil {
 				t.Fatal("account scheduling snapshot lost WorkBuddy state or changed Codex")
 			}

@@ -116,6 +116,20 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("codex-fingerprint-convergence"),
 		[]byte("WorkBuddy 账号指纹收敛"),
 		[]byte("workBuddyFingerprintConvergence.checked = !!data['workbuddy-fingerprint-convergence']"),
+		[]byte("WorkBuddy 自动签到"),
+		[]byte("WorkBuddy 自动完成任务"),
+		[]byte("workbuddy-auto-checkin"),
+		[]byte("workbuddy-checkin-interval-seconds"),
+		[]byte("modal-overlay cpa-workbuddy-task-backdrop"),
+		[]byte("btn btn-secondary btn-sm cpa-workbuddy-task-button"),
+		[]byte("data-checkin-state"),
+		[]byte("workbuddy-auto-tasks"),
+		[]byte("workbuddy-tasks?auth_index="),
+		[]byte("data-cpa-workbuddy-tasks"),
+		[]byte("control.insertAdjacentElement('beforebegin', taskButton)"),
+		[]byte("新增 +"),
+		[]byte("最近执行结果"),
+		[]byte("result.reward_credit"),
 		[]byte("'workbuddy-fingerprint-convergence': workBuddyFingerprintConvergence.checked"),
 		[]byte("form.appendChild(workBuddyFingerprintLabel)"),
 		[]byte("codex-routing-hint"),
@@ -139,7 +153,7 @@ func TestAddRuntimeSchedulerToManagementHTML(t *testing.T) {
 		[]byte("'fake-models': fakeModelRows.map"),
 		[]byte("cpa-runtime-scheduler-position"),
 		[]byte("cpa-runtime-scheduler-toggle-position"),
-		[]byte("body:has([role=\"dialog\"][aria-modal=\"true\"]) .cpa-runtime-scheduler-toggle"),
+		[]byte("body:has([role=\"dialog\"][aria-modal=\"true\"]:not([hidden])) .cpa-runtime-scheduler-toggle"),
 		[]byte("pointerdown"),
 		[]byte("touch-action:none"),
 		[]byte("avoidManagementSaveButton"),
@@ -279,11 +293,19 @@ class Element {
   focus() {}
   remove() { this.parentElement.children = this.parentElement.children.filter(node => node !== this); }
   addEventListener(type, callback) { this.listeners[type] = callback; }
-  click() { if (this.listeners.click) this.listeners.click({stopPropagation() {}}); }
+  click() { if (!this.disabled && this.listeners.click) this.listeners.click({stopPropagation() {}}); }
   setAttribute(key, value) { this.attributes[key] = String(value); if (key === 'id') this.id = String(value); }
   getAttribute(key) { return this.attributes[key] ?? null; }
   removeAttribute(key) { delete this.attributes[key]; }
   querySelectorAll(tag) { return this.children.filter(child => child.tagName === tag); }
+  querySelector(selector) {
+    const space = selector.indexOf(' ');
+    if (space >= 0) return this.querySelector(selector.slice(0, space))?.querySelector(selector.slice(space + 1)) || null;
+    const matches = node => selector.startsWith('.') ? (node.className || '').split(' ').includes(selector.slice(1)) : node.tagName === selector;
+    for (const child of this.children) { if (matches(child)) return child; const nested = child.querySelector(selector); if (nested) return nested; }
+    return null;
+  }
+  insertAdjacentElement(position, node) { const siblings = this.parentElement.children; siblings.splice(siblings.indexOf(this) + (position === 'afterend' ? 1 : 0), 0, node); node.parentElement = this.parentElement; }
   contains(node) { return this.children.includes(node); }
   getBoundingClientRect() { return {left:10,top:10,width:320,height:500,right:330,bottom:510}; }
   reportValidity() { return true; }
@@ -297,6 +319,7 @@ globalThis.document = {
   readyState:'complete', documentElement:new Element('html'), body:new Element('body'),
   addEventListener() {},
   createElement: tag => new Element(tag),
+  createElementNS: (_, tag) => new Element(tag),
   createTextNode: text => { const node = new Element('text'); node.textContent = text; return node; },
   getElementById: id => nodes.find(node => node.id === id),
   querySelectorAll: () => [], querySelector: () => null
@@ -305,6 +328,7 @@ globalThis.localStorage = {getItem: () => null};
 globalThis.MutationObserver = class { observe() {} };
 globalThis.XMLHttpRequest = class { open() {} setRequestHeader() {} send() {} };
 globalThis.setInterval = (callback, interval) => { timers.push({callback,interval}); };
+globalThis.clearInterval = () => {};
 let now = 0;
 Object.defineProperty(globalThis, 'performance', {value:{now: () => now}});
 let patch = null, failStatus = false, lateResolve, statePatch;
@@ -312,6 +336,10 @@ let staticISPSettings = {enabled:false,nodes:[]};
 let fakeModels = [];
 let degradedPort = 0, degradedPortConfigured = false, exoFreePort = 0;
 let persistedSettings = false, failPersistence = false, failRuntime = false;
+let workBuddyCheckin = false, workBuddyTasks = false;
+let workBuddyInterval = 5;
+let delayTask = false, delayedTask, taskRequests = [];
+const taskStatus = index => ({auth_index:index,realm:index === 'a' ? 'cn' : 'intl',checkin:{supported:index === 'a',checked_in:true,today_credit:30},activity:{supported:true,completed:true,streak_days:3},growth:{supported:index === 'a',tasks:[]},last_run:{ok:true,trigger:'manual',started_at:'2026-11-05T00:00:00Z',earned_credit:30,results:[{code:'checkin',name:'Task for ' + index,ok:true,status:'checked',reward_credit:30}]}});
 const account = {id:'account-a',name:'account-a.json',auth_index:'a',provider:'codex',disabled:false,degraded:false};
 const other = {id:'account-b',name:'account-b.json',auth_index:'b',provider:'codex',disabled:false,degraded:false};
 const authCard = new Element('article');
@@ -326,9 +354,10 @@ authCard.querySelector = selector => {
   if (selector.includes('fileName')) return authName;
   if (selector.includes('toggleWrap')) return nativeToggle;
   if (selector.includes('data-cpa-auth-state')) return authCard.children.find(node => node.getAttribute('data-cpa-auth-state')) || null;
+  if (selector.includes('data-cpa-workbuddy-tasks')) return authCard.children.find(node => node.getAttribute('data-cpa-workbuddy-tasks')) || null;
   return null;
 };
-document.querySelectorAll = selector => selector.includes('AuthFileCard-module__card___') ? [authCard] : [];
+document.querySelectorAll = selector => selector.includes('AuthFileCard-module__card___') ? [authCard] : (selector === '[data-cpa-workbuddy-tasks]' ? authCard.children.filter(node => node.getAttribute('data-cpa-workbuddy-tasks')) : []);
 let delayStatus = false;
 window.fetch = async (url, options = {}) => {
   if (url.endsWith('routing/settings')) {
@@ -343,14 +372,24 @@ window.fetch = async (url, options = {}) => {
         return publicNode;
       })};
       persistedSettings = patch['persist-settings'];
+      workBuddyCheckin = patch['workbuddy-auto-checkin'];
+      workBuddyInterval = patch['workbuddy-checkin-interval-seconds'];
+      workBuddyTasks = patch['workbuddy-auto-tasks'];
       fakeModels = patch['fake-models'];
       if (failRuntime) return new Response(JSON.stringify({error:'binding directory unavailable',applied:true,runtime_error:true,persisted:persistedSettings}), {status:503});
       if (failPersistence) return new Response(JSON.stringify({error:'permission denied',applied:true,persisted:false}), {status:500});
       return new Response(JSON.stringify({persisted:persistedSettings,runtime_only:!persistedSettings}));
     }
-    return new Response(JSON.stringify({'persist-settings':persistedSettings,'codex-static-isp':staticISPSettings,'fake-models':fakeModels,'cache-token-rewrite':{enabled:true,'min-percent':80,'max-percent':95},'degraded-port':degradedPort,'degraded-port-configured':degradedPortConfigured,'exo-free-port':exoFreePort}));
+    return new Response(JSON.stringify({'workbuddy-checkin-interval-seconds':workBuddyInterval,'workbuddy-auto-checkin':workBuddyCheckin,'workbuddy-auto-tasks':workBuddyTasks,'persist-settings':persistedSettings,'codex-static-isp':staticISPSettings,'fake-models':fakeModels,'cache-token-rewrite':{enabled:true,'min-percent':80,'max-percent':95},'degraded-port':degradedPort,'degraded-port-configured':degradedPortConfigured,'exo-free-port':exoFreePort}));
   }
-  if (url.endsWith('auth-files')) return new Response(JSON.stringify({files:[account,other]}));
+  if (url.includes('workbuddy-tasks')) {
+    assert.match(url, /\/v8\/management\/credentials\/workbuddy-tasks/);
+    taskRequests.push({url,options});
+    if (options.method === 'POST') return new Response(JSON.stringify({account:{...taskStatus(JSON.parse(options.body).auth_index),running:true}}));
+    if (delayTask) { delayTask = false; return new Promise(resolve => {delayedTask = resolve;}); }
+    return new Response(JSON.stringify(taskStatus(new URL(url).searchParams.get('auth_index'))));
+  }
+  if (url.endsWith('auth-files') || url.endsWith('credentials')) return new Response(JSON.stringify({files:[account,other]}));
   if (url.endsWith('auth-files/status')) {
     statePatch = JSON.parse(options.body);
     account.disabled = statePatch.scheduling_state === 'disabled';
@@ -376,6 +415,17 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   assert.equal(!!rewriteSection.open, false, 'token rewrite controls must be hidden by default');
   const save = nodes.find(node => node.className === 'cpa-runtime-scheduler-save');
   toggle.click(); await flush();
+  const checkinToggle = nodes.find(node => node.tagName === 'label' && node.textContent === 'WorkBuddy 自动签到').children[0];
+  const tasksToggle = nodes.find(node => node.tagName === 'label' && node.textContent === 'WorkBuddy 自动完成任务').children[0];
+  assert.equal(checkinToggle.checked, false);
+  assert.equal(tasksToggle.checked, false);
+  checkinToggle.checked = true; tasksToggle.checked = true;
+  checkinToggle.listeners.change();
+  const checkinInterval = nodes.find(node => node.getAttribute('aria-label') === '自动签到账号间隔（秒）');
+  assert.equal(checkinInterval.value, '5');
+  assert.equal(checkinInterval.disabled, false);
+  assert.equal(checkinInterval.parentElement.parentElement.children[0].children[0], checkinToggle, 'interval must follow the checkin switch in the same row');
+  checkinInterval.value = '12';
   const cardControl = () => authCard.querySelector('[data-cpa-auth-state]');
   assert.equal(cardControl().account.name, account.name, 'injected filename must win over another account appearing as the display label');
   assert.equal(nativeToggle.classList.contains('cpa-native-status-hidden'), true);
@@ -396,6 +446,9 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   assert.equal(!!fakeSection.open, false);
   assert.equal(!!rewriteSection.open, false);
   save.click(); await flush();
+  assert.equal(workBuddyCheckin, true);
+  assert.equal(workBuddyInterval, 12);
+  assert.equal(workBuddyTasks, true);
   for (const key of ['codex-turn-state-enabled','codex-auto-degrade','codex-excel-routing-enabled','codex-excel-disable-fallback','codex-state-cliproxy']) assert.equal(Object.hasOwn(patch,key), false);
   assert.deepEqual(patch['cache-token-rewrite'], {enabled:true,'min-percent':80,'max-percent':95}, 'collapsed values must still save');
   assert.equal(patch['degraded-port'], 18888);
@@ -500,6 +553,37 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   timers.find(timer => timer.interval === 5000).callback(); await flush();
   assert.match(list.children[0].textContent, /状态正常.*ISP: isp-1/);
   assert.equal(list.children[0].children.find(node => node.className === 'cpa-account-state').children[0].attributes['aria-pressed'], 'true');
+  account.provider = 'workbuddy';
+  await window.fetch('https://panel.test/v8/management/credentials', {headers:{Authorization:'Bearer synthetic-key'}});
+  const taskButton = authCard.querySelector('[data-cpa-workbuddy-tasks]');
+  assert.ok(taskButton, 'WorkBuddy card must expose task controls');
+  assert.equal(authCard.children.indexOf(taskButton) + 1, authCard.children.indexOf(cardControl()));
+  taskButton.click(); await flush();
+  const taskModal = nodes.find(node => (node.className || '').includes('cpa-workbuddy-task-backdrop'));
+  assert.match(taskModal.textContent, /Task for a/);
+  assert.match(taskModal.textContent, /到账 \+30/);
+  assert.equal(taskButton.getAttribute('data-checkin-state'), 'checked');
+  assert.equal(taskButton.children[1].tagName, 'svg');
+  assert.equal(taskModal.querySelector('.cpa-workbuddy-task-actions').children[0].disabled, true);
+  const beforeRun = taskRequests.length;
+  taskModal.querySelector('.cpa-workbuddy-task-actions').children[0].click(); await flush();
+  assert.equal(taskRequests.length, beforeRun, 'completed checkin must not issue a request');
+  taskModal.querySelector('.cpa-workbuddy-task-actions').children[1].click(); await flush();
+  assert.equal(taskRequests.length, beforeRun + 2, 'run must immediately refresh after POST');
+  assert.equal(JSON.parse(taskRequests[beforeRun].options.body).auth_index, 'a');
+  taskModal.querySelector('.cpa-workbuddy-task-close').click();
+  delayTask = true;
+  taskButton.click(); await flush();
+  taskModal.querySelector('.cpa-workbuddy-task-close').click();
+  other.provider = 'workbuddy-ai'; taskButton.account = other;
+  taskButton.click(); await flush();
+  assert.match(taskModal.textContent, /Task for b/);
+  assert.equal(taskModal.querySelector('.cpa-workbuddy-task-actions').children[0].disabled, true, 'international checkin must be disabled');
+  delayedTask(new Response(JSON.stringify(taskStatus('a')))); await flush();
+  assert.match(taskModal.textContent, /Task for b/);
+  assert.doesNotMatch(taskModal.textContent, /Task for a/, 'late task responses must not overwrite another account');
+  account.provider = 'codex'; other.provider = 'codex';
+  await window.fetch('https://panel.test/v0/management/auth-files', {headers:{Authorization:'Bearer synthetic-key'}});
   failStatus = true;
   timers.find(timer => timer.interval === 5000).callback(); await flush();
   assert.match(list.textContent, /读取 ISP 状态失败/);
@@ -514,6 +598,9 @@ const flush = async () => { for (let i=0; i<8; i++) await new Promise(setImmedia
   assert.equal(nativeToggle.classList.contains('cpa-native-status-hidden'), false);
   assert.equal(authCard.getAttribute('data-cpa-managed-account'), null);
   assert.equal(persistCheckbox.checked, false);
+  assert.equal(checkinToggle.checked, false);
+  assert.equal(tasksToggle.checked, false);
+  assert.equal(taskModal.hidden, true);
   assert.equal(fakeSection.open, false);
   assert.equal(rewriteSection.open, false);
   assert.equal(ispCheckbox.checked, false);

@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 // responsesLocalInterrupt cancels an in-flight HTTP turn. A websocket upstream
@@ -165,6 +166,9 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 			msgEpoch := epoch.Load()
 			if kind != websocket.TextMessage && kind != websocket.BinaryMessage {
 				continue
+			}
+			if operation := ojson.GetBytesNoCopy(payload, "type").String(); operation == wsRequestTypeCreate || operation == wsRequestTypeAppend {
+				usage.RecordRequestArrival(ctx, time.Now())
 			}
 			// Control frames bypass response.create normalization. The original
 			// response_id, mode, and extension fields must reach upstream unchanged.

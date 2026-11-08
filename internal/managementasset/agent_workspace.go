@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-//go:embed agent_workspace.js agent_workspace.css agent_vendor/*.js
+//go:embed agent_workspace.js agent_workspace.css agent_vendor/*.js performance.js performance.css
 var agentWorkspaceAssets embed.FS
 
 const agentWorkspaceMarker = `id="cpa-agent-workspace-script"`
@@ -289,6 +289,10 @@ func AgentWorkspaceAsset(name string) ([]byte, string, bool) {
 		path = "agent_workspace.js"
 	case "workspace.css":
 		path, contentType = "agent_workspace.css", "text/css; charset=utf-8"
+	case "performance.js":
+		path = "performance.js"
+	case "performance.css":
+		path, contentType = "performance.css", "text/css; charset=utf-8"
 	case "marked.js", "purify.js", "lucide.js":
 		path = "agent_vendor/" + name
 	default:

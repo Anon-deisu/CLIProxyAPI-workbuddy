@@ -259,6 +259,10 @@ func AddCursorAPIKeyInlineToManagementHTML(data []byte) ([]byte, error) {
 const legacyRuntimeSchedulerInlineMarker = `id="cpa-runtime-scheduler-script"`
 const runtimeSchedulerInlineMarker = `id="cpa-runtime-scheduler-script-v2"`
 
+const quotaProviderTabs = "(0,U.jsxs)(`div`,{className:`cpa-quota-provider-picker`,children:[" +
+	"(0,U.jsx)(VA,{types:[`all`],counts:R,active:l,resolvedTheme:n,onChange:ie})," +
+	"(0,U.jsx)(VA,{types:SN.filter(type=>type!==`all`),counts:R,active:l,resolvedTheme:n,onChange:ie})]})"
+
 const runtimeSchedulerInlineScript = `
 <script id="cpa-runtime-scheduler-script-v2">
 (function () {
@@ -281,6 +285,14 @@ const runtimeSchedulerInlineScript = `
   var resetTurnStateView = function () {};
   var renderSchedulerAccounts = function () {};
   var accountStatePending = new Set();
+  var workBuddyTaskModal = null;
+  var workBuddyTaskAccount = null;
+  var workBuddyTaskPoll = null;
+  var workBuddyTaskPending = false;
+  var workBuddyTaskGeneration = 0;
+  var workBuddyTaskData = null;
+  var workBuddyTaskStates = new Map();
+  var workBuddyTaskBadgePending = new Set();
   var nativeFetch = window.fetch;
 
   function clearManagementSession() {
@@ -291,6 +303,9 @@ const runtimeSchedulerInlineScript = `
     authFilesRefreshPending = false;
     authFiles.clear();
     accountStatePending.clear();
+    workBuddyTaskStates.clear();
+    workBuddyTaskBadgePending.clear();
+    closeWorkBuddyTasks();
     resetTurnStateView();
     renderQuotaCosts();
     renderAccountStateControls();
@@ -354,7 +369,8 @@ const runtimeSchedulerInlineScript = `
     if (!managementReady) return Promise.reject(new Error('no-management-session'));
     var options = { method: method, headers: { 'Content-Type': 'application/json', 'Authorization': managementAuthorization } };
     if (body !== undefined) options.body = JSON.stringify(body);
-    return window.fetch(managementBase + path, options).then(function (response) {
+    var base = path.indexOf('workbuddy-tasks') === 0 ? managementBase.replace('/v0/management/', '/v8/management/credentials/') : managementBase;
+    return window.fetch(base + path, options).then(function (response) {
       if (!response.ok) return response.json().then(function (data) {
         var error = new Error(data.error || ('http ' + response.status));
         error.applied = data.applied === true;
@@ -430,6 +446,271 @@ const runtimeSchedulerInlineScript = `
 
   function accountSchedulingState(item) {
     return item.disabled ? 'disabled' : (item.degraded ? 'degraded' : 'normal');
+  }
+
+  function isWorkBuddyAccount(item) {
+    var provider = String((item && (item.provider || item.type)) || '').toLowerCase();
+    return provider === 'workbuddy' || provider === 'workbuddy-ai';
+  }
+
+  function workBuddyTaskLabel(state) {
+    return ({checked:'签到成功', already:'今日已签到', completed:'已完成', claimed:'已领取', accepted:'进行中', manual:'需手动完成', pending:'待处理', not_accepted:'未接取', failed:'失败', unsupported:'不支持'})[state] || state || '待处理';
+  }
+
+  function workBuddyTaskIcon(name) {
+    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '16'); svg.setAttribute('height', '16');
+    svg.setAttribute('fill', 'none'); svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '2'); svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round'); svg.setAttribute('aria-hidden', 'true');
+    var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', ({check:'M20 6 9 17l-5-5', x:'m18 6-12 12M6 6l12 12', refresh:'M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.55-2.61L20 7M4 17l2.35 2.61A7 7 0 0 0 17.9 17'})[name]);
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function updateWorkBuddyTaskButton(button, item) {
+    var status = workBuddyTaskStates.get(item.auth_index);
+    var intl = (item.provider || item.type) === 'workbuddy-ai';
+    var checked = !!(status && (intl ? status.activity.completed : status.checkin.checked_in));
+    var value = checked ? 'checked' : 'unchecked';
+    if (button.getAttribute('data-checkin-state') === value) return;
+    button.setAttribute('data-checkin-state', value);
+    button.textContent = '';
+    button.appendChild(make('span', '', '任务'));
+    button.appendChild(workBuddyTaskIcon(checked ? 'check' : 'x'));
+    button.title = status && status.error ? '签到状态读取失败' : (intl ? (checked ? '今日活跃已完成' : '今日活跃未完成') : (checked ? '今日已签到' : '今日未签到'));
+    button.setAttribute('aria-label', '任务，' + button.title);
+  }
+
+  function rememberWorkBuddyTaskStatus(data) {
+    if (!data.auth_index) return;
+    workBuddyTaskStates.set(data.auth_index, data);
+    document.querySelectorAll('[data-cpa-workbuddy-tasks]').forEach(function (button) {
+      if (button.account && button.account.auth_index === data.auth_index) updateWorkBuddyTaskButton(button, button.account);
+    });
+  }
+
+  function loadWorkBuddyTaskBadge(item) {
+    if (workBuddyTaskBadgePending.has(item.auth_index) || !managementReady) return;
+    var generation = sessionGeneration;
+    workBuddyTaskBadgePending.add(item.auth_index);
+    return request('GET', 'workbuddy-tasks?auth_index=' + encodeURIComponent(item.auth_index) + '&refresh=false').then(function (response) {
+      return response.json();
+    }).then(function (data) {
+      if (generation === sessionGeneration) rememberWorkBuddyTaskStatus(data);
+    }).catch(function (err) {
+      if (generation === sessionGeneration) rememberWorkBuddyTaskStatus({auth_index:item.auth_index,checkin:{},activity:{},error:err.message});
+    }).finally(function () {
+      if (generation === sessionGeneration) workBuddyTaskBadgePending.delete(item.auth_index);
+    });
+  }
+
+  function workBuddyTaskStateClass(ok, status) {
+    if (ok || status === 'completed' || status === 'claimed' || status === 'checked' || status === 'already') return 'success';
+    if (status === 'failed') return 'failed';
+    return 'pending';
+  }
+
+  function formatTaskNumber(value) {
+    return Number(value || 0).toLocaleString('zh-CN', {maximumFractionDigits:2});
+  }
+
+  function closeWorkBuddyTasks() {
+    if (workBuddyTaskPoll) clearInterval(workBuddyTaskPoll);
+    workBuddyTaskPoll = null;
+    workBuddyTaskAccount = null;
+    workBuddyTaskData = null;
+    workBuddyTaskGeneration += 1;
+    workBuddyTaskPending = false;
+    if (workBuddyTaskModal) workBuddyTaskModal.hidden = true;
+  }
+
+  function appendTaskResultRow(list, result) {
+    var row = make('div', 'cpa-workbuddy-task-result');
+    var heading = make('div', 'cpa-workbuddy-task-result-title');
+    heading.appendChild(make('strong', '', result.name || result.code));
+    heading.appendChild(make('span', 'cpa-workbuddy-task-badge ' + workBuddyTaskStateClass(result.ok, result.status), workBuddyTaskLabel(result.status)));
+    row.appendChild(heading);
+    var detail = result.message || '';
+    if (result.target > 0) detail = '进度 ' + result.current + '/' + result.target + (detail ? '；' : '') + detail;
+    if (result.reward_credit) detail += (detail ? '；' : '') + '到账 +' + formatTaskNumber(result.reward_credit) + ' 积分';
+    row.appendChild(make('div', 'cpa-workbuddy-task-result-message', detail));
+    list.appendChild(row);
+  }
+
+  function renderWorkBuddyTasks(data) {
+    if (!workBuddyTaskModal || !workBuddyTaskAccount) return;
+    var body = workBuddyTaskModal.querySelector('.cpa-workbuddy-task-body');
+    body.textContent = '';
+    if (data.error && !data.checkin) {
+      body.appendChild(make('div', 'cpa-workbuddy-task-error', data.error));
+      return;
+    }
+    workBuddyTaskData = data;
+    rememberWorkBuddyTaskStatus(data);
+    var summary = make('div', 'cpa-workbuddy-task-summary');
+    var checkin = data.checkin || {};
+    var activity = data.activity || {};
+    var growth = data.growth || {};
+    summary.appendChild(make('span', 'cpa-workbuddy-task-badge', data.realm === 'intl' ? '国际版' : '国内版'));
+    summary.appendChild(make('span', '', data.running ? '执行中' : '状态已更新'));
+    if (data.checked_at) summary.appendChild(make('span', '', new Date(data.checked_at).toLocaleString()));
+    body.appendChild(summary);
+    var overview = make('div', 'cpa-workbuddy-task-overviews');
+    var checkinSection = make('section', 'cpa-workbuddy-task-section');
+    checkinSection.appendChild(make('h3', '', '每日签到'));
+    if (!checkin.supported) {
+      checkinSection.appendChild(make('div', 'cpa-workbuddy-task-muted', checkin.message || (data.realm === 'intl' ? '国际版无签到活动' : '当前账号不支持签到')));
+    } else {
+      var checkinRow = make('div', 'cpa-workbuddy-task-overview');
+      checkinRow.appendChild(make('strong', '', checkin.checked_in ? '今日已签到' : '今日未签到'));
+      checkinRow.appendChild(make('span', '', '连续 ' + (checkin.streak_days || 0) + ' 天 · 今日 +' + formatTaskNumber(checkin.today_credit) + ' 积分'));
+      if (checkin.message && !checkin.checked_in) checkinRow.appendChild(make('span', 'cpa-workbuddy-task-error', checkin.message));
+      checkinSection.appendChild(checkinRow);
+    }
+    overview.appendChild(checkinSection);
+    var activitySection = make('section', 'cpa-workbuddy-task-section');
+    activitySection.appendChild(make('h3', '', data.realm === 'intl' ? '每日活跃任务' : '对话活跃'));
+    var activityRow = make('div', 'cpa-workbuddy-task-overview');
+    activityRow.appendChild(make('strong', '', activity.completed ? '今日已完成' : '今日未完成'));
+    activityRow.appendChild(make('span', '', '连续打卡 ' + (activity.streak_days || 0) + ' 天'));
+    if (activity.message) activityRow.appendChild(make('span', '', activity.message));
+    activitySection.appendChild(activityRow);
+    overview.appendChild(activitySection);
+    body.appendChild(overview);
+    var growthSection = make('section', 'cpa-workbuddy-task-section');
+    var growthTitle = make('h3', '', '成长任务');
+    growthSection.appendChild(growthTitle);
+    if (growth.supported && growth.total > 0) {
+      growthTitle.appendChild(make('span', 'cpa-workbuddy-task-count', growth.completed + '/' + growth.total + ' 已领奖'));
+    }
+    if (growth.message && !(growth.tasks || []).length) growthSection.appendChild(make('div', 'cpa-workbuddy-task-muted', growth.message));
+    var tasks = growth.tasks || [];
+    if (!tasks.length && growth.supported && !growth.message) growthSection.appendChild(make('div', 'cpa-workbuddy-task-muted', '暂无成长任务'));
+    tasks.forEach(function (task) {
+      var row = make('div', 'cpa-workbuddy-task-row');
+      var head = make('div', 'cpa-workbuddy-task-row-head');
+      head.appendChild(make('strong', '', task.name || task.code));
+      head.appendChild(make('span', 'cpa-workbuddy-task-badge ' + workBuddyTaskStateClass(task.status === 'claimed', task.status), workBuddyTaskLabel(task.status)));
+      row.appendChild(head);
+      var progress = make('div', 'cpa-workbuddy-task-progress');
+      progress.appendChild(make('span', '', '进度 ' + (task.current || 0) + '/' + (task.target || 1)));
+      progress.appendChild(make('span', '', '奖励 ' + formatTaskNumber(task.reward_credit) + ' 积分' + (task.reward_energy ? ' + ' + formatTaskNumber(task.reward_energy) + ' 能量' : '')));
+      row.appendChild(progress);
+      var track = make('div', 'cpa-workbuddy-task-track');
+      var fill = make('div', 'cpa-workbuddy-task-track-fill');
+      fill.style.width = Math.min(100, Math.max(0, (task.current || 0) * 100 / (task.target || 1))) + '%';
+      track.appendChild(fill); row.appendChild(track);
+      if (task.manual_reason) row.appendChild(make('div', 'cpa-workbuddy-task-muted', task.manual_reason));
+      growthSection.appendChild(row);
+    });
+    body.appendChild(growthSection);
+    if (data.last_run) {
+      var run = data.last_run;
+      var resultSection = make('section', 'cpa-workbuddy-task-section');
+      var runTitle = make('h3', '', '最近执行结果');
+      runTitle.appendChild(make('span', 'cpa-workbuddy-task-count', (run.trigger === 'auto' ? '自动' : '手动') + ' · 新增 +' + formatTaskNumber(run.earned_credit) + ' 积分'));
+      resultSection.appendChild(runTitle);
+      resultSection.appendChild(make('div', 'cpa-workbuddy-task-muted', (run.ok ? '执行成功' : '存在未完成项') + ' · ' + new Date(run.started_at).toLocaleString() + (run.message ? ' · ' + run.message : '')));
+      var list = make('div', 'cpa-workbuddy-task-results');
+      (run.results || []).forEach(function (result) { appendTaskResultRow(list, result); });
+      resultSection.appendChild(list);
+      body.appendChild(resultSection);
+    }
+    var actions = workBuddyTaskModal.querySelector('.cpa-workbuddy-task-actions');
+    actions.querySelectorAll('button').forEach(function (button) {
+      var action = button.getAttribute('data-cpa-task-action');
+      button.disabled = !!data.running || (action === 'checkin' && (!checkin.supported || checkin.checked_in)) || (action === 'growth' && !growth.supported && (!activity.supported || activity.completed));
+      if (action === 'checkin') button.textContent = checkin.checked_in ? '今日已签到' : '立即签到';
+      if (action === 'growth') button.textContent = data.realm === 'intl' ? '完成每日活跃' : '完成成长任务';
+    });
+  }
+
+  function loadWorkBuddyTasks(refresh) {
+    if (!workBuddyTaskAccount || workBuddyTaskPending) return Promise.resolve();
+    workBuddyTaskPending = true;
+    var generation = workBuddyTaskGeneration;
+    return request('GET', 'workbuddy-tasks?auth_index=' + encodeURIComponent(workBuddyTaskAccount.auth_index) + (refresh === false ? '&refresh=false' : '')).then(function (response) {
+      return response.json().then(function (data) { return {ok:response.ok, data:data}; });
+    }).then(function (result) {
+      if (generation !== workBuddyTaskGeneration || !workBuddyTaskAccount) return;
+      renderWorkBuddyTasks(result.ok ? result.data : {error:result.data.error || '任务状态读取失败'});
+    }).catch(function (err) {
+      if (generation === workBuddyTaskGeneration && workBuddyTaskAccount) renderWorkBuddyTasks({error:err.message});
+    }).finally(function () { if (generation === workBuddyTaskGeneration) workBuddyTaskPending = false; });
+  }
+
+  function runWorkBuddyTasks(checkin, growth) {
+    if (!workBuddyTaskAccount || workBuddyTaskPending) return;
+    if (checkin && workBuddyTaskData && workBuddyTaskData.checkin.checked_in) return;
+    workBuddyTaskPending = true;
+    workBuddyTaskModal.querySelector('.cpa-workbuddy-task-actions').querySelectorAll('button').forEach(function (button) { button.disabled = true; });
+    var generation = workBuddyTaskGeneration;
+    workBuddyTaskModal.querySelector('.cpa-workbuddy-task-error-line').textContent = '';
+    return request('POST', 'workbuddy-tasks/run', {auth_index:workBuddyTaskAccount.auth_index, checkin:checkin, growth:growth}).then(function (response) {
+      return response.json();
+    }).then(function (result) {
+      if (generation !== workBuddyTaskGeneration) return;
+      if (result.account) renderWorkBuddyTasks(result.account);
+      workBuddyTaskPending = false;
+      return loadWorkBuddyTasks(true);
+    }).catch(function (err) {
+      if (generation === workBuddyTaskGeneration) workBuddyTaskModal.querySelector('.cpa-workbuddy-task-error-line').textContent = err.message;
+    }).finally(function () { if (generation === workBuddyTaskGeneration) workBuddyTaskPending = false; });
+  }
+
+  function openWorkBuddyTasks(item) {
+    closeWorkBuddyTasks();
+    if (!workBuddyTaskModal) {
+      var backdrop = make('div', 'modal-overlay cpa-workbuddy-task-backdrop');
+      backdrop.hidden = true;
+      backdrop.setAttribute('role', 'dialog');
+      backdrop.setAttribute('aria-modal', 'true');
+      backdrop.setAttribute('aria-label', 'WorkBuddy 账号任务');
+      var dialog = make('div', 'modal cpa-workbuddy-task-dialog');
+      var header = make('div', 'modal-header cpa-workbuddy-task-header');
+      var heading = make('div', 'cpa-workbuddy-task-heading');
+      var title = make('h2', 'modal-title', 'WorkBuddy 任务');
+      var subtitle = make('div', 'cpa-workbuddy-task-subtitle');
+      heading.appendChild(title); heading.appendChild(subtitle);
+      var close = make('button', 'modal-close-floating cpa-workbuddy-task-close');
+      close.appendChild(workBuddyTaskIcon('x'));
+      close.type = 'button'; close.title = '关闭任务'; close.setAttribute('aria-label', '关闭任务');
+      close.addEventListener('click', closeWorkBuddyTasks);
+      header.appendChild(heading); header.appendChild(close);
+      var body = make('div', 'modal-body cpa-workbuddy-task-body');
+      var errorLine = make('div', 'cpa-workbuddy-task-error-line');
+      var actions = make('div', 'modal-footer cpa-workbuddy-task-actions');
+      [['立即签到', true, false], ['完成成长任务', false, true]].forEach(function (spec) {
+        var button = make('button', 'btn ' + (spec[1] ? 'btn-primary' : 'btn-secondary') + ' cpa-workbuddy-task-action', spec[0]);
+        button.type = 'button';
+        button.setAttribute('data-cpa-task-action', spec[1] ? 'checkin' : 'growth');
+        button.addEventListener('click', function () { runWorkBuddyTasks(spec[1], spec[2]); });
+        actions.appendChild(button);
+      });
+      var refresh = make('button', 'btn btn-secondary cpa-workbuddy-task-refresh');
+      refresh.appendChild(workBuddyTaskIcon('refresh'));
+      refresh.title = '刷新状态'; refresh.setAttribute('aria-label', '刷新状态');
+      refresh.type = 'button'; refresh.addEventListener('click', function () { loadWorkBuddyTasks(true); });
+      actions.appendChild(refresh);
+      dialog.appendChild(header); dialog.appendChild(body); dialog.appendChild(errorLine); dialog.appendChild(actions);
+      backdrop.appendChild(dialog);
+      backdrop.addEventListener('click', function (event) { if (event.target === backdrop) closeWorkBuddyTasks(); });
+      document.body.appendChild(backdrop);
+      workBuddyTaskModal = backdrop;
+    }
+    workBuddyTaskAccount = item;
+    workBuddyTaskModal.querySelector('.cpa-workbuddy-task-heading h2').textContent = 'WorkBuddy 任务';
+    workBuddyTaskModal.querySelector('.cpa-workbuddy-task-subtitle').textContent = item.email || item.nickname || item.name;
+    workBuddyTaskModal.querySelector('.cpa-workbuddy-task-error-line').textContent = '';
+    workBuddyTaskModal.querySelector('.cpa-workbuddy-task-body').textContent = '正在读取任务状态...';
+    workBuddyTaskModal.hidden = false;
+    workBuddyTaskModal.querySelector('.cpa-workbuddy-task-actions').querySelectorAll('button').forEach(function (button) { button.disabled = true; });
+    loadWorkBuddyTasks(true);
+    if (workBuddyTaskPoll) clearInterval(workBuddyTaskPoll);
+    workBuddyTaskPoll = setInterval(function () { loadWorkBuddyTasks(false); }, 2000);
   }
 
   function makeAccountStateControl(item, afterUpdate) {
@@ -515,8 +796,10 @@ const runtimeSchedulerInlineScript = `
       if (!nativeToggle) return;
       var item = findAuthFileForCard(card, nameNode);
       var control = card.querySelector('[data-cpa-auth-state]');
+      var taskButton = card.querySelector('[data-cpa-workbuddy-tasks]');
       if (!item || item.runtime_only) {
         if (control) control.remove();
+        if (taskButton) taskButton.remove();
         nativeToggle.classList.remove('cpa-native-status-hidden');
         card.classList.remove('cpa-account-managed');
         card.removeAttribute('data-cpa-managed-account');
@@ -526,6 +809,24 @@ const runtimeSchedulerInlineScript = `
       if (!control) {
         control = makeAccountStateControl(item, refreshAuthFiles);
         nativeToggle.insertAdjacentElement('afterend', control);
+      }
+      if (isWorkBuddyAccount(item)) {
+        if (!taskButton) {
+          taskButton = make('button', 'btn btn-secondary btn-sm cpa-workbuddy-task-button');
+          taskButton.type = 'button';
+          taskButton.setAttribute('data-cpa-workbuddy-tasks', 'true');
+          taskButton.addEventListener('click', function (event) {
+            event.stopPropagation();
+            openWorkBuddyTasks(taskButton.account);
+          });
+          control.insertAdjacentElement('beforebegin', taskButton);
+        }
+        taskButton.account = item;
+        taskButton.disabled = !managementReady;
+        updateWorkBuddyTaskButton(taskButton, item);
+        if (!workBuddyTaskStates.has(item.auth_index)) loadWorkBuddyTaskBadge(item);
+      } else if (taskButton) {
+        taskButton.remove();
       }
       nativeToggle.classList.add('cpa-native-status-hidden');
       card.classList.add('cpa-account-managed');
@@ -780,6 +1081,31 @@ const runtimeSchedulerInlineScript = `
     workBuddyFingerprintConvergence.title = 'WorkBuddy 国内站与国际站按账号固定身份，刷新 token 后保持一致';
     workBuddyFingerprintLabel.appendChild(workBuddyFingerprintConvergence);
     workBuddyFingerprintLabel.appendChild(document.createTextNode('WorkBuddy 账号指纹收敛'));
+    var workBuddyCheckinLabel = make('label', 'cpa-runtime-scheduler-check');
+    var workBuddyAutoCheckin = document.createElement('input');
+    workBuddyAutoCheckin.type = 'checkbox';
+    workBuddyAutoCheckin.title = '仅国内版个人 OAuth 账号；开启后立即巡检并定期补跑';
+    workBuddyCheckinLabel.appendChild(workBuddyAutoCheckin);
+    workBuddyCheckinLabel.appendChild(document.createTextNode('WorkBuddy 自动签到'));
+    var workBuddyCheckinRow = make('div', 'cpa-runtime-scheduler-checkin-row');
+    workBuddyCheckinRow.appendChild(workBuddyCheckinLabel);
+    var workBuddyIntervalLabel = make('label', 'cpa-runtime-scheduler-checkin-interval');
+    var workBuddyCheckinInterval = document.createElement('input');
+    workBuddyCheckinInterval.type = 'number';
+    workBuddyCheckinInterval.min = '1'; workBuddyCheckinInterval.max = '86400'; workBuddyCheckinInterval.step = '1';
+    workBuddyCheckinInterval.required = true;
+    workBuddyCheckinInterval.setAttribute('aria-label', '自动签到账号间隔（秒）');
+    workBuddyCheckinInterval.title = '自动签到账号间隔（秒）';
+    workBuddyIntervalLabel.appendChild(workBuddyCheckinInterval);
+    workBuddyIntervalLabel.appendChild(make('span', '', '秒'));
+    workBuddyCheckinRow.appendChild(workBuddyIntervalLabel);
+    workBuddyAutoCheckin.addEventListener('change', function () { workBuddyCheckinInterval.disabled = !workBuddyAutoCheckin.checked; });
+    var workBuddyTasksLabel = make('label', 'cpa-runtime-scheduler-check');
+    var workBuddyAutoTasks = document.createElement('input');
+    workBuddyAutoTasks.type = 'checkbox';
+    workBuddyAutoTasks.title = '国内版执行支持的成长任务，国内/国际版完成每日活跃';
+    workBuddyTasksLabel.appendChild(workBuddyAutoTasks);
+    workBuddyTasksLabel.appendChild(document.createTextNode('WorkBuddy 自动完成任务'));
     var staticISPLabel = make('label', 'cpa-runtime-scheduler-check');
     var staticISPEnabled = document.createElement('input');
     staticISPEnabled.type = 'checkbox';
@@ -968,6 +1294,10 @@ const runtimeSchedulerInlineScript = `
     var accountStatusNodes = new Map();
     resetTurnStateView = function () {
       persistSettings.checked = false;
+      workBuddyAutoCheckin.checked = false;
+      workBuddyCheckinInterval.value = '';
+      workBuddyCheckinInterval.disabled = true;
+      workBuddyAutoTasks.checked = false;
       ispStatusData = null;
       ispStatusPending = false;
       ispStatusError = '';
@@ -1073,6 +1403,8 @@ const runtimeSchedulerInlineScript = `
     form.appendChild(disableCoolingLabel);
     form.appendChild(fingerprintLabel);
     form.appendChild(workBuddyFingerprintLabel);
+    form.appendChild(workBuddyCheckinRow);
+    form.appendChild(workBuddyTasksLabel);
     form.appendChild(staticISPLabel);
     form.appendChild(staticISPFields);
     fakeModelsContent.appendChild(fakeModelsList);
@@ -1232,6 +1564,10 @@ const runtimeSchedulerInlineScript = `
         disableCooling.checked = !!data['disable-cooling'];
         fingerprintConvergence.checked = !!data['codex-fingerprint-convergence'];
         workBuddyFingerprintConvergence.checked = !!data['workbuddy-fingerprint-convergence'];
+        workBuddyAutoCheckin.checked = !!data['workbuddy-auto-checkin'];
+        workBuddyCheckinInterval.value = String(data['workbuddy-checkin-interval-seconds']);
+        workBuddyCheckinInterval.disabled = !workBuddyAutoCheckin.checked;
+        workBuddyAutoTasks.checked = !!data['workbuddy-auto-tasks'];
         var staticISP = data['codex-static-isp'] || {};
         staticISPEnabled.checked = !!staticISP.enabled;
         loadStaticISPNodes(staticISP.nodes || []);
@@ -1301,6 +1637,7 @@ const runtimeSchedulerInlineScript = `
         cacheMax.reportValidity();
         return;
       }
+      if (!workBuddyCheckinInterval.reportValidity()) return;
       if (!staticISPRows.every(function (row) { return Object.keys(row.fields).every(function (key) { return row.fields[key].reportValidity(); }); })) return;
       if (!fakeModelRows.every(function (row) {
         if (!row.responseRows.length) {
@@ -1334,6 +1671,9 @@ const runtimeSchedulerInlineScript = `
          'disable-cooling': disableCooling.checked,
         'codex-fingerprint-convergence': fingerprintConvergence.checked,
         'workbuddy-fingerprint-convergence': workBuddyFingerprintConvergence.checked,
+        'workbuddy-auto-checkin': workBuddyAutoCheckin.checked,
+        'workbuddy-checkin-interval-seconds': Number(workBuddyCheckinInterval.value),
+        'workbuddy-auto-tasks': workBuddyAutoTasks.checked,
         'codex-static-isp': {enabled:staticISPEnabled.checked, nodes:staticISPRows.map(function (row) {
           var node = {};
           Object.keys(row.fields).forEach(function (key) {
@@ -1379,21 +1719,25 @@ const runtimeSchedulerInlineScript = `
     window.addEventListener('resize', positionModelTooltips);
     window.addEventListener('resize', positionAccountTokenTooltips);
     document.addEventListener('scroll', positionAccountTokenTooltips, true);
-    document.addEventListener('keydown', function (event) { if (event.key === 'Escape') hideAccountTokenTooltip(); });
+    document.addEventListener('keydown', function (event) { if (event.key === 'Escape') { hideAccountTokenTooltip(); closeWorkBuddyTasks(); } });
     document.addEventListener('pointerdown', function (event) {
       if (accountTokenAnchor && !accountTokenAnchor.contains(event.target) && !accountTokenTooltip.contains(event.target)) hideAccountTokenTooltip();
     });
     setInterval(function () { if (!panel.hidden) loadISPBindings(); }, 5000);
+    setInterval(function () {
+      document.querySelectorAll('[data-cpa-workbuddy-tasks]').forEach(function (button) { if (button.account) loadWorkBuddyTaskBadge(button.account); });
+    }, 30000);
     renderQuotaCosts();
     renderAccountStateControls();
   }
 
   var style = document.createElement('style');
      style.textContent = '.cpa-runtime-scheduler-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483646;border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:#fff;font-size:13px;font-weight:600;cursor:grab;touch-action:none;user-select:none;box-shadow:0 4px 16px rgba(0,0,0,.2)}' +
-      'body:has([role="dialog"][aria-modal="true"]) .cpa-runtime-scheduler-toggle,body:has([role="dialog"][aria-modal="true"]) .cpa-runtime-scheduler-panel{display:none!important}' +
+      'body:has([role="dialog"][aria-modal="true"]:not([hidden])) .cpa-runtime-scheduler-toggle,body:has([role="dialog"][aria-modal="true"]:not([hidden])) .cpa-runtime-scheduler-panel{display:none!important}' +
       '.cpa-runtime-scheduler-panel{box-sizing:border-box;position:fixed;right:20px;bottom:64px;z-index:2147483646;width:min(340px,calc(100vw - 16px));max-height:70vh;overflow:auto;padding:16px;border:1px solid #d0d7de;border-radius:8px;background:#fff;color:#1f2328;box-shadow:0 10px 32px rgba(0,0,0,.2);font:14px/1.4 system-ui,sans-serif}' +
        '.cpa-runtime-scheduler-title{font-size:16px;font-weight:700;cursor:move;touch-action:none;user-select:none}.cpa-runtime-scheduler-hint{margin:4px 0 14px;color:#57606a;font-size:12px}.cpa-runtime-scheduler-form{display:grid;gap:9px}.cpa-runtime-scheduler-default{padding:7px 9px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:13px}.cpa-runtime-scheduler-number{display:flex;align-items:center;justify-content:space-between;gap:10px;color:#57606a}.cpa-runtime-scheduler-number input{width:100px;padding:5px;border:1px solid #d0d7de;border-radius:5px}.cpa-runtime-scheduler-check{display:flex;gap:8px;align-items:center}.cpa-runtime-scheduler-save{width:max-content;border:0;border-radius:6px;padding:7px 12px;background:#2563eb;color:#fff;cursor:pointer}.cpa-runtime-scheduler-status{color:#57606a;font-size:12px}.cpa-runtime-scheduler-subtitle{margin-top:18px;padding-top:12px;border-top:1px solid #d8dee4;font-weight:700}.cpa-runtime-scheduler-section{min-width:0;border-top:1px solid #d8dee4}.cpa-runtime-scheduler-section-title{padding:12px 0;cursor:pointer;font-weight:700;letter-spacing:0}.cpa-runtime-scheduler-section-title:focus-visible{outline:2px solid #2563eb;outline-offset:2px}.cpa-runtime-scheduler-section-content{display:grid;gap:9px;padding:0 0 8px;min-width:0}.cpa-runtime-scheduler-disabled-list{display:grid;gap:7px;margin-top:8px}.cpa-runtime-scheduler-disabled-row{display:grid;gap:4px;padding:8px;border-radius:6px;background:#f6f8fa;color:#24292f;font-size:12px}.cpa-runtime-scheduler-empty{color:#57606a;font-size:12px}';
   style.textContent += '.cpa-quota-estimate{color:var(--text-secondary,#57606a);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;letter-spacing:0}';
+  style.textContent += '.cpa-quota-provider-picker{display:flex;align-items:stretch;gap:8px;width:100%;min-width:0;max-width:100%}.cpa-quota-provider-picker>:first-child{flex:0 0 auto;overflow:visible}.cpa-quota-provider-picker>:last-child{flex:1 1 0;min-width:0;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin;scrollbar-color:var(--border-hover) transparent;scroll-padding-inline:8px}.cpa-quota-provider-picker>:last-child::-webkit-scrollbar{display:block;height:6px}.cpa-quota-provider-picker>:last-child::-webkit-scrollbar-thumb{background:var(--border-hover);border-radius:3px}.cpa-quota-provider-picker>:last-child::-webkit-scrollbar-track{background:transparent}';
   var modelTooltipSelector = ':is([class*="AuthFileCard-module__statusTooltip___"],[class*="providerStatusBar-module__statusTooltip___"]):has(>[class*="__tooltipStats"]>:nth-child(4))';
    style.textContent += modelTooltipSelector + '{display:grid;grid-template-columns:minmax(0,1fr) max-content max-content max-content;gap:4px 10px;box-sizing:border-box;width:max-content;max-width:min(480px,calc(100vw - 48px),var(--cpa-model-tooltip-width,100vw));letter-spacing:0}' +
     modelTooltipSelector + '>[class*="__tooltipTime"]{grid-column:1 / -1}' +
@@ -1416,6 +1760,13 @@ const runtimeSchedulerInlineScript = `
   style.textContent += '.cpa-runtime-scheduler-panel .cpa-static-isp-add{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;justify-self:start;width:max-content;max-width:100%;min-width:0;height:26px;min-height:0;border:1px solid #d0d7de;border-radius:4px;padding:0 8px;background:transparent;color:#57606a;font:500 12px/1.2 system-ui,sans-serif;cursor:pointer;letter-spacing:0}.cpa-runtime-scheduler-panel .cpa-static-isp-add:hover{background:#f6f8fa;border-color:#afb8c1;color:#24292f}.cpa-runtime-scheduler-panel .cpa-static-isp-add:focus-visible{outline:2px solid #2563eb;outline-offset:2px}';
   style.textContent += '.cpa-fake-model-list{display:grid;gap:10px;min-width:0}.cpa-fake-model-row{position:relative;min-width:0;border-bottom:1px solid #d0d7de;padding-bottom:8px;letter-spacing:0}.cpa-fake-model-row>.cpa-static-isp-remove{top:0;bottom:auto}.cpa-fake-model-summary{padding:5px 34px 5px 0;overflow-wrap:anywhere;cursor:pointer;font-weight:600}.cpa-fake-model-editor{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px;min-width:0}.cpa-fake-model-editor>:first-child,.cpa-fake-model-editor>div,.cpa-fake-model-editor>button{grid-column:1 / -1}.cpa-fake-response-list{display:grid;gap:8px;min-width:0}.cpa-fake-response-row{display:grid;grid-template-columns:minmax(0,1fr) 28px;align-items:start;gap:6px;min-width:0}.cpa-fake-response-row>.cpa-static-isp-remove{position:static}.cpa-fake-model-row textarea{box-sizing:border-box;width:100%;min-width:0;min-height:72px;resize:vertical;padding:6px 8px;border:1px solid #d0d7de;border-radius:5px;font:inherit;letter-spacing:0}.cpa-fake-model-row input:focus-visible,.cpa-fake-model-row textarea:focus-visible,.cpa-fake-model-summary:focus-visible{outline:2px solid #2563eb;outline-offset:2px}';
   style.textContent += '.cpa-native-status-hidden,.cpa-account-managed [class*="AuthFileCard-module__stateBadge"]{display:none!important}.cpa-account-state{display:flex;flex-wrap:wrap;gap:0;max-width:100%;font-size:12px;letter-spacing:0}.cpa-account-state-choice{min-width:48px;padding:5px 8px;border:1px solid var(--border-color,#d0d7de);background:var(--bg-primary,#fff);color:var(--text-secondary,#57606a);cursor:pointer}.cpa-account-state-choice:first-child{border-radius:6px 0 0 6px}.cpa-account-state-choice:nth-child(3){border-radius:0 6px 6px 0}.cpa-account-state-choice[aria-pressed="true"]{background:#2563eb;color:#fff}.cpa-account-state-choice[value="degraded"][aria-pressed="true"]{background:#b45309}.cpa-account-state-choice[value="disabled"][aria-pressed="true"]{background:#6b7280}.cpa-account-state-choice:disabled{cursor:wait;opacity:.6}.cpa-account-state-error{flex-basis:100%;color:#b42318;overflow-wrap:anywhere}.cpa-runtime-scheduler-disabled-row strong{overflow-wrap:anywhere}';
+  style.textContent += '.cpa-workbuddy-task-button{margin-right:8px;gap:6px;letter-spacing:0}.cpa-workbuddy-task-button svg{flex:none;width:14px;height:14px}.cpa-workbuddy-task-button[data-checkin-state="checked"] svg{color:var(--success-color)}.cpa-workbuddy-task-button[data-checkin-state="unchecked"] svg{color:var(--text-tertiary)}' +
+    '.cpa-workbuddy-task-backdrop{z-index:2147483647;letter-spacing:0}.cpa-workbuddy-task-backdrop[hidden]{display:none}.cpa-workbuddy-task-dialog{width:680px;color:var(--text-primary)}.cpa-workbuddy-task-header{padding-right:64px}.cpa-workbuddy-task-heading{min-width:0}.cpa-workbuddy-task-heading h2{margin:0}.cpa-workbuddy-task-subtitle{margin-top:4px;font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}.cpa-workbuddy-task-body{min-height:0;max-height:none;padding:0 24px 12px;overscroll-behavior:contain}.cpa-workbuddy-task-summary{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:16px 0;color:var(--text-secondary);font-size:12px}' +
+    '.cpa-workbuddy-task-overviews{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;border-bottom:1px solid var(--border-color)}.cpa-workbuddy-task-overviews>.cpa-workbuddy-task-section{border:0;padding:4px 0 20px}.cpa-workbuddy-task-section{padding:20px 0;border-bottom:1px solid var(--border-color)}.cpa-workbuddy-task-section:last-child{border-bottom:0}.cpa-workbuddy-task-section h3{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 12px;margin:0 0 12px;font-size:14px;font-weight:600}.cpa-workbuddy-task-count{font-size:12px;font-weight:400;color:var(--text-secondary)}.cpa-workbuddy-task-overview{display:flex;flex-direction:column;align-items:flex-start;gap:6px;font-size:14px}.cpa-workbuddy-task-overview span,.cpa-workbuddy-task-muted{font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}' +
+    '.cpa-workbuddy-task-row{padding:14px 0;border-top:1px solid var(--border-color)}.cpa-workbuddy-task-row:first-of-type{padding-top:0;border-top:0}.cpa-workbuddy-task-row:last-child{padding-bottom:0}.cpa-workbuddy-task-row-head,.cpa-workbuddy-task-result-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.cpa-workbuddy-task-row-head strong,.cpa-workbuddy-task-result-title strong{min-width:0;font-size:13px;font-weight:500;overflow-wrap:anywhere}.cpa-workbuddy-task-badge{flex:none;padding:2px 7px;border:1px solid var(--border-color);border-radius:4px;background:var(--bg-tertiary);color:var(--text-secondary);font-size:11px;line-height:1.4}.cpa-workbuddy-task-badge.success{background:var(--success-badge-bg);color:var(--success-badge-text);border-color:var(--success-badge-border)}.cpa-workbuddy-task-badge.failed{background:var(--failure-badge-bg);color:var(--failure-badge-text);border-color:var(--failure-badge-border)}' +
+    '.cpa-workbuddy-task-progress{display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px 12px;margin-top:7px;font-size:12px;color:var(--text-secondary);font-variant-numeric:tabular-nums}.cpa-workbuddy-task-track{height:3px;margin:8px 0;border-radius:2px;background:var(--bg-tertiary);overflow:hidden}.cpa-workbuddy-task-track-fill{height:100%;background:var(--primary-color)}.cpa-workbuddy-task-results{margin-top:12px}.cpa-workbuddy-task-result{padding:10px 0;border-top:1px solid var(--border-color);font-size:12px}.cpa-workbuddy-task-result-message{margin-top:5px;color:var(--text-secondary);overflow-wrap:anywhere}.cpa-workbuddy-task-actions{flex-wrap:wrap}.cpa-workbuddy-task-refresh{order:-1;margin-right:auto;min-width:34px;padding:8px}.cpa-workbuddy-task-error,.cpa-workbuddy-task-error-line{color:var(--error-color);font-size:12px;overflow-wrap:anywhere}.cpa-workbuddy-task-error-line:not(:empty){padding:0 24px 12px}' +
+    '.cpa-runtime-scheduler-checkin-row{display:flex;align-items:center;justify-content:space-between;gap:8px}.cpa-runtime-scheduler-checkin-row>.cpa-runtime-scheduler-check{min-width:0}.cpa-runtime-scheduler-checkin-interval{display:flex;align-items:center;gap:4px;white-space:nowrap;font-size:12px}.cpa-runtime-scheduler-checkin-interval input{box-sizing:border-box;width:62px;min-width:0;padding:4px 6px;border:1px solid var(--border-color);border-radius:4px;background:var(--bg-primary);color:var(--text-primary)}.cpa-runtime-scheduler-checkin-interval input:disabled{opacity:.5}.cpa-runtime-scheduler-checkin-interval input:focus-visible{outline:2px solid var(--primary-color);outline-offset:2px}' +
+    '@media(max-width:600px){.cpa-workbuddy-task-backdrop{padding:12px}.cpa-workbuddy-task-header{padding:16px 56px 16px 16px}.cpa-workbuddy-task-body{padding:0 16px 8px}.cpa-workbuddy-task-actions{padding:12px 16px;flex-direction:row}.cpa-workbuddy-task-actions .btn{width:auto}.cpa-workbuddy-task-overviews{gap:16px}.cpa-workbuddy-task-section{padding:16px 0}.cpa-workbuddy-task-error-line:not(:empty){padding:0 16px 12px}}';
   style.textContent += '[data-cpa-managed-account="true"] [class*="AuthFileCard-module__toggleWrap"],[data-cpa-managed-account="true"] [class*="AuthFileCard-module__stateBadge"]{display:none!important}';
   document.documentElement.appendChild(style);
   if (document.readyState === 'loading') {
@@ -1443,6 +1794,7 @@ func AddRuntimeSchedulerToManagementHTML(data []byte) ([]byte, error) {
 		}
 	}
 	data = bytes.Replace(data, []byte("(0,U.jsxs)(`article`,{className:[aA.card,"), []byte("(0,U.jsxs)(`article`,{\"data-cpa-auth-name\":n.name,className:[aA.card,"), 1)
+	data = bytes.Replace(data, []byte("(0,U.jsx)(VA,{types:SN,counts:R,active:l,resolvedTheme:n,onChange:ie})"), []byte(quotaProviderTabs), 1)
 	lower := bytes.ToLower(data)
 	index := bytes.LastIndex(lower, []byte("</body>"))
 	if index < 0 {

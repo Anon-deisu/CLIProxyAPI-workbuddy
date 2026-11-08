@@ -18,11 +18,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/hostmetrics"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
@@ -75,6 +77,9 @@ type Handler struct {
 	siwcOAuthFactory        func(*config.Config) siwcOAuthService
 	siwcCommitMu            sync.Mutex
 	pluginLoginSaveMu       sync.Mutex
+	workBuddyTasks          *WorkBuddyTaskService
+	performance             *hostmetrics.Sampler
+	requestRate             *coreusage.RequestRate
 }
 
 type configReloadSnapshot struct {
@@ -96,10 +101,14 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 		autoOAuthJobs:       make(map[string]*codexAutoOAuthJob),
+		performance:         hostmetrics.NewSampler(),
+		requestRate:         &coreusage.RequestRate{},
 	}
 	if h.cfg == nil {
 		h.cfg = &config.Config{}
 	}
+	h.workBuddyTasks = NewWorkBuddyTaskService(h.cfg, manager)
+	h.workBuddyTasks.Start()
 	h.startAttemptCleanup()
 	return h
 }
@@ -152,6 +161,16 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 		return
 	}
 	h.cfg = cloned.CloneForReload(h.cfg)
+	if h.workBuddyTasks != nil {
+		h.workBuddyTasks.Configure(h.cfg)
+	}
+}
+
+// CloseWorkBuddyTasks stops background task requests owned by this handler.
+func (h *Handler) CloseWorkBuddyTasks() {
+	if h != nil && h.workBuddyTasks != nil {
+		h.workBuddyTasks.Close()
+	}
 }
 
 // configSnapshot reads h.cfg under h.mu, for code that runs outside the request holding it.
@@ -309,6 +328,9 @@ func (h *Handler) applyRuntimeConfig(c *gin.Context, mutate func(*config.Config)
 	manager := h.authManager
 	h.mu.Unlock()
 
+	if h.workBuddyTasks != nil {
+		h.workBuddyTasks.Configure(snapshot)
+	}
 	if hook != nil {
 		hook(c.Request.Context(), snapshot)
 	} else if manager != nil {

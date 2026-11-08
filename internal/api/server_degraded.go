@@ -220,7 +220,7 @@ var openCodeFreeModels = [...]struct {
 
 func (s *Server) exoFreeAPIHandler() http.Handler {
 	engine := gin.New()
-	engine.Use(gin.Recovery(), corsMiddleware())
+	engine.Use(gin.Recovery(), s.trackInferenceArrivals(), corsMiddleware())
 	v1 := engine.Group("/v1", AuthMiddleware(s.accessManager))
 	v1.GET("/models", func(c *gin.Context) {
 		models := make([]gin.H, 0, len(openCodeFreeModels))
