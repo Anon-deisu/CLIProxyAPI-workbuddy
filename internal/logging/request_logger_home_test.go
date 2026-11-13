@@ -2,15 +2,439 @@ package logging
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
+
+func TestFileBodySourceOrderedLifecycle(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "lifecycle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = source.Cleanup() })
+	for _, chunk := range []string{"first", "-tail"} {
+		if errAppend := source.AppendBytes([]byte(chunk)); errAppend != nil {
+			t.Fatal(errAppend)
+		}
+	}
+	paths := source.Paths()
+	if got, errRead := os.ReadFile(paths[0]); errRead != nil || string(got) != "first-tail" {
+		t.Fatalf("Paths must publish pending bytes: %q, %v", got, errRead)
+	}
+	if errAppend := source.AppendPart([]byte("  second  ")); errAppend != nil {
+		t.Fatal(errAppend)
+	}
+	if errAppend := source.AppendBytes([]byte("second-tail")); errAppend != nil {
+		t.Fatal(errAppend)
+	}
+	part, errPart := source.CreatePart("external")
+	if errPart != nil {
+		t.Fatal(errPart)
+	}
+	if _, errWrite := part.WriteString("third"); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errClose := part.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	if errAppend := source.AppendBytes([]byte("-tail")); errAppend != nil {
+		t.Fatal(errAppend)
+	}
+	got, errBytes := source.Bytes()
+	if errBytes != nil || string(got) != "first-tail\nsecond\nsecond-tail\nthird-tail" {
+		t.Fatalf("ordered body = %q, %v", got, errBytes)
+	}
+	paths = source.Paths()
+	if errCleanup := source.Cleanup(); errCleanup != nil {
+		t.Fatal(errCleanup)
+	}
+	assertFileBodySourceCleaned(t, paths)
+	if errAppend := source.AppendBytes([]byte("late")); errAppend == nil {
+		t.Fatal("append after cleanup succeeded")
+	}
+}
+
+func TestFileBodySourceCleanupClosesOutstandingPart(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "external")
+	if err != nil {
+		t.Fatal(err)
+	}
+	part, errPart := source.CreatePart("unfinished")
+	if errPart != nil {
+		t.Fatal(errPart)
+	}
+	defer func() { _ = part.Close() }()
+	if errCleanup := source.Cleanup(); errCleanup != nil {
+		t.Fatal(errCleanup)
+	}
+	if _, errWrite := part.WriteString("late"); !errors.Is(errWrite, os.ErrClosed) {
+		t.Fatalf("outstanding handle survived cleanup: %v", errWrite)
+	}
+}
+
+type fileBodyLifecycleWriter struct {
+	source *FileBodySource
+	t      *testing.T
+}
+
+func (w fileBodyLifecycleWriter) Write(p []byte) (int, error) {
+	if w.source.mu.TryLock() {
+		w.source.mu.Unlock()
+		w.t.Error("WriteTo must protect its part files from concurrent cleanup")
+	}
+	return len(p), nil
+}
+
+func TestFileBodySourceWriteToProtectsLifecycle(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = source.Cleanup() }()
+	if errAppend := source.AppendBytes([]byte("payload")); errAppend != nil {
+		t.Fatal(errAppend)
+	}
+	if _, errWrite := source.WriteTo(fileBodyLifecycleWriter{source: source, t: t}); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+}
+
+func TestFileBodySourceConcurrentLifecycle(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "concurrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := range 8 {
+		workers.Go(func() {
+			<-start
+			for range 20 {
+				switch i % 4 {
+				case 0:
+					_ = source.AppendBytes([]byte("chunk"))
+				case 1:
+					_ = source.AppendPart([]byte("part"))
+				case 2:
+					_, _ = source.WriteTo(io.Discard)
+				case 3:
+					_ = source.Cleanup()
+				}
+			}
+		})
+	}
+	close(start)
+	workers.Wait()
+	if errCleanup := source.Cleanup(); errCleanup != nil {
+		t.Fatal(errCleanup)
+	}
+	if _, errStat := os.Stat(source.dir); !os.IsNotExist(errStat) {
+		t.Fatalf("source directory survived cleanup: %v", errStat)
+	}
+}
+
+func TestFileBodySourceBoundedBufferAndFlushFailure(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "flush")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte("x"), 257)
+	for range 1000 {
+		if errAppend := source.AppendBytes(chunk); errAppend != nil {
+			t.Fatal(errAppend)
+		}
+	}
+	stat, errStat := source.appendFile.Stat()
+	if errStat != nil || stat.Size() < int64(1000*len(chunk)-fileBodyBufferSize) {
+		t.Fatalf("pending data exceeded the fixed buffer: %v, %v", stat, errStat)
+	}
+	path := source.appendFile.Name()
+	if errClose := source.appendFile.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	if errFlush := source.Flush(); !errors.Is(errFlush, os.ErrClosed) {
+		t.Fatalf("flush failure = %v", errFlush)
+	}
+	if errAppend := source.AppendBytes([]byte("late")); !errors.Is(errAppend, os.ErrClosed) {
+		t.Fatalf("write failure was lost: %v", errAppend)
+	}
+	if _, errBytes := source.Bytes(); !errors.Is(errBytes, os.ErrClosed) {
+		t.Fatalf("observation failure was lost: %v", errBytes)
+	}
+	for range 2 {
+		if errCleanup := source.Cleanup(); !errors.Is(errCleanup, os.ErrClosed) {
+			t.Fatalf("cleanup failure was lost: %v", errCleanup)
+		}
+	}
+	assertFileBodySourceCleaned(t, []string{path})
+}
+
+func TestFileBodySourceConcurrentAppendsPreserveAllBytes(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "append")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = source.Cleanup() }()
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Go(func() {
+			for range 128 {
+				if errAppend := source.AppendBytes([]byte("chunk\n")); errAppend != nil {
+					t.Error(errAppend)
+				}
+			}
+		})
+	}
+	workers.Wait()
+	body, errBytes := source.Bytes()
+	if errBytes != nil || !bytes.Equal(body, bytes.Repeat([]byte("chunk\n"), 8*128)) {
+		t.Fatalf("concurrent append lost bytes: len=%d, %v", len(body), errBytes)
+	}
+}
+
+func TestFileBodySourceReportsRemovedActivePart(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "removed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = source.Cleanup() }()
+	if errAppend := source.AppendBytes([]byte("pending")); errAppend != nil {
+		t.Fatal(errAppend)
+	}
+	if errRemove := os.Remove(source.appendFile.Name()); errRemove != nil {
+		t.Skipf("platform does not allow removing an open file: %v", errRemove)
+	}
+	if _, errBytes := source.Bytes(); !os.IsNotExist(errBytes) {
+		t.Fatalf("removed active log part silently lost bytes: %v", errBytes)
+	}
+}
+
+func TestFileStreamingLogWriterCleansOwnedSourcesOnCloseFailure(t *testing.T) {
+	source, err := NewFileBodySourceInDir(t.TempDir(), "stream-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = source.Cleanup() }()
+	if errAppend := source.AppendBytes([]byte("pending API response")); errAppend != nil {
+		t.Fatal(errAppend)
+	}
+	paths := source.Paths()
+	w := &FileStreamingLogWriter{logsDir: filepath.Join(t.TempDir(), "missing"), logFilename: "test.log"}
+	if errSource := w.WriteAPIResponseSource(source); errSource != nil {
+		t.Fatal(errSource)
+	}
+	if errClose := w.Close(); errClose == nil {
+		t.Fatal("expected log creation error")
+	}
+	assertFileBodySourceCleaned(t, paths)
+}
+
+func BenchmarkFileBodySourceAppendBytes(b *testing.B) {
+	dir := b.TempDir()
+	chunk := bytes.Repeat([]byte("x"), 256)
+	b.ReportAllocs()
+	b.SetBytes(int64(1024 * len(chunk)))
+	for b.Loop() {
+		source, err := NewFileBodySourceInDir(dir, "bench")
+		if err != nil {
+			b.Fatal(err)
+		}
+		for range 1024 {
+			if errAppend := source.AppendBytes(chunk); errAppend != nil {
+				b.Fatal(errAppend)
+			}
+		}
+		if _, errWrite := source.WriteTo(io.Discard); errWrite != nil {
+			b.Fatal(errWrite)
+		}
+		if errCleanup := source.Cleanup(); errCleanup != nil {
+			b.Fatal(errCleanup)
+		}
+	}
+}
+
+func gzipLogPayload(t testing.TB, payload []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	w := gzip.NewWriter(&compressed)
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
+func logResponseFixture(logger *FileRequestLogger, encoding string, response []byte) error {
+	return logger.LogRequest("/v1/responses", "POST", nil, nil, 200, map[string][]string{"Content-Encoding": {encoding}}, response, nil, nil, nil, nil, nil, "decode-test", time.Time{}, time.Time{})
+}
+
+func TestRequestLogCompressedResponse(t *testing.T) {
+	payload := []byte("\nplain response\n")
+	gz := gzipLogPayload(t, payload)
+	badChecksum := bytes.Clone(gz)
+	badChecksum[len(badChecksum)-8] ^= 1
+	var deflated, brotliBody bytes.Buffer
+	deflater, errDeflate := flate.NewWriter(&deflated, flate.DefaultCompression)
+	if errDeflate != nil {
+		t.Fatal(errDeflate)
+	}
+	_, _ = deflater.Write(payload)
+	if errClose := deflater.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	brotliWriter := brotli.NewWriter(&brotliBody)
+	_, _ = brotliWriter.Write(payload)
+	if errClose := brotliWriter.Close(); errClose != nil {
+		t.Fatal(errClose)
+	}
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = encoder.Close() }()
+	for _, tc := range []struct {
+		name, encoding string
+		raw            []byte
+		malformed      bool
+	}{
+		{"identity", "identity", payload, false},
+		{"gzip", "gzip", gz, false},
+		{"gzip-multistream", "gzip", append(gzipLogPayload(t, payload[:5]), gzipLogPayload(t, payload[5:])...), false},
+		{"zstd", "zstd", encoder.EncodeAll(payload, nil), false},
+		{"deflate", "deflate", deflated.Bytes(), false},
+		{"brotli", "br", brotliBody.Bytes(), false},
+		{"gzip-header", "gzip", []byte("invalid gzip"), true},
+		{"gzip-truncated", "gzip", gz[:len(gz)-4], true},
+		{"gzip-checksum", "gzip", badChecksum, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if errLog := logResponseFixture(NewFileRequestLogger(true, dir, "", 0), tc.encoding, tc.raw); errLog != nil {
+				t.Fatal(errLog)
+			}
+			entries, errRead := os.ReadDir(dir)
+			if errRead != nil || len(entries) != 1 {
+				t.Fatalf("log files: %v, %v", entries, errRead)
+			}
+			logged, errRead := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			body := bytes.SplitN(logged, []byte("=== RESPONSE ===\n"), 2)[1]
+			if tc.malformed {
+				if !bytes.Contains(body, tc.raw) || !bytes.Contains(body, []byte("[DECOMPRESSION ERROR:")) || bytes.Contains(body, payload) {
+					t.Fatalf("malformed response must retain raw bytes with an error and no partial plaintext: %q", body)
+				}
+			} else if !bytes.HasSuffix(body, append(bytes.Clone(payload), '\n')) || bytes.Contains(body, []byte("[DECOMPRESSION ERROR:")) {
+				t.Fatalf("decoded body: %q", body)
+			}
+		})
+	}
+}
+
+func TestRequestLogMalformedGzipDiscardsExpandedBody(t *testing.T) {
+	raw := gzipLogPayload(t, bytes.Repeat([]byte("x"), 1<<20))
+	raw[len(raw)-8] ^= 1
+	for _, destination := range []string{"file", "home-buffer", "arbitrary-writer"} {
+		t.Run(destination, func(t *testing.T) {
+			var body bytes.Buffer
+			var w io.Writer = &body
+			var file *os.File
+			if destination == "file" {
+				var errCreate error
+				file, errCreate = os.CreateTemp(t.TempDir(), "response-*.log")
+				if errCreate != nil {
+					t.Fatal(errCreate)
+				}
+				defer func() { _ = file.Close() }()
+				w = file
+			} else if destination == "arbitrary-writer" {
+				w = struct{ io.Writer }{&body}
+			}
+			_, _ = io.WriteString(w, "request prefix\n")
+			if errWrite := writeDecodedResponseSection(w, 200, map[string][]string{"Content-Encoding": {"gzip"}}, raw); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			logged := body.Bytes()
+			if file != nil {
+				var errRead error
+				logged, errRead = os.ReadFile(file.Name())
+				if errRead != nil {
+					t.Fatal(errRead)
+				}
+			}
+			if !bytes.HasPrefix(logged, []byte("request prefix\n")) || !bytes.Contains(logged, raw) || !bytes.Contains(logged, []byte("[DECOMPRESSION ERROR:")) || len(logged) > len(raw)+512 {
+				t.Fatalf("failed to roll back partial plaintext: log=%d bytes, raw=%d bytes", len(logged), len(raw))
+			}
+		})
+	}
+}
+
+type failingResponseLogWriter struct{ err error }
+
+func (w failingResponseLogWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestRequestLogPropagatesDestinationError(t *testing.T) {
+	want := errors.New("log storage failed")
+	raw := gzipLogPayload(t, []byte("body"))
+	if errWrite := writeDecodedResponseSection(failingResponseLogWriter{err: want}, 200, map[string][]string{"Content-Encoding": {"gzip"}}, raw); !errors.Is(errWrite, want) {
+		t.Fatalf("write error = %v, want %v", errWrite, want)
+	}
+}
+
+func TestRequestLogGzipDoesNotAllocateExpandedBody(t *testing.T) {
+	raw := gzipLogPayload(t, bytes.Repeat([]byte("x"), 8<<20))
+	logger := NewFileRequestLogger(true, t.TempDir(), "", 0)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if errLog := logResponseFixture(logger, "gzip", raw); errLog != nil {
+		t.Fatal(errLog)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4<<20 {
+		t.Fatalf("logging an 8 MiB gzip response allocated %d bytes; decoded output must be streamed", allocated)
+	}
+}
+
+func BenchmarkRequestLogGzipResponse(b *testing.B) {
+	raw := gzipLogPayload(b, bytes.Repeat([]byte("x"), 1<<20))
+	dir := b.TempDir()
+	logger := NewFileRequestLogger(true, dir, "", 0)
+	b.ReportAllocs()
+	b.SetBytes(1 << 20)
+	for b.Loop() {
+		if errLog := logResponseFixture(logger, "gzip", raw); errLog != nil {
+			b.Fatal(errLog)
+		}
+		entries, errRead := os.ReadDir(dir)
+		if errRead != nil {
+			b.Fatal(errRead)
+		}
+		for _, entry := range entries {
+			if errRemove := os.Remove(filepath.Join(dir, entry.Name())); errRemove != nil {
+				b.Fatal(errRemove)
+			}
+		}
+	}
+}
 
 type stubHomeRequestLogClient struct {
 	heartbeatOK bool

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,254 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+func TestManagerSelectionIndexInvalidation(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+	reg := registry.GetGlobalRegistry()
+	authID := t.Name()
+	register := func(model string) {
+		reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+	register("first")
+	if _, errRegister := manager.Register(ctx, &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	index := func(provider, model string) *selectionIndex {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return manager.selectionIndexLocked(provider, model)
+	}
+	initial := index("codex", "first")
+	if len(initial.ids) != 1 || initial != index("codex", "first") {
+		t.Fatal("unchanged route did not reuse membership index")
+	}
+	// Result updates are dynamic; they must not invalidate static membership.
+	manager.MarkResult(ctx, Result{AuthID: authID, Provider: "codex", Model: "first", Success: true})
+	if initial != index("codex", "first") {
+		t.Fatal("result invalidated static membership")
+	}
+	register("second")
+	if len(index("codex", "first").ids) != 0 || len(index("codex", "second").ids) != 1 {
+		t.Fatal("registry replacement retained stale membership")
+	}
+	manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{"codex": {{Name: "second", Alias: "alias"}}})
+	if len(index("codex", "alias").ids) != 1 {
+		t.Fatal("OAuth alias was not indexed")
+	}
+	manager.SetOAuthModelAlias(nil)
+	if len(index("codex", "alias").ids) != 0 {
+		t.Fatal("OAuth alias removal retained membership")
+	}
+	beforeConfig := index("codex", "second")
+	manager.SetConfig(&internalconfig.Config{})
+	if beforeConfig == index("codex", "second") {
+		t.Fatal("config publication retained previous route index")
+	}
+	auth, _ := manager.GetByID(authID)
+	auth.Provider = "claude"
+	if _, errUpdate := manager.Update(ctx, auth); errUpdate != nil {
+		t.Fatal(errUpdate)
+	}
+	if len(index("codex", "second").ids) != 0 || len(index("claude", "second").ids) != 1 {
+		t.Fatal("credential provider update retained stale membership")
+	}
+	manager.Remove(ctx, authID)
+	if len(index("claude", "second").ids) != 0 {
+		t.Fatal("removed credential remains indexed")
+	}
+}
+
+func TestManagerSelectionIndexMetadataPublication(t *testing.T) {
+	for _, initialKind := range []string{AuthKindAPIKey, AuthKindOAuth} {
+		t.Run(initialKind, func(t *testing.T) {
+			ctx := context.Background()
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: "claude"})
+			manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{"claude": {{Name: "real", Alias: "alias"}}})
+			authID := t.Name()
+			registered, errRegister := manager.Register(ctx, &Auth{ID: authID, Provider: "claude", Metadata: map[string]any{AttributeAuthKind: initialKind}})
+			if errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "real"}})
+			t.Cleanup(func() { reg.UnregisterClient(authID) })
+			assertSelection := func(kind string) {
+				t.Helper()
+				selected, errSelect := manager.SelectAuth(ctx, "claude", "alias", cliproxyexecutor.Options{})
+				if kind == AuthKindOAuth {
+					if errSelect != nil || selected == nil || selected.ID != authID || selected.AuthKind() != kind {
+						t.Errorf("OAuth alias membership missing: selected=%t err=%v", selected != nil, errSelect)
+					}
+				} else if selected != nil || errSelect == nil {
+					t.Errorf("API key retained OAuth alias membership: selected=%t err=%v", selected != nil, errSelect)
+				}
+			}
+			assertSelection(initialKind)
+			manager.mu.RLock()
+			before := manager.selectionIndexLocked("claude", "alias")
+			manager.mu.RUnlock()
+			if saved, _ := manager.PersistMetadataEntry(ctx, authID, registered.RegistrationEpoch, "observed_quota", 42, nil); !saved {
+				t.Fatal("quota metadata save failed")
+			}
+			manager.mu.RLock()
+			afterQuota := manager.selectionIndexLocked("claude", "alias")
+			manager.mu.RUnlock()
+			if before != afterQuota {
+				t.Error("unrelated quota metadata invalidated static membership")
+			}
+			nextKind := AuthKindOAuth
+			if initialKind == AuthKindOAuth {
+				nextKind = AuthKindAPIKey
+			}
+			if saved, _ := manager.PersistMetadataEntry(ctx, authID, registered.RegistrationEpoch, AttributeAuthKind, nextKind, nil); !saved {
+				t.Fatal("auth kind metadata save failed")
+			}
+			current, _ := manager.GetByID(authID)
+			if current.Generation != registered.Generation || current.RegistrationEpoch != registered.RegistrationEpoch {
+				t.Fatal("metadata save changed lifecycle versions")
+			}
+			assertSelection(nextKind)
+			manager.mu.RLock()
+			afterKind := manager.selectionIndexLocked("claude", "alias")
+			manager.mu.RUnlock()
+			if afterKind == before {
+				t.Error("auth kind publication retained stale route index")
+			}
+		})
+	}
+}
+
+func TestManagerSelectionIndexStorePublication(t *testing.T) {
+	for _, path := range []string{"metadata-enrichment", "quota-enrichment", "metadata-invalidation"} {
+		t.Run(path, func(t *testing.T) {
+			ctx := context.Background()
+			manager := NewManager(nil, &RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: "claude"})
+			manager.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{"claude": {{Name: "real", Alias: "alias"}}})
+			registered, errRegister := manager.Register(ctx, &Auth{ID: t.Name(), Provider: "claude", Metadata: map[string]any{AttributeAuthKind: AuthKindAPIKey}})
+			if errRegister != nil {
+				t.Fatal(errRegister)
+			}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(registered.ID, "claude", []*registry.ModelInfo{{ID: "real"}})
+			t.Cleanup(func() { reg.UnregisterClient(registered.ID) })
+			if selected, errSelect := manager.SelectAuth(ctx, "claude", "alias", cliproxyexecutor.Options{}); selected != nil || errSelect == nil {
+				t.Fatal("API key must not support the OAuth alias")
+			}
+			metadataValid := true
+			manager.SetStore(&callbackAuthStore{save: func(auth *Auth) error {
+				if path == "metadata-invalidation" {
+					metadataValid = false
+				} else {
+					auth.Metadata[AttributeAuthKind] = AuthKindOAuth
+				}
+				return nil
+			}})
+			switch path {
+			case "metadata-enrichment":
+				if saved, _ := manager.PersistMetadataEntry(ctx, registered.ID, registered.RegistrationEpoch, "notes", "store enriches routing", nil); !saved {
+					t.Fatal("metadata save failed")
+				}
+			case "quota-enrichment":
+				if _, _, errReset := manager.ResetQuota(ctx, registered.ID); errReset != nil {
+					t.Fatal(errReset)
+				}
+			case "metadata-invalidation":
+				if saved, _ := manager.PersistMetadataEntry(ctx, registered.ID, registered.RegistrationEpoch, AttributeAuthKind, AuthKindOAuth, func(*Auth) bool { return metadataValid }); saved {
+					t.Fatal("stale metadata should be removed after validation fails")
+				}
+			}
+			// Removing an explicit API-key kind restores the legacy OAuth alias
+			// channel too. Both successful saves and invalidation must be visible.
+			selected, errSelect := manager.SelectAuth(ctx, "claude", "alias", cliproxyexecutor.Options{})
+			if errSelect != nil || selected == nil || selected.ID != registered.ID {
+				t.Fatalf("store publication retained stale membership: selected=%t err=%v", selected != nil, errSelect)
+			}
+		})
+	}
+}
+
+func TestManagerSchedulingSnapshotIsolation(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID: "snapshot", Provider: "codex", Status: StatusActive,
+		Attributes:  map[string]string{"priority": "2", "unrelated": "keep"},
+		Metadata:    map[string]any{"profile": map[string]any{"value": "keep"}, AttributeWeight: 3},
+		Quota:       QuotaState{Signals: map[string]string{"primary-used-percent": "20"}},
+		ModelStates: map[string]*ModelState{"model": {Status: StatusActive}},
+	}
+	for _, test := range []struct {
+		name     string
+		selector Selector
+		plugin   bool
+		light    bool
+	}{
+		{"builtin", &RoundRobinSelector{}, false, true},
+		{"custom", lastAuthSelector{}, false, false},
+		{"plugin", &RoundRobinSelector{}, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, snapshots, errAvailable := manager.availableAuthsForSelector(test.selector, []*Auth{auth}, "codex", "model", time.Now(), false, test.plugin)
+			if errAvailable != nil {
+				t.Fatal(errAvailable)
+			}
+			got := snapshots[0]
+			if got.selectionOnly != test.light || authWeight(got) != 3 || authPriority(got) != 2 {
+				t.Fatal("snapshot lost scheduling fields or isolation mode")
+			}
+			got.Attributes["priority"] = "99"
+			got.Quota.Signals["primary-used-percent"] = "99"
+			if test.light {
+				if got.Metadata != nil || got.ModelStates != nil || got.Attributes["unrelated"] != "" {
+					t.Fatal("light snapshot copied execution-only data")
+				}
+			} else {
+				got.Metadata["profile"].(map[string]any)["value"] = "changed"
+				got.ModelStates["model"].Status = StatusDisabled
+			}
+			if authPriority(auth) != 2 || auth.Quota.Signals["primary-used-percent"] != "20" || auth.ModelStates["model"].Status != StatusActive || auth.Metadata["profile"].(map[string]any)["value"] != "keep" {
+				t.Fatal("selector mutated manager-owned data")
+			}
+		})
+	}
+}
+
+func TestManagerSessionAffinityConcurrentLiveSnapshots(t *testing.T) {
+	selector := NewSessionAffinitySelector(nil)
+	t.Cleanup(selector.Stop)
+	manager := NewManager(nil, selector, nil)
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+	for _, id := range []string{t.Name() + "-a", t.Name() + "-b"} {
+		if _, errRegister := manager.Register(context.Background(), &Auth{ID: id, Provider: "codex", Metadata: map[string]any{"profile": map[string]any{"value": "original"}}}); errRegister != nil {
+			t.Fatal(errRegister)
+		}
+	}
+	var workers sync.WaitGroup
+	for worker := 0; worker < 6; worker++ {
+		workers.Go(func() {
+			for attempt := 0; attempt < 30; attempt++ {
+				opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": {"shared"}}, Metadata: map[string]any{}}
+				selected, _, _, errPick := manager.pickNextMixed(context.Background(), []string{"codex"}, "", opts, nil)
+				if errPick != nil {
+					t.Error(errPick)
+					return
+				}
+				selected.Metadata["profile"].(map[string]any)["value"] = "executor-owned"
+				manager.MarkResult(context.Background(), Result{AuthID: selected.ID, Provider: "codex", Success: true, Options: opts})
+			}
+		})
+	}
+	workers.Wait()
+	for _, auth := range manager.List() {
+		if auth.Metadata["profile"].(map[string]any)["value"] != "original" {
+			t.Fatal("execution snapshot mutated stored credential")
+		}
+	}
+}
 
 type schedulerTestExecutor struct {
 	provider string

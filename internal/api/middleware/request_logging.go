@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -28,11 +30,37 @@ const (
 	authenticatedRequestBodyCapturerContextKey string = "CPA_AUTHENTICATED_REQUEST_BODY_CAPTURER"
 )
 
+type requestLoggingOptions struct {
+	sampleRate func() float64
+	draw       func() float64
+}
+
+// RequestLoggingOption configures request log capture without wrapping the logger's source interfaces.
+type RequestLoggingOption func(*requestLoggingOptions)
+
+// WithRequestLogSampling supplies a live sampling rate and an optional random draw.
+// Both callbacks must be safe for concurrent use. Nil uses full sampling and the default RNG.
+func WithRequestLogSampling(sampleRate, draw func() float64) RequestLoggingOption {
+	return func(options *requestLoggingOptions) {
+		options.sampleRate = sampleRate
+		options.draw = draw
+	}
+}
+
 // RequestLoggingMiddleware creates a Gin middleware that logs HTTP requests and responses.
 // It captures detailed information about the request and response, including headers and body,
 // and uses the provided RequestLogger to record this data. When full request logging is disabled,
 // large and unknown-size bodies are spooled to disk and retained only for error logs.
-func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
+func RequestLoggingMiddleware(logger logging.RequestLogger, options ...RequestLoggingOption) gin.HandlerFunc {
+	settings := requestLoggingOptions{}
+	for _, option := range options {
+		if option != nil {
+			option(&settings)
+		}
+	}
+	if settings.draw == nil {
+		settings.draw = rand.Float64
+	}
 	return func(c *gin.Context) {
 		if logger == nil {
 			c.Next()
@@ -50,8 +78,20 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			return
 		}
 
-		loggerEnabled := logger.IsEnabled()
-		captureBody := shouldCaptureRequestBody(loggerEnabled, c.Request)
+		requestLogger := logger
+		// Only snapshot the concrete built-in logger: embedding can promote this method
+		// on custom loggers whose capture or source methods must remain authoritative.
+		if fileLogger, ok := logger.(*logging.FileRequestLogger); ok {
+			requestLogger = fileLogger.SnapshotForRequest()
+		}
+		loggerEnabled := requestLogger.IsEnabled()
+		captureEnabled := loggerEnabled
+		if captureEnabled && settings.sampleRate != nil {
+			rate := settings.sampleRate()
+			captureEnabled = rate >= 1 || (rate > 0 && settings.draw() < rate)
+		}
+		c.Request = c.Request.WithContext(logging.WithRequestLogCapture(c.Request.Context(), captureEnabled))
+		captureBody := shouldCaptureRequestBody(captureEnabled, c.Request)
 
 		// Capture request metadata before authentication without reading the request body.
 		requestInfo, err := captureRequestInfo(c, false)
@@ -61,16 +101,15 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 		}
 
 		// Create response writer wrapper
-		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)
-		if !loggerEnabled {
-			wrapper.logOnErrorOnly = true
-		}
+		wrapper := NewResponseWriterWrapper(c.Writer, requestLogger, requestInfo)
+		wrapper.logOnErrorOnly = !captureEnabled
+		wrapper.sampledOut = loggerEnabled && !captureEnabled
 		c.Writer = wrapper
-		attachRequestLogSources(c, logger, loggerEnabled)
-		deferredCapture := attachDeferredRequestBodyCapture(c.Request, logger, requestInfo, false, false)
+		attachRequestLogSources(c, requestLogger, captureEnabled)
+		deferredCapture := attachDeferredRequestBodyCapture(c.Request, requestLogger, requestInfo, false, false)
 		if captureBody {
 			c.Set(authenticatedRequestBodyCapturerContextKey, func() {
-				if deferredCapture != nil && deferredCapture.bytesRead == 0 {
+				if deferredCapture != nil && deferredCapture.bytesRead == 0 && c.Request.Body == deferredCapture {
 					c.Request.Body = deferredCapture.body
 					requestInfo.deferredBodyCapture = nil
 					deferredCapture.Cleanup()
@@ -439,32 +478,61 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 	return info, nil
 }
 
+// failedRequestBodyCapture replays a partial read and its terminal error so
+// eager logging cannot turn a failed request into a successful empty body read.
+type failedRequestBodyCapture struct {
+	reader *bytes.Reader
+	body   io.Closer
+	err    error
+}
+
+func (b *failedRequestBodyCapture) Read(p []byte) (int, error) {
+	n, errRead := b.reader.Read(p)
+	if errRead == io.EOF {
+		return n, b.err
+	}
+	return n, errRead
+}
+
+func (b *failedRequestBodyCapture) Close() error { return b.body.Close() }
+
 func captureRequestInfoBody(c *gin.Context, info *RequestInfo) error {
 	if c == nil || c.Request == nil || c.Request.Body == nil || info == nil {
 		return nil
 	}
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		c.Request.Body = &failedRequestBodyCapture{reader: bytes.NewReader(bodyBytes), body: c.Request.Body, err: err}
 		return err
 	}
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 	// The decoded body is bounded even when no max-request-body-bytes is configured:
 	// a small zstd body can expand to gigabytes.
 	maxBytes := c.GetInt64("maxRequestBodyBytes")
 	if maxBytes <= 0 || maxBytes > maxDeferredErrorRequestBodyBytes {
 		maxBytes = maxDeferredErrorRequestBodyBytes
 	}
-	info.Body = decodeCapturedRequestBodyForLogWithLimit(bodyBytes, c.Request.Header.Get("Content-Encoding"), maxBytes)
+	loggedBody, complete := decodeCapturedRequestBody(bodyBytes, c.Request.Header.Get("Content-Encoding"), maxBytes)
+	info.Body = loggedBody
+	var decoded []byte
+	if complete {
+		decoded = loggedBody
+	}
+	handlers.RestoreCapturedRequestBody(c.Request, bodyBytes, decoded, maxBytes)
 	return nil
 }
 
 func decodeCapturedRequestBodyForLogWithLimit(raw []byte, encoding string, limit int64) []byte {
+	body, _ := decodeCapturedRequestBody(raw, encoding, limit)
+	return body
+}
+
+func decodeCapturedRequestBody(raw []byte, encoding string, limit int64) ([]byte, bool) {
 	if len(raw) == 0 || limit <= 0 {
-		return raw
+		return raw, false
 	}
 	encoding = strings.TrimSpace(encoding)
 	if encoding == "" || strings.EqualFold(encoding, "identity") {
-		return raw
+		return raw, true
 	}
 
 	parts := strings.Split(encoding, ",")
@@ -477,20 +545,20 @@ func decodeCapturedRequestBodyForLogWithLimit(raw []byte, encoding string, limit
 		case "zstd":
 			decoded, truncated, errDecode := decodeCapturedZstdRequestBodyWithLimit(body, limit)
 			if errDecode != nil {
-				return raw
+				return raw, false
 			}
 			body = decoded
 			if truncated {
 				if len(body) > 0 && !bytes.HasSuffix(body, []byte("\n")) {
 					body = append(body, '\n')
 				}
-				return append(body, "[DECOMPRESSED REQUEST BODY TRUNCATED]"...)
+				return append(body, "[DECOMPRESSED REQUEST BODY TRUNCATED]"...), false
 			}
 		default:
-			return raw
+			return raw, false
 		}
 	}
-	return body
+	return body, true
 }
 
 func decodeCapturedZstdRequestBodyWithLimit(raw []byte, limit int64) ([]byte, bool, error) {

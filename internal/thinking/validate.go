@@ -255,6 +255,35 @@ func convertAutoToMidRange(config ThinkingConfig, support *registry.ThinkingSupp
 // standardLevelOrder defines the canonical ordering of thinking levels from lowest to highest.
 var standardLevelOrder = []ThinkingLevel{LevelMinimal, LevelLow, LevelMedium, LevelHigh, LevelXHigh, LevelMax}
 
+// normalizeWorkBuddyConfig replaces unsupported efforts with the model's highest
+// advertised level before generic validation or nearest-level conversion.
+func normalizeWorkBuddyConfig(config ThinkingConfig, modelInfo *registry.ModelInfo) ThinkingConfig {
+	level := config.Level
+	switch config.Mode {
+	case ModeLevel:
+	case ModeBudget:
+		if detectModelCapability(modelInfo) != CapabilityLevelOnly {
+			return config
+		}
+		converted, ok := ConvertBudgetToLevel(config.Budget)
+		if !ok {
+			return config
+		}
+		level = ThinkingLevel(converted)
+	default:
+		return config
+	}
+	if level == LevelNone || level == LevelAuto || isLevelSupported(string(level), modelInfo.Thinking.Levels) {
+		return config
+	}
+	for i := len(standardLevelOrder) - 1; i >= 0; i-- {
+		if isLevelSupported(string(standardLevelOrder[i]), modelInfo.Thinking.Levels) {
+			return ThinkingConfig{Mode: ModeLevel, Level: standardLevelOrder[i]}
+		}
+	}
+	return config
+}
+
 // lowestSupportedLevel returns the lowest canonical effort level in supported,
 // ignoring mode markers such as "none" and "auto".
 func lowestSupportedLevel(supported []string) (ThinkingLevel, bool) {

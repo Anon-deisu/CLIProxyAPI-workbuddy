@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +23,207 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 )
+
+func TestRequestBodyCaptureReturnsIndependentBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	payload := []byte(`{"input":"old"}`)
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = encoder.Close() }()
+	for _, encoding := range []string{"identity", "zstd"} {
+		t.Run(encoding, func(t *testing.T) {
+			raw := payload
+			if encoding == "zstd" {
+				raw = encoder.EncodeAll(payload, nil)
+			}
+			wantRaw := bytes.Clone(raw)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(raw))
+			c.Request.Header.Set("Content-Encoding", encoding)
+			info, errCapture := captureRequestInfo(c, true)
+			if errCapture != nil {
+				t.Fatal(errCapture)
+			}
+			got, errRead := handlers.ReadRequestBody(c)
+			if errRead != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("handler body = %q, %v", got, errRead)
+			}
+			if !bytes.Equal(got, info.Body) {
+				t.Fatalf("handler body differs from captured log: %q, %q", got, info.Body)
+			}
+			if &got[0] == &info.Body[0] {
+				t.Error("handler body shares storage with the captured log")
+			}
+			copy(got, []byte(`{"input":"new"}`))
+			if !bytes.Equal(info.Body, payload) {
+				t.Fatalf("handler mutation changed the original log: %q", info.Body)
+			}
+			if !bytes.Equal(raw, wantRaw) {
+				t.Fatalf("handler mutation changed the original request body: %q", raw)
+			}
+			if c.Request.Header.Get("Content-Encoding") != encoding {
+				t.Fatal("capture changed Content-Encoding")
+			}
+			remaining, errRead := io.ReadAll(c.Request.Body)
+			if errRead != nil || len(remaining) != 0 {
+				t.Fatalf("handler did not consume the restored body: %q, %v", remaining, errRead)
+			}
+		})
+	}
+}
+
+func TestRequestBodyCaptureInvalidatesOnReplacementOrRead(t *testing.T) {
+	for _, change := range []string{"replace", "partial", "wrapped-limit", "encoding"} {
+		t.Run(change, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/responses", strings.NewReader("original"))
+			info, errCapture := captureRequestInfo(c, true)
+			if errCapture != nil {
+				t.Fatal(errCapture)
+			}
+			want := "replacement"
+			switch change {
+			case "replace":
+				c.Request.Body = io.NopCloser(strings.NewReader(want))
+			case "partial":
+				_, _ = c.Request.Body.Read(make([]byte, 1))
+				want = "riginal"
+			case "wrapped-limit":
+				c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2)
+			case "encoding":
+				c.Request.Header.Set("Content-Encoding", "unsupported")
+			}
+			got, errRead := handlers.ReadRequestBody(c)
+			if change == "wrapped-limit" {
+				var maxErr *http.MaxBytesError
+				if !errors.As(errRead, &maxErr) {
+					t.Fatalf("body limit was bypassed: %v", errRead)
+				}
+			} else if change == "encoding" {
+				if errRead == nil {
+					t.Fatal("changed encoding was ignored")
+				}
+			} else if errRead != nil || string(got) != want {
+				t.Fatalf("body after %s = %q, %v", change, got, errRead)
+			}
+			if string(info.Body) != "original" {
+				t.Fatalf("original log snapshot changed: %q", info.Body)
+			}
+		})
+	}
+}
+
+type failingCapturedRequestBody struct {
+	failed bool
+}
+
+func (b *failingCapturedRequestBody) Read(p []byte) (int, error) {
+	if b.failed {
+		return 0, io.EOF
+	}
+	b.failed = true
+	return copy(p, "partial"), io.ErrUnexpectedEOF
+}
+
+func (b *failingCapturedRequestBody) Close() error { return nil }
+
+func TestRequestBodyCapturePreservesReadErrorForHandler(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/responses", &failingCapturedRequestBody{})
+	if _, errCapture := captureRequestInfo(c, true); !errors.Is(errCapture, io.ErrUnexpectedEOF) {
+		t.Fatalf("capture error = %v", errCapture)
+	}
+	if _, errRead := handlers.ReadRequestBody(c); !errors.Is(errRead, io.ErrUnexpectedEOF) {
+		t.Fatalf("capture swallowed the handler read error: %v", errRead)
+	}
+}
+
+func TestRequestBodyCaptureDoesNotReuseTruncatedLog(t *testing.T) {
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = encoder.Close() }()
+	payload := bytes.Repeat([]byte("x"), 128)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(encoder.EncodeAll(payload, nil)))
+	c.Request.Header.Set("Content-Encoding", "zstd")
+	c.Set(handlers.MaxRequestBodyBytesContextKey, int64(32))
+	info, errCapture := captureRequestInfo(c, true)
+	if errCapture != nil || !bytes.Contains(info.Body, []byte("[DECOMPRESSED REQUEST BODY TRUNCATED]")) {
+		t.Fatalf("capture must retain the bounded log representation: %v", errCapture)
+	}
+	var maxErr *http.MaxBytesError
+	if _, errRead := handlers.ReadRequestBody(c); !errors.As(errRead, &maxErr) {
+		t.Fatalf("truncated log bypassed the decoded body limit: %v", errRead)
+	}
+}
+
+type unreadRequestBody struct{ reads int }
+
+func (b *unreadRequestBody) Read([]byte) (int, error) { b.reads++; return 0, io.EOF }
+func (b *unreadRequestBody) Close() error             { return nil }
+
+func TestRequestBodyCaptureWaitsForAuthenticationAndHonorsReplacement(t *testing.T) {
+	for _, authorized := range []bool{false, true} {
+		router := gin.New()
+		router.Use(RequestLoggingMiddleware(&spyRequestLogger{}))
+		router.POST("/v1/responses", func(c *gin.Context) {
+			if !authorized {
+				c.AbortWithStatus(http.StatusUnauthorized)
+				return
+			}
+			c.Request.Body = io.NopCloser(strings.NewReader("plugin replacement"))
+			CaptureAuthenticatedRequestBody(c)
+			got, errRead := handlers.ReadRequestBody(c)
+			if errRead != nil || string(got) != "plugin replacement" {
+				t.Errorf("authentication capture overwrote replacement: %q, %v", got, errRead)
+			}
+		})
+		body := &unreadRequestBody{}
+		req := httptest.NewRequest("POST", "/v1/responses", body)
+		router.ServeHTTP(httptest.NewRecorder(), req)
+		if body.reads != 0 {
+			t.Fatalf("authorized=%v: original body read %d times", authorized, body.reads)
+		}
+	}
+}
+
+func BenchmarkRequestBodyCaptureAndRead(b *testing.B) {
+	gin.SetMode(gin.TestMode)
+	payload := bytes.Repeat([]byte("x"), 256<<10)
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = encoder.Close() }()
+	compressed := encoder.EncodeAll(payload, nil)
+	for _, encoding := range []string{"identity", "zstd"} {
+		b.Run(encoding, func(b *testing.B) {
+			raw := payload
+			if encoding == "zstd" {
+				raw = compressed
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(raw))
+				c.Request.Header.Set("Content-Encoding", encoding)
+				if _, errCapture := captureRequestInfo(c, true); errCapture != nil {
+					b.Fatal(errCapture)
+				}
+				if got, errRead := handlers.ReadRequestBody(c); errRead != nil || len(got) != len(payload) {
+					b.Fatalf("read body: %d, %v", len(got), errRead)
+				}
+			}
+		})
+	}
+}
 
 func TestShouldSkipMethodForRequestLogging(t *testing.T) {
 	tests := []struct {

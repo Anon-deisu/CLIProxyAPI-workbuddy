@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 // RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
@@ -929,7 +930,7 @@ func codex2APIProven(auth *Auth) bool {
 // Pick selects the available credential with the most remaining observed quota.
 func (s *RemainingQuotaSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
-	available, errAvailable := getAvailableAuths(auths, provider, model, time.Now())
+	available, errAvailable := getSelectorAvailableAuths(ctx, auths, provider, model, time.Now())
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
@@ -1265,6 +1266,68 @@ type SessionAffinitySelector struct {
 	providerFilter map[string]struct{}
 }
 
+type sessionAffinityCandidateSourceKey struct{}
+
+// A source belongs to one synchronous Pick call. It defers the pool snapshot
+// until a binding cannot be served by a live lookup of its credential ID.
+type sessionAffinityCandidateSource struct {
+	lookup    func(string) *Auth
+	load      func() ([]*Auth, map[string]struct{}, error)
+	loaded    bool
+	auths     []*Auth
+	transient map[string]struct{}
+	err       error
+	last      *Auth
+}
+
+func affinityCandidateSource(ctx context.Context) *sessionAffinityCandidateSource {
+	if ctx == nil {
+		return nil
+	}
+	source, _ := ctx.Value(sessionAffinityCandidateSourceKey{}).(*sessionAffinityCandidateSource)
+	return source
+}
+
+func (s *SessionAffinitySelector) boundAuth(ctx context.Context, auths []*Auth, id, model string, now time.Time) *Auth {
+	var auth *Auth
+	if source := affinityCandidateSource(ctx); source != nil {
+		auth = source.lookup(id)
+		source.last = auth
+	} else {
+		auth = findAuthByID(auths, id)
+		validated := false
+		if ctx != nil {
+			validated, _ = ctx.Value(prevalidatedAuthCandidatesKey{}).(bool)
+		}
+		if !validated {
+			if blocked, _, _ := isAuthBlockedForModel(auth, model, now); blocked {
+				return nil
+			}
+		}
+	}
+	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted && authWeight(auth) <= 0 {
+		return nil
+	}
+	return auth
+}
+
+func (s *SessionAffinitySelector) availableAuths(ctx context.Context, auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	if source := affinityCandidateSource(ctx); source != nil {
+		if !source.loaded {
+			source.auths, source.transient, source.err = source.load()
+			source.loaded = true
+		}
+		if source.err != nil {
+			return nil, source.err
+		}
+		auths = source.auths
+	}
+	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
+		auths = positiveWeightAuths(auths)
+	}
+	return getSelectorAvailableAuthsAcrossPriorities(ctx, auths, provider, model, now)
+}
+
 const (
 	// SessionAffinityRebindOnAny rebinds on any credential-attributed failure.
 	SessionAffinityRebindOnAny = "any"
@@ -1358,6 +1421,10 @@ func (s *SessionAffinitySelector) shouldPreserveBindingWhenUnavailable(ctx conte
 	if s == nil || !s.rebindOnQuotaOnly || authID == "" {
 		return false
 	}
+	if source := affinityCandidateSource(ctx); source != nil {
+		_, preserved := source.transient[authID]
+		return preserved
+	}
 	if ctx != nil {
 		if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated {
 			_, ok := sessionAffinityTransientAuthIDsFromContext(ctx)[authID]
@@ -1439,10 +1506,8 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	if len(s.providerFilter) > 0 {
-		if _, ok := s.providerFilter[strings.ToLower(strings.TrimSpace(provider))]; !ok {
-			return s.fallback.Pick(ctx, provider, model, opts, auths)
-		}
+	if !s.appliesTo(provider) {
+		return s.fallback.Pick(ctx, provider, model, opts, auths)
 	}
 	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
@@ -1493,21 +1558,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
 	if primaryID == "" {
-		fallbackAuths, errAvailable := getSelectorAvailableAuths(ctx, availabilityCandidates, provider, model, now)
+		fallbackAuths, errAvailable := s.availableAuths(ctx, availabilityCandidates, provider, model, now)
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return s.fallback.Pick(ctx, provider, model, opts, highestPriorityAuths(fallbackAuths))
 	}
-
-	// A single availability pass serves both lookups: the bound credential is validated against
-	// every priority tier, while the fallback selector keeps seeing only the highest tier.
-	available, err := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
-	if err != nil {
-		return nil, err
-	}
-	fallbackAuths := highestPriorityAuths(available)
 
 	modelKey := canonicalModelKey(model)
 	cacheProvider := affinityPoolNamespace(provider, opts.Metadata)
@@ -1533,7 +1590,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return
 		}
 		bindingProvider := canonicalSchedulingProvider(provider)
-		for _, candidate := range auths {
+		bindingCandidates := auths
+		if source := affinityCandidateSource(ctx); source != nil {
+			bindingCandidates = source.auths
+			if source.last != nil && source.last.ID == authID {
+				bindingProvider = canonicalSchedulingProvider(executorKeyFromAuth(source.last))
+			}
+		}
+		for _, candidate := range bindingCandidates {
 			if candidate != nil && candidate.ID == authID {
 				if candidateProvider := canonicalSchedulingProvider(executorKeyFromAuth(candidate)); candidateProvider != "" {
 					bindingProvider = candidateProvider
@@ -1544,12 +1608,20 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		s.cache.setSessionAliases(authID, bindingProvider, primaryID, keys...)
 	}
 
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		if auth := findAuthByID(available, cachedAuthID); auth != nil {
+	cachedAuthID, cacheHit := s.cache.Get(cacheKey)
+	if cacheHit {
+		if auth := s.boundAuth(ctx, auths, cachedAuthID, model, now); auth != nil {
 			bind(auth.ID, true)
 			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 			return auth, nil
 		}
+	}
+	available, err := s.availableAuths(ctx, availabilityCandidates, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	fallbackAuths := highestPriorityAuths(available)
+	if cacheHit {
 		// Cached auth not available, reselect via fallback selector for even distribution
 		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
@@ -1637,6 +1709,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	return auth, nil
 }
 
+func (s *SessionAffinitySelector) appliesTo(provider string) bool {
+	if len(s.providerFilter) == 0 {
+		return true
+	}
+	_, allowed := s.providerFilter[strings.ToLower(strings.TrimSpace(provider))]
+	return allowed
+}
+
 func findAuthByID(auths []*Auth, id string) *Auth {
 	if id == "" {
 		return nil
@@ -1649,6 +1729,54 @@ func findAuthByID(auths []*Auth, id string) *Auth {
 	return nil
 }
 
+const lcpPreparationMetadataKey = "cliproxy.auth.lcp-preparation"
+
+// lcpPreparation is immutable after publication. The body is owned so in-place
+// edits and metadata inherited by a different request cannot reuse stale work.
+// Public result slices are separate from these private fingerprint slices.
+type lcpPreparation struct {
+	body             string
+	format           sdktranslator.Format
+	matcher          *cliproxysession.MerklePrefixMatcher
+	fingerprints     []string
+	minPrefixLength  int
+	tailFingerprints []string
+	envDigest        string
+}
+
+func (s *SessionAffinitySelector) prepareLCP(opts cliproxyexecutor.Options) *lcpPreparation {
+	prepared, _ := opts.Metadata[lcpPreparationMetadataKey].(*lcpPreparation)
+	if prepared == nil || prepared.matcher != s.matcher || prepared.format != opts.SourceFormat || prepared.body != string(opts.OriginalRequest) {
+		if previousID, _ := opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey].(string); previousID != "" {
+			if opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] == previousID {
+				delete(opts.Metadata, cliproxyexecutor.CanonicalSessionIDMetadataKey)
+			}
+			delete(opts.Metadata, cliproxyexecutor.LCPAffinitySessionIDMetadataKey)
+			delete(opts.Metadata, cliproxyexecutor.LCPAccessGenerationMetadataKey)
+			delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
+			delete(opts.Metadata, cliproxyexecutor.IsForkMetadataKey)
+			delete(opts.Metadata, cliproxyexecutor.IsCompactionMetadataKey)
+			delete(opts.Metadata, cliproxyexecutor.NodeKindMetadataKey)
+		}
+		turns := cliproxysession.ExtractCanonicalTurns(opts.SourceFormat, opts.OriginalRequest)
+		fingerprints, minimum, tail, environment := s.matcher.PrepareExt(turns)
+		prepared = &lcpPreparation{
+			body: string(opts.OriginalRequest), format: opts.SourceFormat, matcher: s.matcher,
+			fingerprints: fingerprints, minPrefixLength: minimum, tailFingerprints: tail, envDigest: environment,
+		}
+		if opts.Metadata != nil {
+			opts.Metadata[lcpPreparationMetadataKey] = prepared
+		}
+	}
+	if opts.Metadata != nil {
+		opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey] = append([]string(nil), prepared.fingerprints...)
+		opts.Metadata[cliproxyexecutor.LCPMinPrefixLengthMetadataKey] = prepared.minPrefixLength
+		opts.Metadata[cliproxyexecutor.LCPTailFingerprintsMetadataKey] = append([]string(nil), prepared.tailFingerprints...)
+		opts.Metadata[cliproxyexecutor.LCPEnvironmentDigestMetadataKey] = prepared.envDigest
+	}
+	return prepared
+}
+
 func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry) (*Auth, bool, error) {
 	if s == nil || s.matcher == nil {
 		return nil, false, nil
@@ -1657,37 +1785,17 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if namespace == "" {
 		return nil, false, nil
 	}
-	turns := cliproxysession.ExtractCanonicalTurns(opts.SourceFormat, opts.OriginalRequest)
-	if len(turns) == 0 {
-		return nil, false, nil
-	}
-	fingerprints, minPrefixLength, tailFingerprints, envDigest := s.matcher.PrepareExt(turns)
+	prepared := s.prepareLCP(opts)
+	fingerprints, minPrefixLength := prepared.fingerprints, prepared.minPrefixLength
+	tailFingerprints, envDigest := prepared.tailFingerprints, prepared.envDigest
 	if len(fingerprints) == 0 || minPrefixLength <= 0 || minPrefixLength > len(fingerprints) {
 		return nil, false, nil
 	}
-	if opts.Metadata != nil {
-		opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey] = fingerprints
-		opts.Metadata[cliproxyexecutor.LCPMinPrefixLengthMetadataKey] = minPrefixLength
-		opts.Metadata[cliproxyexecutor.LCPTailFingerprintsMetadataKey] = tailFingerprints
-		opts.Metadata[cliproxyexecutor.LCPEnvironmentDigestMetadataKey] = envDigest
-	}
-
-	availabilityCandidates := auths
-	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
-		availabilityCandidates = positiveWeightAuths(auths)
-	}
 	now := time.Now()
-	available, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
-	if errAvailable != nil {
-		return nil, true, errAvailable
-	}
-
 	var preservedAuthID string
-	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
-		for _, auth := range available {
-			if auth == nil || auth.ID != match.AuthID {
-				continue
-			}
+	match, matched := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength)
+	if matched {
+		if auth := s.boundAuth(ctx, auths, match.AuthID, model, now); auth != nil {
 			if match.SessionID != "" {
 				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
 				opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = match.SessionID
@@ -1724,9 +1832,13 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 			}
 			return auth, true, nil
 		}
-		if !match.IsFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, match.AuthID, now) {
-			preservedAuthID = match.AuthID
-		}
+	}
+	available, errAvailable := s.availableAuths(ctx, auths, provider, model, now)
+	if errAvailable != nil {
+		return nil, true, errAvailable
+	}
+	if matched && !match.IsFork && s.shouldPreserveBindingWhenUnavailable(ctx, auths, model, match.AuthID, now) {
+		preservedAuthID = match.AuthID
 	}
 
 	fallbackAuths := highestPriorityAuths(available)

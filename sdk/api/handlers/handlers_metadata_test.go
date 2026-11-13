@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +16,6 @@ import (
 	coresession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
-	"golang.org/x/net/context"
 )
 
 func TestGetContextWithCancelCapturesClientRequestMetadata(t *testing.T) {
@@ -55,6 +56,41 @@ func TestDegradedRoutingSurvivesHandlerContext(t *testing.T) {
 	}
 	if requestCallerScope(c) == coresession.CallerScope("shared-key") {
 		t.Fatal("degraded caller reused normal affinity namespace")
+	}
+}
+
+func TestRequestLogSamplingContextSurvivesGinReuse(t *testing.T) {
+	for _, selected := range []bool{false, true} {
+		for _, explicit := range []bool{false, true} {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			requestCtx := context.Background()
+			if explicit {
+				requestCtx = logging.WithRequestLogCapture(requestCtx, selected)
+			}
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(requestCtx)
+			h := NewBaseAPIHandlers(&config.SDKConfig{RequestLog: selected}, nil)
+			ctx, cancel := h.GetContextWithCancel(nil, c, context.Background())
+			cancel()
+			late := context.WithoutCancel(ctx)
+			other := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(logging.WithRequestLogCapture(context.Background(), !selected))
+			c.Request = other
+			h.UpdateClients(&config.SDKConfig{RequestLog: !selected})
+			if got := logging.RequestLogCaptureEnabled(late, !selected); got != selected {
+				t.Errorf("explicit=%v: reused Gin context changed capture to %v", explicit, got)
+			}
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range 1000 {
+					_ = logging.RequestLogCaptureEnabled(late, selected)
+				}
+			}()
+			for range 1000 {
+				c.Request = other
+			}
+			wg.Wait()
+		}
 	}
 }
 

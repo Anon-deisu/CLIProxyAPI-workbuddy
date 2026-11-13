@@ -87,6 +87,9 @@ type SDKConfig struct {
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 
+	// RequestLogSampleRate samples successful request logs. Nil preserves full logging.
+	RequestLogSampleRate *float64 `yaml:"request-log-sample-rate,omitempty" json:"request-log-sample-rate,omitempty"`
+
 	// CodexOrphanDelegationCompatibility mirrors the provider-wide runtime setting for API handlers.
 	CodexOrphanDelegationCompatibility bool `yaml:"-" json:"-"`
 
@@ -106,6 +109,43 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+}
+
+// EffectiveRequestLogSampleRate returns the configured probability, defaulting to one.
+func (c *SDKConfig) EffectiveRequestLogSampleRate() float64 {
+	if c == nil || c.RequestLogSampleRate == nil {
+		return 1
+	}
+	return *c.RequestLogSampleRate
+}
+
+func validateRequestLogSampleRateNode(node *yaml.Node) error {
+	if node == nil || node.Tag == "!!null" {
+		return nil
+	}
+	var rate float64
+	if node.Kind != yaml.ScalarNode || (node.Tag != "!!int" && node.Tag != "!!float") || node.Decode(&rate) != nil || math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 || rate > 1 {
+		return fmt.Errorf("observability.logs.request-log-sample-rate must be a finite number between 0 and 1")
+	}
+	return nil
+}
+
+// Validate sampling before optional loading can replace a malformed value with defaults.
+func validateRequestLogSampleRateYAML(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil || len(doc.Content) == 0 {
+		return nil // The normal loader handles malformed YAML and optional empty files.
+	}
+	var shape any
+	if err := doc.Decode(&shape); err != nil {
+		return nil // Reject cyclic aliases and duplicate keys before alias expansion in the normal loader.
+	}
+	root := expandConfigAliases(doc.Content[0])
+	node := yamlPath(root, "observability.logs.request-log-sample-rate")
+	if node == nil {
+		node = yamlPath(root, "request-log-sample-rate")
+	}
+	return validateRequestLogSampleRateNode(node)
 }
 
 // TLSHandshakeTimeout returns the upstream TLS handshake bound for the shared uTLS client.

@@ -124,6 +124,7 @@ func buildV8Paths() []configPath {
 		{"video-result-auth-cache-ttl", "multimedia.video-result-auth-cache-ttl"},
 		{"debug", "observability.logs.debug"}, {"logging-to-file", "observability.logs.logging-to-file"},
 		{"logs-max-total-size-mb", "observability.logs.logs-max-total-size-mb"}, {"request-log", "observability.logs.request-log"},
+		{"request-log-sample-rate", "observability.logs.request-log-sample-rate"},
 		{"error-logs-max-files", "observability.logs.error-logs-max-files"},
 		{"usage-statistics-enabled", "observability.usage.usage-statistics-enabled"},
 		{"redis-usage-queue-retention-seconds", "observability.usage.redis-usage-queue-retention-seconds"}, {"pprof", "observability.pprof"},
@@ -280,6 +281,9 @@ func (cfg *Config) SyncServerResponseCompression() {
 func (cfg *Config) UnmarshalYAML(node *yaml.Node) error {
 	root, err := flattenV8(node)
 	if err != nil {
+		return err
+	}
+	if err = validateRequestLogSampleRateNode(yamlPath(root, "request-log-sample-rate")); err != nil {
 		return err
 	}
 	decoded := legacyConfig(*cfg)
@@ -927,6 +931,9 @@ func expandConfigAliases(node *yaml.Node) *yaml.Node {
 // ValidateV8Config accepts only the v8 layout in management writes.
 // Plugin-owned configuration remains extensible through its existing decoder.
 func ValidateV8Config(data []byte) error {
+	if err := validateRequestLogSampleRateYAML(data); err != nil {
+		return err
+	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return err

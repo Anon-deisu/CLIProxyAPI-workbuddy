@@ -584,6 +584,7 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(chunk))
 			flusher.Flush()
 			if termErr := chunkTerminalError(chunk); termErr != nil {
+				h.LoggingAPIResponseError(cliCtx, termErr)
 				cliCancel(termErr.Error)
 				return
 			}

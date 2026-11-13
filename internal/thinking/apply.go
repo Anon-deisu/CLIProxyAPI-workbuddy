@@ -431,6 +431,9 @@ func applyThinkingDocCore(doc *ojson.Doc, docValid bool, sourceBody []byte, mode
 		}
 		return modified, nil
 	}
+	if providerKey == "workbuddy" || providerKey == "workbuddy-ai" {
+		config = normalizeWorkBuddyConfig(config, modelInfo)
+	}
 	if modelInfoResolved && config.Mode == ModeLevel && modelInfo != nil && modelInfo.Thinking != nil && shouldMapConfiguredHighIntent(fromFormat, providerFormat, modelInfo) {
 		config.Level = mapConfiguredHighIntent(config.Level, modelInfo)
 	}

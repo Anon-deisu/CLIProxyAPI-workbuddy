@@ -78,6 +78,7 @@ type Handler struct {
 	siwcCommitMu            sync.Mutex
 	pluginLoginSaveMu       sync.Mutex
 	workBuddyTasks          *WorkBuddyTaskService
+	workBuddyCredits        workBuddyCreditCache
 	performance             *hostmetrics.Sampler
 	requestRate             *coreusage.RequestRate
 }

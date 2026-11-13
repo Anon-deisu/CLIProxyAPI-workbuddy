@@ -1,7 +1,13 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"reflect"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1847,4 +1853,279 @@ func turnsFromTexts(values ...string) []CanonicalTurn {
 		})
 	}
 	return turns
+}
+
+// legacyTurnFingerprint preserves the normalization and framing before the performance changes.
+func legacyTurnFingerprint(turn CanonicalTurn) string {
+	turn.Role = canonicalRole(turn.Role)
+	parts := make([]CanonicalPart, 0, len(turn.Parts))
+	for _, part := range turn.Parts {
+		if part.Value == "" {
+			continue
+		}
+		part.Kind = strings.ToLower(strings.TrimSpace(part.Kind))
+		part.MIME = strings.ToLower(strings.TrimSpace(part.MIME))
+		if part.OriginalSize <= 0 {
+			part.OriginalSize = len(part.Value)
+		}
+		if part.Kind == "text" {
+			if turn.Role == "system" || !part.Sampled {
+				part.Value = legacyNormalizeText(part.Value, turn.Role == "system")
+			}
+			if !part.Sampled {
+				part.OriginalSize = len(part.Value)
+			}
+		}
+		if part.Value != "" {
+			parts = append(parts, part)
+		}
+	}
+	parts = limitCanonicalParts(nil, parts)
+	var indexes []int
+	var tools []CanonicalPart
+	for i, part := range parts {
+		if strings.HasPrefix(part.Kind, "tool:") || strings.Contains(part.Kind, "function_call") {
+			indexes = append(indexes, i)
+			tools = append(tools, part)
+		}
+	}
+	sort.SliceStable(tools, func(i, j int) bool {
+		if tools[i].Value != tools[j].Value {
+			return tools[i].Value < tools[j].Value
+		}
+		return tools[i].Digest < tools[j].Digest
+	})
+	for i, index := range indexes {
+		parts[index] = tools[i]
+	}
+	hash := sha256.New()
+	writeFingerprintField(hash, canonicalTurnVersion)
+	writeFingerprintField(hash, turn.Role)
+	for _, part := range parts {
+		writeFingerprintField(hash, part.Kind)
+		writeFingerprintField(hash, part.MIME)
+		writeFingerprintField(hash, strconv.Itoa(part.OriginalSize))
+		if turn.Role != "system" || !part.Sampled {
+			writeFingerprintField(hash, part.Digest)
+		}
+		value := part.Value
+		if !part.Sampled && (part.OriginalSize > largePartThreshold || len(value) > largePartThreshold) {
+			value = sparseSample(value, sparseFingerprintBytes)
+		}
+		writeFingerprintField(hash, value)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func legacyNormalizeText(value string, system bool) string {
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	value = thinkPattern.ReplaceAllString(value, " ")
+	if system {
+		value = iso8601Pattern.ReplaceAllString(value, "<timestamp>")
+		value = uuidPattern.ReplaceAllString(value, "<uuid>")
+	}
+	return strings.TrimSpace(value)
+}
+
+func FuzzNormalizeTextDifferential(f *testing.F) {
+	for _, value := range []string{"plain", "<thinK>x</THINK>", "<thinking>outer<think>inner</think></thinking>", "\r\n2026-08-29T12:00:00Z", "123e4567-e89b-12d3-a456-426614174000", "\xff<think>"} {
+		f.Add(value, true)
+		f.Add(value, false)
+	}
+	f.Fuzz(func(t *testing.T, value string, system bool) {
+		for pass := 0; pass < 3; pass++ {
+			got, want := normalizeText(value, system), legacyNormalizeText(value, system)
+			if got != want {
+				t.Fatalf("pass %d: got %q want %q", pass, got, want)
+			}
+			value = got
+		}
+	})
+}
+
+func TestTurnFingerprintNormalizationDifferential(t *testing.T) {
+	texts := []string{
+		"plain", "", " \r\n x\r y ", "a <THINK>hidden</tHiNkInG> b",
+		"<thinK>hidden</THINK>", "<thinking>outer <think>inner</think> tail</thinking>",
+		"<thi<think>hidden</think>nk>visible</think>", "<think>unclosed",
+		"2026-08-29T12:00:00Z 123e4567-e89b-12d3-a456-426614174000",
+		strings.Repeat("large ", 4000),
+	}
+	for _, text := range texts {
+		for _, role := range []string{"user", " DeVelOper ", "assistant", ""} {
+			for _, sampled := range []bool{false, true} {
+				turn := CanonicalTurn{Role: role, Parts: []CanonicalPart{
+					{Kind: " TeXT ", MIME: " TEXT/PLAIN ", Value: text, Sampled: sampled, Digest: "full-digest"},
+					{Kind: "tool:call", Value: "z", Digest: "b"},
+					{Kind: "text", Value: "between"},
+					{Kind: "tool:call", Value: "a", Digest: "a"},
+				}}
+				before := append([]CanonicalPart(nil), turn.Parts...)
+				if got, want := FastTurnFingerprint(turn), legacyTurnFingerprint(turn); got != want {
+					t.Fatalf("role=%q sampled=%v text=%q: got %s want %s", role, sampled, text[:min(len(text), 100)], got, want)
+				}
+				if !reflect.DeepEqual(turn.Parts, before) {
+					t.Fatal("fingerprinting mutated caller parts")
+				}
+			}
+		}
+	}
+	for _, count := range []int{255, 256, 257, 300} {
+		turn := CanonicalTurn{Role: "user", Parts: make([]CanonicalPart, count)}
+		for i := range turn.Parts {
+			turn.Parts[i] = CanonicalPart{Kind: "text", Value: "part"}
+		}
+		turn.Parts[count-1] = CanonicalPart{Kind: "value", Value: "<truncated:7 parts>", OriginalSize: 7}
+		if got, want := FastTurnFingerprint(turn), legacyTurnFingerprint(turn); got != want {
+			t.Fatalf("part limit %d: got %s want %s", count, got, want)
+		}
+	}
+}
+
+func TestPrepareExtDifferentialAndMutableTurns(t *testing.T) {
+	matcher := NewMerklePrefixMatcherWithConfig(MerklePrefixMatcherConfig{MaxTurns: 3})
+	for _, count := range []int{0, 1, 2, 31, 32, 33, 100, maxCanonicalTurns + 40} {
+		turns := make([]CanonicalTurn, count)
+		for i := range turns {
+			turns[i] = CanonicalTurn{Role: "user", Parts: []CanonicalPart{{Kind: "text", Value: fmt.Sprintf("turn %d <think>hidden</think>", i)}}}
+			if i%17 == 0 {
+				turns[i].Role = "developer"
+			}
+		}
+		fps, boundary, tails, env := matcher.PrepareExt(turns)
+		if len(fps) != min(count, maxCanonicalTurns) || boundary != minimumAffinityPrefixLength(turns) {
+			t.Fatalf("count %d: unexpected prefix bounds", count)
+		}
+		if len(tails) != min(count, maxCompactionProbeWindow) {
+			t.Fatalf("count %d: unexpected tail bounds", count)
+		}
+		for i, turn := range turns {
+			want := legacyTurnFingerprint(turn)
+			if i < len(fps) && fps[i] != want {
+				t.Fatalf("count %d prefix %d changed", count, i)
+			}
+			if j := i - (count - len(tails)); j >= 0 && tails[j] != want {
+				t.Fatalf("count %d tail %d changed", count, j)
+			}
+		}
+		if env != EnvironmentDigest(turns) {
+			t.Fatalf("count %d: environment digest changed", count)
+		}
+		if count > 0 && count <= len(tails) {
+			want := tails[0]
+			fps[0] = "caller mutation"
+			if tails[0] != want {
+				t.Fatal("returned prefix and tail slices alias")
+			}
+		}
+	}
+	payload := []byte(`{"messages":[{"role":"user","content":"<thi<think>hidden</think>nk>visible</think>"}]}`)
+	turns := ExtractCanonicalTurns(sdktranslator.FormatOpenAI, payload)
+	wantValue := legacyNormalizeText(legacyNormalizeText("<thi<think>hidden</think>nk>visible</think>", false), false)
+	if len(turns) != 1 || turns[0].Parts[0].Value != wantValue {
+		t.Fatal("extraction changed repeated normalization semantics")
+	}
+	before := FastTurnFingerprint(turns[0])
+	turns[0].Parts[0].Value = "caller changed <think>hidden</think> value"
+	after, _, _, _ := matcher.PrepareExt(turns)
+	if after[0] == before || after[0] != legacyTurnFingerprint(turns[0]) {
+		t.Fatal("mutable public turn was treated as previously normalized")
+	}
+}
+
+func legacyPrefixKey(fingerprints []string) string {
+	var previous [32]byte
+	for _, fingerprint := range fingerprints {
+		hash := sha256.New()
+		hash.Write(previous[:])
+		hash.Write([]byte{0})
+		hash.Write([]byte(fingerprint))
+		copy(previous[:], hash.Sum(nil))
+	}
+	return strconv.Itoa(len(fingerprints)) + ":" + hex.EncodeToString(previous[:])
+}
+
+func TestMatcherArbitraryFingerprintIdentityAndIsolation(t *testing.T) {
+	for _, fingerprints := range [][]string{
+		{"", "not-hex", "\x00:"},
+		{strings.Repeat("a", 64), strings.Repeat("A", 64), "tail"},
+		{strings.Repeat("0", 64), strings.Repeat("\x00", 32), "tail"},
+	} {
+		matcher := NewMerklePrefixMatcher(time.Hour)
+		got := matcher.BindFingerprintsWithResult("scope-a", fingerprints, 1, "auth-a")
+		if want := newLCPSessionID("scope-a", legacyPrefixKey(fingerprints[:1])); got.SessionID != want {
+			t.Fatalf("session bytes changed: got %s want %s", got.SessionID, want)
+		}
+		if _, ok := matcher.MatchFingerprints("scope-b", fingerprints, 1); ok {
+			t.Fatal("fingerprints crossed namespaces")
+		}
+		fork := append([]string(nil), fingerprints...)
+		fork[1] += "different"
+		match, ok := matcher.MatchFingerprints("scope-a", fork, 1)
+		if !ok || !match.IsFork || match.PrefixLength != 1 || match.SessionID != newLCPSessionID("scope-a", legacyPrefixKey(fork[:2])) {
+			t.Fatalf("arbitrary fingerprint fork changed: %+v %v", match, ok)
+		}
+	}
+}
+
+func TestMatcherRetainedTailsOwnCallerSlice(t *testing.T) {
+	for _, operation := range []string{"bind", "rebind", "touch"} {
+		t.Run(operation, func(t *testing.T) {
+			matcher := NewMerklePrefixMatcher(time.Hour)
+			parent := []string{"a", "b", "c", "d"}
+			tails := append([]string(nil), parent...)
+			bound := matcher.BindFingerprintsWithContext("scope", parent, tails, "env", 1, "auth")
+			if operation == "rebind" {
+				bound = matcher.BindFingerprintsWithContext("scope", parent, tails, "env", 1, "auth")
+			} else if operation == "touch" {
+				tails = []string{"new-c", "new-d"}
+				matcher.TouchFingerprintsWithContext("scope", parent, tails, "env", 1, "auth")
+			}
+			candidate := []string{"summary", tails[len(tails)-2], tails[len(tails)-1]}
+			tails[len(tails)-2] = "caller mutation"
+			match, ok := matcher.MatchFingerprintsWithContext("scope", candidate, candidate, "env", 1)
+			if !ok || !match.IsCompaction || match.ParentSessionID != bound.SessionID {
+				t.Fatalf("retained tail changed with caller slice: %+v %v", match, ok)
+			}
+		})
+	}
+}
+
+func BenchmarkPrepareExt100Turns(b *testing.B) {
+	turns := turnsFromTexts(strings.Split(strings.Repeat("turn,", 100), ",")[:100]...)
+	matcher := NewMerklePrefixMatcher(time.Hour)
+	b.ReportAllocs()
+	for b.Loop() {
+		matcher.PrepareExt(turns)
+	}
+}
+
+func BenchmarkMerklePrefixMatcherBindSharedPrefixes(b *testing.B) {
+	build := func() *MerklePrefixMatcher {
+		matcher := NewMerklePrefixMatcher(time.Hour)
+		for size := 32; size < 96; size++ {
+			fps := make([]string, size)
+			for i := range fps {
+				fps[i] = computeHexSHA256(strconv.Itoa(i))
+			}
+			matcher.BindFingerprints("scope", fps, 1, "auth")
+		}
+		return matcher
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	retained := build()
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(retained)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		runtime.KeepAlive(build())
+	}
+	if after.HeapAlloc > before.HeapAlloc {
+		b.ReportMetric(float64(after.HeapAlloc-before.HeapAlloc)/64, "retained-B/group")
+	}
 }

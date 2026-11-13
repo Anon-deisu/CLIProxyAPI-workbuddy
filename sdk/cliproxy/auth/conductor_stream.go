@@ -3,11 +3,11 @@ package auth
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -274,7 +274,7 @@ func streamPayloadCompletionFlags(payload []byte) (completed, incomplete bool) {
 	if len(payload) == 0 {
 		return false, false
 	}
-	for _, rawLine := range bytes.Split(payload, []byte("\n")) {
+	for rawLine := range bytes.Lines(payload) {
 		line := bytes.TrimSpace(rawLine)
 		if len(line) == 0 || bytes.HasPrefix(line, []byte(":")) || bytes.HasPrefix(line, []byte("event:")) || bytes.HasPrefix(line, []byte("id:")) || bytes.HasPrefix(line, []byte("retry:")) {
 			continue
@@ -301,132 +301,147 @@ func streamPayloadCompletionFlags(payload []byte) (completed, incomplete bool) {
 }
 
 func jsonObjectCompletionFlags(rawJSON []byte) (completed, incomplete bool) {
-	var obj map[string]any
-	if err := json.Unmarshal(rawJSON, &obj); err != nil || len(obj) == 0 {
-		return false, false
+	completed, incomplete, _ = executionPayloadCompletionFlags(rawJSON)
+	return completed, incomplete
+}
+
+// executionPayloadCompletionFlags validates once and reads only completion fields.
+// Result views borrow the payload for this call; no response tree is materialized.
+func executionPayloadCompletionFlags(rawJSON []byte) (completed, incomplete, executionCompleted bool) {
+	rawJSON = bytes.TrimSpace(rawJSON)
+	if len(rawJSON) < 2 || rawJSON[0] != '{' || rawJSON[len(rawJSON)-1] != '}' || !ojson.ValidBytes(rawJSON) {
+		return false, false, false
 	}
-	if obj["error"] != nil {
-		return false, true
-	}
-	eventType, _ := obj["type"].(string)
-	eventType = strings.TrimSpace(eventType)
-	status, _ := obj["status"].(string)
-	status = strings.ToLower(strings.TrimSpace(status))
-	if respObj, ok := obj["response"].(map[string]any); ok {
-		if respObj["error"] != nil || respObj["incomplete_details"] != nil {
-			incomplete = true
+	var eventType, status, stopReason string
+	var rootError, rootIncomplete, hasOutput bool
+	var response, delta, choices, candidates ojson.Result
+	// Visiting in document order retains the last-key-wins behavior of the old
+	// map decoder, including escaped and duplicate keys.
+	ojson.GetBytesNoCopy(rawJSON, "@this").ForEach(func(key, value ojson.Result) bool {
+		switch key.Str {
+		case "type":
+			eventType = completionString(value)
+		case "status":
+			status = completionString(value)
+		case "error":
+			rootError = value.Type != ojson.Null
+		case "incomplete_details":
+			rootIncomplete = value.Type != ojson.Null
+		case "response":
+			response = value
+		case "delta":
+			delta = value
+		case "choices":
+			choices = value
+		case "candidates":
+			candidates = value
+		case "stop_reason":
+			stopReason = completionString(value)
+		case "output":
+			hasOutput = value.IsArray() && value.Get("0").Exists()
 		}
-		if respStatus, _ := respObj["status"].(string); strings.TrimSpace(respStatus) != "" {
-			status = strings.ToLower(strings.TrimSpace(respStatus))
+		return true
+	})
+	if rootError {
+		return false, true, false
+	}
+	if response.IsObject() {
+		var responseError, responseIncomplete bool
+		var responseStatus string
+		response.ForEach(func(key, value ojson.Result) bool {
+			switch key.Str {
+			case "error":
+				responseError = value.Type != ojson.Null
+			case "incomplete_details":
+				responseIncomplete = value.Type != ojson.Null
+			case "status":
+				responseStatus = completionString(value)
+			}
+			return true
+		})
+		incomplete = responseError || responseIncomplete
+		if responseStatus != "" {
+			status = responseStatus
 		}
 	}
+	status = strings.ToLower(status)
 	switch status {
 	case "incomplete", "failed", "cancelled", "canceled":
-		return false, true
+		return false, true, false
 	}
 	switch eventType {
 	case "response.incomplete", "response.failed", "response.cancelled", "response.canceled", "error":
-		return false, true
+		return false, true, false
 	case "response.completed", "response.done", "message_stop":
 		if status == "" || status == "completed" {
-			return true, incomplete
+			return true, incomplete, !incomplete && !rootIncomplete
 		}
-		return false, true
+		return false, true, false
 	case "message_delta":
-		if deltaObj, ok := obj["delta"].(map[string]any); ok {
-			if sr, okSR := deltaObj["stop_reason"].(string); okSR {
-				switch strings.ToLower(strings.TrimSpace(sr)) {
-				case "max_tokens", "StopSequenceMaxTokens":
-					incomplete = true
-				case "end_turn", "stop_sequence", "tool_use":
-					completed = true
-				}
+		if delta.IsObject() {
+			switch strings.ToLower(completionObjectString(delta, "stop_reason")) {
+			case "max_tokens", "StopSequenceMaxTokens":
+				incomplete = true
+			case "end_turn", "stop_sequence", "tool_use":
+				completed = true
 			}
 		}
 	}
-	if choices, ok := obj["choices"].([]any); ok {
-		for _, item := range choices {
-			choice, okChoice := item.(map[string]any)
-			if !okChoice {
-				continue
+	if choices.IsArray() {
+		choices.ForEach(func(_, choice ojson.Result) bool {
+			if !choice.IsObject() {
+				return true
 			}
-			fr, okFR := choice["finish_reason"].(string)
-			if !okFR {
-				continue
-			}
-			switch strings.ToLower(strings.TrimSpace(fr)) {
+			switch strings.ToLower(completionObjectString(choice, "finish_reason")) {
 			case "length", "content_filter":
 				incomplete = true
 			case "stop", "tool_calls", "function_call", "end_turn":
 				completed = true
 			}
-		}
+			return true
+		})
 	}
-	if candidates, ok := obj["candidates"].([]any); ok {
-		for _, item := range candidates {
-			cand, okCand := item.(map[string]any)
-			if !okCand {
-				continue
+	if candidates.IsArray() {
+		candidates.ForEach(func(_, candidate ojson.Result) bool {
+			if !candidate.IsObject() {
+				return true
 			}
-			fr, okFR := cand["finishReason"].(string)
-			if !okFR {
-				continue
-			}
-			switch strings.ToUpper(strings.TrimSpace(fr)) {
+			switch strings.ToUpper(completionObjectString(candidate, "finishReason")) {
 			case "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER":
 				incomplete = true
 			case "STOP":
 				completed = true
 			}
-		}
+			return true
+		})
 	}
-	return completed, incomplete
+	if !incomplete && !rootIncomplete {
+		executionCompleted = completed || status == "completed" || (status != "in_progress" && status != "queued" &&
+			((eventType == "message" && stopReason != "") || (hasOutput && status == "")))
+	}
+	return completed, incomplete, executionCompleted
+}
+
+func completionString(value ojson.Result) string {
+	if value.Type != ojson.String {
+		return ""
+	}
+	return strings.TrimSpace(value.Str)
+}
+
+func completionObjectString(object ojson.Result, name string) (value string) {
+	object.ForEach(func(key, item ojson.Result) bool {
+		if key.Str == name {
+			value = completionString(item)
+		}
+		return true
+	})
+	return value
 }
 
 func isCompletedExecutionPayload(payload []byte) bool {
-	trimmed := bytes.TrimSpace(payload)
-	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
-		return false
-	}
-	var obj map[string]any
-	if err := json.Unmarshal(trimmed, &obj); err != nil || len(obj) == 0 {
-		return false
-	}
-	if obj["error"] != nil || obj["incomplete_details"] != nil {
-		return false
-	}
-	comp, incomp := jsonObjectCompletionFlags(trimmed)
-	if incomp {
-		return false
-	}
-	if comp {
-		return true
-	}
-	status, _ := obj["status"].(string)
-	status = strings.ToLower(strings.TrimSpace(status))
-	if respObj, ok := obj["response"].(map[string]any); ok {
-		if respObj["error"] != nil || respObj["incomplete_details"] != nil {
-			return false
-		}
-		if respStatus, _ := respObj["status"].(string); strings.TrimSpace(respStatus) != "" {
-			status = strings.ToLower(strings.TrimSpace(respStatus))
-		}
-	}
-	switch status {
-	case "incomplete", "failed", "cancelled", "canceled", "in_progress", "queued":
-		return false
-	case "completed":
-		return true
-	}
-	if objType, _ := obj["type"].(string); strings.TrimSpace(objType) == "message" {
-		if stopReason, ok := obj["stop_reason"].(string); ok && strings.TrimSpace(stopReason) != "" {
-			return true
-		}
-	}
-	if output, ok := obj["output"].([]any); ok && len(output) > 0 && status == "" {
-		return true
-	}
-	return false
+	_, _, completed := executionPayloadCompletionFlags(payload)
+	return completed
 }
 
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, executionModel string, execModels []string, pooled bool, aliasResult OAuthModelAliasResult, routing *apiKeyModelRoutingSnapshot, allowRetry bool, ephemeralResult bool) (*cliproxyexecutor.StreamResult, error) {

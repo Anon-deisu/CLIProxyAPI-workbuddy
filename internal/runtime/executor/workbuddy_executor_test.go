@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,18 +15,622 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/workbuddy"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
+	log "github.com/sirupsen/logrus"
 )
 
 const workBuddyTestSSE = "data: {\"id\":\"c1\",\"model\":\"upstream\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Think\",\"tool_calls\":[]}}]}\n\n" +
 	"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}]}\n\n" +
 	"data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n" + "data: [DONE]\n\n"
+
+type workBuddyTestTransport func(*http.Request) (*http.Response, error)
+
+func (f workBuddyTestTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestWorkBuddyDuplicateKeysExecutorCompatibility(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, finish := range []string{"length", "stop"} {
+			for _, rules := range []bool{false, true} {
+				t.Run(fmt.Sprintf("stream=%t/finish=%s/rules=%t", stream, finish, rules), func(t *testing.T) {
+					cfg := &config.Config{}
+					if rules {
+						cfg.Payload.Override = []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "m", Match: []map[string]any{{"stream": true, "max_tokens": 64, "messages.0.role": "system", "tools.0.function.name": "mcp_lookup"}}}}, Params: map[string]any{"stream": false, "audit.-1": "once", "response_format": "configured"}}}
+						cfg.Payload.Filter = []config.PayloadFilterRule{{Models: []config.PayloadModelRule{{Name: "m"}}, Params: []string{"unknown"}}}
+					}
+					firstFinish := "stop"
+					if finish == "stop" {
+						firstFinish = "length"
+					}
+					upstreamFrame := fmt.Sprintf(`{"id":"duplicate","choices":[{"index":0,"delta":{"content":"old","content":"Hello","tool_calls":[{"index":0,"id":"c","function":{"name":"wrong","na\u006de":"mcp_lookup","arguments":"{}"}}]},"finish_reason":"%s","finish_\u0072eason":"%s"}],"usage":{"total_tokens":1,"total_tokens":15}}`, firstFinish, finish)
+					var hits, finalized int
+					ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", workBuddyTestTransport(func(r *http.Request) (*http.Response, error) {
+						hits++
+						body, err := io.ReadAll(r.Body)
+						if err != nil {
+							return nil, err
+						}
+						var decoded map[string]json.RawMessage
+						if err := json.Unmarshal(body, &decoded); err != nil {
+							t.Fatal(err)
+						}
+						wantStream := "true"
+						if rules {
+							wantStream = "false"
+						}
+						if string(decoded["stream"]) != wantStream || ojson.GetBytes(body, "stream").Raw != wantStream || ojson.GetBytes(body, "max_tokens").Int() != 64 || ojson.GetBytes(body, "max_completion_tokens").Exists() ||
+							ojson.GetBytes(body, "messages.0.role").String() != "system" || ojson.GetBytes(body, "tools.0.function.name").String() != "mcp_lookup" ||
+							ojson.GetBytes(body, "tool_choice").String() != "mcp_lookup" {
+							t.Errorf("upstream saw wrong duplicate resolution: %s", body)
+						}
+						counts := make(map[string]int)
+						ojson.GetBytesNoCopy(body, "@this").ForEach(func(key, _ ojson.Result) bool { counts[key.String()]++; return true })
+						if counts["stream"] != 1 || finalized != hits {
+							t.Errorf("stream keys=%d finalized=%d hits=%d", counts["stream"], finalized, hits)
+						}
+						if rules {
+							if ojson.GetBytes(body, "audit.#").Int() != 1 || ojson.GetBytes(body, "unknown").Exists() {
+								t.Errorf("final rules were overwritten/repeated: %s", body)
+							}
+						} else if ojson.GetBytes(body, "unknown.n").Raw != "9007199254740993" {
+							t.Errorf("unknown duplicate lost last integer: %s", body)
+						}
+						return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: " + upstreamFrame + "\n\ndata: [DONE]\n\n"))}, nil
+					}))
+					auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: "duplicates", AccessToken: "test"})
+					req := cliproxyexecutor.Request{Model: "m", Payload: []byte(`{"stream":false,"str\u0065am":false,"max_completion_tokens":7,"max_completion_tokens":64,"messages":[{"role":"user","role":"developer","content":"hi"}],"tools":[{"function":{"name":"mcp.old","na\u006de":"mcp.lookup","parameters":{}}}],"tool_choice":{"type":"function","function":{"name":"mcp.lookup"}},"unknown":{"n":0,"n":9007199254740993}}`)}
+					original := bytes.Clone(req.Payload)
+					opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: req.Payload, Stream: stream, Metadata: map[string]any{cliproxyexecutor.FinalizedResponseFormatCallbackMetadataKey: func(string) { finalized++ }}}
+					executor := NewWorkBuddyExecutor(cfg, auth.Provider)
+					if stream {
+						result, err := executor.ExecuteStream(ctx, auth, req, opts)
+						if err != nil {
+							t.Fatal(err)
+						}
+						finishes, contents := 0, 0
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatal(chunk.Err)
+							}
+							for _, line := range bytes.Split(chunk.Payload, []byte("\n")) {
+								frame := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+								if len(frame) == 0 || bytes.Equal(frame, []byte("[DONE]")) {
+									continue
+								}
+								if reason := ojson.GetBytes(frame, "choices.0.finish_reason"); reason.Exists() {
+									finishes++
+									if reason.String() != finish || ojson.GetBytes(frame, "choices.0.delta").Raw != "{}" {
+										t.Errorf("wrong terminal: %s", frame)
+									}
+								} else if ojson.GetBytes(frame, "choices.0.delta.content").String() == "Hello" {
+									contents++
+									if ojson.GetBytes(frame, "choices.0.delta.tool_calls.0.function.name").String() != "mcp.lookup" {
+										t.Errorf("tool identity did not roundtrip: %s", frame)
+									}
+								}
+							}
+						}
+						if finishes != 1 || contents != 1 {
+							t.Errorf("finish frames=%d content frames=%d", finishes, contents)
+						}
+					} else {
+						response, err := executor.Execute(ctx, auth, req, opts)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if ojson.GetBytes(response.Payload, "choices.0.finish_reason").String() != finish || ojson.GetBytes(response.Payload, "choices.0.message.content").String() != "Hello" || ojson.GetBytes(response.Payload, "choices.0.message.tool_calls.0.function.name").String() != "mcp.lookup" {
+							t.Errorf("aggregate changed duplicate semantics: %s", response.Payload)
+						}
+					}
+					if !bytes.Equal(original, req.Payload) || hits != 1 || finalized != 1 {
+						t.Fatal("input isolation or final rule count changed")
+					}
+				})
+			}
+		}
+	}
+}
+
+type workBuddyPreparationCounter struct {
+	model string
+	calls atomic.Int64
+}
+
+func (h *workBuddyPreparationCounter) Levels() []log.Level { return []log.Level{log.DebugLevel} }
+func (h *workBuddyPreparationCounter) Fire(entry *log.Entry) error {
+	if entry.Message == "thinking: processed config to apply |" && entry.Data["model"] == h.model {
+		h.calls.Add(1)
+	}
+	return nil
+}
+
+type workBuddyHolderProbe struct {
+	*WorkBuddyExecutor
+	check func(context.Context)
+}
+
+func (e *workBuddyHolderProbe) Execute(ctx context.Context, _ *coreauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.check(ctx)
+	return cliproxyexecutor.Response{Payload: []byte(`{"choices":[]}`)}, nil
+}
+func (e *workBuddyHolderProbe) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.check(ctx)
+	chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte("data: [DONE]\n\n")}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+}
+func (e *workBuddyHolderProbe) CountTokens(ctx context.Context, _ *coreauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.check(ctx)
+	return cliproxyexecutor.Response{Payload: []byte(`{"total_tokens":1}`)}, nil
+}
+
+func TestWorkBuddyManagerPreparationHolderBoundaries(t *testing.T) {
+	cfg := &config.Config{}
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.SetConfig(cfg)
+	ctx := cliproxyexecutor.WithRequestPreparationCache(t.Context())
+	parent := cliproxyexecutor.RequestPreparationCacheFromContext(ctx)
+	parent.Store("probe", "parent")
+	seen := make(map[*cliproxyexecutor.RequestPreparationCache]bool)
+	probe := &workBuddyHolderProbe{WorkBuddyExecutor: NewWorkBuddyExecutor(cfg, workbuddy.ProviderCN), check: func(ctx context.Context) {
+		holder := cliproxyexecutor.RequestPreparationCacheFromContext(ctx)
+		if holder == nil || holder == parent || seen[holder] {
+			t.Error("Manager invocation did not create an independent holder")
+		}
+		if _, ok := holder.Load("probe"); ok {
+			t.Error("new invocation inherited preparation")
+		}
+		holder.Store("probe", "attempt")
+		seen[holder] = true
+	}}
+	manager.RegisterExecutor(probe)
+	auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: "probe", AccessToken: "probe"})
+	auth.ID = t.Name()
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "probe"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, err := manager.Register(t.Context(), auth); err != nil {
+		t.Fatal(err)
+	}
+	req := cliproxyexecutor.Request{Model: "probe", Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI}
+	for range 2 {
+		if _, err := manager.Execute(ctx, []string{auth.Provider}, req, opts); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.ExecuteCount(ctx, []string{auth.Provider}, req, opts); err != nil {
+			t.Fatal(err)
+		}
+		result, err := manager.ExecuteStream(ctx, []string{auth.Provider}, req, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				t.Fatal(chunk.Err)
+			}
+		}
+	}
+	if len(seen) != 6 {
+		t.Fatalf("Manager invocation count = %d", len(seen))
+	}
+	if value, _ := parent.Load("probe"); value != "parent" {
+		t.Fatal("Manager mutated parent holder")
+	}
+}
+
+func TestWorkBuddyManagerFailoverReusesPreparation(t *testing.T) {
+	const model = "workbuddy-retry-preparation"
+	from := sdktranslator.Format("workbuddy-manager-retry-translation")
+	var translations atomic.Int64
+	sdktranslator.Register(from, sdktranslator.FormatOpenAI, func(_ string, body []byte, _ bool) ([]byte, error) {
+		translations.Add(1)
+		return bytes.Clone(body), nil
+	}, sdktranslator.ResponseTransform{})
+	t.Cleanup(func() { sdktranslator.Unregister(from, sdktranslator.FormatOpenAI) })
+	hook := &workBuddyPreparationCounter{model: model}
+	logger := log.StandardLogger()
+	oldHooks := logger.ReplaceHooks(make(log.LevelHooks))
+	oldLevel, oldOutput := logger.GetLevel(), logger.Out
+	logger.AddHook(hook)
+	logger.SetLevel(log.DebugLevel)
+	logger.SetOutput(io.Discard)
+	t.Cleanup(func() { logger.ReplaceHooks(oldHooks); logger.SetLevel(oldLevel); logger.SetOutput(oldOutput) })
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			hook.calls.Store(0)
+			translations.Store(0)
+			cfg := &config.Config{Routing: config.RoutingConfig{DisableCooling: new(true), WorkBuddyFingerprintConvergence: new(true)}, Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{Name: model}}, Params: map[string]any{"audit.-1": "once", "response_format": "configured"},
+			}}}}
+			manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+			manager.SetConfig(cfg)
+			manager.SetRetryConfig(0, 0, 3)
+			manager.RegisterExecutor(NewWorkBuddyExecutor(cfg, workbuddy.ProviderCN))
+			reg := registry.GetGlobalRegistry()
+			for i := range 3 {
+				uid := fmt.Sprintf("uid-%d", i)
+				auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: uid, AccessToken: "token-" + uid, EnterpriseID: "team-" + uid})
+				auth.ID = fmt.Sprintf("%s-%d", t.Name(), i)
+				reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model, Type: auth.Provider, Thinking: &registry.ThinkingSupport{Levels: []string{"high", "max"}}}})
+				t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+				if _, err := manager.Register(t.Context(), auth); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var hits, finalized atomic.Int64
+			seenIDs, seenAccounts := make(map[string]bool), make(map[string]bool)
+			ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", workBuddyTestTransport(func(r *http.Request) (*http.Response, error) {
+				n := hits.Add(1)
+				body, errRead := io.ReadAll(r.Body)
+				if errRead != nil {
+					return nil, errRead
+				}
+				uid := r.Header.Get("X-User-ID")
+				if r.Header.Get("Authorization") != "Bearer token-"+uid || r.Header.Get("X-Enterprise-ID") != "team-"+uid {
+					t.Error("attempt reused another account's signing headers")
+				}
+				if id := r.Header.Get("X-Request-ID"); id == "" || seenIDs[id] {
+					t.Error("attempt reused request identity")
+				} else {
+					seenIDs[id] = true
+				}
+				seenAccounts[uid] = true
+				if ojson.GetBytes(body, "audit.#").Int() != 1 || finalized.Load() != n || ojson.GetBytes(body, "reasoning_effort").String() != "high" ||
+					ojson.GetBytes(body, "messages.0.role").String() != "system" || ojson.GetBytes(body, "tools.0.function.name").String() != "mcp_lookup" {
+					t.Errorf("attempt %d skipped preparation or final rules: %s, callbacks=%d", n, body, finalized.Load())
+				}
+				if n%3 != 0 {
+					return &http.Response{StatusCode: 503, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"retry on next account"}}`))}, nil
+				}
+				return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(workBuddyTestSSE))}, nil
+			}))
+			req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"messages":[{"role":"developer","content":"instructions"},{"role":"user","content":"hello"}],"reasoning_effort":"high","tools":[{"function":{"name":"mcp.lookup","parameters":{}}}]}`)}
+			original := bytes.Clone(req.Payload)
+			opts := cliproxyexecutor.Options{SourceFormat: from, ResponseFormat: sdktranslator.FormatOpenAI, OriginalRequest: req.Payload, Stream: stream, Metadata: map[string]any{
+				cliproxyexecutor.FinalizedResponseFormatCallbackMetadataKey: func(format string) {
+					finalized.Add(1)
+					if format != "configured" {
+						t.Errorf("final format = %q", format)
+					}
+				},
+			}}
+			for request := int64(1); request <= 2; request++ {
+				if stream {
+					result, err := manager.ExecuteStream(ctx, []string{workbuddy.ProviderCN}, req, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for chunk := range result.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+					}
+				} else if _, err := manager.Execute(ctx, []string{workbuddy.ProviderCN}, req, opts); err != nil {
+					t.Fatal(err)
+				}
+				if hits.Load() != request*3 || finalized.Load() != request*3 || len(seenAccounts) != 3 {
+					t.Fatalf("real failover attempts=%d finalized=%d accounts=%v", hits.Load(), finalized.Load(), seenAccounts)
+				}
+				if got := hook.calls.Load(); got != request {
+					t.Errorf("base thinking conversions = %d after %d requests and %d attempts, want %d", got, request, hits.Load(), request)
+				}
+				if translations.Load() != request*3 {
+					t.Errorf("registered translator side effects skipped: calls=%d", translations.Load())
+				}
+			}
+			if !bytes.Equal(req.Payload, original) {
+				t.Fatal("retry mutated caller input")
+			}
+		})
+	}
+}
+
+func TestWorkBuddyPayloadBarrierAfterNormalization(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, filter := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/filter=%t", stream, filter), func(t *testing.T) {
+				models := []config.PayloadModelRule{{Name: "m", Protocol: "openai", Match: []map[string]any{{
+					"model": "m", "stream": true, "messages.0.role": "system", "max_tokens": 64,
+					"stop.0": "END", "tools.0.function.name": "mcp_lookup", "tool_choice": "mcp_lookup",
+				}}}}
+				cfg := &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{Models: models, Params: map[string]any{"audit.-1": "once"}}}}}
+				cfg.Payload.Override = append(cfg.Payload.Override, config.PayloadRule{Models: []config.PayloadModelRule{{Name: "m"}}, Params: map[string]any{"apply_calls.-1": "once"}})
+				paths := []string{"model", "stream", "messages", "tools", "tool_choice", "stop", "max_tokens"}
+				if filter {
+					cfg.Payload.Filter = []config.PayloadFilterRule{{Models: models, Params: paths}}
+				} else {
+					cfg.Payload.Override = append(cfg.Payload.Override, config.PayloadRule{Models: models, Params: map[string]any{
+						"model": "configured", "stream": false, "messages.0.role": "developer", "messages.0.content": "You are an AI agent powered by DeepSeek Harness",
+						"stop": "configured-stop", "tool_choice": "none", "tools.0.function.name": "configured.tool", "max_completion_tokens": 99,
+					}})
+				}
+				var requests int
+				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", workBuddyTestTransport(func(r *http.Request) (*http.Response, error) {
+					requests++
+					body, errRead := io.ReadAll(r.Body)
+					if errRead != nil {
+						t.Fatal(errRead)
+					}
+					if ojson.GetBytes(body, "audit.#").Int() != 1 || ojson.GetBytes(body, "apply_calls.#").Int() != 1 {
+						t.Errorf("rules must run once after normalization: %s", body)
+					}
+					if filter {
+						for _, path := range paths {
+							if ojson.GetBytes(body, path).Exists() {
+								t.Errorf("filtered %s restored: %s", path, body)
+							}
+						}
+					} else {
+						for path, want := range map[string]string{
+							"model": "configured", "stream": "false", "messages.0.role": "developer", "messages.0.content": "You are an AI agent powered by DeepSeek Harness",
+							"stop": "configured-stop", "tool_choice": "none", "tools.0.function.name": "configured.tool", "max_completion_tokens": "99",
+						} {
+							if got := ojson.GetBytes(body, path).String(); got != want {
+								t.Errorf("%s = %q, want %q", path, got, want)
+							}
+						}
+					}
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(workBuddyTestSSE))}, nil
+				}))
+				auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: "barrier", AccessToken: "test"})
+				executor := NewWorkBuddyExecutor(cfg, auth.Provider)
+				req := cliproxyexecutor.Request{Model: "m", Payload: []byte(`{"model":"client","messages":[{"role":"developer","content":"hi"}],"max_completion_tokens":64,"stop":"END","tools":[{"function":{"name":"mcp.lookup","parameters":{}}}],"tool_choice":{"type":"function","function":{"name":"mcp.lookup"}}}`)}
+				before := bytes.Clone(req.Payload)
+				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: req.Payload, Stream: stream}
+				for range 2 {
+					if stream {
+						result, err := executor.ExecuteStream(ctx, auth, req, opts)
+						if err != nil {
+							t.Fatal(err)
+						}
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatal(chunk.Err)
+							}
+						}
+					} else if _, err := executor.Execute(ctx, auth, req, opts); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if requests != 2 || !bytes.Equal(before, req.Payload) {
+					t.Fatal("attempt state leaked into the caller request")
+				}
+			})
+		}
+	}
+}
+
+func TestWorkBuddyRequestPairTranslationAndIsolation(t *testing.T) {
+	from := sdktranslator.Format("workbuddy-count-translations")
+	var calls int
+	sdktranslator.Register(from, sdktranslator.FormatOpenAI, func(_ string, body []byte, stream bool) ([]byte, error) {
+		calls++
+		if !stream {
+			t.Error("WorkBuddy translation must request streaming")
+		}
+		return bytes.Clone(body), nil
+	}, sdktranslator.ResponseTransform{})
+	t.Cleanup(func() { sdktranslator.Unregister(from, sdktranslator.FormatOpenAI) })
+	for _, mode := range []string{"absent", "same-slice", "same-bytes", "different"} {
+		t.Run(mode, func(t *testing.T) {
+			payload := []byte(`{"messages":[{"role":"user","content":"working"}],"tools":[{"function":{"name":"mcp.lookup"}}]}`)
+			original := payload
+			wantCalls := 1
+			switch mode {
+			case "absent":
+				original = nil
+			case "same-bytes":
+				original = bytes.Clone(payload)
+			case "different":
+				original = []byte(`{"messages":[{"role":"user","content":"original"}],"temperature":0.9}`)
+				wantCalls = 2
+			}
+			before, originalBefore := bytes.Clone(payload), bytes.Clone(original)
+			req := cliproxyexecutor.Request{Model: "m", Payload: payload}
+			opts := cliproxyexecutor.Options{SourceFormat: from, OriginalRequest: original}
+			cfg := &config.Config{Payload: config.PayloadConfig{Default: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "m"}}, Params: map[string]any{"temperature": 0.2}}}}}
+			executor := NewWorkBuddyExecutor(cfg, workbuddy.ProviderCN)
+			for _, uid := range []string{"first", "second"} {
+				calls = 0
+				ctx := context.WithValue(t.Context(), "cliproxy.roundtripper", workBuddyTestTransport(func(r *http.Request) (*http.Response, error) {
+					if r.Header.Get("X-User-ID") != uid {
+						t.Error("account headers leaked")
+					}
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+				}))
+				auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: uid, AccessToken: uid})
+				reporter := helps.NewExecutorUsageReporter(ctx, executor, "m", auth)
+				response, body, names, err := executor.open(ctx, auth, req, opts, reporter)
+				if err != nil {
+					t.Fatal(err)
+				}
+				executor.closeResponse(response)
+				if calls != wantCalls {
+					t.Errorf("translations = %d, want %d", calls, wantCalls)
+				}
+				if ojson.GetBytes(body, "messages.1.content").String() != "working" || names["mcp_lookup"] != "mcp.lookup" {
+					t.Errorf("incorrect prepared payload: %s %v", body, names)
+				}
+				if mode == "different" && ojson.GetBytes(body, "temperature").Exists() {
+					t.Error("default rules lost original request intent")
+				}
+				body[0] = '!'
+				names["mcp_lookup"] = "mutated"
+			}
+			if !bytes.Equal(payload, before) || !bytes.Equal(original, originalBefore) {
+				t.Fatal("preparation mutated caller inputs")
+			}
+		})
+	}
+}
+
+func TestWorkBuddyQueueWaitingStreamScope(t *testing.T) {
+	executor := NewWorkBuddyExecutor(&config.Config{}, workbuddy.ProviderCN)
+	for _, prefix := range []string{"data: ", "event: error\ndata: "} {
+		payload := `{"code":6020,"msg":"queue waiting","data":{"retry_after":7},"request_id":"keep"}`
+		err := executor.readStream(t.Context(), strings.NewReader(prefix+payload+"\n\n"), http.Header{"Retry-After": {"90"}}, "m", nil, func([]byte, bool) error {
+			t.Error("queue error delivered as content")
+			return nil
+		})
+		var upstream statusErr
+		if !errors.As(err, &upstream) || upstream.StatusCode() != 429 || upstream.IsCredentialScoped() || upstream.ResultCode() != "" || upstream.RetryAfter() == nil || *upstream.RetryAfter() != 7*time.Second || upstream.Error() != payload {
+			t.Errorf("queue scope, retry or details lost: %#v", err)
+		}
+	}
+}
+
+func TestWorkBuddyGenericStreamErrorCompatibility(t *testing.T) {
+	executor := NewWorkBuddyExecutor(&config.Config{}, workbuddy.ProviderCN)
+	for _, payload := range []string{
+		`{"choices":[{"delta":{"content":"ordinary"}}]}`,
+		`{"code":500,"msg":"not a standard message"}`,
+		`{"code":500,"message":"generic error","status":404}`,
+		`{"error":{"message":"failed","status_code":503},"status":200}`,
+		`{"error":false,"status_code":"429"}`,
+		`{"error":null}`, `{"type":"ReSpOnSe.FaIlEd","status":401}`,
+		`{"response":{"error":{"message":"failed","status":400}}}`,
+		`{"code":6020,"msg":"queue","data":{"retry_after":7}}`,
+		`{"code":6020,"msg":"queue without delay"}`,
+	} {
+		for _, event := range []string{"", "error", "RESPONSE.ERROR", "response.failed"} {
+			want, failed := openAICompatStreamDataError([]byte(payload), event)
+			input := "event: " + event + "\ndata: " + payload + "\n\ndata: [DONE]\n\n"
+			gotErr := executor.readStream(t.Context(), strings.NewReader(input), http.Header{"Retry-After": {"90"}}, "m", nil, func([]byte, bool) error { return nil })
+			if !failed {
+				if gotErr != nil {
+					t.Errorf("%s/%s: unexpected error %v", event, payload, gotErr)
+				}
+				continue
+			}
+			var got statusErr
+			if !errors.As(gotErr, &got) || got.StatusCode() != want.StatusCode() || got.Error() != want.Error() || got.IsCredentialScoped() != want.IsCredentialScoped() || !reflect.DeepEqual(got.RetryAfter(), want.RetryAfter()) {
+				t.Errorf("%s/%s: got %#v, want %#v", event, payload, gotErr, want)
+			}
+		}
+	}
+}
+
+func BenchmarkWorkBuddyReadStream(b *testing.B) {
+	executor := NewWorkBuddyExecutor(&config.Config{}, workbuddy.ProviderCN)
+	stream := strings.Repeat("data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\",\"tool_calls\":[]}}]}\n\n", 64) + "data: [DONE]\n\n"
+	consume := func([]byte, bool) error { return nil }
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := executor.readStream(b.Context(), strings.NewReader(stream), nil, "m", nil, consume); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkWorkBuddyOpen(b *testing.B) {
+	executor := NewWorkBuddyExecutor(&config.Config{}, workbuddy.ProviderCN)
+	auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: "bench", AccessToken: "bench"})
+	ctx := context.WithValue(b.Context(), "cliproxy.roundtripper", workBuddyTestTransport(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}))
+	text, _ := json.Marshal(strings.Repeat("Ordinary instructions and tool output.\n", 128))
+	req := cliproxyexecutor.Request{Model: "m", Payload: []byte(`{"messages":[{"role":"developer","content":` + string(text) + `},{"role":"user","content":"hi"}],"max_completion_tokens":1024}`)}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, OriginalRequest: req.Payload}
+	b.ReportAllocs()
+	for b.Loop() {
+		reporter := helps.NewExecutorUsageReporter(ctx, executor, "m", auth)
+		response, _, _, err := executor.open(ctx, auth, req, opts, reporter)
+		if err != nil {
+			b.Fatal(err)
+		}
+		executor.closeResponse(response)
+	}
+}
+
+func TestWorkBuddyThinkingFallbackReachesUpstream(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	for _, provider := range []string{workbuddy.ProviderCN, workbuddy.ProviderAI} {
+		for _, stream := range []bool{false, true} {
+			for _, tc := range []struct {
+				name, body, suffix, want string
+				format                   sdktranslator.Format
+				payload                  config.PayloadConfig
+			}{
+				{name: "unsupported chat effort", format: sdktranslator.FormatOpenAI, body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"}`, want: "max"},
+				{name: "supported chat effort", format: sdktranslator.FormatOpenAI, body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`, want: "high"},
+				{name: "model suffix", format: sdktranslator.FormatOpenAI, body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`, suffix: "(medium)", want: "max"},
+				{name: "Responses effort", format: sdktranslator.FormatOpenAIResponse, body: `{"input":"hi","reasoning":{"effort":"medium"}}`, want: "max"},
+				{name: "Claude budget", format: sdktranslator.FormatClaude, body: `{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192},"max_tokens":16384}`, want: "max"},
+				{
+					name: "payload override remains final", format: sdktranslator.FormatOpenAI, body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"}`, want: "high",
+					payload: config.PayloadConfig{Override: []config.PayloadRule{{
+						Models: []config.PayloadModelRule{{Name: model, Protocol: "openai", Match: []map[string]any{{"reasoning_effort": "max"}}}},
+						Params: map[string]any{"reasoning_effort": "high"},
+					}}},
+				},
+				{
+					name: "payload filter remains final", format: sdktranslator.FormatOpenAI, body: `{"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"}`,
+					payload: config.PayloadConfig{Filter: []config.PayloadFilterRule{{
+						Models: []config.PayloadModelRule{{Name: model, Protocol: "openai", Match: []map[string]any{{"reasoning_effort": "max"}}}},
+						Params: []string{"reasoning_effort"},
+					}}},
+				},
+			} {
+				t.Run(fmt.Sprintf("%s/stream=%t/%s", provider, stream, tc.name), func(t *testing.T) {
+					var requests atomic.Int32
+					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						requests.Add(1)
+						body, errRead := io.ReadAll(r.Body)
+						if errRead != nil {
+							t.Error(errRead)
+							return
+						}
+						effort := ojson.GetBytes(body, "reasoning_effort")
+						if effort.String() != tc.want || (tc.want == "" && effort.Exists()) {
+							t.Errorf("upstream reasoning_effort = %s, want %q", effort.Raw, tc.want)
+						}
+						if got := ojson.GetBytes(body, "model").String(); got != model {
+							t.Errorf("upstream model = %q, want %q", got, model)
+						}
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = io.WriteString(w, workBuddyTestSSE)
+					}))
+					defer upstream.Close()
+					reg := registry.GetGlobalRegistry()
+					reg.RegisterClient(t.Name(), provider, []*registry.ModelInfo{{ID: model, Type: provider, Thinking: &registry.ThinkingSupport{Levels: []string{"high", "max"}}}})
+					t.Cleanup(func() { reg.UnregisterClient(t.Name()) })
+					auth := workbuddy.NewAuthRecord(provider, workbuddy.Credentials{UID: "thinking-test", AccessToken: "test-access"})
+					auth.Metadata["base_url"] = upstream.URL
+					executor := NewWorkBuddyExecutor(&config.Config{Payload: tc.payload}, provider)
+					req := cliproxyexecutor.Request{Model: model + tc.suffix, Payload: []byte(tc.body)}
+					opts := cliproxyexecutor.Options{SourceFormat: tc.format, OriginalRequest: req.Payload, Stream: stream}
+					if stream {
+						result, errStream := executor.ExecuteStream(t.Context(), auth, req, opts)
+						if errStream != nil {
+							t.Fatal(errStream)
+						}
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								t.Fatal(chunk.Err)
+							}
+						}
+					} else if _, errExecute := executor.Execute(t.Context(), auth, req, opts); errExecute != nil {
+						t.Fatal(errExecute)
+					}
+					if requests.Load() != 1 {
+						t.Fatalf("upstream requests = %d, want 1", requests.Load())
+					}
+					if string(req.Payload) != tc.body {
+						t.Fatal("thinking fallback mutated the caller request")
+					}
+				})
+			}
+		}
+	}
+}
 
 func TestWorkBuddyFingerprintConvergence(t *testing.T) {
 	for _, provider := range []string{workbuddy.ProviderCN, workbuddy.ProviderAI} {
@@ -90,7 +696,7 @@ func TestWorkBuddyFingerprintConvergence(t *testing.T) {
 					if sample.headers.Get("X-Request-ID") != sample.headers.Get("X-Conversation-Message-ID") {
 						t.Fatal("message and request IDs disagree")
 					}
-					if gjson.GetBytes(sample.body, "prompt_cache_key").String() != "caller-cache" || gjson.GetBytes(sample.body, "user").String() != "caller-user" {
+					if ojson.GetBytes(sample.body, "prompt_cache_key").String() != "caller-cache" || ojson.GetBytes(sample.body, "user").String() != "caller-user" {
 						t.Fatal("convergence changed cache or user payload fields")
 					}
 				}
@@ -800,7 +1406,7 @@ func TestWorkBuddyBothSitesStreamingAndNonStreaming(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/stream=%t", provider, stream), func(t *testing.T) {
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					body, _ := io.ReadAll(r.Body)
-					if r.URL.Path != "/v2/chat/completions" || !gjson.GetBytes(body, "stream").Bool() {
+					if r.URL.Path != "/v2/chat/completions" || !ojson.GetBytes(body, "stream").Bool() {
 						t.Errorf("upstream must always stream: %s %s", r.URL.Path, body)
 					}
 					for key, value := range map[string]string{"Authorization": "Bearer access", "X-User-Id": "uid", "X-Domain": "account.example", "User-Agent": "WorkBuddy/" + workbuddy.UserAgentVersion, "X-IDE-Type": "WorkBuddy", "X-Enterprise-Id": "team", "X-Tenant-Id": "team"} {
@@ -811,13 +1417,13 @@ func TestWorkBuddyBothSitesStreamingAndNonStreaming(t *testing.T) {
 					if (r.Header.Get("X-Agent-Type") == "main") != (provider == workbuddy.ProviderAI) {
 						t.Error("site-specific headers were mixed")
 					}
-					if gjson.GetBytes(body, "messages.0.role").String() != "system" || gjson.GetBytes(body, "max_tokens").Int() != 64 || gjson.GetBytes(body, "max_completion_tokens").Exists() {
+					if ojson.GetBytes(body, "messages.0.role").String() != "system" || ojson.GetBytes(body, "max_tokens").Int() != 64 || ojson.GetBytes(body, "max_completion_tokens").Exists() {
 						t.Errorf("incorrect WorkBuddy request normalization: %s", body)
 					}
-					if got := gjson.GetBytes(body, "messages.0.content").String(); got != "Be helpful.\n  - Users can report issues and share feedback at https://github.com/anthropics/claude-code/issues" {
+					if got := ojson.GetBytes(body, "messages.0.content").String(); got != "Be helpful.\n  - Users can report issues and share feedback at https://github.com/anthropics/claude-code/issues" {
 						t.Errorf("Claude feedback notice was not normalized: %q", got)
 					}
-					if stop := gjson.GetBytes(body, "stop"); !stop.IsArray() || len(stop.Array()) != 1 || stop.Array()[0].String() != "</block>" {
+					if stop := ojson.GetBytes(body, "stop"); !stop.IsArray() || len(stop.Array()) != 1 || stop.Array()[0].String() != "</block>" {
 						t.Errorf("stop string was not normalized to a single-element array: %s", stop.Raw)
 					}
 					w.Header().Set("Content-Type", "text/event-stream")
@@ -849,7 +1455,7 @@ func TestWorkBuddyBothSitesStreamingAndNonStreaming(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if gjson.GetBytes(response.Payload, "choices.0.message.content").String() != "Hello" || gjson.GetBytes(response.Payload, "choices.0.message.reasoning_content").String() != "Think" || gjson.GetBytes(response.Payload, "usage.total_tokens").Int() != 15 {
+					if ojson.GetBytes(response.Payload, "choices.0.message.content").String() != "Hello" || ojson.GetBytes(response.Payload, "choices.0.message.reasoning_content").String() != "Think" || ojson.GetBytes(response.Payload, "usage.total_tokens").Int() != 15 {
 						t.Fatalf("incorrect aggregate %s", response.Payload)
 					}
 				}
@@ -887,7 +1493,7 @@ func TestWorkBuddyToolNamesAndIncompleteStreams(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if gjson.GetBytes(response.Payload, "choices.0.message.tool_calls.0.function.name").String() != "mcp.search" || gjson.GetBytes(response.Payload, "choices.0.message.tool_calls.0.function.arguments").String() != "{}" {
+			if ojson.GetBytes(response.Payload, "choices.0.message.tool_calls.0.function.name").String() != "mcp.search" || ojson.GetBytes(response.Payload, "choices.0.message.tool_calls.0.function.arguments").String() != "{}" {
 				t.Fatalf("tool call did not round trip: %s", response.Payload)
 			}
 		})
@@ -907,7 +1513,7 @@ func TestWorkBuddyClientProtocolConversions(t *testing.T) {
 		t.Run(test.format.String(), func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)
-				if gjson.GetBytes(body, "messages.1.content").String() != "hi" || !gjson.GetBytes(body, "stream").Bool() {
+				if ojson.GetBytes(body, "messages.1.content").String() != "hi" || !ojson.GetBytes(body, "stream").Bool() {
 					t.Errorf("client request did not become a WorkBuddy chat: %s", body)
 				}
 				w.Header().Set("Content-Type", "text/event-stream")

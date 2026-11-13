@@ -236,7 +236,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// any panic response written by GinLogrusRecovery or custom extraMiddleware is
 	// captured before request logging finalizes.
 	if requestLogger != nil {
-		engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
+		engine.Use(middleware.RequestLoggingMiddleware(requestLogger, middleware.WithRequestLogSampling(func() float64 {
+			s.cfgMu.RLock()
+			defer s.cfgMu.RUnlock()
+			return s.cfg.EffectiveRequestLogSampleRate()
+		}, nil)))
 	}
 
 	engine.Use(logging.GinLogrusRecovery())
@@ -462,9 +466,15 @@ func (s *Server) Start() error {
 		defer close(monitorDone)
 		s.mgmt.RunPerformance(monitorCtx)
 	}()
+	creditsDone := make(chan struct{})
+	go func() {
+		defer close(creditsDone)
+		s.mgmt.RunWorkBuddyCredits(monitorCtx)
+	}()
 	defer func() {
 		stopMonitor()
 		<-monitorDone
+		<-creditsDone
 	}()
 
 	go func() {

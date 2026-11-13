@@ -1300,6 +1300,12 @@ observability:
     # Record proxy request/response logs. Management requests are excluded.
     request-log: false
 
+    # Optional successful-request sampling probability in [0, 1]. Omitted/null means 1 (full logging).
+    # With request-log enabled: 1 logs all requests; 0 retains only errors; intermediate values sample
+    # successes once per request. Errors keep the existing retention rules and client-cancellation exclusions.
+    # With request-log disabled, the existing error-only logging behavior is unchanged.
+    # request-log-sample-rate: 1
+
   usage:
     # When false, disable in-memory usage statistics aggregation
     usage-statistics-enabled: false

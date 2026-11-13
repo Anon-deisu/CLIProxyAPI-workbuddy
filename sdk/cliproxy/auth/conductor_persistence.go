@@ -228,6 +228,11 @@ func (m *Manager) persistLocked(ctx context.Context, auth *Auth) error {
 	err := m.persist(ctx, saved)
 	m.mu.Lock()
 	mergeAuthSaveDelta(auth, before, saved, true)
+	// Some result/reset paths persist the published object in place. Stores may
+	// enrich routing fields as well as file paths, so fence those changes here.
+	if m.auths[auth.ID] == auth && !sameSelectionMembership(before, auth) {
+		m.structuralEpoch.Add(1)
+	}
 	return err
 }
 
@@ -367,6 +372,9 @@ func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedE
 		if current.Metadata != nil {
 			invalidated := current.Clone()
 			delete(invalidated.Metadata, key)
+			if !sameSelectionMembership(current, invalidated) {
+				m.structuralEpoch.Add(1)
+			}
 			m.auths[id] = invalidated
 		}
 		m.mu.Unlock()
@@ -375,6 +383,9 @@ func (m *Manager) PersistMetadataEntry(ctx context.Context, id string, expectedE
 	mergeAuthSaveDelta(updated, existingBeforeSave, current, false)
 	if current.Generation > updated.Generation {
 		updated.Generation = current.Generation
+	}
+	if !sameSelectionMembership(current, updated) {
+		m.structuralEpoch.Add(1)
 	}
 	m.auths[id] = updated.Clone()
 	m.mu.Unlock()

@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/google/uuid"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
-	"github.com/tidwall/gjson"
 )
 
 var workBuddyIDSeed = uuid.NewString()
@@ -44,7 +44,7 @@ func applyWorkBuddyConversationHeaders(req *http.Request, body []byte, opts clip
 			conversation = idFor("conversation", session)
 		}
 	}
-	messages := gjson.GetBytes(body, "messages").Array()
+	messages := ojson.GetBytes(body, "messages").Array()
 	if conversation == "" {
 		for _, message := range messages {
 			if message.Get("role").String() == "user" {

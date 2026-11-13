@@ -605,6 +605,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	if requestCtx != nil {
 		parentCtx = httptransport.InheritDecorator(parentCtx, requestCtx)
 	}
+	captureEnabled := false
+	if cfg := h.CurrentConfig(); cfg != nil {
+		captureEnabled = cfg.RequestLog
+	}
+	captureEnabled = logging.RequestLogCaptureEnabled(requestCtx, logging.RequestLogCaptureEnabled(parentCtx, captureEnabled))
+	parentCtx = logging.WithRequestLogCapture(parentCtx, captureEnabled)
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
@@ -664,7 +670,7 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		if c != nil {
 			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
 		}
-		if cfg := h.CurrentConfig(); cfg != nil && cfg.RequestLog && len(params) == 1 {
+		if captureEnabled && c != nil && len(params) == 1 {
 			if captured, exists := c.Get(logging.APIResponseCapturedContextKey); exists {
 				if capturedBool, ok := captured.(bool); ok && capturedBool {
 					cancel()

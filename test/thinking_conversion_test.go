@@ -41,6 +41,86 @@ type thinkingTestCase struct {
 	expectErr       bool
 }
 
+func TestWorkBuddyThinkingUsesHighestSupportedEffort(t *testing.T) {
+	cases := []struct {
+		name, from, body, suffix, want string
+		levels                         []string
+	}{
+		{name: "unsupported medium", from: "openai", body: `{"reasoning_effort":"medium"}`, levels: []string{"none", "high", "max"}, want: "max"},
+		{name: "unsupported low", from: "openai", body: `{"reasoning_effort":"low"}`, levels: []string{"high", "max"}, want: "max"},
+		{name: "unknown effort", from: "openai", body: `{"reasoning_effort":"ultra"}`, levels: []string{"high", "max"}, want: "max"},
+		{name: "supported high", from: "openai", body: `{"reasoning_effort":"high"}`, levels: []string{"high", "max"}, want: "high"},
+		{name: "supported max", from: "openai", body: `{"reasoning_effort":"max"}`, levels: []string{"high", "max"}, want: "max"},
+		{name: "supported medium", from: "openai", body: `{"reasoning_effort":"medium"}`, levels: []string{"low", "medium", "high"}, want: "medium"},
+		{name: "highest high", from: "openai", body: `{"reasoning_effort":"medium"}`, levels: []string{"low", "high"}, want: "high"},
+		{name: "highest xhigh", from: "openai", body: `{"reasoning_effort":"medium"}`, levels: []string{"high", "xhigh"}, want: "xhigh"},
+		{name: "unordered levels", from: "openai", body: `{"reasoning_effort":"medium"}`, levels: []string{"max", "none", "high", "low"}, want: "max"},
+		{name: "no requested effort", from: "openai", body: `{}`, levels: []string{"high", "max"}},
+		{name: "thinking unsupported", from: "openai", body: `{"reasoning_effort":"medium"}`},
+		{name: "explicit disable", from: "openai", body: `{"reasoning_effort":"none"}`, levels: []string{"none", "high", "max"}, want: "none"},
+		{name: "disable retains existing fallback", from: "openai", body: `{"reasoning_effort":"none"}`, levels: []string{"high", "max"}, want: "high"},
+		{name: "auto retains existing fallback", from: "openai", body: `{"reasoning_effort":"auto"}`, levels: []string{"high", "max"}, want: "high"},
+		{name: "unsupported suffix overrides body", from: "openai", body: `{"reasoning_effort":"high"}`, suffix: "(medium)", levels: []string{"high", "max"}, want: "max"},
+		{name: "supported suffix overrides body", from: "openai", body: `{"reasoning_effort":"medium"}`, suffix: "(high)", levels: []string{"high", "max"}, want: "high"},
+		{name: "numeric suffix", from: "openai", body: `{}`, suffix: "(8192)", levels: []string{"high", "max"}, want: "max"},
+		{name: "unknown suffix", from: "openai", body: `{}`, suffix: "(ultra)", levels: []string{"high", "max"}, want: "max"},
+		{name: "Responses effort", from: "openai-response", body: `{"input":"hi","reasoning":{"effort":"medium"}}`, levels: []string{"high", "max"}, want: "max"},
+		{name: "Responses update", from: "openai-response", body: `{"reasoning":{"effort":"high"},"input":[{"type":"configuration_update","reasoning":{"effort":"medium"}},{"role":"user","content":"hi"}]}`, levels: []string{"high", "max"}, want: "max"},
+		{name: "Claude effort", from: "claude", body: `{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}`, levels: []string{"high", "max"}, want: "max"},
+		{name: "Claude budget", from: "claude", body: `{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8192}}`, levels: []string{"high", "max"}, want: "max"},
+		{name: "Gemini budget", from: "gemini", body: `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}`, levels: []string{"high", "max"}, want: "max"},
+	}
+	for _, provider := range []string{"workbuddy", "workbuddy-ai"} {
+		for _, tc := range cases {
+			t.Run(provider+"/"+tc.name, func(t *testing.T) {
+				info := &registry.ModelInfo{ID: "workbuddy-effort-test", Type: provider}
+				if len(tc.levels) > 0 {
+					info.Thinking = &registry.ThinkingSupport{Levels: tc.levels}
+				}
+				reg := registry.GetGlobalRegistry()
+				reg.RegisterClient(t.Name(), provider, []*registry.ModelInfo{info})
+				t.Cleanup(func() { reg.UnregisterClient(t.Name()) })
+				source := []byte(tc.body)
+				body := sdktranslator.TranslateRequest(sdktranslator.FromString(tc.from), sdktranslator.FormatOpenAI, info.ID, source, true)
+				summary := thinking.ExtractSummaryConfig(source, tc.from)
+				for _, useDoc := range []bool{false, true} {
+					var out []byte
+					var err error
+					if useDoc {
+						doc := ojson.NewDoc(body)
+						err = thinking.ApplyThinkingWithSourceAndSummaryDoc(doc, source, info.ID+tc.suffix, tc.from, "openai", provider, summary)
+						out = doc.Bytes()
+					} else {
+						out, err = thinking.ApplyThinkingWithSourceAndSummary(body, source, info.ID+tc.suffix, tc.from, "openai", provider, summary)
+					}
+					if err != nil {
+						t.Fatalf("doc=%t: unexpected thinking error: %v", useDoc, err)
+					}
+					effort := ojson.GetBytes(out, "reasoning_effort")
+					if effort.String() != tc.want || (tc.want == "" && effort.Exists()) {
+						t.Fatalf("doc=%t: reasoning_effort = %s, want %q; body=%s", useDoc, effort.Raw, tc.want, out)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestUnsupportedEffortFallbackIsWorkBuddyOnly(t *testing.T) {
+	for _, provider := range []string{"openai", "codex", "custom-compat"} {
+		t.Run(provider, func(t *testing.T) {
+			info := &registry.ModelInfo{ID: "non-workbuddy-effort-test", Type: provider, Thinking: &registry.ThinkingSupport{Levels: []string{"high", "max"}}}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(t.Name(), provider, []*registry.ModelInfo{info})
+			t.Cleanup(func() { reg.UnregisterClient(t.Name()) })
+			_, err := thinking.ApplyThinking([]byte(`{"reasoning_effort":"medium"}`), info.ID, "openai", "openai", provider)
+			if thinkingErr, ok := err.(*thinking.ThinkingError); !ok || thinkingErr.Code != thinking.ErrLevelNotSupported {
+				t.Fatalf("unsupported effort error = %v, want LEVEL_NOT_SUPPORTED", err)
+			}
+		})
+	}
+}
+
 // TestThinkingE2EMatrix_Suffix tests the thinking configuration transformation using model name suffix.
 // Data flow: Input JSON → TranslateRequest → ApplyThinking → Validate Output
 // No helper functions are used; all test data is inline.

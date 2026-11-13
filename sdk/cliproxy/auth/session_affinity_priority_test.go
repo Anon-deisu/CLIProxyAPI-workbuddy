@@ -3,13 +3,239 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	log "github.com/sirupsen/logrus"
 )
+
+type affinitySelectionPauseHook struct {
+	authID  string
+	reached chan struct{}
+	resume  chan struct{}
+	once    sync.Once
+}
+
+func (*affinitySelectionPauseHook) Levels() []log.Level { return []log.Level{log.InfoLevel} }
+
+func (h *affinitySelectionPauseHook) Fire(entry *log.Entry) error {
+	if strings.HasPrefix(entry.Message, "session-affinity: cache hit |") && strings.Contains(entry.Message, "auth="+h.authID+" ") {
+		h.once.Do(func() {
+			close(h.reached)
+			<-h.resume
+		})
+	}
+	return nil
+}
+
+func TestManagerSessionAffinityRevalidatesSelectedSnapshot(t *testing.T) {
+	for _, mode := range []string{"kind", "single", "mixed", "execute"} {
+		for _, change := range []string{"provider-kind", "same-generation-kind", "degraded", "model", "cooldown", "dispatch-state", "pinned", "tried", "unrelated-metadata"} {
+			if (change == "pinned" || change == "tried") && (mode == "kind" || mode == "execute") {
+				continue
+			}
+			t.Run(mode+"/"+change, func(t *testing.T) {
+				ctx := context.Background()
+				selector := NewSessionAffinitySelector(nil)
+				t.Cleanup(selector.Stop)
+				manager := NewManager(nil, selector, nil)
+				codex := &successExecutor{provider: "codex"}
+				claude := &successExecutor{provider: "claude"}
+				manager.RegisterExecutor(codex)
+				manager.RegisterExecutor(claude)
+				manager.SetRetryConfig(0, 0, 0)
+				authID := t.Name()
+				registered, errRegister := manager.Register(ctx, &Auth{ID: authID, Provider: "codex", ConcurrencyLimit: 1, Metadata: map[string]any{AttributeAuthKind: AuthKindOAuth}})
+				if errRegister != nil {
+					t.Fatal(errRegister)
+				}
+				reg := registry.GetGlobalRegistry()
+				reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "model"}})
+				t.Cleanup(func() { reg.UnregisterClient(authID) })
+				opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": {"selection-race"}}, Metadata: map[string]any{}}
+				tried := make(map[string]struct{})
+				namespace := "codex"
+				if mode == "mixed" || mode == "execute" {
+					namespace = "mixed"
+				}
+				selector.cache.setSessionAliases(authID, "codex", "codex:selection-race", namespace+"::codex:selection-race::model")
+
+				logger := log.StandardLogger()
+				previousLevel := logger.GetLevel()
+				previousHooks := logger.ReplaceHooks(make(log.LevelHooks))
+				hook := &affinitySelectionPauseHook{authID: authID, reached: make(chan struct{}), resume: make(chan struct{})}
+				logger.SetLevel(log.InfoLevel)
+				logger.AddHook(hook)
+				t.Cleanup(func() { logger.ReplaceHooks(previousHooks); logger.SetLevel(previousLevel) })
+				var resumeOnce sync.Once
+				resume := func() { resumeOnce.Do(func() { close(hook.resume) }) }
+				defer resume()
+				type outcome struct {
+					auth *Auth
+					err  error
+				}
+				done := make(chan outcome, 1)
+				go func() {
+					selectionCtx := withRequiredAuthKind(ctx, AuthKindOAuth)
+					var result outcome
+					switch mode {
+					case "kind":
+						result.auth, result.err = manager.SelectAuthByKind(ctx, "codex", "model", AuthKindOAuth, opts)
+					case "single":
+						result.auth, _, result.err = manager.pickNext(selectionCtx, "codex", "model", opts, tried)
+					case "mixed":
+						result.auth, _, _, result.err = manager.pickNextMixed(selectionCtx, []string{"codex"}, "model", opts, tried)
+					case "execute":
+						_, result.err = manager.Execute(selectionCtx, []string{"codex"}, cliproxyexecutor.Request{Model: "model"}, opts)
+					}
+					done <- result
+				}()
+				select {
+				case <-hook.reached:
+				case result := <-done:
+					t.Fatalf("selection did not reach bound snapshot: %v", result.err)
+				}
+				updated, _ := manager.GetByID(authID)
+				switch change {
+				case "provider-kind":
+					updated.Provider = "claude"
+					updated.Metadata[AttributeAuthKind] = AuthKindAPIKey
+					if _, errUpdate := manager.Update(ctx, updated); errUpdate != nil {
+						t.Fatal(errUpdate)
+					}
+				case "dispatch-state":
+					updated.dispatchState = nil
+					updated.ensureDispatchState()
+					if _, errUpdate := manager.Update(ctx, updated); errUpdate != nil {
+						t.Fatal(errUpdate)
+					}
+				case "same-generation-kind", "degraded", "unrelated-metadata":
+					key, value := AttributeAuthKind, any(AuthKindAPIKey)
+					if change == "degraded" {
+						key, value = "degraded", true
+					} else if change == "unrelated-metadata" {
+						key, value = "observed_quota", 42
+					}
+					if saved, _ := manager.PersistMetadataEntry(ctx, authID, updated.RegistrationEpoch, key, value, nil); !saved {
+						t.Fatal("metadata publication failed")
+					}
+				case "model":
+					reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "different"}})
+				case "pinned":
+					opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = "different-auth"
+				case "tried":
+					tried[authID] = struct{}{}
+				case "cooldown":
+					manager.mu.Lock()
+					manager.auths[authID].ModelStates = map[string]*ModelState{"model": {Unavailable: true, NextRetryAfter: time.Now().Add(time.Hour)}}
+					manager.mu.Unlock()
+				}
+				current, _ := manager.GetByID(authID)
+				if current.RegistrationEpoch != registered.RegistrationEpoch {
+					t.Fatal("test unexpectedly changed registration epoch")
+				}
+				if change != "provider-kind" && change != "dispatch-state" && current.Generation != registered.Generation {
+					t.Fatal("test must cover changes without a generation increment")
+				}
+				resume()
+				result := <-done
+				if result.auth != nil && mode != "kind" {
+					result.auth.ReleaseDispatchSlot()
+				}
+				if change == "unrelated-metadata" {
+					if result.err != nil {
+						t.Fatalf("unrelated metadata rejected valid selection: %v", result.err)
+					}
+				} else {
+					if result.err == nil || result.auth != nil {
+						t.Errorf("ineligible auth escaped snapshot validation: returnedAuth=%t err=%v", result.auth != nil, result.err)
+					}
+					if codex.calls.Load()+claude.calls.Load() != 0 {
+						t.Errorf("ineligible credential executed: codex=%d claude=%d", codex.calls.Load(), claude.calls.Load())
+					}
+				}
+				if got := registered.ActiveDispatchRequests(); got != 0 {
+					t.Errorf("selected slot leaked: %d", got)
+				}
+				current, _ = manager.GetByID(authID)
+				if got := current.ActiveDispatchRequests(); got != 0 {
+					t.Errorf("current slot leaked: %d", got)
+				}
+			})
+		}
+	}
+}
+
+func TestManagerSessionAffinityLiveBindingValidation(t *testing.T) {
+	for _, mode := range []string{"single", "mixed"} {
+		for _, reason := range []string{"busy", "disabled", "cooldown", "tried", "model", "pinned"} {
+			t.Run(mode+"/"+reason, func(t *testing.T) {
+				selector := NewSessionAffinitySelector(nil)
+				t.Cleanup(selector.Stop)
+				manager := NewManager(nil, selector, nil)
+				manager.RegisterExecutor(schedulerTestExecutor{provider: "codex"})
+				reg := registry.GetGlobalRegistry()
+				aID, bID := t.Name()+"-a", t.Name()+"-b"
+				for _, id := range []string{aID, bID} {
+					if _, errRegister := manager.Register(context.Background(), &Auth{ID: id, Provider: "codex", ConcurrencyLimit: 1, Metadata: map[string]any{"profile": "execution-data"}}); errRegister != nil {
+						t.Fatal(errRegister)
+					}
+					reg.RegisterClient(id, "codex", []*registry.ModelInfo{{ID: "model"}})
+					t.Cleanup(func() { reg.UnregisterClient(id) })
+				}
+				opts := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": {"session"}}, Metadata: map[string]any{}}
+				pick := func(tried map[string]struct{}) *Auth {
+					t.Helper()
+					var selected *Auth
+					var errPick error
+					if mode == "single" {
+						selected, _, errPick = manager.pickNext(context.Background(), "codex", "model", opts, tried)
+					} else {
+						selected, _, _, errPick = manager.pickNextMixed(context.Background(), []string{"codex"}, "model", opts, tried)
+					}
+					if errPick != nil {
+						t.Fatal(errPick)
+					}
+					selected.ReleaseDispatchSlot()
+					if selected.Metadata["profile"] != "execution-data" {
+						t.Fatal("execution received incomplete scheduling snapshot")
+					}
+					return selected
+				}
+				if got := pick(nil); got.ID != aID {
+					t.Fatalf("initial binding = %q", got.ID)
+				}
+				tried := map[string]struct{}{}
+				manager.mu.Lock()
+				bound := manager.auths[aID]
+				switch reason {
+				case "busy":
+					bound.TryAcquireDispatchSlot()
+					t.Cleanup(bound.ReleaseDispatchSlot)
+				case "disabled":
+					bound.Disabled = true
+				case "cooldown":
+					bound.ModelStates = map[string]*ModelState{"model": {Unavailable: true, NextRetryAfter: time.Now().Add(time.Hour)}}
+				case "tried":
+					tried[aID] = struct{}{}
+				case "model":
+					reg.UnregisterClient(aID)
+				case "pinned":
+					opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = bID
+				}
+				manager.mu.Unlock()
+				if got := pick(tried); got.ID != bID {
+					t.Fatalf("invalid binding selected %q, want fallback %q", got.ID, bID)
+				}
+			})
+		}
+	}
+}
 
 func TestManagerSessionAffinityPreservesBindingAcrossHigherPriorityRecovery(t *testing.T) {
 	for _, testCase := range []struct {

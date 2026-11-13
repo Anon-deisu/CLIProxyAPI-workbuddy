@@ -2,15 +2,17 @@ package auth
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	log "github.com/sirupsen/logrus"
 )
 
 type schedulerBenchmarkExecutor struct {
@@ -274,6 +276,74 @@ func BenchmarkManagerPickCodexPool(b *testing.B) {
 					selected.ReleaseDispatchSlot()
 				}
 			})
+		}
+	}
+}
+
+func BenchmarkManagerPickAffinityPool(b *testing.B) {
+	previousLevel := log.GetLevel()
+	log.SetLevel(log.WarnLevel)
+	b.Cleanup(func() { log.SetLevel(previousLevel) })
+	for _, total := range []int{187, 200} {
+		for _, identity := range []string{"explicit", "lcp"} {
+			for _, scenario := range []string{"hit", "retry75", "busy50", "busy90"} {
+				b.Run(fmt.Sprintf("accounts=%d/%s/%s", total, identity, scenario), func(b *testing.B) {
+					manager, _, model := benchmarkManagerSetup(b, total, false, false)
+					selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{RebindOn: SessionAffinityRebindOnQuota})
+					manager.SetSelector(selector)
+					b.Cleanup(selector.Stop)
+					for _, auth := range manager.auths {
+						auth.SetConcurrencyLimit(1)
+						auth.Metadata = map[string]any{"token": strings.Repeat("x", 1024), "profile": map[string]any{"nested": []any{"a", "b"}}}
+						auth.Attributes = map[string]string{"priority": "0", "unrelated": strings.Repeat("x", 1024)}
+					}
+					opts := cliproxyexecutor.Options{
+						SourceFormat:    sdktranslator.FormatOpenAI,
+						OriginalRequest: []byte(`{"messages":[{"role":"system","content":"stable"},` + strings.Repeat(`{"role":"user","content":"benchmark conversation turn"},`, 63) + `{"role":"user","content":"last"}]}`),
+						Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "benchmark"},
+					}
+					if identity == "explicit" {
+						opts.Headers = http.Header{"Session-Id": {"benchmark"}}
+					}
+					ctx := context.Background()
+					warm, _, _, errWarm := manager.pickNextMixed(ctx, []string{"gemini"}, model, opts, nil)
+					if errWarm != nil {
+						b.Fatal(errWarm)
+					}
+					warm.ReleaseDispatchSlot()
+					tried := make(map[string]struct{})
+					percent := 0
+					switch scenario {
+					case "retry75":
+						percent = 75
+					case "busy50":
+						percent = 50
+					case "busy90":
+						percent = 90
+					}
+					for index := 0; index < total*percent/100; index++ {
+						id := fmt.Sprintf("bench-gemini-%04d", index)
+						if scenario == "retry75" {
+							tried[id] = struct{}{}
+						} else {
+							auth := manager.auths[id]
+							if !auth.TryAcquireDispatchSlot() {
+								b.Fatal("occupy auth")
+							}
+							b.Cleanup(auth.ReleaseDispatchSlot)
+						}
+					}
+					b.ReportAllocs()
+					for b.Loop() {
+						opts.Metadata = cloneRequestMetadata(opts.Metadata)
+						selected, _, _, errPick := manager.pickNextMixed(ctx, []string{"gemini"}, model, opts, tried)
+						if errPick != nil {
+							b.Fatal(errPick)
+						}
+						selected.ReleaseDispatchSlot()
+					}
+				})
+			}
 		}
 	}
 }

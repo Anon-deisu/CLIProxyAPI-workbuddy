@@ -47,6 +47,8 @@ func TestAddWorkBuddyQuotaRegistersNativePageAndAuthFileCards(t *testing.T) {
 		"workbuddyQuota:{}", "workbuddyAIQuota:{}", "workbuddyQuota:i(e.workbuddyQuota)", "workbuddyAIQuota:i(e.workbuddyAIQuota)",
 		"workbuddy:cpaWorkBuddyQuota", `"workbuddy-ai":cpaWorkBuddyQuota`,
 		"l.storeSelector(e)[u]", "/credentials/workbuddy-quota", "workbuddy_quota", "WorkBuddy 国内站", "WorkBuddy 国际站",
+		"function cpaWorkBuddyCredits(", "workbuddy剩余积分:", "/observability/workbuddy-credits",
+		"function cpaAllQuotaEntries(", "function cpaLoadQuotaEntries(", "cpa-quota-refresh-every", `刷新"全部"凭证`,
 	} {
 		if !bytes.Contains(got, []byte(marker)) {
 			t.Fatalf("missing native quota integration: %s", marker)

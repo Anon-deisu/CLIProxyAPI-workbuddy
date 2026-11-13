@@ -1,7 +1,9 @@
 package logging
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,12 +13,19 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const fileBodyBufferSize = 16 << 10
+
 // FileBodySource stores large log sections as ordered temp-file parts.
 type FileBodySource struct {
-	mu      sync.Mutex
-	dir     string
-	paths   []string
-	cleaned bool
+	mu           sync.Mutex
+	dir          string
+	paths        []string
+	partFiles    []*os.File
+	appendFile   *os.File
+	appendBuffer *bufio.Writer
+	writeErr     error
+	cleanupErr   error
+	cleaned      bool
 }
 
 // NewFileBodySourceInDir creates a temp-backed source under baseDir.
@@ -63,15 +72,28 @@ func sanitizeTempPrefix(prefix string) string {
 	return out
 }
 
-// CreatePart creates one ordered detail log part.
+// CreatePart creates one ordered detail log part. The caller must finish writing
+// and close it before observing the source or appending bytes to that part.
+// Cleanup also closes outstanding handles, including on cancellation.
 func (s *FileBodySource) CreatePart(prefix string) (*os.File, error) {
 	if s == nil {
 		return nil, fmt.Errorf("file body source is nil")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	file, errCreate := s.createPartLocked(prefix)
+	if errCreate == nil {
+		s.partFiles = append(s.partFiles, file)
+	}
+	return file, errCreate
+}
+
+func (s *FileBodySource) createPartLocked(prefix string) (*os.File, error) {
 	if s.cleaned {
 		return nil, fmt.Errorf("file body source has been cleaned")
+	}
+	if errClose := s.closeAppendLocked(); errClose != nil {
+		return nil, errClose
 	}
 	prefix = sanitizeTempPrefix(prefix)
 	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
@@ -91,7 +113,12 @@ func (s *FileBodySource) AppendPart(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
-	file, errCreate := s.CreatePart("part")
+	if s == nil {
+		return fmt.Errorf("file body source is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file, errCreate := s.createPartLocked("part")
 	if errCreate != nil {
 		return errCreate
 	}
@@ -101,7 +128,8 @@ func (s *FileBodySource) AppendPart(data []byte) error {
 			writeErr = errClose
 		}
 	}
-	return writeErr
+	s.writeErr = writeErr
+	return s.writeErr
 }
 
 // AppendBytes appends raw bytes to a single ordered part.
@@ -117,31 +145,66 @@ func (s *FileBodySource) AppendBytes(data []byte) error {
 	if s.cleaned {
 		return fmt.Errorf("file body source has been cleaned")
 	}
-	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
-		return errMkdir
+	if s.writeErr != nil {
+		return s.writeErr
 	}
 
-	var file *os.File
-	var errOpen error
-	if len(s.paths) == 0 {
-		file, errOpen = os.CreateTemp(s.dir, "part-*.tmp")
-		if errOpen == nil {
-			s.paths = append(s.paths, file.Name())
+	if s.appendFile == nil {
+		var file *os.File
+		var errOpen error
+		if len(s.paths) == 0 {
+			file, errOpen = s.createPartLocked("part")
+		} else {
+			file, errOpen = os.OpenFile(s.paths[len(s.paths)-1], os.O_WRONLY|os.O_APPEND, 0644)
 		}
-	} else {
-		file, errOpen = os.OpenFile(s.paths[len(s.paths)-1], os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	}
-	if errOpen != nil {
-		return errOpen
+		if errOpen != nil {
+			return errOpen
+		}
+		s.appendFile = file
+		if s.appendBuffer == nil {
+			s.appendBuffer = bufio.NewWriterSize(file, fileBodyBufferSize)
+		} else {
+			s.appendBuffer.Reset(file)
+		}
 	}
 
-	_, writeErr := file.Write(data)
-	if errClose := file.Close(); errClose != nil {
-		if writeErr == nil {
-			writeErr = errClose
+	_, s.writeErr = s.appendBuffer.Write(data)
+	return s.writeErr
+}
+
+// Flush publishes buffered bytes and reports deferred write errors. The buffer
+// belongs to this source only; it never delays forwarding a network stream.
+func (s *FileBodySource) Flush() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushLocked()
+}
+
+func (s *FileBodySource) flushLocked() error {
+	if s.appendFile != nil && s.writeErr == nil {
+		s.writeErr = s.appendBuffer.Flush()
+		if s.writeErr == nil {
+			// An open handle can still accept writes after its path is removed.
+			// Detect that at observation boundaries rather than on every chunk.
+			_, s.writeErr = os.Stat(s.appendFile.Name())
 		}
 	}
-	return writeErr
+	return s.writeErr
+}
+
+func (s *FileBodySource) closeAppendLocked() error {
+	_ = s.flushLocked()
+	if s.appendFile != nil {
+		if errClose := s.appendFile.Close(); errClose != nil && s.writeErr == nil {
+			s.writeErr = errClose
+		}
+		s.appendFile = nil
+		s.appendBuffer.Reset(nil)
+	}
+	return s.writeErr
 }
 
 // HasPayload reports whether any detail parts were recorded.
@@ -154,13 +217,18 @@ func (s *FileBodySource) HasPayload() bool {
 	return len(s.paths) > 0 && !s.cleaned
 }
 
-// Paths returns a copy of the ordered part paths.
+// Paths flushes pending writes and returns a copy of the ordered part paths.
+// Its legacy signature cannot return errors; use Flush or WriteTo to observe
+// write failures. Failures remain sticky until Cleanup and are also logged here.
 func (s *FileBodySource) Paths() []string {
 	if s == nil {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if errFlush := s.flushLocked(); errFlush != nil {
+		log.WithError(errFlush).Warn("failed to flush log part files")
+	}
 	out := make([]string, len(s.paths))
 	copy(out, s.paths)
 	return out
@@ -171,10 +239,16 @@ func (s *FileBodySource) WriteTo(w io.Writer) (int64, error) {
 	if s == nil || w == nil {
 		return 0, nil
 	}
+	// Keep cleanup and append operations serialized with the entire observation.
+	// A path snapshot alone would allow Cleanup to remove unread parts.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if errFlush := s.flushLocked(); errFlush != nil {
+		return 0, errFlush
+	}
 	var totalWritten int64
-	paths := s.Paths()
 	wrote := false
-	for _, path := range paths {
+	for _, path := range s.paths {
 		file, errOpen := os.Open(path)
 		if errOpen != nil {
 			if os.IsNotExist(errOpen) {
@@ -223,29 +297,33 @@ func (s *FileBodySource) Cleanup() error {
 		return nil
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.cleaned {
-		s.mu.Unlock()
-		return nil
+		return s.cleanupErr
 	}
-	paths := make([]string, len(s.paths))
-	copy(paths, s.paths)
-	dir := s.dir
-	s.paths = nil
 	s.cleaned = true
-	s.mu.Unlock()
 
-	var firstErr error
-	for _, path := range paths {
+	firstErr := s.closeAppendLocked()
+	for _, file := range s.partFiles {
+		if errClose := file.Close(); errClose != nil && !errors.Is(errClose, os.ErrClosed) && firstErr == nil {
+			firstErr = errClose
+		}
+	}
+	s.partFiles = nil
+	s.appendBuffer = nil
+	for _, path := range s.paths {
 		if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) && firstErr == nil {
 			firstErr = errRemove
 		}
 	}
-	if dir != "" {
-		if errRemove := os.RemoveAll(dir); errRemove != nil && firstErr == nil {
+	if s.dir != "" {
+		if errRemove := os.RemoveAll(s.dir); errRemove != nil && firstErr == nil {
 			firstErr = errRemove
 		}
 	}
-	return firstErr
+	s.paths = nil
+	s.cleanupErr = firstErr
+	return s.cleanupErr
 }
 
 func cleanupFileBodySources(sources ...*FileBodySource) {

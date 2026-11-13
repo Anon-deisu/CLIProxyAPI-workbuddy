@@ -6,6 +6,7 @@ package logging
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
@@ -135,7 +136,8 @@ type StreamingLogWriter interface {
 // It provides file-based logging functionality for HTTP requests and responses.
 type FileRequestLogger struct {
 	// enabled indicates whether request logging is currently enabled.
-	enabled bool
+	enabledMu sync.RWMutex
+	enabled   bool
 
 	// logsDir is the directory where log files are stored.
 	logsDir string
@@ -178,6 +180,8 @@ func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorL
 // Returns:
 //   - bool: True if logging is enabled, false otherwise
 func (l *FileRequestLogger) IsEnabled() bool {
+	l.enabledMu.RLock()
+	defer l.enabledMu.RUnlock()
 	return l.enabled
 }
 
@@ -187,7 +191,20 @@ func (l *FileRequestLogger) IsEnabled() bool {
 // Parameters:
 //   - enabled: Whether request logging should be enabled
 func (l *FileRequestLogger) SetEnabled(enabled bool) {
+	l.enabledMu.Lock()
+	defer l.enabledMu.Unlock()
 	l.enabled = enabled
+}
+
+// SnapshotForRequest freezes the logging switch while preserving all file-source interfaces.
+// Reloads affect subsequent requests; an existing stream retains its writer and capture policy.
+func (l *FileRequestLogger) SnapshotForRequest() RequestLogger {
+	return &FileRequestLogger{
+		enabled:           l.IsEnabled(),
+		logsDir:           l.logsDir,
+		errorLogsMaxFiles: l.errorLogsMaxFiles,
+		homeEnabled:       l.homeEnabled,
+	}
 }
 
 // SetErrorLogsMaxFiles updates the maximum number of error log files to retain.

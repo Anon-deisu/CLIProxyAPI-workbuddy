@@ -188,6 +188,9 @@ type Manager struct {
 	selectorMu                sync.Mutex
 	configCooldownMu          sync.Mutex
 	syncSchedulerMu           sync.Mutex
+	selectionIndexMu          sync.Mutex
+	selectionIndexVersion     selectionIndexVersion
+	selectionIndexes          map[selectionIndexKey]*selectionIndex
 	// executionSeq stamps upstream dispatches with a monotonic sequence used
 	// to reject cooldown clears from executions dispatched before the cooldown.
 	executionSeq       atomic.Uint64

@@ -1,6 +1,37 @@
 package logging
 
-import "context"
+import (
+	"context"
+
+	"github.com/gin-gonic/gin"
+)
+
+type requestLogCaptureKey struct{}
+
+// WithRequestLogCapture fixes the full capture decision for a request and its descendants.
+func WithRequestLogCapture(ctx context.Context, enabled bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, requestLogCaptureKey{}, enabled)
+}
+
+// RequestLogCaptureEnabled shares the middleware decision with upstream recorders.
+// Callers without request logging middleware retain their configured behavior.
+func RequestLogCaptureEnabled(ctx context.Context, fallback bool) bool {
+	if ctx == nil {
+		return fallback
+	}
+	if enabled, ok := ctx.Value(requestLogCaptureKey{}).(bool); ok {
+		return enabled
+	}
+	if c, ok := ctx.Value("gin").(*gin.Context); ok && c != nil && c.Request != nil {
+		if enabled, ok := c.Request.Context().Value(requestLogCaptureKey{}).(bool); ok {
+			return enabled
+		}
+	}
+	return fallback
+}
 
 type deferredAPIRequestCaptureDisabledKey struct{}
 

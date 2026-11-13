@@ -373,6 +373,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			codexResponseSteering = cfg.CodexResponseSteering
 		}
 	}
+	requestLogEnabled = logging.RequestLogCaptureEnabled(socketCtx, requestLogEnabled)
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
 	localInterrupt := newResponsesLocalInterrupt()
 	// Advanced on every upstream loss: input read under an older epoch predates the loss.

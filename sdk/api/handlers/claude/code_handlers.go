@@ -350,6 +350,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 
 type claudeSSEStreamState struct {
 	sawErrorEvent      bool
+	errorMessage       *interfaces.ErrorMessage
 	sawMessageStop     bool
 	sawBareMessageJSON bool
 	trailingNewlines   int
@@ -434,7 +435,7 @@ func (s *claudeSSEStreamState) observeJSONPayload(payload []byte, hasDataPrefix 
 	case "message_stop":
 		s.sawMessageStop = true
 	case "error":
-		s.sawErrorEvent = true
+		s.observeErrorPayload(payload)
 	case "message":
 		if !hasDataPrefix && strings.TrimSpace(root.Get("stop_reason").String()) != "" {
 			s.sawMessageStop = true
@@ -442,7 +443,18 @@ func (s *claudeSSEStreamState) observeJSONPayload(payload []byte, hasDataPrefix 
 		}
 	default:
 		if hasDataPrefix && s.currentEvent == "error" && root.Get("error").Exists() {
-			s.sawErrorEvent = true
+			s.observeErrorPayload(payload)
+		}
+	}
+}
+
+func (s *claudeSSEStreamState) observeErrorPayload(payload []byte) {
+	s.sawErrorEvent = true
+	if s.errorMessage == nil {
+		// Keep an owned diagnostic after the parser reuses its line and event buffers.
+		s.errorMessage = &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadGateway,
+			Error:      errors.New(string(payload)),
 		}
 	}
 }
@@ -476,13 +488,33 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 	if state == nil {
 		state = &claudeSSEStreamState{trailingNewlines: 2}
 	}
+	errorLogged := false
+	logError := func(errMsg *interfaces.ErrorMessage) {
+		if errorLogged {
+			return
+		}
+		if state.errorMessage != nil {
+			errMsg = state.errorMessage
+		}
+		if errMsg != nil {
+			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+			errorLogged = true
+		}
+	}
+	// The first payload was observed before entering the shared stream forwarder.
+	logError(nil)
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
 			if len(chunk) == 0 {
 				return
 			}
 			state.ObserveChunk(chunk)
+			logError(nil)
 			_, _ = c.Writer.Write(chunk)
+		},
+		LogTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			state.FlushPendingLine()
+			logError(errMsg)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			state.FlushPendingLine()
@@ -500,6 +532,7 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 		},
 		CloseError: func() *interfaces.ErrorMessage {
 			state.FlushPendingLine()
+			logError(nil)
 			if state.sawMessageStop || state.sawErrorEvent {
 				return nil
 			}

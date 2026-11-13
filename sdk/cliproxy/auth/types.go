@@ -169,6 +169,7 @@ type Auth struct {
 	recentModelRequests recentModelRequestRing `json:"-"`
 	indexAssigned       bool                   `json:"-"`
 	dispatchState       *authDispatchState     `json:"-"`
+	selectionOnly       bool                   `json:"-"`
 	// File observations are cleared after publication to runtime state.
 	fileSnapshotPath   string `json:"-"`
 	fileSnapshotDigest string `json:"-"`
@@ -725,6 +726,61 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// cloneForSelection is used only after live route/credential validation, and
+// only by built-in selectors. Mutable scheduling data remains independently
+// owned; credentials, request history and transport state are copied only for
+// the selected execution. Custom selectors retain the full Clone contract.
+func (a *Auth) cloneForSelection() *Auth {
+	if a == nil {
+		return nil
+	}
+	snapshot := &Auth{
+		selectionOnly:      true,
+		ID:                 a.ID,
+		Provider:           a.Provider,
+		Label:              a.Label,
+		Index:              a.Index,
+		indexAssigned:      a.indexAssigned,
+		RegistrationEpoch:  a.RegistrationEpoch,
+		Generation:         a.Generation,
+		Status:             a.Status,
+		Disabled:           a.Disabled,
+		AutoDisabled:       a.AutoDisabled,
+		Unavailable:        a.Unavailable,
+		NextRetryAfter:     a.NextRetryAfter,
+		CodexQuotaResumeAt: a.CodexQuotaResumeAt,
+		UpdatedAt:          a.UpdatedAt,
+		Success:            a.Success,
+		Failed:             a.Failed,
+		Quota:              a.Quota.Clone(),
+		dispatchState:      a.dispatchState,
+		ConcurrencyLimit:   a.ConcurrencyLimit,
+	}
+	for _, key := range []string{"priority", AttributeWeight, "websockets", "score_bias_override", "provider_key", "compat_name"} {
+		if value, exists := a.Attributes[key]; exists {
+			if snapshot.Attributes == nil {
+				snapshot.Attributes = make(map[string]string)
+			}
+			snapshot.Attributes[key] = value
+		}
+	}
+	// Normalize metadata fallbacks to scalar scheduling attributes.
+	if snapshot.Attributes == nil {
+		snapshot.Attributes = make(map[string]string, 2)
+	}
+	snapshot.Attributes[AttributeWeight] = strconv.FormatInt(authWeight(a), 10)
+	snapshot.Attributes["websockets"] = strconv.FormatBool(authWebsocketsEnabled(a))
+	if a.LastError != nil {
+		lastErr := *a.LastError
+		snapshot.LastError = &lastErr
+	}
+	// WorkBuddy health incorporates expired per-model rate limit states.
+	if strings.EqualFold(a.Provider, "workbuddy") || strings.EqualFold(a.Provider, "workbuddy-ai") {
+		snapshot.ModelStates = cloneModelStates(a.ModelStates)
+	}
+	return snapshot
 }
 
 // ProxyConnectionPoolOverride holds the per-api-key connection-pool settings.

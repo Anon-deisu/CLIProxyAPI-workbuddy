@@ -556,9 +556,17 @@ func normalizeCanonicalTurns(turns []CanonicalTurn) []CanonicalTurn {
 
 func normalizeCanonicalTurn(turn CanonicalTurn) CanonicalTurn {
 	turn.Role = canonicalRole(turn.Role)
-	parts := make([]CanonicalPart, 0, len(turn.Parts))
-	for _, part := range turn.Parts {
+	// Inspect values on every call: public turns and their parts remain caller-mutable.
+	// Copy only when normalization changes a part or its position.
+	parts := turn.Parts
+	changed := false
+	for index, original := range turn.Parts {
+		part := original
 		if part.Value == "" {
+			if !changed {
+				parts = append(make([]CanonicalPart, 0, len(turn.Parts)), turn.Parts[:index]...)
+				changed = true
+			}
 			continue
 		}
 		part.Kind = strings.ToLower(strings.TrimSpace(part.Kind))
@@ -576,11 +584,36 @@ func normalizeCanonicalTurn(turn CanonicalTurn) CanonicalTurn {
 				part.OriginalSize = len(part.Value)
 			}
 		}
-		if part.Value != "" {
+		if !changed && (part != original || part.Value == "") {
+			parts = append(make([]CanonicalPart, 0, len(turn.Parts)), turn.Parts[:index]...)
+			changed = true
+		}
+		if changed && part.Value != "" {
 			parts = append(parts, part)
 		}
 	}
-	parts = limitCanonicalParts(nil, parts)
+	if len(parts) > maxCanonicalPartsPerTurn || (len(parts) > 0 && parts[len(parts)-1].Kind == "value" && strings.HasPrefix(parts[len(parts)-1].Value, "<truncated:")) {
+		parts = limitCanonicalParts(nil, parts)
+		changed = true
+	}
+	previousTool := -1
+	unsorted := false
+	for index, part := range parts {
+		if strings.HasPrefix(part.Kind, "tool:") || strings.Contains(part.Kind, "function_call") {
+			if previousTool >= 0 && (parts[previousTool].Value > part.Value || (parts[previousTool].Value == part.Value && parts[previousTool].Digest > part.Digest)) {
+				unsorted = true
+				break
+			}
+			previousTool = index
+		}
+	}
+	if !unsorted {
+		turn.Parts = parts
+		return turn
+	}
+	if !changed {
+		parts = append([]CanonicalPart(nil), parts...)
+	}
 	toolIndexes := make([]int, 0)
 	toolParts := make([]CanonicalPart, 0)
 	for index, part := range parts {
@@ -607,8 +640,11 @@ func normalizeCanonicalTurn(turn CanonicalTurn) CanonicalTurn {
 func normalizeText(value string, maskSystemDynamics bool) string {
 	value = strings.ReplaceAll(value, "\r\n", "\n")
 	value = strings.ReplaceAll(value, "\r", "\n")
-	value = thinkPattern.ReplaceAllString(value, " ")
-	if maskSystemDynamics {
+	// Every match needs literal angle brackets; this gate is independent of Unicode case folding.
+	if strings.Contains(value, "<") && strings.Contains(value, "</") {
+		value = thinkPattern.ReplaceAllString(value, " ")
+	}
+	if maskSystemDynamics && strings.Contains(value, "-") {
 		value = iso8601Pattern.ReplaceAllString(value, "<timestamp>")
 		value = uuidPattern.ReplaceAllString(value, "<uuid>")
 	}
@@ -674,13 +710,27 @@ type MerklePrefixMatcher struct {
 }
 
 type lcpNamespace struct {
-	groups   map[string]*lcpGroup
-	prefixes map[string]map[string]*lcpGroup
+	groups   map[lcpPrefixKey]*lcpGroup
+	prefixes map[lcpPrefixKey]map[*lcpGroup]struct{}
 	tails    map[string]map[*lcpGroup]struct{}
 }
 
+// lcpPrefixKey stores the digest without its hexadecimal expansion. Depth remains
+// part of the key, and String preserves the original session identity framing.
+type lcpPrefixKey struct {
+	digest [sha256.Size]byte
+	depth  int
+}
+
+func (key lcpPrefixKey) String() string {
+	if key.depth == 0 {
+		return ""
+	}
+	return strconv.Itoa(key.depth) + ":" + hex.EncodeToString(key.digest[:])
+}
+
 type lcpGroup struct {
-	key               string
+	key               lcpPrefixKey
 	namespace         string
 	authID            string
 	sessionID         string
@@ -692,7 +742,7 @@ type lcpGroup struct {
 	environmentDigest string
 	fingerprints      []string
 	tailFingerprints  []string
-	prefixKeys        []string
+	prefixKeys        []lcpPrefixKey
 	expiresAt         time.Time
 	lastAccessNumber  uint64
 }
@@ -757,7 +807,40 @@ func (m *MerklePrefixMatcher) PrepareExt(turns []CanonicalTurn) (fingerprints []
 	if m == nil {
 		return nil, 0, nil, ""
 	}
-	return m.fingerprints(turns), minimumAffinityPrefixLength(turns), m.tailFingerprints(turns), EnvironmentDigest(turns)
+	if len(turns) == 0 {
+		return nil, 0, nil, ""
+	}
+	prefixLimit := min(len(turns), maxCanonicalTurns)
+	tailStart := max(0, len(turns)-maxCompactionProbeWindow)
+	fingerprints = make([]string, prefixLimit)
+	tailFingerprints = make([]string, len(turns)-tailStart)
+	environmentHash := sha256.New()
+	hasSystem := false
+	for index, turn := range turns {
+		isSystem := canonicalRole(turn.Role) == "system"
+		if !isSystem && minPrefixLength == 0 {
+			minPrefixLength = index + 1
+		}
+		if index >= prefixLimit && index < tailStart && !isSystem {
+			continue
+		}
+		// Keep the public normalization semantics, but compute each selected turn only once.
+		fingerprint := FastTurnFingerprint(turn)
+		if index < prefixLimit {
+			fingerprints[index] = fingerprint
+		}
+		if index >= tailStart {
+			tailFingerprints[index-tailStart] = fingerprint
+		}
+		if isSystem {
+			hasSystem = true
+			writeFingerprintField(environmentHash, fingerprint)
+		}
+	}
+	if hasSystem {
+		envDigest = hex.EncodeToString(environmentHash.Sum(nil))
+	}
+	return
 }
 
 // EnvironmentDigest computes a deterministic SHA-256 digest across all system and developer turns in a conversation.
@@ -987,11 +1070,7 @@ func (m *MerklePrefixMatcher) RemoveFingerprintsBefore(namespace string, fingerp
 	if ns == nil {
 		return false
 	}
-	prefixKeys := rollingPrefixKeys(fingerprints)
-	if len(prefixKeys) == 0 {
-		return false
-	}
-	group := ns.groups[prefixKeys[len(prefixKeys)-1]]
+	group := ns.groups[sequenceKey(fingerprints)]
 	if group == nil || group.authID != authID {
 		return false
 	}
@@ -1150,8 +1229,8 @@ func (m *MerklePrefixMatcher) namespaceLocked(namespace string) *lcpNamespace {
 	result := m.groups[namespace]
 	if result == nil {
 		result = &lcpNamespace{
-			groups:   make(map[string]*lcpGroup),
-			prefixes: make(map[string]map[string]*lcpGroup),
+			groups:   make(map[lcpPrefixKey]*lcpGroup),
+			prefixes: make(map[lcpPrefixKey]map[*lcpGroup]struct{}),
 			tails:    make(map[string]map[*lcpGroup]struct{}),
 		}
 		m.groups[namespace] = result
@@ -1183,7 +1262,7 @@ func (m *MerklePrefixMatcher) touchLocked(namespace string, fingerprints, tailFi
 		existing.environmentDigest = envDigest
 		if len(tailFingerprints) > 0 && !equalStrings(existing.tailFingerprints, tailFingerprints) {
 			m.removeGroupLocked(existing)
-			existing.tailFingerprints = tailFingerprints
+			existing.tailFingerprints = retainTailFingerprints(existing.fingerprints, tailFingerprints)
 			m.addGroupLocked(existing)
 		}
 		if element := m.lruElements[existing]; element != nil {
@@ -1224,11 +1303,11 @@ func (m *MerklePrefixMatcher) bindLocked(namespace string, fingerprints, tailFin
 				nodeKind:          nodeKind,
 				environmentDigest: envDigest,
 				fingerprints:      append([]string(nil), fingerprints...),
-				tailFingerprints:  tailFingerprints,
 				prefixKeys:        existing.prefixKeys,
 				expiresAt:         now.Add(m.ttl),
 				lastAccessNumber:  m.nextAccessNumberLocked(),
 			}
+			reboundGroup.tailFingerprints = retainTailFingerprints(reboundGroup.fingerprints, tailFingerprints)
 			m.addGroupLocked(reboundGroup)
 			return MerklePrefixBindResult{
 				SessionID:       sessionID,
@@ -1247,7 +1326,8 @@ func (m *MerklePrefixMatcher) bindLocked(namespace string, fingerprints, tailFin
 	isFork := false
 	isCompaction := false
 	nodeKind := ""
-	if match, ok := m.matchLocked(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength, now); ok {
+	prefixKeys := rollingPrefixKeys(fingerprints)
+	if match, ok := m.matchPrefixKeysLocked(m.groups[namespace], namespace, fingerprints, tailFingerprints, envDigest, prefixKeys, minPrefixLength, now); ok {
 		sessionID = match.SessionID
 		parentSessionID = match.ParentSessionID
 		isFork = match.IsFork
@@ -1257,9 +1337,8 @@ func (m *MerklePrefixMatcher) bindLocked(namespace string, fingerprints, tailFin
 			authID = match.AuthID
 		}
 	}
-	prefixKeys := rollingPrefixKeys(fingerprints)
 	if sessionID == "" {
-		firstKey := ""
+		var firstKey lcpPrefixKey
 		if len(prefixKeys) > 0 {
 			targetIndex := 0
 			if minPrefixLength > 0 && minPrefixLength <= len(prefixKeys) {
@@ -1267,7 +1346,7 @@ func (m *MerklePrefixMatcher) bindLocked(namespace string, fingerprints, tailFin
 			}
 			firstKey = prefixKeys[targetIndex]
 		}
-		sessionID = newLCPSessionID(namespace, firstKey)
+		sessionID = newLCPSessionID(namespace, firstKey.String())
 	}
 	createdGroup := &lcpGroup{
 		key:               key,
@@ -1281,11 +1360,11 @@ func (m *MerklePrefixMatcher) bindLocked(namespace string, fingerprints, tailFin
 		nodeKind:          nodeKind,
 		environmentDigest: envDigest,
 		fingerprints:      append([]string(nil), fingerprints...),
-		tailFingerprints:  tailFingerprints,
 		prefixKeys:        prefixKeys,
 		expiresAt:         now.Add(m.ttl),
 		lastAccessNumber:  m.nextAccessNumberLocked(),
 	}
+	createdGroup.tailFingerprints = retainTailFingerprints(createdGroup.fingerprints, tailFingerprints)
 	m.addGroupLocked(createdGroup)
 	return MerklePrefixBindResult{
 		SessionID:       sessionID,
@@ -1303,13 +1382,22 @@ func (m *MerklePrefixMatcher) addGroupLocked(group *lcpGroup) {
 		group.prefixKeys = rollingPrefixKeys(group.fingerprints)
 	}
 	ns.groups[group.key] = group
-	for _, prefix := range group.prefixKeys {
+	for index, prefix := range group.prefixKeys {
 		bucket := ns.prefixes[prefix]
 		if bucket == nil {
-			bucket = make(map[string]*lcpGroup)
+			bucket = make(map[*lcpGroup]struct{})
 			ns.prefixes[prefix] = bucket
+		} else {
+			// Share immutable fingerprint strings for the same prefix, within the bounded index.
+			// Keep exact comparison for arbitrary caller-provided (including non-hex) fingerprints.
+			for existing := range bucket {
+				if index < len(existing.fingerprints) && existing.fingerprints[index] == group.fingerprints[index] {
+					group.fingerprints[index] = existing.fingerprints[index]
+					break
+				}
+			}
 		}
-		bucket[group.key] = group
+		bucket[group] = struct{}{}
 	}
 	tails := group.tailFingerprints
 	if len(tails) == 0 {
@@ -1359,7 +1447,7 @@ func (m *MerklePrefixMatcher) removeGroupLocked(group *lcpGroup) {
 			if bucket == nil {
 				continue
 			}
-			delete(bucket, group.key)
+			delete(bucket, group)
 			if len(bucket) == 0 {
 				delete(ns.prefixes, prefix)
 			}
@@ -1397,10 +1485,16 @@ func (m *MerklePrefixMatcher) removeGroupLocked(group *lcpGroup) {
 
 func (m *MerklePrefixMatcher) matchLocked(namespace string, fingerprints, tailFingerprints []string, envDigest string, minPrefixLength int, now time.Time) (MerklePrefixMatch, bool) {
 	ns := m.groups[namespace]
+	if ns == nil {
+		return MerklePrefixMatch{}, false
+	}
+	return m.matchPrefixKeysLocked(ns, namespace, fingerprints, tailFingerprints, envDigest, rollingPrefixKeys(fingerprints), minPrefixLength, now)
+}
+
+func (m *MerklePrefixMatcher) matchPrefixKeysLocked(ns *lcpNamespace, namespace string, fingerprints, tailFingerprints []string, envDigest string, prefixKeys []lcpPrefixKey, minPrefixLength int, now time.Time) (MerklePrefixMatch, bool) {
 	if ns == nil || len(fingerprints) == 0 || minPrefixLength <= 0 || minPrefixLength > len(fingerprints) {
 		return MerklePrefixMatch{}, false
 	}
-	prefixKeys := rollingPrefixKeys(fingerprints)
 	low, high := minPrefixLength, len(fingerprints)
 	var best *lcpGroup
 	bestLength := 0
@@ -1440,8 +1534,8 @@ func (m *MerklePrefixMatcher) matchLocked(namespace string, fingerprints, tailFi
 
 			isFork = true
 			nodeKind = "fork"
-			parentSessionID = newLCPSessionID(namespace, prefixKeys[bestLength-1])
-			sessionID = newLCPSessionID(namespace, prefixKeys[bestLength])
+			parentSessionID = newLCPSessionID(namespace, prefixKeys[bestLength-1].String())
+			sessionID = newLCPSessionID(namespace, prefixKeys[bestLength].String())
 		}
 
 		return MerklePrefixMatch{
@@ -1459,7 +1553,7 @@ func (m *MerklePrefixMatcher) matchLocked(namespace string, fingerprints, tailFi
 	return m.matchCompactionLocked(ns, namespace, fingerprints, tailFingerprints, envDigest, prefixKeys, minPrefixLength, 0, now)
 }
 
-func (m *MerklePrefixMatcher) matchCompactionLocked(ns *lcpNamespace, namespace string, fingerprints, tailFingerprints []string, envDigest string, prefixKeys []string, minPrefixLength int, bestLength int, now time.Time) (MerklePrefixMatch, bool) {
+func (m *MerklePrefixMatcher) matchCompactionLocked(ns *lcpNamespace, namespace string, fingerprints, tailFingerprints []string, envDigest string, prefixKeys []lcpPrefixKey, minPrefixLength int, bestLength int, now time.Time) (MerklePrefixMatch, bool) {
 	candTail := tailFingerprints
 	if len(candTail) == 0 {
 		candTail = extractTailFingerprints(fingerprints)
@@ -1563,8 +1657,8 @@ func (m *MerklePrefixMatcher) matchCompactionLocked(ns *lcpNamespace, namespace 
 	}
 
 	parentSessionID := best.sessionID
-	seqKey := sequenceKey(fingerprints)
-	sessionID := newLCPCompactionSessionID(namespace, parentSessionID, seqKey)
+	seqKey := prefixKeys[len(prefixKeys)-1]
+	sessionID := newLCPCompactionSessionID(namespace, parentSessionID, seqKey.String())
 
 	return MerklePrefixMatch{
 		AuthID:          best.authID,
@@ -1658,9 +1752,9 @@ func calculateOverlap(cand, parent []string, candEnd, parentEnd int) int {
 	return overlap
 }
 
-func newestMatchingGroup(bucket map[string]*lcpGroup, fingerprints []string, now time.Time) *lcpGroup {
+func newestMatchingGroup(bucket map[*lcpGroup]struct{}, fingerprints []string, now time.Time) *lcpGroup {
 	var best *lcpGroup
-	for _, group := range bucket {
+	for group := range bucket {
 		if group == nil || !now.Before(group.expiresAt) || group.minPrefixLength > len(fingerprints) || len(group.fingerprints) < len(fingerprints) || !equalStrings(group.fingerprints[:len(fingerprints)], fingerprints) {
 			continue
 		}
@@ -1700,29 +1794,43 @@ func minimumAffinityPrefixLength(turns []CanonicalTurn) int {
 	return 0
 }
 
-func rollingPrefixKeys(fingerprints []string) []string {
-	keys := make([]string, 0, len(fingerprints))
-	var previous [32]byte
+func rollingPrefixKeys(fingerprints []string) []lcpPrefixKey {
+	keys := make([]lcpPrefixKey, len(fingerprints))
+	var previous [sha256.Size]byte
 	for index, fingerprint := range fingerprints {
-		hash := sha256.New()
-		_, _ = hash.Write(previous[:])
-		_, _ = hash.Write([]byte("\x00"))
-		_, _ = hash.Write([]byte(fingerprint))
-		sum := hash.Sum(nil)
-		for offset, value := range sum {
-			previous[offset] = value
-		}
-		keys = append(keys, strconv.Itoa(index+1)+":"+hex.EncodeToString(previous[:]))
+		previous = nextPrefixDigest(previous, fingerprint)
+		keys[index] = lcpPrefixKey{digest: previous, depth: index + 1}
 	}
 	return keys
 }
 
-func sequenceKey(fingerprints []string) string {
-	keys := rollingPrefixKeys(fingerprints)
-	if len(keys) == 0 {
-		return ""
+func nextPrefixDigest(previous [sha256.Size]byte, fingerprint string) [sha256.Size]byte {
+	hash := sha256.New()
+	_, _ = hash.Write(previous[:])
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(fingerprint))
+	var sum [sha256.Size]byte
+	hash.Sum(sum[:0])
+	return sum
+}
+
+func sequenceKey(fingerprints []string) lcpPrefixKey {
+	var key lcpPrefixKey
+	for _, fingerprint := range fingerprints {
+		key.digest = nextPrefixDigest(key.digest, fingerprint)
+		key.depth++
 	}
-	return keys[len(keys)-1]
+	return key
+}
+
+func retainTailFingerprints(fingerprints, tails []string) []string {
+	if len(tails) <= len(fingerprints) {
+		suffix := fingerprints[len(fingerprints)-len(tails):]
+		if equalStrings(suffix, tails) {
+			return suffix
+		}
+	}
+	return append([]string(nil), tails...)
 }
 
 func newLCPSessionID(namespace, firstPrefix string) string {

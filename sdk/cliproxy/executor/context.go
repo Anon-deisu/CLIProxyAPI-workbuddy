@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 )
 
@@ -9,6 +10,7 @@ type downstreamWebsocketContextKey struct{}
 type requireUpstreamWebsocketContextKey struct{}
 type upstreamAttemptTrackerContextKey struct{}
 type degradedRoutingContextKey struct{}
+type requestPreparationCacheContextKey struct{}
 
 // DegradedRoutingMetadataKey scopes session affinity within the selected account pool.
 const DegradedRoutingMetadataKey = "degraded_routing"
@@ -34,6 +36,56 @@ func HasRoutingPool(ctx context.Context) bool {
 
 type upstreamAttemptTracker struct {
 	attempted atomic.Bool
+}
+
+// RequestPreparationCache stores one request-scoped, immutable preparation snapshot.
+// Executors own the value types; the holder only provides isolated synchronization
+// and never survives the request context.
+type RequestPreparationCache struct {
+	mu    sync.Mutex
+	key   string
+	value any
+}
+
+// WithRequestPreparationCache always installs a fresh holder for one Manager
+// invocation, even when its parent context belongs to an earlier invocation.
+func WithRequestPreparationCache(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, requestPreparationCacheContextKey{}, &RequestPreparationCache{})
+}
+
+// RequestPreparationCacheFromContext returns the request-local holder, if any.
+func RequestPreparationCacheFromContext(ctx context.Context) *RequestPreparationCache {
+	if ctx == nil {
+		return nil
+	}
+	holder, _ := ctx.Value(requestPreparationCacheContextKey{}).(*RequestPreparationCache)
+	return holder
+}
+
+// Load retrieves one request-local snapshot.
+func (c *RequestPreparationCache) Load(key string) (any, bool) {
+	if c == nil {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.key != key || c.value == nil {
+		return nil, false
+	}
+	return c.value, true
+}
+
+// Store publishes one request-local snapshot.
+func (c *RequestPreparationCache) Store(key string, value any) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.key, c.value = key, value
 }
 
 // WithDownstreamWebsocket marks the current request as coming from a downstream websocket connection.

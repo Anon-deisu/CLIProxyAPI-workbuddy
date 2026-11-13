@@ -125,6 +125,10 @@ type StreamForwardOptions struct {
 	// written or passed to cancel.
 	NormalizeTerminalError func(errMsg *interfaces.ErrorMessage) *interfaces.ErrorMessage
 
+	// LogTerminalError optionally registers a structured error with protocol-specific diagnostics.
+	// The default registers API_RESPONSE_ERROR independently of payload capture.
+	LogTerminalError func(errMsg *interfaces.ErrorMessage)
+
 	// WriteTerminalError writes an error payload to the response body when streaming fails
 	// after headers have already been committed. It should not flush.
 	WriteTerminalError func(errMsg *interfaces.ErrorMessage)
@@ -148,6 +152,10 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 	}
 	if cancel == nil {
 		return
+	}
+	logTerminalError := opts.LogTerminalError
+	if logTerminalError == nil {
+		logTerminalError = func(errMsg *interfaces.ErrorMessage) { recordAPIResponseError(c, errMsg) }
 	}
 
 	flush := func() bool {
@@ -202,6 +210,7 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 					terminalErr = opts.CloseError()
 				}
 				if terminalErr != nil {
+					logTerminalError(terminalErr)
 					if opts.WriteTerminalError != nil {
 						opts.WriteTerminalError(terminalErr)
 					}
@@ -221,22 +230,29 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				return
 			}
 			writeChunk(chunk)
+			var chunkErr *interfaces.ErrorMessage
+			if opts.ChunkError != nil {
+				chunkErr = opts.ChunkError()
+			}
+			hasChunkError := chunkErr != nil
+			if hasChunkError {
+				if opts.NormalizeTerminalError != nil {
+					chunkErr = opts.NormalizeTerminalError(chunkErr)
+				}
+				if chunkErr != nil {
+					logTerminalError(chunkErr)
+				}
+			}
 			if !flush() {
 				return
 			}
-			if opts.ChunkError != nil {
-				chunkErr := opts.ChunkError()
+			if hasChunkError {
 				if chunkErr != nil {
-					if opts.NormalizeTerminalError != nil {
-						chunkErr = opts.NormalizeTerminalError(chunkErr)
-					}
-					if chunkErr != nil {
-						cancel(chunkErr.Error)
-					} else {
-						cancel(nil)
-					}
-					return
+					cancel(chunkErr.Error)
+				} else {
+					cancel(nil)
 				}
+				return
 			}
 			if opts.ChunkDone != nil && opts.ChunkDone() {
 				cancel(nil)
@@ -251,6 +267,9 @@ func (h *BaseAPIHandler) ForwardStream(c *gin.Context, flusher http.Flusher, can
 				terminalErr = errMsg
 				if opts.NormalizeTerminalError != nil {
 					terminalErr = opts.NormalizeTerminalError(terminalErr)
+				}
+				if terminalErr != nil {
+					logTerminalError(terminalErr)
 				}
 				if opts.WriteTerminalError != nil {
 					opts.WriteTerminalError(terminalErr)

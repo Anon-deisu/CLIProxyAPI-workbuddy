@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"net/http"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +14,134 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
+
+func TestSessionAffinityLCPRetryPreparationIsolation(t *testing.T) {
+	selector := NewSessionAffinitySelector(nil)
+	t.Cleanup(selector.Stop)
+	auths := []*Auth{{ID: "a"}, {ID: "b"}}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatOpenAI,
+		OriginalRequest: []byte(`{"messages":[{"role":"user","content":"first"}]}`),
+		Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: t.Name()},
+	}
+	pick := func(opts cliproxyexecutor.Options, candidates []*Auth) {
+		t.Helper()
+		if _, errPick := selector.Pick(context.Background(), "openai", "model", opts, candidates); errPick != nil {
+			t.Fatal(errPick)
+		}
+	}
+	pick(opts, auths)
+	prepared := opts.Metadata[lcpPreparationMetadataKey]
+	original := append([]string(nil), opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey].([]string)...)
+	retry := opts
+	retry.Metadata = cloneRequestMetadata(opts.Metadata)
+	retry.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey].([]string)[0] = "changed before retry"
+	if !reflect.DeepEqual(opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey], original) {
+		t.Fatal("clone shares mutable result fingerprints")
+	}
+	pick(retry, auths[1:])
+	if retry.Metadata[lcpPreparationMetadataKey] != prepared {
+		t.Fatal("retry reparsed unchanged request")
+	}
+	if got := retry.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey]; got == "" {
+		t.Fatal("retry lost session identity")
+	}
+	// Public result metadata must not allow one attempt to mutate another attempt.
+	retry.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey].([]string)[0] = "changed"
+	if !reflect.DeepEqual(opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey], original) {
+		t.Fatal("attempt metadata shares mutable fingerprints")
+	}
+	// A same-length in-place payload edit must invalidate preparation.
+	copy(opts.OriginalRequest, []byte(`{"messages":[{"role":"user","content":"other"}]}`))
+	pick(opts, auths)
+	if reflect.DeepEqual(opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey], original) {
+		t.Fatal("payload change reused stale fingerprints")
+	}
+	if opts.Metadata[lcpPreparationMetadataKey] == prepared {
+		t.Fatal("payload change retained old preparation")
+	}
+	opts.SourceFormat = sdktranslator.FormatOpenAIResponse
+	opts.OriginalRequest = []byte(`{"messages":[{"role":"user","content":"other"}],"input":[{"role":"user","content":"response"}]}`)
+	pick(opts, auths)
+	responseFingerprints := append([]string(nil), opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey].([]string)...)
+	prepared = opts.Metadata[lcpPreparationMetadataKey]
+	opts.SourceFormat = sdktranslator.FormatOpenAI
+	pick(opts, auths)
+	if opts.Metadata[lcpPreparationMetadataKey] == prepared || reflect.DeepEqual(opts.Metadata[cliproxyexecutor.LCPFingerprintMetadataKey], responseFingerprints) {
+		t.Fatal("source format change reused stale preparation")
+	}
+	// Cloned metadata can be used concurrently with independent request bodies.
+	var workers sync.WaitGroup
+	for index := 0; index < 8; index++ {
+		copyOpts := opts
+		copyOpts.Metadata = cloneRequestMetadata(opts.Metadata)
+		workers.Go(func() {
+			if _, errPick := selector.Pick(context.Background(), "openai", "model", copyOpts, auths); errPick != nil {
+				t.Error(errPick)
+			}
+		})
+	}
+	workers.Wait()
+}
+
+func TestSessionAffinityLCPPreparationAcrossRetryRounds(t *testing.T) {
+	for _, path := range []string{"execute", "count", "stream"} {
+		t.Run(path, func(t *testing.T) {
+			selector := NewSessionAffinitySelector(nil)
+			t.Cleanup(selector.Stop)
+			manager := NewManager(nil, selector, nil)
+			manager.SetRetryConfig(2, 0, 0)
+			executor := &lcpRetryPreparationExecutor{schedulerBenchmarkExecutor: schedulerBenchmarkExecutor{id: "lcp-retry"}}
+			manager.RegisterExecutor(executor)
+			registerRetryRoundLocalAuths(t, manager, "lcp-retry", "lcp-retry-model", map[string]int{t.Name(): 2})
+			opts := cliproxyexecutor.Options{
+				SourceFormat:    sdktranslator.FormatOpenAI,
+				OriginalRequest: []byte(`{"messages":[{"role":"user","content":"retry all rounds"}]}`),
+				Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: t.Name()},
+			}
+			req := cliproxyexecutor.Request{Model: "lcp-retry-model"}
+			switch path {
+			case "execute":
+				_, _ = manager.Execute(context.Background(), []string{"lcp-retry"}, req, opts)
+			case "count":
+				_, _ = manager.ExecuteCount(context.Background(), []string{"lcp-retry"}, req, opts)
+			case "stream":
+				_, _ = manager.ExecuteStream(context.Background(), []string{"lcp-retry"}, req, opts)
+			}
+			if len(executor.preparations) != 3 || executor.preparations[0] == nil {
+				t.Fatalf("preparations = %v, want three prepared attempts", executor.preparations)
+			}
+			for _, prepared := range executor.preparations[1:] {
+				if prepared != executor.preparations[0] {
+					t.Fatal("retry round repeated LCP preparation")
+				}
+			}
+			if opts.Metadata[lcpPreparationMetadataKey] != nil {
+				t.Fatal("request wrote preparation into caller-owned metadata")
+			}
+		})
+	}
+}
+
+type lcpRetryPreparationExecutor struct {
+	schedulerBenchmarkExecutor
+	preparations []*lcpPreparation
+}
+
+func (e *lcpRetryPreparationExecutor) Execute(_ context.Context, _ *Auth, _ cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	prepared, _ := opts.Metadata[lcpPreparationMetadataKey].(*lcpPreparation)
+	e.preparations = append(e.preparations, prepared)
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusInternalServerError, Message: "retry preparation"}
+}
+
+func (e *lcpRetryPreparationExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return e.Execute(ctx, auth, req, opts)
+}
+
+func (e *lcpRetryPreparationExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	_, errExecute := e.Execute(ctx, auth, req, opts)
+	return nil, errExecute
+}
 
 func TestSessionAffinitySelectorLCPPreservesBindingAcrossConversationGrowth(t *testing.T) {
 	t.Parallel()

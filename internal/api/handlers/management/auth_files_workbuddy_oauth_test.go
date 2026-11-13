@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/workbuddy"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -102,6 +103,161 @@ func TestWorkBuddyQuotaRejectsMissingAndUnrelatedCredentials(t *testing.T) {
 		if w.Code != test.status {
 			t.Fatalf("quota%s status = %d, want %d", test.query, w.Code, test.status)
 		}
+	}
+}
+
+func TestWorkBuddyCreditSummaryAutomaticAndManualRefresh(t *testing.T) {
+	var used atomic.Int64
+	var fail atomic.Bool
+	var reads atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads.Add(1)
+		if fail.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		doc := ojson.NewDocString(`{"code":0,"data":{"Packages":[{"CycleTotalCapacity":100.5,"CycleUsedCapacity":0}]}}`)
+		if err := doc.Set("data.Packages.0.CycleUsedCapacity", used.Load()); err != nil {
+			t.Error(err)
+		}
+		_, _ = w.Write(doc.Bytes())
+	}))
+	defer upstream.Close()
+	manager := coreauth.NewManager(nil, nil, nil)
+	var accounts []*coreauth.Auth
+	for _, provider := range []string{workbuddy.ProviderCN, workbuddy.ProviderAI} {
+		auth := workbuddy.NewAuthRecord(provider, workbuddy.Credentials{UID: provider, AccessToken: "test-access"})
+		auth.Disabled = true
+		auth.Metadata["base_url"] = upstream.URL
+		registered, err := manager.Register(t.Context(), auth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		accounts = append(accounts, registered)
+	}
+	if _, err := manager.Register(t.Context(), &coreauth.Auth{ID: "other", Provider: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+	h.refreshWorkBuddyCredits(t.Context())
+	assertTotal := func(want float64, failed int) {
+		t.Helper()
+		got := h.workBuddyCredits.snapshot()
+		if !got.Available || got.Remaining != want || got.Accounts != 2 || got.Failed != failed {
+			t.Fatalf("summary = %+v, want remaining=%v, accounts=2, failed=%d", got, want, failed)
+		}
+	}
+	assertTotal(201, 0)
+	if reads.Load() != 2 {
+		t.Fatalf("quota reads = %d, want both disabled regional accounts", reads.Load())
+	}
+	used.Store(20)
+	router := gin.New()
+	router.GET("/quota", h.GetWorkBuddyQuota)
+	router.GET("/total", h.GetWorkBuddyCredits)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/quota?auth_index="+accounts[0].Index, nil))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	assertTotal(181, 0)
+	before := reads.Load()
+	for range 3 {
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/total", nil))
+		if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("summary response = %d %s", w.Code, w.Body.String())
+		}
+	}
+	if reads.Load() != before {
+		t.Fatal("reading the dashboard total queried upstream")
+	}
+	assertTotal(181, 0)
+	fail.Store(true)
+	h.refreshWorkBuddyCredits(t.Context())
+	assertTotal(181, 2)
+	fail.Store(false)
+	h.refreshWorkBuddyCredits(t.Context())
+	assertTotal(161, 0)
+	if workBuddyCreditRefreshInterval != 30*time.Minute {
+		t.Fatal("automatic refresh must run every half hour")
+	}
+}
+
+func TestWorkBuddyCreditSummaryIgnoresOlderAutomaticResult(t *testing.T) {
+	var state workBuddyCreditCache
+	old := state.begin("account")
+	newer := state.begin("account")
+	state.finish("account", newer, workbuddy.Quota{Credits: &workbuddy.CreditQuota{Remaining: 42}}, nil)
+	state.finish("account", old, workbuddy.Quota{Credits: &workbuddy.CreditQuota{Remaining: 99}}, nil)
+	if got := state.snapshot(); got.Remaining != 42 {
+		t.Fatalf("late automatic result overwrote the manual result: %+v", got)
+	}
+	latest := state.begin("account")
+	state.finish("account", latest, workbuddy.Quota{}, nil)
+	if got := state.snapshot(); !got.Available || got.Remaining != 0 {
+		t.Fatalf("empty credit package did not replace the previous balance: %+v", got)
+	}
+}
+
+func TestWorkBuddyCreditRefreshLoopUsesTicksAndStops(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+	ticks := make(chan time.Time)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.runWorkBuddyCredits(ctx, ticks)
+	}()
+	ticks <- time.Now()
+	cancel()
+	<-done
+	if got := h.workBuddyCredits.snapshot(); !got.Available || got.Remaining != 0 || got.Accounts != 0 {
+		t.Fatalf("empty account catalog summary = %+v", got)
+	}
+}
+
+func TestWorkBuddyCreditRefreshBoundsConcurrencyAndCancels(t *testing.T) {
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var active, peak atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for old := peak.Load(); current > old; old = peak.Load() {
+			if peak.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer upstream.Close()
+	defer close(release)
+	manager := coreauth.NewManager(nil, nil, nil)
+	for index := range 8 {
+		auth := workbuddy.NewAuthRecord(workbuddy.ProviderCN, workbuddy.Credentials{UID: string(rune('a' + index)), AccessToken: "test-access"})
+		auth.Metadata["base_url"] = upstream.URL
+		if _, err := manager.Register(t.Context(), auth); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := &Handler{cfg: &config.Config{}, authManager: manager}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); h.refreshWorkBuddyCredits(ctx) }()
+	for range workBuddyQuotaConcurrency {
+		<-started
+	}
+	cancel()
+	<-done
+	if peak.Load() != workBuddyQuotaConcurrency {
+		t.Fatalf("peak quota concurrency = %d, want %d", peak.Load(), workBuddyQuotaConcurrency)
 	}
 }
 

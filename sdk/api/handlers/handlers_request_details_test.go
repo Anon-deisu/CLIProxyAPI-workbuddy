@@ -1,20 +1,196 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/gin-gonic/gin"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
+
+func TestReadRequestBodyEncodingAndLimits(t *testing.T) {
+	payload := []byte(`{"input":"request body"}`)
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = encoder.Close() }()
+	zstdBody := encoder.EncodeAll(payload, nil)
+	for _, tc := range []struct {
+		name, encoding string
+		raw            []byte
+		limit          int64
+		wantErr        bool
+		wantLimit      bool
+	}{
+		{"identity", "identity", payload, 0, false, false},
+		{"zstd", "zstd", zstdBody, int64(len(payload)), false, false},
+		{"stacked", "zstd, identity, zstd", encoder.EncodeAll(zstdBody, nil), 0, false, false},
+		{"decoded-limit", "zstd", zstdBody, 3, true, true},
+		{"plain-json-fallback", "zstd", payload, 0, false, false},
+		{"unsupported-json-fallback", "br", payload, 0, false, false},
+		{"malformed", "zstd", []byte("broken"), 0, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/responses", bytes.NewReader(tc.raw))
+			c.Request.Header.Set("Content-Encoding", tc.encoding)
+			c.Set(MaxRequestBodyBytesContextKey, tc.limit)
+			got, errRead := ReadRequestBody(c)
+			if (errRead != nil) != tc.wantErr {
+				t.Fatalf("ReadRequestBody error = %v", errRead)
+			}
+			var maxErr *http.MaxBytesError
+			if errors.As(errRead, &maxErr) != tc.wantLimit {
+				t.Fatalf("limit error = %v", errRead)
+			}
+			if !tc.wantErr && !bytes.Equal(got, payload) {
+				t.Fatalf("payload = %q", got)
+			}
+		})
+	}
+}
+
+type requestBodyReadError struct{ err error }
+
+func (b requestBodyReadError) Read([]byte) (int, error) { return 0, b.err }
+func (b requestBodyReadError) Close() error             { return nil }
+
+func TestReadRequestBodyPropagatesReadErrors(t *testing.T) {
+	want := io.ErrUnexpectedEOF
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/responses", requestBodyReadError{err: want})
+	if _, errRead := ReadRequestBody(c); !errors.Is(errRead, want) {
+		t.Fatalf("read error = %v, want %v", errRead, want)
+	}
+}
+
+func TestReadRequestBodySnapshotRespectsChangedDecodeLimit(t *testing.T) {
+	payload := []byte(`{"input":"request body"}`)
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = encoder.Close() }()
+	raw := encoder.EncodeAll(payload, nil)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	c.Request.Header.Set("Content-Encoding", "zstd")
+	RestoreCapturedRequestBody(c.Request, raw, payload, int64(len(payload)))
+	c.Set(MaxRequestBodyBytesContextKey, int64(2))
+	var maxErr *http.MaxBytesError
+	if _, errRead := ReadRequestBody(c); !errors.As(errRead, &maxErr) || maxErr.Limit != 2 {
+		t.Fatalf("snapshot bypassed tightened decode limit: %v", errRead)
+	}
+}
+
+func TestReadRequestBodySnapshotDoesNotTrustGinBodyCache(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+	raw := []byte("original")
+	RestoreCapturedRequestBody(c.Request, raw, raw, 32<<20)
+	c.Set(gin.BodyBytesKey, raw)
+	c.Request.Body = io.NopCloser(strings.NewReader("replacement"))
+	got, errRead := ReadRequestBody(c)
+	if errRead != nil || string(got) != "replacement" {
+		t.Fatalf("stale context bytes reused: %q, %v", got, errRead)
+	}
+}
+
+func TestReadRequestBodySnapshotConcurrentClose(t *testing.T) {
+	for range 64 {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+		raw := []byte(`{"input":"request body"}`)
+		RestoreCapturedRequestBody(c.Request, raw, raw, 32<<20)
+		body := c.Request.Body
+		start := make(chan struct{})
+		var workers sync.WaitGroup
+		workers.Go(func() {
+			<-start
+			got, errRead := ReadRequestBody(c)
+			if errRead != nil || !bytes.Equal(got, raw) {
+				t.Errorf("body changed during concurrent close: %q, %v", got, errRead)
+			}
+		})
+		workers.Go(func() {
+			<-start
+			if errClose := body.Close(); errClose != nil {
+				t.Error(errClose)
+			}
+		})
+		close(start)
+		workers.Wait()
+	}
+}
+
+func TestReadRequestBodySnapshotEditsPreserveOriginal(t *testing.T) {
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = encoder.Close() }()
+	for _, tc := range []struct {
+		name, encoding  string
+		compressed      bool
+		decoded         bool
+		changedEncoding string
+	}{
+		{name: "identity", encoding: "identity", decoded: true},
+		{name: "zstd", encoding: "zstd", compressed: true, decoded: true},
+		{name: "identity-raw-only", encoding: "identity"},
+		{name: "zstd-raw-only", encoding: "zstd", compressed: true},
+		{name: "zstd-json-fallback", encoding: "zstd"},
+		{name: "unsupported-json-fallback", encoding: "br"},
+		{name: "changed-encoding", encoding: "identity", decoded: true, changedEncoding: "identity, identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte(`{"input":"old"}`)
+			raw := payload
+			if tc.compressed {
+				raw = encoder.EncodeAll(payload, nil)
+			}
+			wantRaw := bytes.Clone(raw)
+			var decoded []byte
+			if tc.decoded {
+				decoded = payload
+			}
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+			c.Request.Header.Set("Content-Encoding", tc.encoding)
+			RestoreCapturedRequestBody(c.Request, raw, decoded, 32<<20)
+			if tc.changedEncoding != "" {
+				c.Request.Header.Set("Content-Encoding", tc.changedEncoding)
+			}
+			got, errRead := ReadRequestBody(c)
+			if errRead != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("ReadRequestBody = %q, %v", got, errRead)
+			}
+			copy(got, []byte(`{"input":"new"}`))
+			if string(payload) != `{"input":"old"}` {
+				t.Errorf("SDK caller mutated the captured payload: %q", payload)
+			}
+			if !bytes.Equal(raw, wantRaw) {
+				t.Errorf("SDK caller mutated the original request bytes: %q", raw)
+			}
+		})
+	}
+}
 
 func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	modelRegistry := registry.GetGlobalRegistry()

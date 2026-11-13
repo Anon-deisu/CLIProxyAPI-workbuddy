@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/workbuddy"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
@@ -18,7 +19,6 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/sjson"
 )
 
 // WorkBuddyExecutor serves both regional plans using their stream-only gateway.
@@ -86,24 +86,8 @@ func (e *WorkBuddyExecutor) open(ctx context.Context, auth *coreauth.Auth, req c
 	if opts.Alt == "responses/compact" {
 		return nil, nil, nil, statusErr{code: http.StatusNotImplemented, msg: "workbuddy: compact responses are not supported"}
 	}
-	model := thinking.ParseSuffix(req.Model).ModelName
 	to := sdktranslator.FormatOpenAI
-	original := opts.OriginalRequest
-	if len(original) == 0 {
-		original = req.Payload
-	}
-	originalTranslated := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, opts.SourceFormat, to, model, original, true)
-	body := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, opts.SourceFormat, to, model, req.Payload, true)
-	body, err := helps.ApplyRequestThinking(body, req, opts, opts.SourceFormat.String(), to.String(), e.provider)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	body = helps.ApplyPayloadConfigWithRequest(e.cfg, model, to.String(), opts.SourceFormat.String(), "", body, originalTranslated, helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers)
-	body, err = sjson.SetBytes(body, "model", model)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	body, names, err := helps.NormalizeWorkBuddyRequest(body)
+	body, names, err := helps.PrepareWorkBuddyRequest(ctx, e.cfg, e.provider, req, opts)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -146,48 +130,36 @@ func (e *WorkBuddyExecutor) open(ctx context.Context, auth *coreauth.Auth, req c
 }
 
 func (e *WorkBuddyExecutor) upstreamStatusError(status int, headers http.Header, payload []byte) statusErr {
-	if helps.IsWorkBuddyAccountBanned(payload) {
-		err := newOpenAICompatStatusError(http.StatusForbidden, headers, payload)
-		err.credentialScoped = true
-		err.resultCode = coreauth.ErrorCodeWorkBuddyAccountBanned
-		return err
-	}
-	if helps.IsWorkBuddyQuotaExhausted(payload) {
-		err := newOpenAICompatStatusError(http.StatusTooManyRequests, headers, payload)
-		err.credentialScoped = true
-		err.resultCode = "usage_limit_reached"
-		return err
-	}
-	if helps.IsWorkBuddyModelRateLimit(payload) {
-		err := newOpenAICompatStatusError(http.StatusTooManyRequests, headers, payload)
-		err.resultCode = coreauth.ErrorCodeWorkBuddyModelRateLimit
-		if retryAfter := helps.WorkBuddyRateLimitRetryAfter(payload, time.Now()); retryAfter != nil {
-			err.retryAfter = retryAfter
-		}
-		return err
-	}
-	if helps.IsWorkBuddyRateLimit(payload) {
-		err := newOpenAICompatStatusError(http.StatusTooManyRequests, headers, payload)
-		err.credentialScoped = true
-		err.resultCode = coreauth.ErrorCodeWorkBuddyRateLimit
-		if retryAfter := helps.WorkBuddyRateLimitRetryAfter(payload, time.Now()); retryAfter != nil {
-			err.retryAfter = retryAfter
-		}
-		return err
-	}
-	if helps.IsWorkBuddyQueueWaiting(payload) {
-		// Admission-queue backpressure: the credential stays usable, so keep the
-		// 429 request-scoped and honour the queue's own retry delay.
-		err := newOpenAICompatStatusError(http.StatusTooManyRequests, headers, payload)
-		if retryAfter := helps.WorkBuddyQueueWaitingRetryAfter(payload, time.Now()); retryAfter != nil {
-			err.retryAfter = retryAfter
-		}
-		return err
-	}
-	if status >= 200 && status < 300 {
+	return e.classifiedStatusError(status, headers, payload, helps.ParseWorkBuddyError(payload))
+}
+
+func (e *WorkBuddyExecutor) classifiedStatusError(status int, headers http.Header, payload []byte, parsed helps.WorkBuddyError) statusErr {
+	if parsed.Code == "11140" {
+		status = http.StatusForbidden
+	} else if parsed.Recognized() {
+		status = http.StatusTooManyRequests
+	} else if status >= 200 && status < 300 {
 		status = http.StatusBadGateway
 	}
-	return newOpenAICompatStatusError(status, headers, payload)
+	err := newOpenAICompatStatusError(status, headers, payload)
+	switch parsed.Code {
+	case "11140":
+		err.credentialScoped = true
+		err.resultCode = coreauth.ErrorCodeWorkBuddyAccountBanned
+	case "14018":
+		err.credentialScoped = true
+		err.resultCode = "usage_limit_reached"
+	case "6000":
+		err.resultCode = coreauth.ErrorCodeWorkBuddyModelRateLimit
+	case "6004":
+		err.credentialScoped = true
+		err.resultCode = coreauth.ErrorCodeWorkBuddyRateLimit
+	}
+	// Queue backpressure (6020) remains request-scoped, without a quota code.
+	if retryAfter := parsed.RetryAfter(time.Now()); retryAfter != nil {
+		err.retryAfter = retryAfter
+	}
+	return err
 }
 
 func (e *WorkBuddyExecutor) Execute(ctx context.Context, auth *coreauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (result cliproxyexecutor.Response, err error) {
@@ -235,10 +207,11 @@ func (e *WorkBuddyExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Au
 	if len(original) == 0 {
 		original = req.Payload
 	}
-	original, err = sjson.SetBytes(original, "stream", true)
-	if err != nil {
+	originalDoc := ojson.NewDoc(original)
+	if err = originalDoc.Set("stream", true); err != nil {
 		return nil, err
 	}
+	original = originalDoc.Bytes()
 	response, body, names, err := e.open(ctx, auth, req, opts, reporter)
 	if err != nil {
 		return nil, err
@@ -303,17 +276,20 @@ func (e *WorkBuddyExecutor) readStream(ctx context.Context, body io.Reader, head
 			done = true
 			return consume(payload, true)
 		}
-		if helps.IsWorkBuddyAccountBanned(payload) || helps.IsWorkBuddyQuotaExhausted(payload) || helps.IsWorkBuddyModelRateLimit(payload) || helps.IsWorkBuddyRateLimit(payload) {
-			return e.upstreamStatusError(http.StatusTooManyRequests, headers, payload)
+		if parsed := helps.ParseWorkBuddyError(payload); parsed.Recognized() {
+			if parsed.Code == "6020" {
+				return statusErr{code: http.StatusTooManyRequests, msg: string(payload), retryAfter: parsed.RetryAfter(time.Now())}
+			}
+			return e.classifiedStatusError(http.StatusTooManyRequests, headers, payload, parsed)
 		}
-		if upstreamErr, failed := openAICompatStreamDataError(payload, currentEvent); failed {
-			return upstreamErr
+		if status := helps.WorkBuddyStreamErrorStatus(payload, currentEvent); status != 0 {
+			return statusErr{code: status, msg: string(payload)}
 		}
-		normalized, err := helps.NormalizeWorkBuddyChunk(payload, model, names)
+		frames, err := helps.NormalizeWorkBuddyChunks(payload, model, names)
 		if err != nil {
 			return statusErr{code: http.StatusBadGateway, msg: "workbuddy: malformed upstream stream"}
 		}
-		for _, frame := range helps.SplitWorkBuddyFinishChunks(normalized) {
+		for _, frame := range frames {
 			if err := consume(frame, false); err != nil {
 				return err
 			}

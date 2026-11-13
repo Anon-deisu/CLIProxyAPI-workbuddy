@@ -7,6 +7,36 @@ import (
 	"time"
 )
 
+func TestSessionCacheRefreshKeepsGroupAndSelectionOrder(t *testing.T) {
+	cache := NewSessionCacheWithCapacity(time.Hour, 4)
+	t.Cleanup(cache.Stop)
+	cache.setSessionAliases("a", "codex", "session", "primary", "alias")
+	cache.mu.RLock()
+	element := cache.evictionElements["primary"]
+	sequence := cache.entries["primary"].binding.sequence
+	cache.mu.RUnlock()
+	cache.setSessionAliases("b", "codex", "session", "other")
+	cache.GetAndRefresh("alias")
+	cache.Touch("primary", "a")
+	if got := cache.latestSessionAuth("session", map[string]struct{}{"codex": {}}); got != "b" {
+		t.Fatalf("result refresh changed latest selection: %q", got)
+	}
+	cache.setSessionAliases("a", "codex", "session", "primary", "alias")
+	cache.mu.RLock()
+	if cache.evictionElements["primary"] != element || cache.entries["primary"].binding.sequence <= sequence {
+		t.Error("same-group selection rebuilt LRU node or failed to advance sequence")
+	}
+	cache.mu.RUnlock()
+	cache.SetAliases("c", "primary")
+	if cache.Touch("alias", "a") || cache.CompareAndDelete("primary", "a") {
+		t.Fatal("stale result changed rebound group")
+	}
+	cache.InvalidateAuth("c")
+	if _, ok := cache.Get("alias"); ok {
+		t.Fatal("invalidation left alias alive")
+	}
+}
+
 func TestSessionCache_CapacityEvictionOrder(t *testing.T) {
 	t.Parallel()
 

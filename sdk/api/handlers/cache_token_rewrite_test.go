@@ -194,6 +194,47 @@ func TestCacheTokenRewriteDoesNotChangeInternalUsage(t *testing.T) {
 	}
 }
 
+func TestCacheTokenRewriteStreamDoesNotChangeInternalUsage(t *testing.T) {
+	const provider = "cache-rewrite-stream-test-provider"
+	plugin := newCapturePluginExecutorUsagePlugin(provider)
+	registerUsagePluginForTest(t, "cache-rewrite-stream-original-usage", plugin)
+	upstream := []byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110,\"prompt_tokens_details\":{\"cached_tokens\":98}}}\n\n")
+	original := bytes.Clone(upstream)
+	chunks := make(chan coreexecutor.StreamChunk, 2)
+	chunks <- coreexecutor.StreamChunk{Payload: upstream}
+	chunks <- coreexecutor.StreamChunk{Payload: []byte("data: [DONE]\n\n")}
+	close(chunks)
+	host := &mockPluginUsageHost{streamResult: &coreexecutor.StreamResult{Chunks: chunks}}
+	host.hasRouters = true
+	host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: provider}, true
+	}
+	h := NewBaseAPIHandlers(rewriteConfig(95, nil), nil)
+	h.SetModelRouterHost(host)
+	data, _, errs := h.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model","stream":true}`), "")
+	var output []byte
+	for chunk := range data {
+		output = append(output, chunk...)
+	}
+	for errMsg := range errs {
+		if errMsg != nil {
+			t.Fatal(errMsg)
+		}
+	}
+	line, _, _ := bytes.Cut(output, []byte("\n"))
+	payload, found := sseJSONValidationDataPayload(line)
+	if !found || cacheRewriteGet(payload, "usage.prompt_tokens_details.cached_tokens").Int() != 95 {
+		t.Fatalf("downstream usage not rewritten: %s", output)
+	}
+	record := plugin.waitRecord(t)
+	if !record.Stream || record.Detail.InputTokens != 100 || record.Detail.CachedTokens != 98 || record.Detail.OutputTokens != 10 || record.Detail.TotalTokens != 110 {
+		t.Fatalf("internal stream usage was overwritten: %+v", record)
+	}
+	if !bytes.Equal(upstream, original) {
+		t.Fatal("source stream buffer changed")
+	}
+}
+
 func TestCacheTokenRewriteScannerLines(t *testing.T) {
 	for _, format := range []string{"openai-response", "claude"} {
 		t.Run(format, func(t *testing.T) {
@@ -222,5 +263,159 @@ func TestCacheTokenRewriteScannerLines(t *testing.T) {
 			}
 		})
 
+	}
+}
+
+func TestCacheTokenRewriteReadOnlyContracts(t *testing.T) {
+	for _, input := range []string{
+		`{"type":"response.output_text.delta","delta":"usage cached_tokens response.usage"}`,
+		`{"type":"content_block_delta","delta":{"text":"hello","usage":{"prompt_tokens":100,"cached_tokens":98}}}`,
+		`{"usage":null}`, `{"usage":[]}`, `{"usage":"cached_tokens"}`,
+		`{"usage":{"prompt_tokens":100,"cached_tokens":98},"broken":}`,
+		`{"usage":{"prompt_tokens":100,"cached_tokens":98},}`,
+		`{"usage":{"prompt_tokens":100,"cached_tokens":98}} {}`,
+		`[null,1,"usage",{"type":"message_stop"}]`, `null`, `false`, `17`, `"usage"`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai")
+			if got := r.rewriteJSON([]byte(input)); string(got) != input {
+				t.Fatalf("unexpected mutation: %s", got)
+			}
+		})
+	}
+	for _, event := range []string{"response.output_text.delta", "content_block_delta", "unknown"} {
+		input := []byte(`{"type":"` + event + `","\u0075sage":{"prompt_tokens":100,"cached_tokens":98}}`)
+		r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai")
+		if got := cacheRewriteGet(r.rewriteJSON(input), "usage.cached_tokens").Int(); got != 95 {
+			t.Fatalf("event %s with usage was skipped: %d", event, got)
+		}
+	}
+}
+
+func TestCacheTokenRewriteArrayClaudeResetAndPartialUsage(t *testing.T) {
+	input := []byte(`[
+		{"type":"message_start","message":{"usage":{"input_tokens":1,"cache_read_input_tokens":98,"cache_creation_input_tokens":1}}},
+		[{"type":"message_delta","usage":{"output_tokens":9}}],
+		{"type":"message_start"},
+		{"type":"message_delta","usage":{"output_tokens":2}},
+		{"type":"message_delta","usage":{"input_tokens":100}},
+		{"type":"message_delta","usage":{"output_tokens":3,"cache_read_input_tokens":0}}
+	]`)
+	original := bytes.Clone(input)
+	r := newCacheTokenRewriter(rewriteConfig(95, nil), "claude")
+	out := r.rewriteJSON(input)
+	for _, path := range []string{"0.message.usage", "1.0.usage"} {
+		u := cacheRewriteGet(out, path)
+		if u.Get("input_tokens").Int() != 5 || u.Get("cache_read_input_tokens").Int() != 95 || u.Get("cache_creation_input_tokens").Int() != 0 {
+			t.Fatalf("missing cumulative usage at %s: %s", path, out)
+		}
+	}
+	if cacheRewriteGet(out, "3.usage.input_tokens").Exists() || cacheRewriteGet(out, "4.usage.cache_read_input_tokens").Exists() || cacheRewriteGet(out, "5.usage.input_tokens").Exists() {
+		t.Fatalf("message_start retained stale usage: %s", out)
+	}
+	if !bytes.Equal(input, original) || !ojson.ValidBytes(out) {
+		t.Fatal("mutated upstream array or produced invalid JSON")
+	}
+}
+
+func TestCacheTokenRewriteSplitJSONArray(t *testing.T) {
+	input := []byte(`[{"usage":{"prompt_tokens":100,"cached_tokens":98}},null,[{"usage":{"prompt_tokens":100,"cached_tokens":99}}]]`)
+	want := newCacheTokenRewriter(rewriteConfig(95, nil), "openai").rewriteJSON(input)
+	for split := 1; split < len(input); split++ {
+		r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai")
+		out := append([]byte(nil), r.rewriteChunk(input[:split])...)
+		out = append(out, r.rewriteChunk(input[split:])...)
+		out = append(out, r.finish()...)
+		if !bytes.Equal(out, want) {
+			t.Fatalf("split %d: got %s, want %s", split, out, want)
+		}
+	}
+}
+
+func TestCacheTokenRewriteMultilineAndChunkBoundaries(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n"} {
+		frame := ": keep" + newline + "id: 7" + newline + "event: response.completed" + newline +
+			`data: {"type":"response.completed",` + newline +
+			`data: "response":{"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":98}}}}` + newline + newline
+		r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai-response")
+		want := r.rewriteChunk([]byte(frame))
+		want = append(want, r.finish()...)
+		payload, found := sseJSONValidationDataPayload(want)
+		if !found || !ojson.ValidBytes(payload) || cacheRewriteGet(payload, "response.usage.input_tokens_details.cached_tokens").Int() != 95 || !bytes.HasPrefix(want, []byte(": keep"+newline+"id: 7"+newline)) {
+			t.Fatalf("invalid rewritten multiline event: %q", want)
+		}
+		for split := 1; split < len(frame); split++ {
+			r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai-response")
+			out := append([]byte(nil), r.rewriteChunk([]byte(frame[:split]))...)
+			out = append(out, r.rewriteChunk([]byte(frame[split:]))...)
+			out = append(out, r.finish()...)
+			if !bytes.Equal(out, want) {
+				t.Fatalf("split %d: got %q, want %q", split, out, want)
+			}
+		}
+	}
+}
+
+func TestCacheTokenRewriteFramePassthroughAndOwnership(t *testing.T) {
+	for _, wire := range []string{
+		"data: {\"usage\":{\"prompt_tokens\":100,\"cached_tokens\":98},}\r\n\r\n",
+		"data: {\"usage\":\ndata: invalid}\n\n",
+		"data: {\"type\":\"response.completed\"}\ndata: {\"usage\":{\"prompt_tokens\":100,\"cached_tokens\":98}}\n\n",
+		"event: unknown\nx-opaque: value\n\n",
+		"data: [DONE]\r\n\r\n",
+	} {
+		r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai")
+		out := r.rewriteChunk([]byte(wire))
+		out = append(out, r.finish()...)
+		if string(out) != wire {
+			t.Fatalf("altered unknown or invalid framing: %q", out)
+		}
+	}
+	r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai")
+	frame := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")
+	out := r.rewriteChunk(append(bytes.Clone(frame), []byte("data: {")...))
+	snapshot := bytes.Clone(out)
+	r.rewriteChunk([]byte("\"type\":\"message_stop\"}\n\n"))
+	r.finish()
+	if !bytes.Equal(snapshot, out) || !bytes.Equal(snapshot, frame) {
+		t.Fatal("later chunks mutated previously returned bytes")
+	}
+}
+
+func BenchmarkCacheTokenRewrite(b *testing.B) {
+	for _, tc := range []struct{ name, format, payload string }{
+		{"delta", "openai-response", `{"type":"response.output_text.delta","delta":"hello"}`},
+		{"large_delta", "openai-response", `{"type":"response.output_text.delta","delta":"` + strings.Repeat("x", 8192) + `"}`},
+		{"usage_unchanged", "openai", `{"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":90}}}`},
+		{"usage_rewrite", "openai", `{"usage":{"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":98},"cached_tokens":98,"cache_creation_input_tokens":1}}`},
+		{"array", "gemini", `[{"candidates":[]},{"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":98}},{"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":98}}]`},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			r := newCacheTokenRewriter(rewriteConfig(95, nil), tc.format)
+			payload := []byte(tc.payload)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				r.rewriteJSON(payload)
+			}
+		})
+	}
+}
+
+func BenchmarkCacheTokenRewriteStream(b *testing.B) {
+	delta := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+	terminal := "data: {\"response\":{\"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":98}}}}\n\n"
+	for _, tc := range []struct{ name, payload string }{
+		{"delta", delta}, {"batch_64", strings.Repeat(delta, 64) + terminal},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			r := newCacheTokenRewriter(rewriteConfig(95, nil), "openai-response")
+			payload := []byte(tc.payload)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for b.Loop() {
+				r.rewriteChunk(payload)
+			}
+		})
 	}
 }

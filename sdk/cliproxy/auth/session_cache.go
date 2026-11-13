@@ -138,8 +138,7 @@ func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 		return "", false
 	}
 
-	aliases := compactSessionAliases(mergeSessionAliases([]string{sessionID}, entry.aliases...))
-	c.replaceAliasGroupsLocked(entry.authID, now.Add(c.ttl), aliases, entry.binding, entry)
+	c.refreshAliasGroupLocked(entry, now.Add(c.ttl), entry.binding)
 	return entry.authID, true
 }
 
@@ -172,6 +171,33 @@ func (c *SessionCache) setAliases(authID string, binding sessionBinding, session
 	c.ensureInitializedLocked()
 	now := time.Now()
 
+	// Repeated selections normally name aliases already in one live group.
+	// Preserve its alias storage, reverse index and LRU node in that case.
+	if len(sessionIDs) > 0 {
+		entry, ok := c.entries[sessionIDs[0]]
+		sameGroup := ok && entry.authID == authID && now.Before(entry.expiresAt)
+		for _, key := range sessionIDs[1:] {
+			if key == "" {
+				continue
+			}
+			other, exists := c.entries[key]
+			if !exists || len(other.aliases) == 0 || len(entry.aliases) == 0 || other.aliases[0] != entry.aliases[0] {
+				sameGroup = false
+				break
+			}
+		}
+		if sameGroup {
+			if binding.sessionID != "" && binding.provider != "" {
+				c.bindingSequence++
+				binding.sequence = c.bindingSequence
+			} else {
+				binding = entry.binding
+			}
+			c.refreshAliasGroupLocked(entry, now.Add(c.ttl), binding)
+			return
+		}
+	}
+
 	aliases := mergeSessionAliases(nil, sessionIDs...)
 	previousGroups := make([]sessionEntry, 0, len(sessionIDs))
 	for _, sessionID := range sessionIDs {
@@ -201,6 +227,33 @@ func (c *SessionCache) setAliases(authID string, binding sessionBinding, session
 		}
 	}
 	c.replaceAliasGroupsLocked(authID, now.Add(c.ttl), aliases, binding, previousGroups...)
+}
+
+func (c *SessionCache) refreshAliasGroupLocked(entry sessionEntry, expiresAt time.Time, binding sessionBinding) {
+	primaryKey := entry.aliases[0]
+	if entry.binding.sessionID != binding.sessionID || entry.binding.sequence == 0 && binding.sequence != 0 {
+		if groups := c.sessionGroups[entry.binding.sessionID]; groups != nil {
+			delete(groups, primaryKey)
+			if len(groups) == 0 {
+				delete(c.sessionGroups, entry.binding.sessionID)
+			}
+		}
+		if binding.sequence != 0 {
+			if c.sessionGroups[binding.sessionID] == nil {
+				c.sessionGroups[binding.sessionID] = make(map[string]struct{})
+			}
+			c.sessionGroups[binding.sessionID][primaryKey] = struct{}{}
+		}
+	}
+	entry.expiresAt = expiresAt
+	entry.binding = binding
+	c.groups[primaryKey] = entry
+	for _, alias := range entry.aliases {
+		c.entries[alias] = entry
+	}
+	if element := c.evictionElements[primaryKey]; element != nil {
+		c.evictionOrder.MoveToBack(element)
+	}
 }
 
 func (c *SessionCache) replaceAliasGroupsLocked(authID string, expiresAt time.Time, aliases []string, binding sessionBinding, previousGroups ...sessionEntry) {
@@ -389,8 +442,7 @@ func (c *SessionCache) Touch(sessionID, expectedAuthID string) bool {
 	if !ok || entry.authID != expectedAuthID || !now.Before(entry.expiresAt) {
 		return false
 	}
-	aliases := compactSessionAliases(mergeSessionAliases([]string{sessionID}, entry.aliases...))
-	c.replaceAliasGroupsLocked(expectedAuthID, now.Add(c.ttl), aliases, entry.binding, entry)
+	c.refreshAliasGroupLocked(entry, now.Add(c.ttl), entry.binding)
 	return true
 }
 

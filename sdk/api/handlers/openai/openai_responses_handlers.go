@@ -1434,7 +1434,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			status = errMsg.StatusCode
 		}
 		errText := responsesStreamErrorText(errMsg, status)
-		h.logResponsesStreamError(c, framer, errMsg)
 		if framer.terminalEvent != "" {
 			return
 		}
@@ -1456,7 +1455,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		NormalizeTerminalError: sanitizeResponsesStreamErrorMessage,
-		Flush:                  func() error { return flushResponsesSSE(c.Writer) },
+		LogTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			// Downstream write failures are cancellations, not upstream stream failures.
+			if framer.writeErr == nil {
+				h.logResponsesStreamError(c, framer, errMsg)
+			}
+		},
+		Flush: func() error { return flushResponsesSSE(c.Writer) },
 		WriteChunk: func(chunk []byte) {
 			framer.WriteChunk(c.Writer, chunk)
 		},
@@ -1466,9 +1471,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 		ChunkError: func() *interfaces.ErrorMessage {
 			if framer.writeErr != nil {
 				return &interfaces.ErrorMessage{Error: framer.writeErr}
-			}
-			if framer.terminalError != nil {
-				h.logResponsesStreamError(c, framer, framer.terminalError)
 			}
 			return framer.terminalError
 		},

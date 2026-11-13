@@ -2,11 +2,13 @@
 package session
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -144,16 +146,14 @@ func NormalizeExplicitID(raw string) string {
 
 // ClaudeMetadataIdentities extracts session_id, parent_session_id, and agent_id from Claude user_id metadata.
 func ClaudeMetadataIdentities(payload []byte) (sessionID, parentSessionID, agentID string) {
-	if len(payload) == 0 {
-		return "", "", ""
-	}
-	root := util.ParseGJSONBytesNoCopy(payload)
+	parsed := sessionPayload{payload: payload}
+	return parsed.claudeIdentities()
+}
+
+func claudeMetadataIdentities(root, reqRoot sessionJSONObject, hasNestedReq bool) (sessionID, parentSessionID, agentID string) {
 	userID := strings.TrimSpace(root.Get("metadata.user_id").String())
-	if userID == "" {
-		req := root.Get("request")
-		if req.Exists() && !root.Get("contents").Exists() {
-			userID = strings.TrimSpace(req.Get("metadata.user_id").String())
-		}
+	if userID == "" && hasNestedReq {
+		userID = strings.TrimSpace(reqRoot.Get("metadata.user_id").String())
 	}
 	if userID == "" {
 		return "", "", ""
@@ -237,7 +237,8 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (clipro
 	}
 	executionID := firstNormalizedMetadataID(cliproxyexecutor.ExecutionSessionMetadataKey, opts.Metadata, req.Metadata)
 
-	if hasExplicitSession(opts.Headers, payload) {
+	parsed := sessionPayload{payload: payload}
+	if hasExplicitSessionWithPayload(opts.Headers, &parsed) {
 		req.Metadata = metadataWithoutKey(req.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey)
 		opts.Metadata = metadataWithoutKey(opts.Metadata, cliproxyexecutor.DerivedSessionIDMetadataKey)
 		if executionID != "" {
@@ -247,7 +248,7 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (clipro
 			req.Metadata = metadataWithoutKey(req.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
 			opts.Metadata = metadataWithoutKey(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
 		}
-		if info, ok := ExtractSessionInfo(opts.Headers, payload, opts.Metadata); ok && info.SessionID != "" {
+		if info, ok := extractSessionInfo(opts.Headers, &parsed, opts.Metadata); ok && info.SessionID != "" {
 			canonicalSessionID := BoundSessionIdentity(info.SessionID)
 			req.Metadata = metadataWithValue(req.Metadata, cliproxyexecutor.CanonicalSessionIDMetadataKey, canonicalSessionID)
 			opts.Metadata = metadataWithValue(opts.Metadata, cliproxyexecutor.CanonicalSessionIDMetadataKey, canonicalSessionID)
@@ -343,6 +344,10 @@ func Enrich(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (clipro
 }
 
 func hasExplicitSession(headers map[string][]string, payload []byte) bool {
+	return hasExplicitSessionWithPayload(headers, &sessionPayload{payload: payload})
+}
+
+func hasExplicitSessionWithPayload(headers map[string][]string, parsed *sessionPayload) bool {
 	for _, header := range []string{
 		"X-Claude-Code-Session-Id",
 		"X-Claude-Code-Agent-Id",
@@ -382,18 +387,12 @@ func hasExplicitSession(headers map[string][]string, payload []byte) bool {
 			return true
 		}
 	}
-	if len(payload) == 0 {
+	if len(parsed.payload) == 0 {
 		return false
 	}
 	// Parsing without copying matters here: this runs on every request and the
 	// payload can be multiple megabytes.
-	root := indexSessionJSONObject(util.ParseGJSONBytesNoCopy(payload))
-	reqRoot := root
-	req := root.Get("request")
-	hasNestedReq := req.Exists() && !root.Get("contents").Exists()
-	if hasNestedReq {
-		reqRoot = indexSessionJSONObject(req)
-	}
+	root, reqRoot, hasNestedReq := parsed.objects()
 	for _, path := range []string{
 		"session_id",
 		"sessionId",
@@ -454,7 +453,7 @@ func hasExplicitSession(headers map[string][]string, payload []byte) bool {
 			return true
 		}
 	}
-	if ClaudeMetadataSessionID(payload) != "" {
+	if sessionID, _, _ := parsed.claudeIdentities(); sessionID != "" {
 		return true
 	}
 	userID := strings.TrimSpace(root.Get("metadata.user_id").String())
@@ -490,11 +489,11 @@ func headerValue(headers map[string][]string, name string) string {
 
 // DeriveID builds a stable identity from leading instructions and the first complete user input.
 func DeriveID(format sdktranslator.Format, payload []byte, callerScope string) string {
-	if len(payload) == 0 {
+	if len(payload) == 0 || !ojson.ValidBytes(payload) || !identityJSONNumbersAndDepthValid(payload) {
 		return ""
 	}
-	var body map[string]any
-	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
+	body := util.ParseGJSONBytesNoCopy(payload)
+	if !body.IsObject() {
 		return ""
 	}
 
@@ -503,30 +502,190 @@ func DeriveID(format sdktranslator.Format, payload []byte, callerScope string) s
 		Format:      format.String(),
 		CallerScope: strings.TrimSpace(callerScope),
 	}
-	if sourceFormatEqual(format, sdktranslator.FormatGemini) || sourceFormatEqual(format, sdktranslator.FormatAntigravity) {
-		reqBody := body
-		if req, ok := body["request"].(map[string]any); ok {
-			reqBody = req
-		}
-		root.Resource = stringField(reqBody, "cachedContent", "cached_content")
-	}
-
+	fields := identityJSONFields(body)
 	switch {
 	case sourceFormatEqual(format, sdktranslator.FormatGemini), sourceFormatEqual(format, sdktranslator.FormatAntigravity):
-		root.Instructions, root.User = geminiRoot(body)
+		if req := fields["request"]; req.IsObject() {
+			fields = identityJSONFields(req)
+		}
+		resource, _ := decodeIdentityValue(firstIdentityField(fields, "cachedContent", "cached_content")).(string)
+		root.Resource = strings.TrimSpace(resource)
+		root.Instructions = appendInstruction(root.Instructions, contentValue(decodeIdentityValue(firstIdentityField(fields, "systemInstruction", "system_instruction"))))
+		root.Instructions, root.User = identitySequenceRoot(fields["contents"], root.Instructions, true)
 	case sourceFormatEqual(format, sdktranslator.FormatInteractions):
-		root.Instructions, root.User = interactionsRoot(body)
+		root.Instructions = appendInstruction(root.Instructions, contentValue(decodeIdentityValue(firstIdentityField(fields, "system_instruction", "systemInstruction"))))
+		visitIdentityInteractions(fields["input"], "", &root)
 	case sourceFormatEqual(format, sdktranslator.FormatOpenAIResponse), sourceFormatEqual(format, sdktranslator.FormatCodex):
-		root.Instructions, root.User = responsesRoot(body)
-	case sourceFormatEqual(format, sdktranslator.FormatClaude):
-		root.Instructions, root.User = messagesRoot(body, true)
+		root.Instructions = appendInstruction(root.Instructions, decodeIdentityValue(fields["instructions"]))
+		if input := fields["input"]; input.Type == ojson.String {
+			root.User = canonicalParts(decodeIdentityValue(input))
+		} else {
+			root.Instructions, root.User = identitySequenceRoot(input, root.Instructions, false)
+		}
 	default:
-		root.Instructions, root.User = messagesRoot(body, false)
+		if sourceFormatEqual(format, sdktranslator.FormatClaude) {
+			root.Instructions = appendInstruction(root.Instructions, decodeIdentityValue(fields["system"]))
+		}
+		root.Instructions, root.User = identitySequenceRoot(fields["messages"], root.Instructions, false)
 	}
 	if len(root.User) == 0 {
 		return ""
 	}
 	return hashRoot(root)
+}
+
+// Identity derivation historically used encoding/json maps, whose duplicate keys
+// keep the last value. Session field lookup intentionally has different semantics.
+func identityJSONFields(object ojson.Result) map[string]ojson.Result {
+	fields := make(map[string]ojson.Result)
+	object.ForEach(func(key, value ojson.Result) bool {
+		fields[key.String()] = value
+		return true
+	})
+	return fields
+}
+
+func firstIdentityField(fields map[string]ojson.Result, keys ...string) ojson.Result {
+	for _, key := range keys {
+		if value, exists := fields[key]; exists {
+			return value
+		}
+	}
+	return ojson.Result{}
+}
+
+func decodeIdentityValue(value ojson.Result) any {
+	var decoded any
+	if value.Raw != "" {
+		// Keep canonical JSON number, duplicate-key and invalid UTF-8 handling for
+		// the selected root content; later conversation content is never decoded.
+		_ = json.Unmarshal([]byte(value.Raw), &decoded)
+	}
+	return decoded
+}
+
+func identitySequenceRoot(sequence ojson.Result, instructions []string, gemini bool) ([]string, []canonicalPart) {
+	var user []canonicalPart
+	if !sequence.IsArray() {
+		return instructions, nil
+	}
+	sequence.ForEach(func(_, item ojson.Result) bool {
+		if !item.IsObject() {
+			return true
+		}
+		fields := identityJSONFields(item)
+		role := normalizedString(decodeIdentityValue(fields["role"]))
+		if !gemini && (role == "system" || role == "developer") {
+			instructions = appendInstruction(instructions, decodeIdentityValue(fields["content"]))
+		} else if role == "user" {
+			content := fields["content"]
+			if gemini {
+				content = firstIdentityField(fields, "content", "parts", "text")
+				if content.Raw == "" {
+					content = item
+				}
+			}
+			user = canonicalParts(decodeIdentityValue(content))
+		}
+		return len(user) == 0
+	})
+	return instructions, user
+}
+
+// visitIdentityInteractions stops even on an empty eligible user entry, matching
+// the original flattened traversal and its inherited-role rules.
+func visitIdentityInteractions(value ojson.Result, inheritedRole string, root *canonicalRoot) bool {
+	if value.IsArray() {
+		done := false
+		value.ForEach(func(_, child ojson.Result) bool {
+			done = visitIdentityInteractions(child, inheritedRole, root)
+			return !done
+		})
+		return done
+	}
+	if value.Type == ojson.String {
+		root.User = canonicalParts(decodeIdentityValue(value))
+		return true
+	}
+	if !value.IsObject() {
+		return false
+	}
+	fields := identityJSONFields(value)
+	role := normalizedString(decodeIdentityValue(fields["role"]))
+	if role == "" {
+		role = inheritedRole
+	}
+	if steps := fields["steps"]; steps.IsArray() {
+		return visitIdentityInteractions(steps, role, root)
+	}
+	stepType := normalizedString(decodeIdentityValue(fields["type"]))
+	isInstruction := role == "system" || role == "developer" || stepType == "system_instruction" || stepType == "developer_instruction"
+	isUser := role == "user" || stepType == "user_input" || ((stepType == "message" || stepType == "") && role == "")
+	if !isInstruction && !isUser {
+		return false
+	}
+	step, _ := decodeIdentityValue(value).(map[string]any)
+	if role != "" && normalizedString(step["role"]) == "" {
+		step["role"] = role
+	}
+	if isInstruction {
+		root.Instructions = appendInstruction(root.Instructions, contentValue(step))
+		return false
+	}
+	root.User = canonicalParts(contentValue(step))
+	return true
+}
+
+// A syntax-valid document may still be rejected by the old whole-document
+// decoder for excessive depth or float64 overflow, including in ignored history.
+// Scan these tokens without allocating decoded history or copying string values.
+func identityJSONNumbersAndDepthValid(payload []byte) bool {
+	depth := 0
+	for index := 0; index < len(payload); index++ {
+		switch payload[index] {
+		case '"':
+			for index++; index < len(payload); {
+				offset := bytes.IndexByte(payload[index:], '"')
+				if offset < 0 {
+					return false
+				}
+				quote := index + offset
+				slashes := 0
+				for before := quote - 1; before >= index && payload[before] == '\\'; before-- {
+					slashes++
+				}
+				index = quote
+				if slashes%2 == 0 {
+					break
+				}
+				index++
+			}
+		case '{', '[':
+			depth++
+			if depth > 10000 {
+				return false
+			}
+		case '}', ']':
+			depth--
+		default:
+			if payload[index] != '-' && (payload[index] < '0' || payload[index] > '9') {
+				continue
+			}
+			start := index
+			exponent := false
+			for index < len(payload) && strings.ContainsRune("0123456789.eE+-", rune(payload[index])) {
+				exponent = exponent || payload[index] == 'e' || payload[index] == 'E'
+				index++
+			}
+			if exponent || index-start > 308 {
+				if _, err := strconv.ParseFloat(string(payload[start:index]), 64); err != nil {
+					return false
+				}
+			}
+			index--
+		}
+	}
+	return true
 }
 
 func messagesRoot(body map[string]any, includeTopLevelSystem bool) ([]string, []canonicalPart) {

@@ -50,6 +50,7 @@ type ResponseWriterWrapper struct {
 	statusCode          int                        // statusCode stores the HTTP status code of the response.
 	headers             map[string][]string        // headers stores the response headers.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
+	sampledOut          bool                       // sampledOut preserves non-2xx logs when successful requests are sampled.
 	hijacked            bool                       // hijacked reports whether the underlying connection was hijacked.
 	panicked            bool                       // panicked records whether a handler panicked (even after committing a 2xx response).
 	finalized           bool                       // finalized prevents post-Finalize writes (e.g. outer recovery) from reopening stream writers.
@@ -86,6 +87,7 @@ func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger
 		ResponseWriter: w,
 		body:           &bytes.Buffer{},
 		logger:         logger,
+		logOnErrorOnly: logger == nil || !logger.IsEnabled(),
 		requestInfo:    requestInfo,
 		headers:        make(map[string][]string),
 	}
@@ -164,14 +166,23 @@ func (w *ResponseWriterWrapper) closeConnectionIfRequestBodyUnconsumed(statusCod
 }
 
 func (w *ResponseWriterWrapper) shouldBufferResponseBody() bool {
-	if w.logger != nil && w.logger.IsEnabled() {
+	if w.fullRequestLoggingEnabled() {
 		return true
 	}
 	if !w.logOnErrorOnly {
 		return false
 	}
 	status := w.effectiveStatusCode()
-	return status >= http.StatusBadRequest && status != clienterror.StatusClientClosedRequest
+	return (status >= http.StatusBadRequest && status != clienterror.StatusClientClosedRequest) || w.sampledNonSuccessStatus(status)
+}
+
+func (w *ResponseWriterWrapper) fullRequestLoggingEnabled() bool {
+	return !w.logOnErrorOnly && w.logger != nil
+}
+
+func (w *ResponseWriterWrapper) sampledNonSuccessStatus(status int) bool {
+	// A successful WebSocket upgrade and the existing client-cancellation exclusion are preserved.
+	return w.sampledOut && status != http.StatusSwitchingProtocols && status != clienterror.StatusClientClosedRequest && (status < http.StatusOK || status >= http.StatusMultipleChoices)
 }
 
 // WriteString wraps the underlying ResponseWriter's WriteString method to capture response data.
@@ -224,7 +235,7 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	w.isStreaming = w.detectStreaming(contentType) || w.streamWriter != nil
 
 	// If streaming, initialize streaming log writer once and refresh uncommitted status updates.
-	if !w.finalized && w.isStreaming && w.logger != nil && w.logger.IsEnabled() {
+	if !w.finalized && w.isStreaming && w.fullRequestLoggingEnabled() {
 		if w.streamWriter == nil {
 			streamWriter, err := w.logger.LogStreamingRequest(
 				w.requestInfo.URL,
@@ -351,13 +362,37 @@ func (w *ResponseWriterWrapper) processStreamingChunks(done chan struct{}, chunk
 // For streaming responses, it closes the chunk channel and the stream writer.
 // For non-streaming responses, it logs the complete request and response details,
 // including any API-specific request/response data stored in the Gin context.
-func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
+func (w *ResponseWriterWrapper) Finalize(c *gin.Context) (errFinalize error) {
 	if w == nil || w.finalized {
 		return nil
 	}
 	w.finalized = true
 	if w.requestInfo != nil && w.requestInfo.deferredBodyCapture != nil {
 		defer w.requestInfo.deferredBodyCapture.Cleanup()
+	}
+	websocketTimelineSource := w.extractWebsocketTimelineSource(c)
+	apiRequestSource := w.extractAPIRequestSource(c)
+	apiResponseSource := w.extractAPIResponseSource(c)
+	apiWebsocketTimelineSource := w.extractAPIWebsocketTimelineSource(c)
+	defer cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
+	// Once created, the writer owns resources even if logging is disabled or a source fails.
+	if w.streamWriter != nil {
+		if w.chunkChannel != nil {
+			close(w.chunkChannel)
+			w.chunkChannel = nil
+		}
+		if w.streamDone != nil {
+			<-w.streamDone
+			w.streamDone = nil
+		}
+		w.streamWriter.SetFirstChunkTimestamp(w.firstChunkTimestamp)
+		defer func() {
+			errClose := w.streamWriter.Close()
+			w.streamWriter = nil
+			if errFinalize == nil {
+				errFinalize = errClose
+			}
+		}()
 	}
 	if w.logger == nil {
 		return nil
@@ -380,30 +415,13 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		}
 	}
 
-	hasAPIError := w.panicked || hasActionableError(c, finalStatusCode, slicesAPIResponseError)
-	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
-	websocketTimelineSource := w.extractWebsocketTimelineSource(c)
-	apiRequestSource := w.extractAPIRequestSource(c)
-	apiResponseSource := w.extractAPIResponseSource(c)
-	apiWebsocketTimelineSource := w.extractAPIWebsocketTimelineSource(c)
-	if !w.logger.IsEnabled() && !forceLog {
-		cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
+	hasAPIError := w.panicked || hasActionableError(c, finalStatusCode, slicesAPIResponseError) || (w.sampledNonSuccessStatus(finalStatusCode) && !isContextCanceled(c))
+	forceLog := w.logOnErrorOnly && hasAPIError
+	if !w.fullRequestLoggingEnabled() && !forceLog {
 		return nil
 	}
 
 	if w.isStreaming && w.streamWriter != nil {
-		if w.chunkChannel != nil {
-			close(w.chunkChannel)
-			w.chunkChannel = nil
-		}
-
-		if w.streamDone != nil {
-			<-w.streamDone
-			w.streamDone = nil
-		}
-
-		w.streamWriter.SetFirstChunkTimestamp(w.firstChunkTimestamp)
-
 		// Write API Request and Response to the streaming log before closing
 		apiRequest := w.extractAPIRequest(c)
 		apiResponse := w.extractAPIResponse(c)
@@ -427,12 +445,10 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 			var errMerge error
 			apiRequest, errMerge = mergeFileBodySource(apiRequest, apiRequestSource)
 			if errMerge != nil {
-				cleanupFileBodySources(websocketTimelineSource, apiResponseSource, apiWebsocketTimelineSource)
 				return errMerge
 			}
 			apiResponse, errMerge = mergeFileBodySource(apiResponse, apiResponseSource)
 			if errMerge != nil {
-				cleanupFileBodySources(websocketTimelineSource, apiWebsocketTimelineSource)
 				return errMerge
 			}
 			if len(apiRequest) > 0 {
@@ -446,19 +462,11 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		var errMerge error
 		apiWebsocketTimeline, errMerge = mergeFileBodySource(apiWebsocketTimeline, apiWebsocketTimelineSource)
 		if errMerge != nil {
-			cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource)
 			return errMerge
 		}
 		if len(apiWebsocketTimeline) > 0 {
 			_ = w.streamWriter.WriteAPIWebsocketTimeline(apiWebsocketTimeline)
 		}
-		if err := w.streamWriter.Close(); err != nil {
-			w.streamWriter = nil
-			cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource)
-			return err
-		}
-		w.streamWriter = nil
-		cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource)
 		return nil
 	}
 

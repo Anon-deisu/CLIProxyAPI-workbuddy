@@ -139,7 +139,8 @@ func (w *FileStreamingLogWriter) WriteAPIRequest(apiRequest []byte) error {
 	return nil
 }
 
-// WriteAPIRequestSource buffers a file-backed upstream API request for final writing.
+// WriteAPIRequestSource takes ownership of a file-backed upstream API request
+// until Close, which cleans it up even if final log creation fails.
 func (w *FileStreamingLogWriter) WriteAPIRequestSource(apiRequestSource *FileBodySource) error {
 	if apiRequestSource == nil || !apiRequestSource.HasPayload() {
 		return nil
@@ -163,7 +164,8 @@ func (w *FileStreamingLogWriter) WriteAPIResponse(apiResponse []byte) error {
 	return nil
 }
 
-// WriteAPIResponseSource buffers a file-backed upstream API response for final writing.
+// WriteAPIResponseSource takes ownership of a file-backed upstream API response
+// until Close, which cleans it up even if final log creation fails.
 func (w *FileStreamingLogWriter) WriteAPIResponseSource(apiResponseSource *FileBodySource) error {
 	if apiResponseSource == nil || !apiResponseSource.HasPayload() {
 		return nil
@@ -304,6 +306,10 @@ func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
 }
 
 func (w *FileStreamingLogWriter) cleanupTempFiles() {
+	cleanupFileBodySources(w.apiRequestSource, w.apiResponseSource)
+	w.apiRequestSource = nil
+	w.apiResponseSource = nil
+
 	if w.requestBodyPath != "" {
 		if errRemove := os.Remove(w.requestBodyPath); errRemove != nil {
 			log.WithError(errRemove).Warn("failed to remove request body temp file")

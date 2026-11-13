@@ -64,6 +64,11 @@ func TestForwardStreamNormalizesErrorBeforeWriteAndCancel(t *testing.T) {
 	if written != "safe error" || canceled != "safe error" {
 		t.Fatalf("written=%q canceled=%q, want sanitized error", written, canceled)
 	}
+	value, _ := c.Get("API_RESPONSE_ERROR")
+	logged, _ := value.([]*interfaces.ErrorMessage)
+	if len(logged) != 1 || logged[0].Error.Error() != "safe error" {
+		t.Fatalf("structured error must use normalized content: %#v", logged)
+	}
 }
 
 func TestPendingStreamErrorIgnoresUnavailableErrors(t *testing.T) {

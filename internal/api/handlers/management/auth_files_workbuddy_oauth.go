@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -92,6 +93,167 @@ func (p workBuddyQuotaPreparer) PrepareRequestAuth(ctx context.Context, auth *co
 	return executor.NewWorkBuddyExecutor(p.cfg, auth.Provider).Refresh(ctx, auth)
 }
 
+const workBuddyCreditRefreshInterval = 30 * time.Minute
+const workBuddyQuotaConcurrency = 4
+
+type workBuddyCreditSummary struct {
+	Available bool      `json:"available"`
+	Remaining float64   `json:"remaining"`
+	Accounts  int       `json:"accounts"`
+	Known     int       `json:"known"`
+	Failed    int       `json:"failed"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type workBuddyCreditEntry struct {
+	version   uint64
+	remaining float64
+	known     bool
+	failed    bool
+}
+
+type workBuddyCreditCache struct {
+	mu          sync.Mutex
+	entries     map[string]workBuddyCreditEntry
+	version     uint64
+	initialized bool
+	updatedAt   time.Time
+	slots       chan struct{}
+}
+
+func (s *workBuddyCreditCache) begin(id string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries == nil {
+		s.entries = make(map[string]workBuddyCreditEntry)
+		s.slots = make(chan struct{}, workBuddyQuotaConcurrency)
+	}
+	s.version++
+	entry := s.entries[id]
+	entry.version = s.version
+	s.entries[id] = entry
+	return entry.version
+}
+
+func (s *workBuddyCreditCache) finish(id string, version uint64, quota workbuddy.Quota, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, exists := s.entries[id]
+	if !exists || entry.version != version {
+		return
+	}
+	entry.failed = err != nil
+	if err == nil {
+		entry.remaining = 0
+		if quota.Credits != nil {
+			entry.remaining = quota.Credits.Remaining
+		}
+		entry.known = true
+	}
+	s.entries[id] = entry
+	s.updatedAt = time.Now()
+}
+
+func (s *workBuddyCreditCache) snapshot() workBuddyCreditSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := workBuddyCreditSummary{Accounts: len(s.entries), UpdatedAt: s.updatedAt}
+	for _, entry := range s.entries {
+		if entry.known {
+			result.Remaining += entry.remaining
+			result.Known++
+		}
+		if entry.failed {
+			result.Failed++
+		}
+	}
+	result.Available = result.Known > 0 || (s.initialized && result.Accounts == 0)
+	return result
+}
+
+// GetWorkBuddyCredits reads the last observations without contacting upstream.
+func (h *Handler) GetWorkBuddyCredits(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, h.workBuddyCredits.snapshot())
+}
+
+func (h *Handler) RunWorkBuddyCredits(ctx context.Context) {
+	ticker := time.NewTicker(workBuddyCreditRefreshInterval)
+	defer ticker.Stop()
+	h.runWorkBuddyCredits(ctx, ticker.C)
+}
+
+func (h *Handler) runWorkBuddyCredits(ctx context.Context, ticks <-chan time.Time) {
+	h.refreshWorkBuddyCredits(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			h.refreshWorkBuddyCredits(ctx)
+		}
+	}
+}
+
+func (h *Handler) refreshWorkBuddyCredits(ctx context.Context) {
+	if h.authManager == nil || h.authManager.HomeEnabled() {
+		return
+	}
+	accounts := make(map[string]*coreauth.Auth)
+	for _, auth := range h.authManager.List() {
+		if auth.Provider == workbuddy.ProviderCN || auth.Provider == workbuddy.ProviderAI {
+			accounts[auth.ID] = auth
+		}
+	}
+	h.workBuddyCredits.mu.Lock()
+	for id := range h.workBuddyCredits.entries {
+		if accounts[id] == nil {
+			delete(h.workBuddyCredits.entries, id)
+		}
+	}
+	h.workBuddyCredits.initialized = true
+	h.workBuddyCredits.mu.Unlock()
+	type job struct {
+		auth    *coreauth.Auth
+		version uint64
+	}
+	jobs := make(chan job, len(accounts))
+	for _, auth := range accounts {
+		jobs <- job{auth: auth, version: h.workBuddyCredits.begin(auth.ID)}
+	}
+	close(jobs)
+	var workers sync.WaitGroup
+	for range min(workBuddyQuotaConcurrency, len(accounts)) {
+		workers.Go(func() {
+			for item := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				_, _ = h.fetchWorkBuddyQuota(ctx, item.auth, item.version)
+			}
+		})
+	}
+	workers.Wait()
+}
+
+func (h *Handler) fetchWorkBuddyQuota(ctx context.Context, auth *coreauth.Auth, version uint64) (quota workbuddy.Quota, err error) {
+	defer func() { h.workBuddyCredits.finish(auth.ID, version, quota, err) }()
+	select {
+	case h.workBuddyCredits.slots <- struct{}{}:
+		defer func() { <-h.workBuddyCredits.slots }()
+	case <-ctx.Done():
+		return quota, ctx.Err()
+	}
+	cfg := h.configSnapshot()
+	prepared, errPrepare := h.authManager.PrepareRequestAuth(ctx, workBuddyQuotaPreparer{cfg}, auth)
+	if errPrepare != nil {
+		return quota, errors.New("WorkBuddy token refresh failed; sign in again")
+	}
+	service := workbuddy.NewService(prepared.Provider, &http.Client{Transport: (&Handler{cfg: cfg}).apiCallTransport(prepared, "")})
+	service.SetEndpoint(workbuddy.EndpointForAuth(prepared))
+	return service.FetchQuota(ctx, workbuddy.CredentialsFromAuth(prepared), stringValue(prepared.Metadata, "plan"))
+}
+
 // GetWorkBuddyQuota keeps account credentials on the server for both regional sites.
 func (h *Handler) GetWorkBuddyQuota(c *gin.Context) {
 	if h.authManager == nil {
@@ -112,17 +274,7 @@ func (h *Handler) GetWorkBuddyQuota(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "credential is not a WorkBuddy account"})
 		return
 	}
-	h.mu.Lock()
-	cfg := h.cfg
-	h.mu.Unlock()
-	auth, err := h.authManager.PrepareRequestAuth(c.Request.Context(), workBuddyQuotaPreparer{cfg}, auth)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "WorkBuddy token refresh failed; sign in again"})
-		return
-	}
-	service := workbuddy.NewService(auth.Provider, &http.Client{Transport: h.apiCallTransport(auth, "")})
-	service.SetEndpoint(workbuddy.EndpointForAuth(auth))
-	quota, err := service.FetchQuota(c.Request.Context(), workbuddy.CredentialsFromAuth(auth), stringValue(auth.Metadata, "plan"))
+	quota, err := h.fetchWorkBuddyQuota(c.Request.Context(), auth, h.workBuddyCredits.begin(auth.ID))
 	if err != nil {
 		var apiErr *workbuddy.APIError
 		if errors.As(err, &apiErr) {

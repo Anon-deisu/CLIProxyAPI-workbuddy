@@ -122,7 +122,107 @@ function cpaWorkBuddyQuotaBody({quota, classes}) {
     ]}) : U.jsx('div', {className: classes.quotaMessage, children: t('workbuddy_quota.empty_data')})
   ]});
 }
+function cpaWorkBuddyCredits({className}) {
+  const connected = Mm(state => state.connectionStatus === 'connected');
+  const generation = Om(state => state.cacheGeneration);
+  const [summary, setSummary] = y.useState(null);
+  const [failed, setFailed] = y.useState(false);
+  y.useEffect(() => {
+    let active = true, pending = false;
+    setSummary(null);
+    if (!connected) return;
+    const load = async () => {
+      if (document.hidden || pending) return;
+      pending = true;
+      try {
+        const data = await sp.get('/observability/workbuddy-credits');
+        if (active) { setSummary(data); setFailed(false); }
+      } catch (error) {
+        if (active) setFailed(true);
+      } finally { pending = false; }
+    };
+    load();
+    const timer = window.setInterval(load, 30000);
+    document.addEventListener('visibilitychange', load);
+    return () => { active = false; window.clearInterval(timer); document.removeEventListener('visibilitychange', load); };
+  }, [connected, generation]);
+  if (summary?.available && summary.remaining === 0) return null;
+  const value = summary?.available ? new Intl.NumberFormat('zh-CN', {maximumFractionDigits: 2, useGrouping: false}).format(summary.remaining) : '--';
+  const partial = summary && (summary.failed > 0 || summary.known < summary.accounts);
+  const title = failed ? '积分汇总读取失败，保留最近结果' : partial ? '部分凭证未刷新成功，保留最近一次成功余额' : summary?.updated_at ? new Date(summary.updated_at).toLocaleString() : '';
+  return U.jsx('span', {className, 'data-cpa-workbuddy-credits': true, title, children: 'workbuddy剩余积分:' + value});
+}
+function cpaAllQuotaEntries(files) {
+  return files.flatMap(file => {
+    const type = OM.find(type => Wk[type].filterFn({...file, disabled: false}));
+    return type ? [{type, file}] : [];
+  });
+}
+async function cpaLoadQuotaEntries(entries, t, generation) {
+  const groups = new Map();
+  for (const {type, file} of entries) {
+    if (!groups.has(type)) groups.set(type, {files: [], results: []});
+    groups.get(type).files.push(file);
+  }
+  for (const [type, group] of groups) {
+    const adapter = Wk[type];
+    Gk(adapter)(state => {
+      const next = {...state};
+      for (const file of group.files) Am(generation, () => { next[wm(file)] = adapter.buildLoadingState(); }, file.name);
+      return next;
+    });
+  }
+  let next = 0;
+  const worker = async () => {
+    while (next < entries.length) {
+      const {type, file} = entries[next++];
+      if (!Am(generation, () => {}, file.name)) continue;
+      const adapter = Wk[type], key = wm(file);
+      let result;
+      try { result = adapter.buildSuccessState(await adapter.fetchQuota(file, t)); }
+      catch (error) { result = adapter.buildErrorState(error instanceof Error ? error.message : t('common.unknown_error'), M_(error)); }
+      groups.get(type).results.push({file, key, result});
+    }
+  };
+  await Promise.all(Array.from({length: Math.min(4, entries.length)}, worker));
+  for (const [type, group] of groups) {
+    Gk(Wk[type])(state => {
+      const next = {...state};
+      for (const {file, key, result} of group.results) Am(generation, () => { next[key] = result; }, file.name);
+      return next;
+    });
+  }
+}
 `
+
+const workBuddyQuotaBatchRuntime = `function pN() {
+  const {t} = H();
+  const [batchLoading, setLoading] = y.useState(false);
+  const pending = y.useRef(false);
+  const loadQuota = y.useCallback(async entries => {
+    if (pending.current || entries.length === 0) return;
+    pending.current = true;
+    setLoading(true);
+    try { await cpaLoadQuotaEntries(entries, t, km()); }
+    finally { pending.current = false; setLoading(false); }
+  }, [t]);
+  return {batchLoading, loadQuota};
+}`
+
+const workBuddyRefreshEveryRuntime = `let [cpaAllLoading,cpaSetAllLoading]=y.useState(false),cpaAllPending=y.useRef(false);
+let cpaRefreshEvery=y.useCallback(async()=>{
+  if(b||a||le||cpaAllPending.current)return;
+  cpaAllPending.current=true;cpaSetAllLoading(true);c('');
+  const generation=km();
+  try{
+    const response=await Ry.list();
+    if(!Am(generation,()=>{}))return;
+    const files=response?.files||[];
+    i(files);C(x);
+    await ue(cpaAllQuotaEntries(files));
+  }catch(error){Am(generation,()=>c(error instanceof Error?error.message:e('notification.refresh_failed')));}
+  finally{cpaAllPending.current=false;cpaSetAllLoading(false);}
+},[b,a,le,ue,x,e]);`
 
 var workBuddyQuotaLocaleAnchor = regexp.MustCompile(`(?:"kimi_quota"|kimi_quota):\{`)
 
@@ -151,6 +251,11 @@ func AddWorkBuddyQuotaToManagementHTML(data []byte) ([]byte, error) {
 		{"M=Om(e=>e.xaiQuota),N=", "M=Om(e=>e.xaiQuota),cpaWB=Om(e=>e.workbuddyQuota),cpaWBAI=Om(e=>e.workbuddyAIQuota),N="},
 		{"meta:j,xai:M}),[E,D,O,k,A,j,M])", "meta:j,xai:M,workbuddy:cpaWB,\"workbuddy-ai\":cpaWBAI}),[E,D,O,k,A,j,M,cpaWB,cpaWBAI])"},
 		{"if(!n||n.status!==`success`)return[];if(e===`claude`", "if(!n||n.status!==`success`)return[];if(e==='workbuddy'||e==='workbuddy-ai')return t.credits?.resets_at?[{rowId:'credits',atMs:Date.parse(t.credits.resets_at),kind:'window'}]:[];if(e===`claude`"},
+		{"(0,U.jsx)(`span`,{className:K.statHint,children:e.hint})", "(0,U.jsx)(`span`,{className:K.statHint,children:e.hint}),e.key==='credentials'&&(0,U.jsx)(cpaWorkBuddyCredits,{className:K.statHint})"},
+		{"[b,T,x]);(0,y.useEffect)", "[b,T,x]);" + workBuddyRefreshEveryRuntime + "(0,y.useEffect)"},
+		{"uN(V,b||a||le||!!s||S!==x,ue);let _e=!b&&!a&&S===x", "uN(V,b||a||le||cpaAllLoading||!!s||S!==x,ue);let _e=!b&&!a&&!le&&!cpaAllLoading&&S===x"},
+		{"refreshing:a||le,disableControls:b,onRefreshAll:ge", "refreshing:a||le||cpaAllLoading,disableControls:b,onRefreshAll:ge,onRefreshEveryCredential:cpaRefreshEvery"},
+		{"(0,U.jsx)(`div`,{className:EM.actions,\"data-reveal\":!0,children:(0,U.jsxs)(`button`,{type:`button`,className:EM.primaryAction,onClick:o,disabled:a||i,children:[(0,U.jsx)(Cs,{size:14,className:i?EM.spinning:void 0}),s(`quota_management.refresh_all_credentials`)]})})", `(0,U.jsxs)('div',{className:EM.actions,style:{flexWrap:'wrap'},"data-reveal":true,children:[(0,U.jsxs)('button',{type:'button',className:EM.primaryAction+' cpa-quota-refresh-every',style:{background:'var(--danger-color, #dc2626)',borderColor:'var(--danger-color, #dc2626)',color:'#fff'},onClick:e.onRefreshEveryCredential,disabled:a||i,children:[(0,U.jsx)(Cs,{size:14,className:i?EM.spinning:void 0}),'刷新"全部"凭证']}),(0,U.jsxs)('button',{type:'button',className:EM.primaryAction,onClick:o,disabled:a||i,children:[(0,U.jsx)(Cs,{size:14,className:i?EM.spinning:void 0}),s('quota_management.refresh_all_credentials')]})]})`},
 	}
 	for _, patch := range patches {
 		if !bytes.Contains(data, []byte(patch.old)) {
@@ -158,6 +263,15 @@ func AddWorkBuddyQuotaToManagementHTML(data []byte) ([]byte, error) {
 		}
 		data = bytes.ReplaceAll(data, []byte(patch.old), []byte(patch.replacement))
 	}
+	batchStart := bytes.Index(data, []byte("function pN(){"))
+	if batchStart < 0 {
+		return nil, fmt.Errorf("management html quota batch anchor not found")
+	}
+	batchEnd := bytes.Index(data[batchStart:], []byte("var mN="))
+	if batchEnd < 0 {
+		return nil, fmt.Errorf("management html quota batch boundary not found")
+	}
+	data = bytes.Replace(data, data[batchStart:batchStart+batchEnd], []byte(workBuddyQuotaBatchRuntime), 1)
 	matches := workBuddyQuotaLocaleAnchor.FindAllIndex(data, -1)
 	if len(matches) == 0 {
 		return nil, fmt.Errorf("management html WorkBuddy quota locale anchor not found")

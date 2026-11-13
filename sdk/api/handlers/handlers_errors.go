@@ -201,17 +201,20 @@ func writeDirectErrorResponse(c *gin.Context, status int, msg *interfaces.ErrorM
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
-	if cfg := h.CurrentConfig(); cfg != nil && cfg.RequestLog {
-		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
-			if apiResponseErrors, isExist := ginContext.Get("API_RESPONSE_ERROR"); isExist {
-				if slicesAPIResponseError, isOk := apiResponseErrors.([]*interfaces.ErrorMessage); isOk {
-					slicesAPIResponseError = append(slicesAPIResponseError, err)
-					ginContext.Set("API_RESPONSE_ERROR", slicesAPIResponseError)
-				}
-			} else {
-				// Create new response data entry
-				ginContext.Set("API_RESPONSE_ERROR", []*interfaces.ErrorMessage{err})
-			}
-		}
+	if ctx == nil {
+		return
 	}
+	ginContext, _ := ctx.Value("gin").(*gin.Context)
+	recordAPIResponseError(ginContext, err)
+}
+
+// recordAPIResponseError preserves failure classification independently of payload capture.
+// Callers register errors while the request is active; middleware applies cancellation exclusions.
+func recordAPIResponseError(c *gin.Context, err *interfaces.ErrorMessage) {
+	if c == nil || err == nil {
+		return
+	}
+	value, _ := c.Get("API_RESPONSE_ERROR")
+	errs, _ := value.([]*interfaces.ErrorMessage)
+	c.Set("API_RESPONSE_ERROR", append(errs, err))
 }

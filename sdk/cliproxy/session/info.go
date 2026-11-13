@@ -73,6 +73,43 @@ func (object sessionJSONObject) Get(path string) ojson.Result {
 	return value
 }
 
+// sessionPayload keeps only request-local, read-only views. Public entry points
+// create a fresh view so caller mutations cannot invalidate a retained cache.
+type sessionPayload struct {
+	payload      []byte
+	indexed      bool
+	root         sessionJSONObject
+	reqRoot      sessionJSONObject
+	hasNestedReq bool
+	claudeParsed bool
+	claudeID     string
+	claudeParent string
+	claudeAgent  string
+}
+
+func (payload *sessionPayload) objects() (sessionJSONObject, sessionJSONObject, bool) {
+	if !payload.indexed {
+		payload.indexed = true
+		payload.root = indexSessionJSONObject(util.ParseGJSONBytesNoCopy(payload.payload))
+		payload.reqRoot = payload.root
+		req := payload.root.Get("request")
+		payload.hasNestedReq = req.Exists() && !payload.root.Get("contents").Exists()
+		if payload.hasNestedReq {
+			payload.reqRoot = indexSessionJSONObject(req)
+		}
+	}
+	return payload.root, payload.reqRoot, payload.hasNestedReq
+}
+
+func (payload *sessionPayload) claudeIdentities() (string, string, string) {
+	if !payload.claudeParsed {
+		payload.claudeParsed = true
+		root, reqRoot, nested := payload.objects()
+		payload.claudeID, payload.claudeParent, payload.claudeAgent = claudeMetadataIdentities(root, reqRoot, nested)
+	}
+	return payload.claudeID, payload.claudeParent, payload.claudeAgent
+}
+
 // ExtractSessionInfo extracts session hierarchy and client identification from request attributes.
 // Priority matches selector.go:
 //  1. X-Claude-Code-Session-Id
@@ -88,6 +125,11 @@ func (object sessionJSONObject) Get(path string) ojson.Result {
 //  11. conversation_id / chat_id
 //  12. execution_session_id metadata
 func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string]any) (SessionInfo, bool) {
+	return extractSessionInfo(headers, &sessionPayload{payload: payload}, metadata)
+}
+
+func extractSessionInfo(headers http.Header, parsed *sessionPayload, metadata map[string]any) (SessionInfo, bool) {
+	payload := parsed.payload
 	var info SessionInfo
 	if metadata != nil {
 		if scope, ok := metadata[cliproxyexecutor.CallerScopeMetadataKey].(string); ok {
@@ -101,13 +143,7 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 	var parentCandidate string
 
 	if len(payload) > 0 {
-		root = indexSessionJSONObject(util.ParseGJSONBytesNoCopy(payload))
-		reqRoot = root
-		req := root.Get("request")
-		hasNestedReq = req.Exists() && !root.Get("contents").Exists()
-		if hasNestedReq {
-			reqRoot = indexSessionJSONObject(req)
-		}
+		root, reqRoot, hasNestedReq = parsed.objects()
 		for _, p := range []string{
 			// Standard session / thread parent keys
 			"parent_session_id", "parentSessionId", "parentSessionID",
@@ -160,7 +196,7 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 			}
 		}
 		if parentCandidate == "" {
-			parentCandidate = ClaudeMetadataParentSessionID(payload)
+			_, parentCandidate, _ = parsed.claudeIdentities()
 		}
 	}
 
@@ -181,7 +217,7 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 			}
 		}
 		if agentID == "" {
-			_, _, agentID = ClaudeMetadataIdentities(payload)
+			_, _, agentID = parsed.claudeIdentities()
 		}
 		parentAgentID := sessionHeaderValue(headers, "X-Claude-Code-Parent-Agent-Id")
 		if parentAgentID == "" && root.Exists() {
@@ -218,7 +254,7 @@ func ExtractSessionInfo(headers http.Header, payload []byte, metadata map[string
 
 	// 2. Claude Code metadata.user_id in payload (outranks generic headers)
 	if len(payload) > 0 {
-		if sid, parentSID, agentID := ClaudeMetadataIdentities(payload); sid != "" {
+		if sid, parentSID, agentID := parsed.claudeIdentities(); sid != "" {
 			info.ClientType = "claude"
 			if agentID == "" {
 				agentID = sessionHeaderValue(headers, "X-Claude-Code-Agent-Id")

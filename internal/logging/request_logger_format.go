@@ -37,7 +37,6 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	statusCode int,
 	responseHeaders map[string][]string,
 	response []byte,
-	decompressErr error,
 	requestTimestamp time.Time,
 	apiResponseTimestamp time.Time,
 ) error {
@@ -71,7 +70,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 		// and appending a one-off upgrade response snapshot would dilute that transcript.
 		return nil
 	}
-	return writeResponseSection(w, statusCode, true, responseHeaders, bytes.NewReader(response), decompressErr, true)
+	return writeDecodedResponseSection(w, statusCode, responseHeaders, response)
 }
 
 func writeRequestInfoWithBody(
@@ -542,135 +541,129 @@ func (l *FileRequestLogger) formatLogContent(url, method string, headers map[str
 	return content.String()
 }
 
-// decompressResponse decompresses response data based on Content-Encoding header.
-//
-// Parameters:
-//   - responseHeaders: The response headers
-//   - response: The response data to decompress
-//
-// Returns:
-//   - []byte: The decompressed response data
-//   - error: An error if decompression fails, nil otherwise
-func (l *FileRequestLogger) decompressResponse(responseHeaders map[string][]string, response []byte) ([]byte, error) {
-	if responseHeaders == nil || len(response) == 0 {
-		return response, nil
-	}
+// responseLogDecoder distinguishes decoding failures from destination failures.
+// Only decoding failures trigger the legacy raw-response fallback.
+type responseLogDecoder struct {
+	reader   io.Reader
+	close    func() error
+	encoding string
+	err      error
+}
 
-	// Check Content-Encoding header
-	var contentEncoding string
-	for key, values := range responseHeaders {
-		if strings.ToLower(key) == "content-encoding" && len(values) > 0 {
-			contentEncoding = strings.ToLower(values[0])
+func (r *responseLogDecoder) Read(p []byte) (int, error) {
+	n, errRead := r.reader.Read(p)
+	if errRead != nil && errRead != io.EOF {
+		r.err = fmt.Errorf("failed to decompress %s data: %w", r.encoding, errRead)
+		return n, r.err
+	}
+	return n, errRead
+}
+
+func (r *responseLogDecoder) Close() {
+	if r.close != nil {
+		if errClose := r.close(); errClose != nil {
+			log.WithError(errClose).Warn("failed to close response decoder in request logger")
+		}
+	}
+}
+
+func newResponseLogDecoder(headers map[string][]string, response []byte) (*responseLogDecoder, error) {
+	if len(response) == 0 {
+		return nil, nil
+	}
+	var encoding string
+	for key, values := range headers {
+		if strings.EqualFold(key, "Content-Encoding") && len(values) > 0 {
+			encoding = strings.ToLower(values[0])
 			break
 		}
 	}
-
-	switch contentEncoding {
+	raw := bytes.NewReader(response)
+	decoder := &responseLogDecoder{encoding: encoding}
+	switch encoding {
 	case "gzip":
-		return l.decompressGzip(response)
+		reader, errNew := gzip.NewReader(raw)
+		if errNew != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", errNew)
+		}
+		decoder.reader, decoder.close = reader, reader.Close
 	case "deflate":
-		return l.decompressDeflate(response)
+		reader := flate.NewReader(raw)
+		decoder.reader, decoder.close = reader, reader.Close
 	case "br":
-		return l.decompressBrotli(response)
+		decoder.reader = brotli.NewReader(raw)
+		decoder.encoding = "brotli"
 	case "zstd":
-		return l.decompressZstd(response)
+		reader, errNew := zstd.NewReader(raw, zstd.WithDecoderConcurrency(1))
+		if errNew != nil {
+			return nil, fmt.Errorf("failed to create zstd reader: %w", errNew)
+		}
+		decoder.reader = reader
+		decoder.close = func() error { reader.Close(); return nil }
 	default:
-		// No compression or unsupported compression
-		return response, nil
+		return nil, nil
 	}
+	return decoder, nil
 }
 
-// decompressGzip decompresses gzip-encoded data.
-//
-// Parameters:
-//   - data: The gzip-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
-func (l *FileRequestLogger) decompressGzip(data []byte) ([]byte, error) {
-	reader, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
-	}
-	defer func() {
-		if errClose := reader.Close(); errClose != nil {
-			log.WithError(errClose).Warn("failed to close gzip reader in request logger")
+// responseLogRollback checkpoints only the local log destination. It never
+// operates on the downstream HTTP writer or changes compression on the wire.
+func responseLogRollback(w io.Writer) (func() error, error) {
+	switch dst := w.(type) {
+	case *os.File:
+		offset, errSeek := dst.Seek(0, io.SeekCurrent)
+		if errSeek != nil {
+			return nil, errSeek
 		}
-	}()
-
-	decompressed, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress gzip data: %w", err)
+		return func() error {
+			if _, errRewind := dst.Seek(offset, io.SeekStart); errRewind != nil {
+				return errRewind
+			}
+			return dst.Truncate(offset)
+		}, nil
+	case *bytes.Buffer:
+		offset := dst.Len()
+		return func() error { dst.Truncate(offset); return nil }, nil
+	default:
+		return nil, nil
 	}
-
-	return decompressed, nil
 }
 
-// decompressDeflate decompresses deflate-encoded data.
-//
-// Parameters:
-//   - data: The deflate-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
-func (l *FileRequestLogger) decompressDeflate(data []byte) ([]byte, error) {
-	reader := flate.NewReader(bytes.NewReader(data))
-	defer func() {
-		if errClose := reader.Close(); errClose != nil {
-			log.WithError(errClose).Warn("failed to close deflate reader in request logger")
+func writeDecodedResponseSection(w io.Writer, status int, headers map[string][]string, response []byte) error {
+	writeRaw := func(errDecode error) error {
+		return writeResponseSection(w, status, true, headers, bytes.NewReader(response), errDecode, true)
+	}
+	decoder, errNew := newResponseLogDecoder(headers, response)
+	if errNew != nil || decoder == nil {
+		return writeRaw(errNew)
+	}
+	rollback, errCheckpoint := responseLogRollback(w)
+	if errCheckpoint != nil {
+		decoder.Close()
+		return errCheckpoint
+	}
+	if rollback == nil {
+		// Arbitrary writers cannot discard a partially decoded response. Validate
+		// with bounded memory first; file and Home log destinations use one pass.
+		_, errValidate := io.Copy(io.Discard, decoder)
+		decoder.Close()
+		if errValidate != nil {
+			return writeRaw(errValidate)
 		}
-	}()
-
-	decompressed, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress deflate data: %w", err)
-	}
-
-	return decompressed, nil
-}
-
-// decompressBrotli decompresses brotli-encoded data.
-//
-// Parameters:
-//   - data: The brotli-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
-func (l *FileRequestLogger) decompressBrotli(data []byte) ([]byte, error) {
-	reader := brotli.NewReader(bytes.NewReader(data))
-
-	decompressed, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress brotli data: %w", err)
-	}
-
-	return decompressed, nil
-}
-
-// decompressZstd decompresses zstd-encoded data.
-//
-// Parameters:
-//   - data: The zstd-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
-func (l *FileRequestLogger) decompressZstd(data []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create zstd reader: %w", err)
+		decoder, errNew = newResponseLogDecoder(headers, response)
+		if errNew != nil {
+			return writeRaw(errNew)
+		}
 	}
 	defer decoder.Close()
-
-	decompressed, err := io.ReadAll(decoder)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decompress zstd data: %w", err)
+	errWrite := writeResponseSection(w, status, true, headers, decoder, nil, true)
+	if errWrite != nil && errWrite == decoder.err && rollback != nil {
+		if errRollback := rollback(); errRollback != nil {
+			return fmt.Errorf("failed to roll back decoded response log (%v): %w", errWrite, errRollback)
+		}
+		return writeRaw(errWrite)
 	}
-
-	return decompressed, nil
+	return errWrite
 }
 
 // formatRequestInfo creates the request information section of the log.

@@ -3,7 +3,6 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -40,31 +39,71 @@ func newCacheTokenRewriter(cfg *config.SDKConfig, format string) *cacheTokenRewr
 }
 
 func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
-	if r == nil || !json.Valid(data) {
+	if r == nil || !ojson.ValidBytes(data) {
 		return data
 	}
-	doc := ojson.NewDoc(data)
-	root := ojson.Parse(string(data))
-	if root.IsArray() {
-		for index, item := range root.Array() {
-			itemBytes := []byte(item.Raw)
-			rewritten := r.rewriteJSON(itemBytes)
-			if !bytes.Equal(rewritten, itemBytes) {
-				_ = doc.SetRawBytes(strconv.Itoa(index), rewritten)
-			}
-		}
-		return doc.Bytes()
+	return r.rewriteValidJSON(data)
+}
+
+// rewriteValidJSON is the exit for one validated payload, including arrays.
+// Read-only views share the input; a Doc is created only for an actual mutation.
+func (r *cacheTokenRewriter) rewriteValidJSON(data []byte) []byte {
+	var doc *ojson.Doc
+	r.rewriteJSONValue(ojson.GetBytesNoCopy(data, "@this"), "", data, &doc)
+	if doc == nil {
+		return data
 	}
-	if doc.Get("type").String() == "message_start" {
+	return doc.Bytes()
+}
+
+func (r *cacheTokenRewriter) rewriteJSONValue(root ojson.Result, prefix string, data []byte, doc **ojson.Doc) {
+	if root.IsArray() {
+		root.ForEach(func(index, item ojson.Result) bool {
+			r.rewriteJSONValue(item, prefix+strconv.FormatInt(index.Int(), 10)+".", data, doc)
+			return true
+		})
+		return
+	}
+	if !root.IsObject() {
+		return
+	}
+	var hasUsage, messageStart, seenType bool
+	root.ForEach(func(key, value ojson.Result) bool {
+		switch key.Str {
+		case "type":
+			if !seenType {
+				messageStart = value.String() == "message_start"
+				seenType = true
+			}
+		case "usage", "usageMetadata":
+			hasUsage = hasUsage || value.IsObject()
+		case "response":
+			hasUsage = hasUsage || (value.IsObject() && (value.Get("usage").IsObject() || value.Get("usageMetadata").IsObject()))
+		case "message", "interaction":
+			hasUsage = hasUsage || (value.IsObject() && value.Get("usage").IsObject())
+		case "metadata":
+			hasUsage = hasUsage || (value.IsObject() && value.Get("total_usage").IsObject())
+		}
+		return true
+	})
+	if messageStart {
 		r.claudeInput, r.claudeRead, r.claudeWrite, r.claudeKnown = 0, 0, 0, false
 		r.claudeRewrite, r.claudeCached = false, 0
 	}
+	if !hasUsage {
+		return
+	}
 	for _, path := range []string{"usage", "response.usage", "message.usage", "interaction.usage", "metadata.total_usage", "usageMetadata", "response.usageMetadata"} {
-		u := doc.Get(path)
+		u := root.Get(path)
 		if !u.IsObject() {
 			continue
 		}
-		set := func(key string, value int64) { _ = doc.Set(path+"."+key, value) }
+		set := func(key string, value int64) {
+			if *doc == nil {
+				*doc = ojson.NewDoc(data)
+			}
+			_ = (*doc).Set(prefix+path+"."+key, value)
+		}
 		zeroExisting := func(keys ...string) {
 			for _, key := range keys {
 				if u.Get(key).Exists() {
@@ -162,26 +201,35 @@ func (r *cacheTokenRewriter) rewriteJSON(data []byte) []byte {
 			set("cachedContentTokenCount", cached)
 		}
 	}
-	return doc.Bytes()
 }
 
 func (r *cacheTokenRewriter) rewriteFrame(frame []byte) []byte {
-	payload, found := sseJSONValidationDataPayload(frame)
-	if !found || !json.Valid(bytes.TrimSpace(payload)) {
+	payload, found := cacheTokenSSEPayload(frame)
+	if !found || !ojson.ValidBytes(payload) {
 		return frame
 	}
-	rewritten := r.rewriteJSON(payload)
+	return r.rewriteValidFrame(frame, payload)
+}
+
+func (r *cacheTokenRewriter) rewriteValidFrame(frame, payload []byte) []byte {
+	rewritten := r.rewriteValidJSON(payload)
 	if bytes.Equal(payload, rewritten) {
 		return frame
 	}
 	// SSE payload lines need their own data: prefix. Compact multiline JSON
 	// before replacing several data lines with a single one.
 	if bytes.IndexAny(rewritten, "\r\n") >= 0 {
-		var compact bytes.Buffer
-		_ = json.Compact(&compact, rewritten)
-		rewritten = compact.Bytes()
+		rewritten = []byte(ojson.GetBytesNoCopy(rewritten, "@ugly").Raw)
 	}
 	lines := bytes.Split(frame, []byte("\n"))
+	// The collapsed data line inherits the last line's ending. A chunk may end
+	// before that line's CRLF even when earlier data lines already include CR.
+	lastDataCR := false
+	for _, line := range lines {
+		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:")) {
+			lastDataCR = bytes.HasSuffix(line, []byte("\r"))
+		}
+	}
 	out := make([][]byte, 0, len(lines))
 	inserted := false
 	for _, line := range lines {
@@ -192,7 +240,7 @@ func (r *cacheTokenRewriter) rewriteFrame(frame []byte) []byte {
 			prefix := line[:bytes.Index(line, []byte("data:"))+5]
 			newLine := append(bytes.Clone(prefix), ' ')
 			newLine = append(newLine, rewritten...)
-			if bytes.HasSuffix(line, []byte("\r")) {
+			if lastDataCR {
 				newLine = append(newLine, '\r')
 			}
 			out = append(out, newLine)
@@ -204,43 +252,94 @@ func (r *cacheTokenRewriter) rewriteFrame(frame []byte) []byte {
 	return bytes.Join(out, []byte("\n"))
 }
 
+// cacheTokenSSEPayload borrows single-line data and joins only explicitly framed
+// data fields. It never treats an unframed continuation as another SSE field.
+func cacheTokenSSEPayload(frame []byte) ([]byte, bool) {
+	var payload, joined []byte
+	found := false
+	for line := range bytes.Lines(frame) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[len("data:"):])
+		if found {
+			if joined == nil {
+				joined = make([]byte, 0, len(payload)+len(data)+1)
+				joined = append(joined, payload...)
+			}
+			joined = append(joined, '\n')
+			joined = append(joined, data...)
+			payload = joined
+		} else {
+			payload = data
+			found = true
+		}
+	}
+	return payload, found
+}
+
+func cacheTokenSSEFrameEnd(data []byte) int {
+	for i, c := range data {
+		if c == '\n' && ((i > 0 && data[i-1] == '\n') ||
+			(i >= 3 && data[i-1] == '\r' && data[i-2] == '\n' && data[i-3] == '\r')) {
+			return i + 1
+		}
+	}
+	return -1
+}
+
 // Chunks may be standalone JSON, SSE frames, or arbitrary fragments of either.
 func (r *cacheTokenRewriter) rewriteChunk(chunk []byte) []byte {
 	// Native executors can pass scanner lines without their newline. Preserve
 	// the boundary between SSE fields before buffering the JSON data fragment.
 	if len(r.pending) > 0 && !bytes.HasSuffix(r.pending, []byte("\n")) && !bytes.HasPrefix(chunk, []byte("\n")) {
-		first := bytes.TrimSpace(bytes.SplitN(chunk, []byte("\n"), 2)[0])
+		first, _, _ := bytes.Cut(chunk, []byte("\n"))
+		first = bytes.TrimSpace(first)
 		if bytes.HasPrefix(first, []byte("data:")) || bytes.HasPrefix(first, []byte("event:")) {
-			if _, found := sseJSONValidationDataPayload(r.pending); !found {
+			if _, found := cacheTokenSSEPayload(r.pending); !found {
 				r.pending = append(r.pending, '\n')
 			}
 		}
 	}
 	r.pending = append(r.pending, chunk...)
-	if json.Valid(bytes.TrimSpace(r.pending)) {
-		out := r.rewriteJSON(r.pending)
-		r.pending = nil
-		return out
-	}
-	var out []byte
-	for {
-		end, delimiter := -1, 0
-		for _, separator := range [][]byte{[]byte("\n\n"), []byte("\r\n\r\n")} {
-			if i := bytes.Index(r.pending, separator); i >= 0 && (end < 0 || i < end) {
-				end, delimiter = i, len(separator)
+	trimmed := bytes.TrimSpace(r.pending)
+	if len(trimmed) > 0 {
+		switch trimmed[0] {
+		case '{', '[', '"', 't', 'f', 'n', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+			if ojson.ValidBytes(trimmed) {
+				out := r.rewriteValidJSON(r.pending)
+				r.pending = nil
+				return out
 			}
 		}
+	}
+	var out []byte
+	consumed := 0
+	for {
+		end := cacheTokenSSEFrameEnd(r.pending[consumed:])
 		if end < 0 {
 			break
 		}
-		end += delimiter
-		out = append(out, r.rewriteFrame(r.pending[:end])...)
-		r.pending = bytes.Clone(r.pending[end:])
+		if out == nil {
+			out = make([]byte, 0, len(r.pending))
+		}
+		end += consumed
+		out = append(out, r.rewriteFrame(r.pending[consumed:end])...)
+		consumed = end
 	}
-	payload, found := sseJSONValidationDataPayload(r.pending)
-	if (found && (json.Valid(bytes.TrimSpace(payload)) || bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")))) || len(bytes.TrimSpace(r.pending)) == 0 {
-		out = append(out, r.rewriteFrame(r.pending)...)
+	tail := r.pending[consumed:]
+	payload, found := cacheTokenSSEPayload(tail)
+	if len(bytes.TrimSpace(tail)) == 0 || (found && bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]"))) {
+		out = append(out, tail...)
 		r.pending = nil
+	} else if found && ojson.ValidBytes(payload) {
+		out = append(out, r.rewriteValidFrame(tail, payload)...)
+		r.pending = nil
+	} else if consumed > 0 {
+		// Detach the unfinished suffix once, after all complete frames have been
+		// consumed. Returned bytes never alias a buffer reused by a later chunk.
+		r.pending = bytes.Clone(tail)
 	}
 	return out
 }

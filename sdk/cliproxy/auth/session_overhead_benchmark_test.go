@@ -257,6 +257,26 @@ func BenchmarkSessionCacheScale100kEviction(b *testing.B) {
 	}
 }
 
+func BenchmarkSessionCacheRefreshBinding(b *testing.B) {
+	for _, count := range []int{2, 16, 64} {
+		b.Run(fmt.Sprintf("aliases=%d", count), func(b *testing.B) {
+			cache := NewSessionCache(time.Hour)
+			b.Cleanup(cache.Stop)
+			keys := make([]string, count)
+			for index := range keys {
+				keys[index] = fmt.Sprintf("session-alias-%d", index)
+			}
+			cache.setSessionAliases("auth", "codex", "session", keys...)
+			b.ReportAllocs()
+			for b.Loop() {
+				cache.GetAndRefresh(keys[1])
+				cache.setSessionAliases("auth", "codex", "session", keys[0], keys[1])
+				cache.Touch(keys[0], "auth")
+			}
+		})
+	}
+}
+
 // 8. MerklePrefixMatcher Large Scale LRU Eviction (Simulates continuous conversation churn with maxGroups=1000)
 func BenchmarkMerkleMatcherScaleLRUEviction(b *testing.B) {
 	matcher := cliproxysession.NewMerklePrefixMatcherWithConfig(cliproxysession.MerklePrefixMatcherConfig{

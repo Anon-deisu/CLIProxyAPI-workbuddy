@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -120,6 +119,7 @@ func preferredExecutionAttemptError(fallback, upstream error) error {
 // Execute performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = cliproxyexecutor.WithRequestPreparationCache(ctx)
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = WithCodexClientRequest(ctx, IsCodexClientRequest(ctx, opts.Headers))
@@ -134,6 +134,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	opts = m.prepareRequestAffinity(opts)
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -182,6 +183,7 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	ctx = cliproxyexecutor.WithRequestPreparationCache(ctx)
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = WithCodexClientRequest(ctx, IsCodexClientRequest(ctx, opts.Headers))
@@ -196,6 +198,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	opts = m.prepareRequestAffinity(opts)
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -237,6 +240,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // ExecuteStream performs a streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	ctx = cliproxyexecutor.WithRequestPreparationCache(ctx)
 	ctx = cliproxyexecutor.WithRequestProxyURL(ctx, opts.ProxyURL)
 	req, opts = cliproxysession.Enrich(req, opts)
 	ctx = WithCodexClientRequest(ctx, IsCodexClientRequest(ctx, opts.Headers))
@@ -252,6 +256,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	}
 
 	defaultRequestRetry, maxRetryCredentials, maxWait := m.retrySettings()
+	opts = m.prepareRequestAffinity(opts)
 
 	var lastErr error
 	var preferredUpstreamErr error
@@ -358,7 +363,7 @@ func applyRequestAfterAuthInterceptor(ctx context.Context, executor ProviderExec
 		if opts.Metadata == nil {
 			opts.Metadata = make(map[string]any, 1)
 		} else {
-			opts.Metadata = maps.Clone(opts.Metadata)
+			opts.Metadata = cloneRequestMetadata(opts.Metadata)
 		}
 		opts.Metadata[cliproxyexecutor.RequestPathMetadataKey] = path
 	}
@@ -520,9 +525,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
-		for authID := range m.requestRetryRoundExclusions(retryRound, defaultRequestRetry) {
-			tried[authID] = struct{}{}
-		}
+		tried = m.requestRetryRoundExclusions(retryRound, defaultRequestRetry)
 	}
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -604,10 +607,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execOpts := opts
 			if pickOpts.Metadata != nil {
 				if canonicalID, ok := pickOpts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey]; ok {
-					meta := make(map[string]any, len(execOpts.Metadata)+2)
-					for k, v := range execOpts.Metadata {
-						meta[k] = v
-					}
+					meta := cloneRequestMetadata(execOpts.Metadata)
 					meta[cliproxyexecutor.CanonicalSessionIDMetadataKey] = canonicalID
 					if parentID, okParent := pickOpts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey]; okParent && parentID != canonicalID {
 						meta[cliproxyexecutor.ParentSessionIDMetadataKey] = parentID
@@ -749,9 +749,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
-		for authID := range m.requestRetryRoundExclusions(retryRound, defaultRequestRetry) {
-			tried[authID] = struct{}{}
-		}
+		tried = m.requestRetryRoundExclusions(retryRound, defaultRequestRetry)
 	}
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -833,10 +831,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execOpts := opts
 			if pickOpts.Metadata != nil {
 				if canonicalID, ok := pickOpts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey]; ok {
-					meta := make(map[string]any, len(execOpts.Metadata)+2)
-					for k, v := range execOpts.Metadata {
-						meta[k] = v
-					}
+					meta := cloneRequestMetadata(execOpts.Metadata)
 					meta[cliproxyexecutor.CanonicalSessionIDMetadataKey] = canonicalID
 					if parentID, okParent := pickOpts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey]; okParent && parentID != canonicalID {
 						meta[cliproxyexecutor.ParentSessionIDMetadataKey] = parentID
@@ -983,9 +978,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	if !homeMode {
-		for authID := range m.requestRetryRoundExclusions(retryRound, defaultRequestRetry) {
-			tried[authID] = struct{}{}
-		}
+		tried = m.requestRetryRoundExclusions(retryRound, defaultRequestRetry)
 	}
 	homeExcludedAuthIDs := make(map[string]struct{})
 	homeSameAuthRetries := make(map[string]int)
@@ -1218,10 +1211,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		if selection != nil {
 			execOpts.ExecutionLifecycle = selection
 			if selection.CanonicalSessionID != "" {
-				meta := make(map[string]any, len(execOpts.Metadata)+2)
-				for k, v := range execOpts.Metadata {
-					meta[k] = v
-				}
+				meta := cloneRequestMetadata(execOpts.Metadata)
 				meta[cliproxyexecutor.CanonicalSessionIDMetadataKey] = selection.CanonicalSessionID
 				if selection.ParentSessionID != "" && selection.ParentSessionID != selection.CanonicalSessionID {
 					meta[cliproxyexecutor.ParentSessionIDMetadataKey] = selection.ParentSessionID
@@ -1232,10 +1222,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 		} else if pickOpts.Metadata != nil {
 			if canonicalID, ok := pickOpts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey]; ok {
-				meta := make(map[string]any, len(execOpts.Metadata)+2)
-				for k, v := range execOpts.Metadata {
-					meta[k] = v
-				}
+				meta := cloneRequestMetadata(execOpts.Metadata)
 				meta[cliproxyexecutor.CanonicalSessionIDMetadataKey] = canonicalID
 				if parentID, okParent := pickOpts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey]; okParent && parentID != canonicalID {
 					meta[cliproxyexecutor.ParentSessionIDMetadataKey] = parentID
@@ -1349,12 +1336,33 @@ func withAttemptedAuthTracker(opts cliproxyexecutor.Options, attempted map[strin
 	return opts
 }
 
+// Prepare before round-local metadata clones so every credential and retry
+// round can share immutable parsing work while retaining independent results.
+func (m *Manager) prepareRequestAffinity(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	selector, ok := m.Selector().(*SessionAffinitySelector)
+	if !ok || selector == nil || !selector.appliesTo("mixed") || m.HomeEnabled() || m.hasPluginScheduler() ||
+		sessionMetadataString(opts.Metadata, cliproxyexecutor.CallerScopeMetadataKey) == "" {
+		return opts
+	}
+	if explicitID, _ := extractExplicitSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata); explicitID != "" {
+		return opts
+	}
+	opts.Metadata = cloneRequestMetadata(opts.Metadata)
+	selector.prepareLCP(opts)
+	return opts
+}
+
 func cloneRequestMetadata(src map[string]any) map[string]any {
 	if len(src) == 0 {
 		return make(map[string]any, 4)
 	}
 	dst := make(map[string]any, len(src)+4)
 	for k, v := range src {
+		if k == cliproxyexecutor.LCPFingerprintMetadataKey || k == cliproxyexecutor.LCPTailFingerprintsMetadataKey {
+			if values, ok := v.([]string); ok {
+				v = append([]string(nil), values...)
+			}
+		}
 		dst[k] = v
 	}
 	return dst

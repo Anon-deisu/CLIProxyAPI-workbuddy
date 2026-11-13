@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -646,5 +647,149 @@ func TestEnrich_DoesNotClonePayloadWhenPopulatingOriginalRequest_Issue6101(t *te
 	_, enrichedOpts2 := Enrich(req, optsWithOriginal)
 	if unsafe.SliceData(enrichedOpts2.OriginalRequest) != unsafe.SliceData(independentOriginal) {
 		t.Fatal("Enrich replaced explicitly provided OriginalRequest")
+	}
+}
+
+func legacyDeriveID(format sdktranslator.Format, payload []byte, scope string) string {
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return ""
+	}
+	root := canonicalRoot{Version: identityVersion, Format: format.String(), CallerScope: strings.TrimSpace(scope)}
+	switch {
+	case sourceFormatEqual(format, sdktranslator.FormatGemini), sourceFormatEqual(format, sdktranslator.FormatAntigravity):
+		req := body
+		if nested, ok := body["request"].(map[string]any); ok {
+			req = nested
+		}
+		root.Resource = stringField(req, "cachedContent", "cached_content")
+		root.Instructions, root.User = geminiRoot(body)
+	case sourceFormatEqual(format, sdktranslator.FormatInteractions):
+		root.Instructions, root.User = interactionsRoot(body)
+	case sourceFormatEqual(format, sdktranslator.FormatOpenAIResponse), sourceFormatEqual(format, sdktranslator.FormatCodex):
+		root.Instructions, root.User = responsesRoot(body)
+	default:
+		root.Instructions, root.User = messagesRoot(body, sourceFormatEqual(format, sdktranslator.FormatClaude))
+	}
+	if len(root.User) == 0 {
+		return ""
+	}
+	return hashRoot(root)
+}
+
+func TestDeriveIDRootDecodeDifferential(t *testing.T) {
+	payloads := []string{
+		`null`, `[]`, `{}`, `{"messages":[]}`, `{"messages":[{"role":"user","content":"hello"}]} trailing`,
+		`{"system":"s","messages":[{"role":"user","content":null},{"role":"developer","content":"d"},{"role":"user","content":[1,true,{"x":2,"cache_control":{}}]}]}`,
+		`{"messages":[{"role":"user","content":"first","content":"last"}],"messages":[{"role":"user","content":"replacement"}]}`,
+		`{"messages":[{"role":"user","content":"first"},{"role":"assistant","content":1e999}]}`,
+		`{"messages":[{"role":"user","content":"first"}],"ignored":1e-999}`,
+		`{"messages":[{"role":"user","content":"first"}],"ignored":` + strings.Repeat("9", 310) + `}`,
+		`{"instructions":"rules","input":[{"role":"user","content":""},{"role":"system","content":"extra"},{"role":"assistant","content":"skip"},{"role":"user","content":{"image_url":{"url":"data:x"}}}]}`,
+		`{"system_instruction":{"parts":[{"text":"rules"}]},"input":[{"role":"user","steps":[{"content":null},{"content":"later"}]}]}`,
+		`{"input":[{"role":"system","steps":[{"text":"rules"}]},{"role":"user","steps":[{"text":"hello"}]}]}`,
+		`{"input":["",{"role":"user","content":"later"}]}`,
+		`{"input":"hello","system_instruction":null,"systemInstruction":"ignored"}`,
+		`{"request":{"cachedContent":null,"cached_content":"ignored","systemInstruction":{"parts":[{"text":"rules"}]},"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"image/png","data":"abc"}}]}]},"contents":[{"role":"user","parts":[{"text":"outer"}]}]}`,
+		`{"messages":[{"role":"USER","content":"\ud800\r\n\u0000"}]}`,
+		"{\"messages\":[{\"role\":\"user\",\"content\":\"bad\xffutf8\"}]}",
+	}
+	formats := []sdktranslator.Format{sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, sdktranslator.FormatOpenAIResponse, sdktranslator.FormatCodex, sdktranslator.FormatGemini, sdktranslator.FormatAntigravity, sdktranslator.FormatInteractions, " OPENAI "}
+	for _, format := range formats {
+		for i, payload := range payloads {
+			for _, scope := range []string{"scope-a", " scope-b "} {
+				if got, want := DeriveID(format, []byte(payload), scope), legacyDeriveID(format, []byte(payload), scope); got != want {
+					t.Fatalf("format %s payload %d scope %q: got %q want %q", format, i, scope, got, want)
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkIdentityExtraction(b *testing.B) {
+	payload := []byte(`{"messages":[{"role":"system","content":"rules"},{"role":"user","content":"first"}` + strings.Repeat(`,{"role":"assistant","content":"`+strings.Repeat("x", 1024)+`"}`, 100) + `],"metadata":{"user_id":"{\"session_id\":\"session\",\"agent_id\":\"worker\"}"}}`)
+	b.Run("DeriveIDHistory", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			DeriveID(sdktranslator.FormatOpenAI, payload, "scope")
+		}
+	})
+	b.Run("EnrichExplicit", func(b *testing.B) {
+		req := cliproxyexecutor.Request{Payload: payload}
+		opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI}
+		b.ReportAllocs()
+		for b.Loop() {
+			Enrich(req, opts)
+		}
+	})
+}
+
+func FuzzDeriveIDRootDecodeDifferential(f *testing.F) {
+	formats := []sdktranslator.Format{sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, sdktranslator.FormatOpenAIResponse, sdktranslator.FormatGemini, sdktranslator.FormatAntigravity, sdktranslator.FormatInteractions}
+	for _, payload := range []string{
+		`{"messages":[{"role":"user","content":"hello"}],"ignored":1e999}`,
+		`{"messages":[{"role":"user","content":"hello"}]}`,
+		`{"input":[{"role":"user","steps":[{"content":"hello"}]}]}`,
+		`{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}`,
+	} {
+		for index := range formats {
+			f.Add(payload, uint8(index))
+		}
+	}
+	f.Fuzz(func(t *testing.T, payload string, index uint8) {
+		format := formats[int(index)%len(formats)]
+		if got, want := DeriveID(format, []byte(payload), "scope"), legacyDeriveID(format, []byte(payload), "scope"); got != want {
+			t.Fatalf("format %s payload %q: got %q want %q", format, payload, got, want)
+		}
+	})
+}
+
+func TestDeriveIDIgnoredHistoryValidation(t *testing.T) {
+	for _, ignored := range []string{
+		`1.7976931348623157e308`, `1.7976931348623159e308`, `1e-999`,
+		strings.Repeat("[", 9999) + "0" + strings.Repeat("]", 9999),
+		strings.Repeat("[", 10000) + "0" + strings.Repeat("]", 10000),
+		`"quote\"slash\\and\"more"`,
+	} {
+		payload := []byte(`{"messages":[{"role":"user","content":"first"}],"ignored":` + ignored + `}`)
+		if got, want := DeriveID(sdktranslator.FormatOpenAI, payload, "scope"), legacyDeriveID(sdktranslator.FormatOpenAI, payload, "scope"); got != want {
+			t.Fatalf("ignored value length %d: got %q want %q", len(ignored), got, want)
+		}
+	}
+}
+
+func TestEnrichSharedExtractionPrecedence(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers http.Header
+		payload string
+		wantID  string
+		parent  string
+	}{
+		{"claude body over codex header", http.Header{"Session-Id": {"header"}}, `{"metadata":{"user_id":"{\"session_id\":\"root\",\"agent_id\":\"child\",\"parent_session_id\":\"parent\"}"}}`, "claude:root:agent:child", "claude:parent"},
+		{"claude header over body", http.Header{"X-Claude-Code-Session-Id": {"header"}}, `{"metadata":{"user_id":"{\"session_id\":\"body\",\"agent_id\":\"worker\"}"}}`, "claude:header:agent:worker", "claude:header"},
+		{"duplicate metadata", nil, `{"metadata":{},"metadata":{"user_id":"user_hash_session_abc-def","parent_agent_id":"parent"}}`, "claude:abc-def", "claude:parent"},
+		{"legacy nested parent stays outer", nil, `{"metadata":{"parent_agent_id":"outer"},"request":{"metadata":{"user_id":"user_hash_session_abc-def","parent_agent_id":"inner"}}}`, "claude:abc-def", "claude:outer"},
+		{"parent only preserves execution fallback", nil, `{"parent_id":"parent","messages":[{"role":"user","content":"first"}]}`, "execution:connection", ""},
+		{"unrecognized explicit alias preserves canonical precedence", nil, `{"metadata":{"sessionID":"body"},"messages":[{"role":"user","content":"first"}]}`, "session:retained", "session:retained-parent"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			metadata := map[string]any{
+				cliproxyexecutor.ExecutionSessionMetadataKey:   "connection",
+				cliproxyexecutor.CanonicalSessionIDMetadataKey: "session:retained",
+				cliproxyexecutor.ParentSessionIDMetadataKey:    "session:retained-parent",
+				cliproxyexecutor.DerivedSessionIDMetadataKey:   "ctx:v1:stale",
+			}
+			req, opts := Enrich(cliproxyexecutor.Request{Payload: []byte(test.payload)}, cliproxyexecutor.Options{Headers: test.headers, Metadata: metadata, SourceFormat: sdktranslator.FormatOpenAI})
+			for _, got := range []map[string]any{req.Metadata, opts.Metadata} {
+				if metadataString(got, cliproxyexecutor.CanonicalSessionIDMetadataKey) != test.wantID || metadataString(got, cliproxyexecutor.ParentSessionIDMetadataKey) != test.parent || DerivedID(got) != "" {
+					t.Fatalf("unexpected enriched identity: %#v", got)
+				}
+			}
+			if DerivedID(metadata) != "ctx:v1:stale" {
+				t.Fatal("Enrich mutated caller metadata")
+			}
+		})
 	}
 }
